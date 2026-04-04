@@ -59,7 +59,7 @@ jobs:
           # 裸 "github.com" 不做任何主机验证，等同于 StrictHostKeyChecking=no，
           # 存在中间人攻击风险（MITM）。
           # 下方为 GitHub 官方发布的 ed25519 公钥指纹（可在 https://docs.github.com/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints 核对）。
-          known_hosts: "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C6MQZ6nhBU7GqB"
+          known_hosts: "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK3pzfEjVuG0d+XmQYsvcsXXMU3K0RTGmi5mKVp+dLAx"
 
       # ── Step 2: 克隆私有仓库 ────────────────────────────────────────────────
       - name: Clone Private Repository
