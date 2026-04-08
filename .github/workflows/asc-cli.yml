@@ -86,7 +86,7 @@ jobs:
           path: |
             core_project/.build
             ~/Library/Caches/org.swift.swiftpm
-            ~/Library/Developer/Xcode/DerivedData/Inkura-*/SourcePackages
+            ~/Library/Developer/Xcode/DerivedData/Readori-*/SourcePackages
           # ✅ 性能优化：Package.resolved 变化时自动失效缓存
           key: spm-${{ runner.os }}-${{ hashFiles('core_project/Package.resolved') }}
           restore-keys: |
@@ -163,7 +163,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: inkura-build-${{ github.run_number }}
+          name: readori-build-${{ github.run_number }}
           # 1 天后自动过期，缩小侧载 IPA 的暴露窗口
           retention-days: 1
           if-no-files-found: warn
