@@ -4,30 +4,31 @@ on:
   workflow_dispatch:
     inputs:
       app_scheme:
-        description: "SPM / xcodebuild Scheme 名称"
+        description: "SPM / xcodebuild scheme name"
         required: false
-        default: "Inkura"
+        default: "Readori"
         type: string
       xcode_version:
-        description: "Xcode 版本（例如 16.2，留空使用默认）"
+        description: "Xcode version (e.g. 16.2, empty uses runner default)"
         required: false
         default: ""
         type: string
       generate_icons:
-        description: "是否运行图标生成脚本"
+        description: "Whether to run icon generation script"
         required: false
         default: "yes"
         type: choice
         options:
           - "yes"
           - "no"
-      # 新增：控制是否执行 asc-cli 任务
       run_asc_tasks:
-        description: "是否执行 App Store Connect 任务 (需要 Secrets)"
+        description: "Whether to run App Store Connect tasks (requires secrets)"
         required: false
         default: "no"
         type: choice
-        options: ["yes", "no"]
+        options:
+          - "yes"
+          - "no"
 
 permissions:
   contents: read
@@ -43,43 +44,32 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      # ── Step 1: 配置 SSH 密钥，准备访问私有仓库 ────────────────────────────
       - name: Install SSH Key
         uses: shimataro/ssh-key-action@v2
         with:
           key: ${{ secrets.PRIVATE_REPO_KEY }}
-          # ✅ 安全修复：必须填写完整的 SSH 主机指纹，而非裸主机名。
-          # 裸 "github.com" 不做任何主机验证，等同于 StrictHostKeyChecking=no，
-          # 存在中间人攻击风险（MITM）。
-          # 下方为 GitHub 官方发布的 ed25519 公钥指纹（可在 https://docs.github.com/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints 核对）。
           known_hosts: "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK3pzfEjVuG0d+XmQYsvcsXXMU3K0RTGmi5mKVp+dLAx"
 
-      # ── Step 2: 克隆私有仓库 ────────────────────────────────────────────────
       - name: Clone Private Repository
         run: |
           git clone --depth=1 git@github.com:readori/readori.git core_project
           echo "[clone] Done. Ref: $(git -C core_project rev-parse --short HEAD)"
 
-      # ── Step 3: 设置 Xcode 版本（可选）─────────────────────────────────────
       - name: Select Xcode (optional)
         if: ${{ github.event.inputs.xcode_version != '' }}
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: ${{ github.event.inputs.xcode_version }}
 
-      # ── Step 4: 打印环境信息 ─────────────────────────────────────────────────
       - name: Environment Diagnostics
         run: |
           xcodebuild -version
           swift --version
-          # ✅ 安全修复：原先 `ls -R core_project` 会将私有仓库完整文件树打印到
-          # Actions 日志（公开仓库 → 任何人可见）。改为只列出顶层目录结构。
           echo "--- Top-level structure ---"
           ls -1 core_project/
           echo "--- Scripts ---"
           ls -1 core_project/scripts/ 2>/dev/null || echo "(no scripts dir)"
 
-      # ── Step 5: SPM 依赖缓存 + 解析 ─────────────────────────────────────────
       - name: Cache Swift packages
         uses: actions/cache@v4
         with:
@@ -87,7 +77,6 @@ jobs:
             core_project/.build
             ~/Library/Caches/org.swift.swiftpm
             ~/Library/Developer/Xcode/DerivedData/Readori-*/SourcePackages
-          # ✅ 性能优化：Package.resolved 变化时自动失效缓存
           key: spm-${{ runner.os }}-${{ hashFiles('core_project/Package.resolved') }}
           restore-keys: |
             spm-${{ runner.os }}-
@@ -97,7 +86,6 @@ jobs:
           cd core_project
           swift package resolve
 
-      # ── Step 6: 生成图标（可选）─────────────────────────────────────────────
       - name: Generate app icons
         if: ${{ github.event.inputs.generate_icons == 'yes' }}
         run: |
@@ -107,7 +95,6 @@ jobs:
             echo "Warning: generate_icons.swift not found, skipping."
           fi
 
-      # ── Step 7: 编译打包 ─────────────────────────────────────────────────────
       - name: Build unsigned IPA
         env:
           ALLOW_WRAPPED_APP: "1"
@@ -115,56 +102,38 @@ jobs:
           mkdir -p "${GITHUB_WORKSPACE}/build"
           cd core_project
           chmod +x scripts/build_unsigned_ipa.sh
-          # REPO_ROOT="$PWD" = core_project/，build_unsigned_ipa.sh 可正确定位
-          # Inkura/Supporting/Info.plist 及各 lproj 目录。
           ./scripts/build_unsigned_ipa.sh \
             "${{ github.event.inputs.app_scheme }}" \
             "${GITHUB_WORKSPACE}/build"
 
-      # ── Step 9: 安装 asc-cli ──────────────────────────────────────────────
       - name: Install asc-cli
         if: ${{ github.event.inputs.run_asc_tasks == 'yes' }}
         run: |
           brew tap tddworks/tap
           brew install asccli
 
-      # ── Step 10: 配置 asc-cli 认证 ─────────────────────────────────────────
       - name: Authenticate asc-cli
         if: ${{ github.event.inputs.run_asc_tasks == 'yes' }}
         run: |
-          # 创建私钥存储目录
           mkdir -p ~/.appstoreconnect/private_keys
-          # 将密钥写入文件（文件名必须匹配 AuthKey_{ID}.p8）
           echo "${{ secrets.ASC_PRIVATE_KEY }}" > ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
-          
-          # 登录
           asc auth login \
             --key-id ${{ secrets.ASC_KEY_ID }} \
             --issuer-id ${{ secrets.ASC_ISSUER_ID }} \
             --p8-path ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
 
-      # ── Step 11: 使用 asc-cli 执行任务（示例：列出所有 App 或检查状态） ──────
       - name: Run asc-cli Commands
         if: ${{ github.event.inputs.run_asc_tasks == 'yes' }}
         run: |
-          echo "--- 检查 API 连接 ---"
+          echo "--- Validate API connection ---"
           asc auth list
-          
-          echo "--- 获取 App 列表状态 ---"
+          echo "--- List apps ---"
           asc app list --limit 5
-          
-          # 如果你想上传 IPA（前提是必须已签名），取消下面注释：
-          # IPA_PATH=$(find build -name "*.ipa" | head -1)
-          # if [[ -f "$IPA_PATH" ]]; then
-          #   asc ipa upload --file "$IPA_PATH"
-          # fi
 
-      # ── Step 12: 上传打包好的 IPA ──────────────────────────────────────────
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: readori-build-${{ github.run_number }}
-          # 1 天后自动过期，缩小侧载 IPA 的暴露窗口
           retention-days: 1
           if-no-files-found: warn
           path: |
