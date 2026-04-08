@@ -57,7 +57,7 @@ jobs:
       # ── Step 2: 克隆私有仓库 ────────────────────────────────────────────────
       - name: Clone Private Repository
         run: |
-          git clone --depth=1 git@github.com:inkuradev/inkura.git core_project
+          git clone --depth=1 git@github.com:readori/readori.git core_project
           echo "[clone] Done. Ref: $(git -C core_project rev-parse --short HEAD)"
 
       # ── Step 3: 设置 Xcode 版本（可选）─────────────────────────────────────
