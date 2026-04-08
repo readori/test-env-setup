@@ -93,7 +93,7 @@ jobs:
           path: |
             core_project/.build
             ~/Library/Caches/org.swift.swiftpm
-            ~/Library/Developer/Xcode/DerivedData/Inkura-*/SourcePackages
+            ~/Library/Developer/Xcode/DerivedData/readori-*/SourcePackages
           # ✅ 性能优化：Package.resolved 变化时自动失效缓存
           key: spm-${{ runner.os }}-${{ hashFiles('core_project/Package.resolved') }}
           restore-keys: |
@@ -121,10 +121,10 @@ jobs:
         run: |
           mkdir -p "${GITHUB_WORKSPACE}/build"
           cd core_project
-          chmod +x scripts/build_unsigned_ipa.sh
-          # REPO_ROOT="$PWD" = core_project/，build_unsigned_ipa.sh 可正确定位
-          # Inkura/Supporting/Info.plist 及各 lproj 目录。
-          ./scripts/build_unsigned_ipa.sh \
+          chmod +x scripts/build_ipa.sh
+          # REPO_ROOT="$PWD" = core_project/，build_ipa.sh 可正确定位
+          # Readori/Supporting/Info.plist 及各 lproj 目录。
+          ./scripts/build_ipa.sh \
             "${{ github.event.inputs.app_scheme }}" \
             "${GITHUB_WORKSPACE}/build"
 
@@ -160,7 +160,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: inkura-unsigned-ipa-${{ github.run_number }}
+          name: readori-ipa-${{ github.run_number }}
           # 1 天后自动过期，缩小侧载 IPA 的暴露窗口
           retention-days: 1
           if-no-files-found: warn
