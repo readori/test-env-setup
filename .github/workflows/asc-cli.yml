@@ -29,7 +29,6 @@ on:
         options:
           - "yes"
           - "no"
-      inputs:
       app_bundle_identifier:
         description: "Bundle identifier for packaging"
         required: false
