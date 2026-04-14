@@ -1,0 +1,214 @@
+name: Build and Manage with asc-cli (Enterprise Enhanced)
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_scheme:
+        description: "SPM / xcodebuild scheme name"
+        required: false
+        default: "Readori"
+        type: string
+
+      xcode_version:
+        description: "Xcode version (optional)"
+        required: false
+        default: ""
+        type: string
+
+      generate_icons:
+        description: "Run icon generation"
+        required: false
+        default: "yes"
+        type: choice
+        options: ["yes", "no"]
+
+      run_asc_tasks:
+        description: "Run App Store Connect tasks"
+        required: false
+        default: "yes"
+        type: choice
+        options: ["yes", "no"]
+
+      app_bundle_identifier:
+        description: "Bundle identifier"
+        required: false
+        default: "com.readori.app"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-remote-${{ github.ref }}
+  cancel-in-progress: true
+
+
+jobs:
+  build-and-manage:
+    runs-on: macos-14
+    timeout-minutes: 90
+
+    steps:
+
+    # =====================================================
+    # 1. SSH + PRIVATE REPO
+    # =====================================================
+    - name: Install SSH Key
+      uses: shimataro/ssh-key-action@v2
+      with:
+        key: ${{ secrets.PRIVATE_REPO_KEY }}
+        known_hosts: github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK3pzfEjVuG0d+XmQYsvcsXXMU3K0RTGmi5mKVp+dLAx
+
+    - name: Clone Private Repository
+      run: |
+        git clone --depth=1 git@github.com:readori/readori.git core_project
+        echo "[clone] $(git -C core_project rev-parse --short HEAD)"
+
+    # =====================================================
+    # 2. XCODE SELECTION
+    # =====================================================
+    - name: Select Xcode
+      if: ${{ github.event.inputs.xcode_version != '' }}
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: ${{ github.event.inputs.xcode_version }}
+
+    # =====================================================
+    # 3. ENV CHECK
+    # =====================================================
+    - name: Diagnostics
+      run: |
+        xcodebuild -version
+        swift --version
+        ls -R core_project | head -200
+
+    # =====================================================
+    # 4. CACHE (ENHANCED)
+    # =====================================================
+    - name: Cache SwiftPM + DerivedData
+      uses: actions/cache@v4
+      with:
+        path: |
+          core_project/.build
+          ~/Library/Caches/org.swift.swiftpm
+          ~/Library/Developer/Xcode/DerivedData
+        key: spm-${{ runner.os }}-${{ hashFiles('core_project/Package.resolved') }}
+        restore-keys: |
+          spm-${{ runner.os }}-
+
+    # =====================================================
+    # 5. SWIFT PACKAGE RESOLVE
+    # =====================================================
+    - name: Resolve Swift Packages
+      run: |
+        cd core_project
+        swift package resolve
+
+    # =====================================================
+    # 6. ICON GENERATION (UNCHANGED)
+    # =====================================================
+    - name: Generate app icons
+      if: ${{ github.event.inputs.generate_icons == 'yes' }}
+      run: |
+        if [[ -f "core_project/scripts/generate_icons.swift" ]]; then
+          swift core_project/scripts/generate_icons.swift "${GITHUB_WORKSPACE}/core_project"
+        fi
+
+    # =====================================================
+    # 7. BUILD (YOUR SYSTEM - KEPT)
+    # =====================================================
+    - name: Build unsigned IPA
+      env:
+        ALLOW_WRAPPED_APP: "1"
+        APP_BUNDLE_IDENTIFIER: ${{ github.event.inputs.app_bundle_identifier }}
+      run: |
+        mkdir -p build
+        cd core_project
+
+        chmod +x scripts/build_unsigned_ipa.sh
+
+        ./scripts/build_unsigned_ipa.sh \
+          "${{ github.event.inputs.app_scheme }}" \
+          "${GITHUB_WORKSPACE}/build"
+
+    # =====================================================
+    # 8. 🔥 ENTERPRISE ENHANCEMENT #1 - VERSIONING
+    # =====================================================
+    - name: Auto Versioning (Enterprise Add-on)
+      run: |
+        cd core_project
+
+        SHORT_SHA=$(git rev-parse --short HEAD)
+        DATE=$(date +%Y%m%d%H%M)
+
+        echo "BUILD_VERSION=$DATE-$SHORT_SHA" >> $GITHUB_ENV
+
+    # =====================================================
+    # 9. 🔥 ENTERPRISE ENHANCEMENT #2 - ARTIFACT NAME FIX
+    # =====================================================
+    - name: Rename IPA (traceable builds)
+      run: |
+        mkdir -p final
+
+        find build -name "*.ipa" | head -1 | while read file; do
+          cp "$file" "final/Readori-${{ env.BUILD_VERSION }}.ipa"
+        done
+
+    # =====================================================
+    # 10. ASC CLI INSTALL
+    # =====================================================
+    - name: Install asc-cli
+      if: ${{ github.event.inputs.run_asc_tasks == 'yes' }}
+      run: |
+        brew tap tddworks/tap
+        brew install asccli
+
+    # =====================================================
+    # 11. ASC AUTH
+    # =====================================================
+    - name: Authenticate asc-cli
+      if: ${{ github.event.inputs.run_asc_tasks == 'yes' }}
+      run: |
+        mkdir -p ~/.appstoreconnect/private_keys
+
+        echo "${{ secrets.ASC_PRIVATE_KEY }}" > \
+          ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
+
+        asc auth login \
+          --key-id ${{ secrets.ASC_KEY_ID }} \
+          --issuer-id ${{ secrets.ASC_ISSUER_ID }} \
+          --p8-path ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
+
+    # =====================================================
+    # 12. 🔥 ENTERPRISE ENHANCEMENT #3 - UPLOAD + LOGGING
+    # =====================================================
+    - name: Upload to TestFlight
+      if: ${{ github.event.inputs.run_asc_tasks == 'yes' }}
+      run: |
+        echo "Uploading build: $BUILD_VERSION"
+
+        asc build upload --path final/*.ipa
+
+    # =====================================================
+    # 13. 🔥 ENTERPRISE ENHANCEMENT #4 - BUILD SUMMARY
+    # =====================================================
+    - name: Build Summary
+      if: always()
+      run: |
+        echo "=================================="
+        echo "BUILD DONE"
+        echo "Version: $BUILD_VERSION"
+        echo "Scheme: ${{ github.event.inputs.app_scheme }}"
+        echo "=================================="
+
+    # =====================================================
+    # 14. ARTIFACT
+    # =====================================================
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: readori-${{ env.BUILD_VERSION }}
+        retention-days: 3
+        path: |
+          final/*.ipa
+          build/*.ipa
