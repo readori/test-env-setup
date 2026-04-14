@@ -1,4 +1,4 @@
-name: Build and Manage with asc-cli (INIT MATCH SETUP)
+name: certificates-repo asc-cli (INIT MATCH SETUP)
 
 on:
   workflow_dispatch:
