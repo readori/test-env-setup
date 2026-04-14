@@ -1,4 +1,4 @@
-name: Build and Manage with asc-cli (Enterprise Enhanced)
+name: Build and Manage with asc-cli-v1 (Enterprise Enhanced)
 
 on:
   workflow_dispatch:
