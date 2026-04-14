@@ -1,4 +1,4 @@
-name: certificates-repo asc-cli (INIT MATCH SETUP)
+name: certificates-repo asc-cli (PRODUCTION SAFE)
 
 on:
   workflow_dispatch:
@@ -16,9 +16,9 @@ on:
         type: string
 
       run_init:
-        description: "Run MATCH INIT (ONLY FIRST TIME)"
+        description: "RUN INITIAL CERT GENERATION (ONLY IF CERT REPO EMPTY)"
         required: false
-        default: "yes"
+        default: "no"
         type: choice
         options:
           - "yes"
@@ -28,84 +28,69 @@ permissions:
   contents: read
 
 concurrency:
-  group: build-init-${{ github.ref }}
+  group: build-${{ github.ref }}
   cancel-in-progress: true
 
 
 jobs:
-  build-and-init:
+  build:
     runs-on: macos-14
     timeout-minutes: 90
 
     steps:
 
-    # =====================================================
-    # 1. SSH (PRIVATE REPO ACCESS)
-    # =====================================================
+    # =========================
+    # 1. SSH SETUP
+    # =========================
     - name: Install SSH Key
       uses: shimataro/ssh-key-action@v2
       with:
         key: ${{ secrets.PRIVATE_REPO_KEY }}
         known_hosts: github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK3pzfEjVuG0d+XmQYsvcsXXMU3K0RTGmi5mKVp+dLAx
 
-    # =====================================================
-    # 2. Clone PRIVATE APP REPO
-    # =====================================================
-    - name: Clone private repository
+    # =========================
+    # 2. CLONE PRIVATE APP
+    # =========================
+    - name: Clone private repo
       run: |
         git clone --depth=1 git@github.com:readori/readori.git core_project
-        echo "Cloned core repo"
 
-    # =====================================================
-    # 3. Install tools
-    # =====================================================
+    # =========================
+    # 3. INSTALL FASTLANE
+    # =========================
     - name: Install Fastlane
-      run: |
-        brew install fastlane
+      run: brew install fastlane
 
-    # =====================================================
-    # 4. OPTIONAL XCODE SWITCH
-    # =====================================================
+    # =========================
+    # 4. OPTIONAL XCODE
+    # =========================
     - name: Select Xcode
       if: ${{ github.event.inputs.xcode_version != '' }}
       uses: maxim-lobanov/setup-xcode@v1
       with:
         xcode-version: ${{ github.event.inputs.xcode_version }}
 
-    # =====================================================
-    # 5. SWIFT PACKAGE RESOLVE
-    # =====================================================
+    # =========================
+    # 5. SWIFT RESOLVE
+    # =========================
     - name: Resolve Swift Packages
       run: |
         cd core_project
         swift package resolve
 
-    # =====================================================
-    # 6. ICON GENERATION (OPTIONAL)
-    # =====================================================
+    # =========================
+    # 6. ICONS
+    # =========================
     - name: Generate icons
       run: |
         if [[ -f "core_project/scripts/generate_icons.swift" ]]; then
           swift core_project/scripts/generate_icons.swift "${GITHUB_WORKSPACE}/core_project"
         fi
 
-    # =====================================================
-    # 7. 🚨 MATCH INIT (ONE-TIME ONLY)
-    # =====================================================
-    - name: INIT FASTLANE MATCH (DO NOT REUSE)
-      if: ${{ github.event.inputs.run_init == 'yes' }}
-      run: |
-        brew install fastlane
-
-        cd core_project
-
-        fastlane match init
-
-    # =====================================================
-    # 8. MATCH GENERATE CERTIFICATES
-    # =====================================================
-    - name: GENERATE CERTIFICATES (APPSTORE)
-      if: ${{ github.event.inputs.run_init == 'yes' }}
+    # =========================
+    # 7. 🚀 SAFE CERT SETUP (NO INIT)
+    # =========================
+    - name: Setup certificates (SAFE MODE)
       env:
         MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
       run: |
@@ -113,12 +98,13 @@ jobs:
 
         fastlane match appstore \
           --git_url git@github.com:readori/readori-certificates.git \
-          --type appstore
+          --type appstore \
+          --readonly
 
-    # =====================================================
-    # 9. BUILD (YOUR EXISTING SYSTEM)
-    # =====================================================
-    - name: Build unsigned IPA
+    # =========================
+    # 8. BUILD
+    # =========================
+    - name: Build IPA
       run: |
         mkdir -p build
         cd core_project
@@ -129,19 +115,17 @@ jobs:
           "${{ github.event.inputs.app_scheme }}" \
           "${GITHUB_WORKSPACE}/build"
 
-    # =====================================================
-    # 10. DEBUG OUTPUT
-    # =====================================================
+    # =========================
+    # 9. OUTPUT CHECK
+    # =========================
     - name: Show output
-      run: |
-        ls -R build || true
+      run: ls -R build || true
 
-    # =====================================================
-    # 11. ARTIFACT UPLOAD
-    # =====================================================
-    - name: Upload artifacts
+    # =========================
+    # 10. ARTIFACT
+    # =========================
+    - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: init-build
-        path: |
-          build/*.ipa
+        name: build
+        path: build/*.ipa
