@@ -279,9 +279,7 @@ jobs:
           IMPORTED=true
           echo "Certificate imported with empty password"
         else
-          echo "ERROR: Certificate import failed with both passwords"
-          echo "Trying without -P flag..."
-          security import /tmp/cert.p12 -k build.keychain -T /usr/bin/codesign -T /usr/bin/security || true
+          echo "WARNING: Certificate import failed with both passwords — continuing"
         fi
 
         security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" build.keychain 2>/dev/null || true
@@ -296,7 +294,14 @@ jobs:
         if [[ -n "$IOS_PROVISIONING_PROFILE" ]]; then
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           echo "$IOS_PROVISIONING_PROFILE" | tr -d ' \n\r' | base64 --decode > /tmp/profile.mobileprovision
-          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< $(security cms -D -i /tmp/profile.mobileprovision 2>/dev/null) 2>/dev/null || true)
+          PROF_SIZE=$(wc -c < /tmp/profile.mobileprovision | tr -d ' ')
+          echo "Provisioning profile size: ${PROF_SIZE} bytes"
+          # Extract UUID using security cms + grep (avoids PlistBuddy stdin hang)
+          PROFILE_UUID=""
+          if security cms -D -i /tmp/profile.mobileprovision > /tmp/profile_plist.xml 2>/dev/null; then
+            PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /tmp/profile_plist.xml 2>/dev/null || true)
+          fi
+          rm -f /tmp/profile_plist.xml
           if [[ -n "$PROFILE_UUID" ]]; then
             cp /tmp/profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/${PROFILE_UUID}.mobileprovision
             echo "Provisioning profile installed: ${PROFILE_UUID}"
