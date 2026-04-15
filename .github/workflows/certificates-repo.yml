@@ -88,9 +88,11 @@ jobs:
         fi
 
     # =========================
-    # 7. 🚀 SAFE CERT SETUP (NO INIT)
+    # 7a. 🔐 INIT CERT REPO (FIRST TIME ONLY)
+    # run_init = yes → generates + stores certs (write access required)
     # =========================
-    - name: Setup certificates (SAFE MODE)
+    - name: Initialize certificates (FIRST TIME ONLY)
+      if: ${{ github.event.inputs.run_init == 'yes' }}
       env:
         MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
       run: |
@@ -99,6 +101,24 @@ jobs:
         fastlane match appstore \
           --git_url git@github.com:readori/readori-certificates.git \
           --type appstore \
+          --app_identifier com.readori.app \
+          --force_for_new_devices
+
+    # =========================
+    # 7b. 🚀 SAFE CERT SETUP (NORMAL RUNS)
+    # run_init = no → readonly, never modifies cert repo
+    # =========================
+    - name: Setup certificates (SAFE MODE)
+      if: ${{ github.event.inputs.run_init == 'no' }}
+      env:
+        MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+      run: |
+        cd core_project
+
+        fastlane match appstore \
+          --git_url git@github.com:readori/readori-certificates.git \
+          --type appstore \
+          --app_identifier com.readori.app \
           --readonly
 
     # =========================
