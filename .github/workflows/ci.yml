@@ -247,8 +247,9 @@ jobs:
 
     # ==============================================
     # 10. IMPORT CERTIFICATE + PROVISIONING PROFILE
-    #     IOS_CERTIFICATE: base64-encoded .p12 distribution cert
-    #     IOS_PROVISIONING_PROFILE: base64-encoded .mobileprovision
+    #     Strategy: try IOS_CERTIFICATE secret first.
+    #     If it fails, use Fastlane cert/sigh via REST API
+    #     to auto-create a distribution cert + profile.
     # ==============================================
     - name: Import signing certificate
       if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
@@ -257,6 +258,8 @@ jobs:
         IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
         IOS_PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE }}
         ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
       run: |
         # Create a dedicated keychain
         security create-keychain -p "" build.keychain
@@ -270,7 +273,6 @@ jobs:
         CERT_SIZE=$(wc -c < /tmp/cert.p12 | tr -d ' ')
         echo "Certificate file size: ${CERT_SIZE} bytes"
 
-        # Try with provided password first, then empty password
         IMPORTED=false
         if security import /tmp/cert.p12 -k build.keychain -P "${IOS_CERTIFICATE_PASSWORD}" -T /usr/bin/codesign -T /usr/bin/security 2>/dev/null; then
           IMPORTED=true
@@ -278,47 +280,107 @@ jobs:
         elif security import /tmp/cert.p12 -k build.keychain -P "" -T /usr/bin/codesign -T /usr/bin/security 2>/dev/null; then
           IMPORTED=true
           echo "Certificate imported with empty password"
-        else
-          echo "WARNING: Certificate import failed with both passwords — continuing"
         fi
-
-        security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" build.keychain 2>/dev/null || true
         rm -f /tmp/cert.p12
 
-        echo "=== Signing identities ==="
-        security find-identity -v -p codesigning build.keychain | head -5
-        IDENTITY_COUNT=$(security find-identity -v -p codesigning build.keychain | grep -c 'valid identities')
-        echo "CERT_IMPORTED=${IMPORTED}" >> $GITHUB_ENV
+        security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" build.keychain 2>/dev/null || true
 
-        # Install provisioning profile
-        if [[ -n "$IOS_PROVISIONING_PROFILE" ]]; then
-          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          echo "$IOS_PROVISIONING_PROFILE" | tr -d ' \n\r' | base64 --decode > /tmp/profile.mobileprovision
-          PROF_SIZE=$(wc -c < /tmp/profile.mobileprovision | tr -d ' ')
-          echo "Provisioning profile size: ${PROF_SIZE} bytes"
-          # Extract UUID using security cms + grep (avoids PlistBuddy stdin hang)
-          PROFILE_UUID=""
-          if security cms -D -i /tmp/profile.mobileprovision > /tmp/profile_plist.xml 2>/dev/null; then
-            PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /tmp/profile_plist.xml 2>/dev/null || true)
+        # --- Fallback: use Fastlane to auto-create/find cert + profile ---
+        if [[ "$IMPORTED" != "true" ]]; then
+          echo "=== Cert import failed. Using Fastlane to find/create distribution cert ==="
+
+          # Create Fastlane API key JSON
+          AUTH_KEY_PATH="/tmp/asc_keys/AuthKey_${ASC_KEY_ID}.p8"
+          export AUTH_KEY_PATH
+          mkdir -p /tmp/asc_keys
+          cp ~/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8 "$AUTH_KEY_PATH" 2>/dev/null || true
+
+          ruby -e '
+        require "json"
+        key = {
+          "key_id" => ENV["ASC_KEY_ID"],
+          "issuer_id" => ENV["ASC_ISSUER_ID"],
+          "key_filepath" => ENV.fetch("AUTH_KEY_PATH", "/tmp/asc_keys/AuthKey_" + ENV["ASC_KEY_ID"] + ".p8"),
+          "in_house" => false
+        }
+        File.write("/tmp/fastlane_api_key.json", JSON.pretty_generate(key))
+        '
+
+          echo "--- Fastlane get_certificates (find/create distribution cert) ---"
+          fastlane run get_certificates \
+            api_key_path:/tmp/fastlane_api_key.json \
+            platform:ios \
+            type:appstore \
+            generate_apple_certs:true \
+            keychain_name:build.keychain \
+            keychain_password:"" \
+            output_path:/tmp/certs || echo "Warning: Fastlane get_certificates failed"
+
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" build.keychain 2>/dev/null || true
+
+          # Check if a signing identity is now available
+          VALID=$(security find-identity -v -p codesigning build.keychain | grep -c "valid identit" || true)
+          if [[ "$VALID" != *"0"* ]]; then
+            IMPORTED=true
+            echo "Distribution certificate obtained via Fastlane"
           fi
-          rm -f /tmp/profile_plist.xml
-          if [[ -n "$PROFILE_UUID" ]]; then
-            cp /tmp/profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/${PROFILE_UUID}.mobileprovision
-            echo "Provisioning profile installed: ${PROFILE_UUID}"
-            echo "PROFILE_UUID=${PROFILE_UUID}" >> $GITHUB_ENV
-          else
-            echo "Warning: could not extract UUID from provisioning profile"
-            # Fall back: install with generic name
-            cp /tmp/profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
+
+          # Also get a matching provisioning profile via Fastlane
+          echo "--- Fastlane get_provisioning_profile ---"
+          fastlane run get_provisioning_profile \
+            api_key_path:/tmp/fastlane_api_key.json \
+            platform:ios \
+            type:appstore \
+            app_identifier:com.readori.app \
+            force:true \
+            keychain_name:build.keychain \
+            keychain_password:"" \
+            output_path:/tmp/profiles || echo "Warning: Fastlane get_provisioning_profile failed"
+
+          # Install the downloaded profile (Fastlane might install it automatically)
+          PROFILE_FILE=$(find /tmp/profiles -name "*.mobileprovision" 2>/dev/null | head -1)
+          if [[ -n "$PROFILE_FILE" ]]; then
+            mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+            PROFILE_UUID=""
+            if security cms -D -i "$PROFILE_FILE" > /tmp/profile_plist.xml 2>/dev/null; then
+              PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /tmp/profile_plist.xml 2>/dev/null || true)
+            fi
+            rm -f /tmp/profile_plist.xml
+            if [[ -n "$PROFILE_UUID" ]]; then
+              cp "$PROFILE_FILE" ~/Library/MobileDevice/Provisioning\ Profiles/${PROFILE_UUID}.mobileprovision
+              echo "Fastlane profile installed: ${PROFILE_UUID}"
+              echo "PROFILE_UUID=${PROFILE_UUID}" >> $GITHUB_ENV
+            fi
           fi
-          rm -f /tmp/profile.mobileprovision
         else
-          echo "No provisioning profile provided — will rely on automatic signing"
+          # Cert import succeeded — install provisioning profile from secret
+          if [[ -n "$IOS_PROVISIONING_PROFILE" ]]; then
+            mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+            echo "$IOS_PROVISIONING_PROFILE" | tr -d ' \n\r' | base64 --decode > /tmp/profile.mobileprovision
+            PROF_SIZE=$(wc -c < /tmp/profile.mobileprovision | tr -d ' ')
+            echo "Provisioning profile size: ${PROF_SIZE} bytes"
+            PROFILE_UUID=""
+            if security cms -D -i /tmp/profile.mobileprovision > /tmp/profile_plist.xml 2>/dev/null; then
+              PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /tmp/profile_plist.xml 2>/dev/null || true)
+            fi
+            rm -f /tmp/profile_plist.xml
+            if [[ -n "$PROFILE_UUID" ]]; then
+              cp /tmp/profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/${PROFILE_UUID}.mobileprovision
+              echo "Provisioning profile installed: ${PROFILE_UUID}"
+              echo "PROFILE_UUID=${PROFILE_UUID}" >> $GITHUB_ENV
+            fi
+            rm -f /tmp/profile.mobileprovision
+          fi
         fi
 
-        # Copy ASC key for use by xcodebuild -authenticationKeyPath
+        echo "CERT_IMPORTED=${IMPORTED}" >> $GITHUB_ENV
+
+        echo "=== Final signing identities ==="
+        security find-identity -v -p codesigning build.keychain | head -5
+
+        # Copy ASC key for xcodebuild
         mkdir -p /tmp/asc_keys
-        cp ~/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8 /tmp/asc_keys/
+        cp ~/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8 /tmp/asc_keys/ 2>/dev/null || true
 
     # ==============================================
     # 11a. BUILD — unsigned (sideload)
