@@ -351,11 +351,13 @@ jobs:
         AUTH_KEY="/tmp/asc_keys/AuthKey_${ASC_KEY_ID}.p8"
 
         # Determine signing style based on what's available
-        if [[ -n "${PROFILE_UUID:-}" ]]; then
-          echo "Using MANUAL signing with provisioning profile ${PROFILE_UUID}"
+        # Need BOTH cert AND profile for manual signing
+        if [[ "${CERT_IMPORTED:-false}" == "true" && -n "${PROFILE_UUID:-}" ]]; then
+          echo "Using MANUAL signing (cert imported + profile ${PROFILE_UUID})"
           SIGN_STYLE="manual"
         else
           echo "Using AUTOMATIC signing with allowProvisioningUpdates"
+          echo "  CERT_IMPORTED=${CERT_IMPORTED:-false}, PROFILE_UUID=${PROFILE_UUID:-<empty>}"
           SIGN_STYLE="automatic"
         fi
 
