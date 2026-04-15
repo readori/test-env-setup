@@ -351,8 +351,6 @@ jobs:
           CODE_SIGN_STYLE=Automatic \
           DEVELOPMENT_TEAM="$ASC_TEAM_ID" \
           TARGETED_DEVICE_FAMILY=1 \
-          GENERATE_INFOPLIST_FILE=NO \
-          INFOPLIST_FILE="Readori/Supporting/Info.plist" \
           CURRENT_PROJECT_VERSION="${{ env.BUILD_NUMBER }}" \
           MARKETING_VERSION="${{ env.APP_VERSION }}" \
           ASSETCATALOG_COMPILER_APPICON_NAME=AppIcon \
