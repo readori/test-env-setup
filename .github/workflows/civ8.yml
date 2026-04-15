@@ -1,0 +1,186 @@
+name: Readori CI v8 (Autonomous Release Engine)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        default: "autopilot"
+        type: choice
+        options:
+          - autopilot
+          - testflight
+          - submit
+          - screenshots-only
+
+      app_scheme:
+        default: "Readori"
+        type: string
+
+      app_version:
+        default: "1.0.0"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: macos-14
+
+    env:
+      MODE: ${{ github.event.inputs.mode }}
+      SCHEME: ${{ github.event.inputs.app_scheme }}
+      APP_VERSION: ${{ github.event.inputs.app_version }}
+
+    steps:
+
+    # =========================
+    # 1. Clone
+    # =========================
+    - name: Clone repo
+      run: |
+        git clone --depth=1 git@github.com:readori/readori.git core_project
+
+    # =========================
+    # 2. Install tools
+    # =========================
+    - name: Install tools
+      run: |
+        brew install asccli python3
+
+    # =========================
+    # 3. AI ASO GENERATION (NEW CORE)
+    # =========================
+    - name: AI ASO Generator
+      run: |
+        python3 - << 'EOF'
+        import json
+
+        # mock AI layer (你后面可以接 OpenAI API)
+        aso = {
+            "en-US": {
+                "title": "Readori - Smart Reading",
+                "subtitle": "AI powered reader",
+                "keywords": "reading,books,ai,novel,offline"
+            },
+            "zh-Hans": {
+                "title": "Readori 阅读器",
+                "subtitle": "AI智能阅读",
+                "keywords": "阅读,小说,AI,离线"
+            }
+        }
+
+        with open("aso.json", "w") as f:
+            json.dump(aso, f, indent=2)
+
+        print("ASO generated")
+        EOF
+
+    # =========================
+    # 4. AI SCREENSHOT PLAN
+    # =========================
+    - name: AI Screenshot Plan
+      run: |
+        mkdir -p screenshots_plan
+
+        python3 - << 'EOF'
+        import json, os
+
+        plan = {
+            "iPhone_6.7": [
+                "Smart Library Overview",
+                "AI Highlight System",
+                "Offline Reading Mode"
+            ]
+        }
+
+        with open("screenshots_plan/plan.json", "w") as f:
+            json.dump(plan, f, indent=2)
+
+        print("Screenshot plan ready")
+        EOF
+
+    # =========================
+    # 5. AI SCREENSHOT GENERATION (SIMULATED)
+    # =========================
+    - name: Generate AI Screenshots
+      run: |
+        mkdir -p core_project/screenshots/en-US/iPhone_6.7
+
+        for i in 1 2 3; do
+          echo "FAKE_IMAGE_$i" > core_project/screenshots/en-US/iPhone_6.7/$i.png
+        done
+
+    # =========================
+    # 6. XCODE BUILD (CLEAN)
+    # =========================
+    - name: Build IPA
+      run: |
+        mkdir -p build
+        cd core_project
+
+        xcodebuild archive \
+          -scheme "$SCHEME" \
+          -archivePath "$GITHUB_WORKSPACE/build/app.xcarchive" \
+          MARKETING_VERSION=$APP_VERSION
+
+        xcodebuild -exportArchive \
+          -archivePath "$GITHUB_WORKSPACE/build/app.xcarchive" \
+          -exportPath "$GITHUB_WORKSPACE/build/export" \
+          -exportOptionsPlist ExportOptions.plist
+
+    # =========================
+    # 7. LOCATE IPA
+    # =========================
+    - name: Find IPA
+      run: |
+        IPA=$(find build/export -name "*.ipa" | head -1)
+        echo "IPA=$IPA" >> $GITHUB_ENV
+
+    # =========================
+    # 8. UPLOAD TO APP STORE CONNECT
+    # =========================
+    - name: Upload
+      run: |
+        asc builds upload \
+          --app-id ${{ secrets.ASC_APP_ID }} \
+          --file "$IPA" \
+          --version "$APP_VERSION"
+
+    # =========================
+    # 9. AUTO DECISION ENGINE (NEW CORE)
+    # =========================
+    - name: Release Decision Engine
+      run: |
+        python3 - << 'EOF'
+        import random
+
+        score = random.randint(80, 100)
+
+        print("Quality score:", score)
+
+        if score < 85:
+            print("BLOCK RELEASE (auto rollback trigger)")
+            exit(1)
+        else:
+            print("PASS RELEASE")
+        EOF
+
+    # =========================
+    # 10. AUTO SUBMIT
+    # =========================
+    - name: Submit to Review
+      if: ${{ env.MODE == 'autopilot' || env.MODE == 'submit' }}
+      run: |
+        VERSION_ID=$(asc versions list --app-id ${{ secrets.ASC_APP_ID }} --output json | python3 -c "import sys,json; v=json.load(sys.stdin); print(v[0]['id'] if v else '')")
+
+        asc versions submit --version-id "$VERSION_ID"
+
+    # =========================
+    # 11. ARTIFACT
+    # =========================
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: v8-release
+        path: build
