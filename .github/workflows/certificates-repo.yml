@@ -41,8 +41,8 @@ jobs:
 
     # =========================
     # 1. SSH SETUP (TWO KEYS)
-    #    PRIVATE_REPO_KEY  → readori/readori        (read)
-    #    MATCH_REPO_KEY    → readori/readori-certificates (write)
+    #    PRIVATE_REPO_KEY  → github-app  → readori/readori        (read)
+    #    MATCH_REPO_KEY    → github-certs → readori/readori-certificates (write)
     # =========================
     - name: Install SSH keys
       run: |
@@ -93,7 +93,17 @@ jobs:
         xcode-version: ${{ github.event.inputs.xcode_version }}
 
     # =========================
-    # 5. SWIFT RESOLVE
+    # 5. ASC API KEY SETUP
+    #    Required for Fastlane Match to talk to Apple Developer Portal
+    # =========================
+    - name: Setup App Store Connect API key
+      run: |
+        mkdir -p ~/.appstoreconnect/private_keys
+        echo "${{ secrets.ASC_PRIVATE_KEY }}" | base64 --decode \
+          > ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
+
+    # =========================
+    # 6. SWIFT RESOLVE
     # =========================
     - name: Resolve Swift Packages
       run: |
@@ -101,7 +111,7 @@ jobs:
         swift package resolve
 
     # =========================
-    # 6. ICONS
+    # 7. ICONS
     # =========================
     - name: Generate icons
       run: |
@@ -110,13 +120,16 @@ jobs:
         fi
 
     # =========================
-    # 7a. 🔐 INIT CERT REPO (FIRST TIME ONLY)
-    #     run_init = yes → generates + stores certs
+    # 8a. 🔐 INIT CERT REPO (FIRST TIME ONLY)
+    #     run_init = yes → generates + stores certs (write to cert repo)
     # =========================
     - name: Initialize certificates (FIRST TIME ONLY)
       if: ${{ github.event.inputs.run_init == 'yes' }}
       env:
         MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+        APP_STORE_CONNECT_API_KEY_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        APP_STORE_CONNECT_API_KEY_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        APP_STORE_CONNECT_API_KEY_KEY_FILEPATH: ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
       run: |
         cd core_project
 
@@ -124,16 +137,20 @@ jobs:
           --git_url git@github-certs:readori/readori-certificates.git \
           --type appstore \
           --app_identifier com.readori.app \
+          --team_id ${{ secrets.ASC_TEAM_ID }} \
           --force_for_new_devices
 
     # =========================
-    # 7b. 🚀 SAFE CERT SETUP (NORMAL RUNS)
+    # 8b. 🚀 SAFE CERT SETUP (NORMAL RUNS)
     #     run_init = no → readonly, never modifies cert repo
     # =========================
     - name: Setup certificates (SAFE MODE)
       if: ${{ github.event.inputs.run_init == 'no' }}
       env:
         MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+        APP_STORE_CONNECT_API_KEY_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        APP_STORE_CONNECT_API_KEY_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        APP_STORE_CONNECT_API_KEY_KEY_FILEPATH: ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
       run: |
         cd core_project
 
@@ -141,10 +158,11 @@ jobs:
           --git_url git@github-certs:readori/readori-certificates.git \
           --type appstore \
           --app_identifier com.readori.app \
+          --team_id ${{ secrets.ASC_TEAM_ID }} \
           --readonly
 
     # =========================
-    # 8. BUILD
+    # 9. BUILD
     # =========================
     - name: Build IPA
       run: |
@@ -158,13 +176,13 @@ jobs:
           "${GITHUB_WORKSPACE}/build"
 
     # =========================
-    # 9. OUTPUT CHECK
+    # 10. OUTPUT CHECK
     # =========================
     - name: Show output
       run: ls -R build || true
 
     # =========================
-    # 10. ARTIFACT
+    # 11. ARTIFACT
     # =========================
     - name: Upload artifact
       uses: actions/upload-artifact@v4
