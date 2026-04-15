@@ -1,4 +1,4 @@
-name: Readori CI v6 (Stable Industrial)
+name: Readori CI v6 (AI Industrial Stable)
 
 on:
   workflow_dispatch:
@@ -51,14 +51,14 @@ jobs:
         ssh-keyscan github.com >> ~/.ssh/known_hosts
 
     # =========================
-    # Clone repo
+    # Clone
     # =========================
     - name: Clone repository
       run: |
         git clone --depth=1 git@github.com:readori/readori.git core_project
 
     # =========================
-    # Tools
+    # Install tools
     # =========================
     - name: Install tools
       if: ${{ env.MODE != 'unsigned' }}
@@ -68,7 +68,7 @@ jobs:
         brew install asccli
 
     # =========================
-    # ASC login
+    # ASC auth
     # =========================
     - name: ASC auth
       if: ${{ env.MODE != 'unsigned' }}
@@ -83,22 +83,32 @@ jobs:
           --private-key-path ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
 
     # =========================
-    # Build number (FIXED - no heredoc)
+    # Build number
     # =========================
     - name: Generate build number
       if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
       run: |
-        BN=$(asc builds list --app-id ${{ secrets.ASC_APP_ID }} --output json | python3 -c "import sys,json; b=json.load(sys.stdin); nums=[int(x.get('buildNumber')) for x in b if x.get('buildNumber') and str(x.get('buildNumber')).isdigit()]; print(max(nums)+1 if nums else 1)")
+        BN=$(asc builds list --app-id ${{ secrets.ASC_APP_ID }} --output json \
+        | python3 - << 'EOF'
+import sys, json
+data = json.load(sys.stdin)
+
+nums = []
+for b in data:
+    v = b.get("buildNumber") or b.get("version")
+    if v and str(v).isdigit():
+        nums.append(int(v))
+
+print(max(nums)+1 if nums else 1)
+EOF
+)
         echo "BUILD_NUMBER=$BN" >> $GITHUB_ENV
-        echo "Build number = $BN"
 
     # =========================
-    # Match (CRITICAL: readonly ONLY)
+    # Match
     # =========================
-    - name: Install certificates (match readonly)
+    - name: Match certificates
       if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
-      env:
-        MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
       run: |
         cd core_project
 
@@ -123,11 +133,12 @@ jobs:
             --scheme "$SCHEME" \
             --output_directory "$GITHUB_WORKSPACE/build" \
             --export_method app-store \
+            --clean \
             --xcargs "CURRENT_PROJECT_VERSION=${BUILD_NUMBER} MARKETING_VERSION=${APP_VERSION}"
         fi
 
     # =========================
-    # Upload build
+    # Upload IPA
     # =========================
     - name: Upload build
       if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
@@ -141,17 +152,27 @@ jobs:
           --build-number "$BUILD_NUMBER"
 
     # =========================
-    # Wait build ready (FIXED python one-liner)
+    # Wait build ready
     # =========================
     - name: Wait build ready
       if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
       run: |
         for i in {1..20}; do
-          ID=$(asc builds list --app-id ${{ secrets.ASC_APP_ID }} --output json | python3 -c "import sys,json; b=json.load(sys.stdin); t='${BUILD_NUMBER}'; m=[x for x in b if str(x.get('buildNumber') or x.get('version'))==t]; print(m[0]['id'] if m else '')")
+          ID=$(asc builds list --app-id ${{ secrets.ASC_APP_ID }} --output json \
+          | python3 - << 'EOF'
+import sys, json, os
+data = json.load(sys.stdin)
+target = os.environ.get("BUILD_NUMBER")
+
+for b in data:
+    if str(b.get("buildNumber") or b.get("version")) == str(target):
+        print(b.get("id",""))
+        break
+EOF
+)
 
           if [[ -n "$ID" ]]; then
             echo "BUILD_ID=$ID" >> $GITHUB_ENV
-            echo "Found build: $ID"
             exit 0
           fi
 
@@ -159,7 +180,6 @@ jobs:
           sleep 15
         done
 
-        echo "Build not found"
         exit 1
 
     # =========================
@@ -175,20 +195,119 @@ jobs:
         fi
 
     # =========================
-    # Submit App Store
+    # Submit
     # =========================
     - name: Submit app
       if: ${{ env.MODE == 'submit' }}
       run: |
-        VERSION_ID=$(asc versions list --app-id ${{ secrets.ASC_APP_ID }} --output json | python3 -c "import sys,json; v=json.load(sys.stdin); print(v[0]['id'] if v else '')")
+        VERSION_ID=$(asc versions list --app-id ${{ secrets.ASC_APP_ID }} --output json \
+        | python3 - << 'EOF'
+import sys, json
+v = json.load(sys.stdin)
+print(v[0]["id"] if v else "")
+EOF
+)
 
         asc versions submit --version-id "$VERSION_ID"
 
     # =========================
-    # Upload artifact
+    # AI Screenshots
+    # =========================
+    - name: AI Screenshot generation
+      if: ${{ env.MODE == 'ai-screenshots' }}
+      run: |
+        python3 - << 'EOF'
+import os, json
+
+root = "core_project/screenshots"
+os.makedirs("build", exist_ok=True)
+
+result = {}
+
+if os.path.exists(root):
+    for locale in os.listdir(root):
+        lp = os.path.join(root, locale)
+        if not os.path.isdir(lp):
+            continue
+
+        result[locale] = {}
+
+        for device in os.listdir(lp):
+            dp = os.path.join(lp, device)
+            if not os.path.isdir(dp):
+                continue
+
+            files = sorted([f for f in os.listdir(dp) if f.endswith(".png")])
+
+            result[locale][device] = [
+                {
+                    "file": f,
+                    "title": f.replace(".png","").replace("_"," "),
+                    "ai_caption": f"Showcase feature: {f}"
+                }
+                for f in files
+            ]
+
+with open("build/ai_screenshots.json","w") as f:
+    json.dump(result,f,indent=2)
+
+print("AI screenshots generated")
+EOF
+
+    # =========================
+    # Upload screenshots
+    # =========================
+    - name: Upload screenshots
+      if: ${{ env.MODE == 'screenshots' || env.MODE == 'ai-screenshots' }}
+      run: |
+        SCREENSHOTS_DIR="core_project/screenshots"
+
+        VERSION_ID=$(asc versions list --app-id ${{ secrets.ASC_APP_ID }} --output json \
+        | python3 - << 'EOF'
+import sys,json
+v=json.load(sys.stdin)
+print(v[0]["id"] if v else "")
+EOF
+)
+
+        for locale in "$SCREENSHOTS_DIR"/*; do
+          [ -d "$locale" ] || continue
+          locale_name=$(basename "$locale")
+
+          for device in "$locale"/*; do
+            [ -d "$device" ] || continue
+            device_name=$(basename "$device")
+
+            SET_ID=$(asc screenshot-sets create \
+              --version-id "$VERSION_ID" \
+              --locale "$locale_name" \
+              --display-target "$device_name" \
+              --output json 2>/dev/null \
+              | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" \
+              || true)
+
+            if [[ -z "$SET_ID" ]]; then
+              SET_ID=$(asc screenshot-sets list \
+                --version-id "$VERSION_ID" \
+                --locale "$locale_name" \
+                --display-target "$device_name" \
+                --output json \
+                | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['id'] if d else '')")
+            fi
+
+            for img in $(ls "$device"/*.png 2>/dev/null | sort); do
+              asc screenshots upload \
+                --set-id "$SET_ID" \
+                --file "$img"
+            done
+          done
+        done
+
+    # =========================
+    # Artifact
     # =========================
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: readori-build
-        path: build/*.ipa
+        path: build/**
