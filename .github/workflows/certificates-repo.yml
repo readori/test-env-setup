@@ -40,20 +40,42 @@ jobs:
     steps:
 
     # =========================
-    # 1. SSH SETUP
+    # 1. SSH SETUP (TWO KEYS)
+    #    PRIVATE_REPO_KEY  → readori/readori        (read)
+    #    MATCH_REPO_KEY    → readori/readori-certificates (write)
     # =========================
-    - name: Install SSH Key
-      uses: shimataro/ssh-key-action@v2
-      with:
-        key: ${{ secrets.PRIVATE_REPO_KEY }}
-        known_hosts: github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK3pzfEjVuG0d+XmQYsvcsXXMU3K0RTGmi5mKVp+dLAx
+    - name: Install SSH keys
+      run: |
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+
+        echo "${{ secrets.PRIVATE_REPO_KEY }}" > ~/.ssh/app_key
+        echo "${{ secrets.MATCH_REPO_KEY }}" > ~/.ssh/match_key
+        chmod 600 ~/.ssh/app_key ~/.ssh/match_key
+
+        cat >> ~/.ssh/config << 'EOF'
+        Host github-app
+          HostName github.com
+          User git
+          IdentityFile ~/.ssh/app_key
+          StrictHostKeyChecking no
+          IdentitiesOnly yes
+
+        Host github-certs
+          HostName github.com
+          User git
+          IdentityFile ~/.ssh/match_key
+          StrictHostKeyChecking no
+          IdentitiesOnly yes
+        EOF
+        chmod 600 ~/.ssh/config
 
     # =========================
     # 2. CLONE PRIVATE APP
     # =========================
     - name: Clone private repo
       run: |
-        git clone --depth=1 git@github.com:readori/readori.git core_project
+        git clone --depth=1 git@github-app:readori/readori.git core_project
 
     # =========================
     # 3. INSTALL FASTLANE
@@ -89,7 +111,7 @@ jobs:
 
     # =========================
     # 7a. 🔐 INIT CERT REPO (FIRST TIME ONLY)
-    # run_init = yes → generates + stores certs (write access required)
+    #     run_init = yes → generates + stores certs
     # =========================
     - name: Initialize certificates (FIRST TIME ONLY)
       if: ${{ github.event.inputs.run_init == 'yes' }}
@@ -99,14 +121,14 @@ jobs:
         cd core_project
 
         fastlane match appstore \
-          --git_url git@github.com:readori/readori-certificates.git \
+          --git_url git@github-certs:readori/readori-certificates.git \
           --type appstore \
           --app_identifier com.readori.app \
           --force_for_new_devices
 
     # =========================
     # 7b. 🚀 SAFE CERT SETUP (NORMAL RUNS)
-    # run_init = no → readonly, never modifies cert repo
+    #     run_init = no → readonly, never modifies cert repo
     # =========================
     - name: Setup certificates (SAFE MODE)
       if: ${{ github.event.inputs.run_init == 'no' }}
@@ -116,7 +138,7 @@ jobs:
         cd core_project
 
         fastlane match appstore \
-          --git_url git@github.com:readori/readori-certificates.git \
+          --git_url git@github-certs:readori/readori-certificates.git \
           --type appstore \
           --app_identifier com.readori.app \
           --readonly
