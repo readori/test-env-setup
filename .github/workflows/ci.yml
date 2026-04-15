@@ -107,6 +107,8 @@ jobs:
       run: |
         mkdir -p ~/.ssh && chmod 700 ~/.ssh
 
+        ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+
         echo "${{ secrets.PRIVATE_REPO_KEY }}" > ~/.ssh/app_key
         echo "${{ secrets.MATCH_REPO_KEY }}"   > ~/.ssh/match_key
         chmod 600 ~/.ssh/app_key ~/.ssh/match_key
@@ -116,14 +118,12 @@ jobs:
           HostName github.com
           User git
           IdentityFile ~/.ssh/app_key
-          StrictHostKeyChecking no
           IdentitiesOnly yes
 
         Host github-certs
           HostName github.com
           User git
           IdentityFile ~/.ssh/match_key
-          StrictHostKeyChecking no
           IdentitiesOnly yes
         EOF
         chmod 600 ~/.ssh/config
@@ -326,6 +326,8 @@ jobs:
     # ==============================================
     - name: Update TestFlight beta notes
       if: ${{ (env.MODE == 'testflight' || env.MODE == 'submit') && github.event.inputs.beta_notes != '' }}
+      env:
+        BETA_NOTES: ${{ github.event.inputs.beta_notes }}
       run: |
         # Wait briefly for ASC to index the new build
         sleep 30
@@ -342,7 +344,7 @@ jobs:
         if [[ -n "$BUILD_ID" ]]; then
           asc builds update-beta-notes \
             --build-id   "$BUILD_ID" \
-            --whats-new  "${{ github.event.inputs.beta_notes }}"
+            --whats-new  "$BETA_NOTES"
           echo "Beta notes updated for build $BUILD_ID"
         else
           echo "Warning: could not find build ${{ env.BUILD_NUMBER }} in ASC — skipping beta notes"
@@ -373,8 +375,8 @@ jobs:
           exit 0
         fi
 
-        # Fetch all version localizations for this version
-        LOCALIZATIONS=$(asc version-localizations list \
+        # Fetch all version localizations and update in one step
+        export LOCALIZATIONS=$(asc version-localizations list \
           --version-id "$VERSION_ID" \
           --output json)
 
@@ -406,7 +408,6 @@ jobs:
                     print(f"  ✗ {locale} failed: {result.stderr.strip()}", file=sys.stderr)
         PYEOF
       env:
-        LOCALIZATIONS: ${{ steps.fetch-localizations.outputs.json }}
         INPUT_WHATS_NEW_EN: ${{ github.event.inputs.whats_new_en }}
         INPUT_WHATS_NEW_ZH_HANS: ${{ github.event.inputs.whats_new_zh_hans }}
         INPUT_WHATS_NEW_ZH_HANT: ${{ github.event.inputs.whats_new_zh_hant }}
