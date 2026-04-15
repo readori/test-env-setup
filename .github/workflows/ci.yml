@@ -2,7 +2,7 @@ name: Readori CI
 
 # Unified pipeline — three modes via single dispatch:
 #   unsigned   → sideload / local testing (no signing, no ASC)
-#   testflight → signed IPA + upload to TestFlight
+#   testflight → signed IPA + upload to TestFlight (build number auto-incremented)
 #   submit     → signed IPA + upload + submit for App Store review
 
 on:
@@ -40,15 +40,9 @@ on:
           - "no"
 
       app_version:
-        description: "Version string for upload (e.g. 1.2.0) — required for testflight/submit"
+        description: "Marketing version string (e.g. 1.2.0) — required for testflight/submit"
         required: false
         default: "1.0.0"
-        type: string
-
-      build_number:
-        description: "Build number for upload (e.g. 42) — required for testflight/submit"
-        required: false
-        default: "1"
         type: string
 
 permissions:
@@ -66,6 +60,7 @@ jobs:
     env:
       MODE: ${{ github.event.inputs.mode }}
       SCHEME: ${{ github.event.inputs.app_scheme }}
+      APP_VERSION: ${{ github.event.inputs.app_version }}
 
     steps:
 
@@ -143,15 +138,18 @@ jobs:
         fi
 
     # ==============================================
-    # 6. INSTALL FASTLANE (signed modes only)
+    # 6. INSTALL FASTLANE + asc-cli (signed modes only)
     # ==============================================
-    - name: Install Fastlane
+    - name: Install tools (Fastlane + asc-cli)
       if: ${{ env.MODE != 'unsigned' }}
-      run: brew install fastlane
+      run: |
+        brew install fastlane
+        brew tap tddworks/tap
+        brew install asccli
 
     # ==============================================
     # 7. ASC API KEY JSON (signed modes only)
-    #    Writes raw PEM from secret → p8 file → Fastlane JSON
+    #    ASC_PRIVATE_KEY stored as raw PEM in secret
     # ==============================================
     - name: Setup ASC API key
       if: ${{ env.MODE != 'unsigned' }}
@@ -179,7 +177,41 @@ jobs:
         PYEOF
 
     # ==============================================
-    # 8. MATCH — fetch signing identity (signed modes only)
+    # 8. AUTHENTICATE asc-cli (signed modes only)
+    #    Flag: --private-key-path (not --p8-path)
+    # ==============================================
+    - name: Authenticate asc-cli
+      if: ${{ env.MODE != 'unsigned' }}
+      run: |
+        asc auth login \
+          --key-id           ${{ secrets.ASC_KEY_ID }} \
+          --issuer-id        ${{ secrets.ASC_ISSUER_ID }} \
+          --private-key-path ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
+
+    # ==============================================
+    # 9. AUTO BUILD NUMBER (signed modes only)
+    #    Fetches latest TestFlight build number and increments by 1
+    # ==============================================
+    - name: Auto-increment build number
+      if: ${{ env.MODE != 'unsigned' }}
+      run: |
+        LATEST=$(asc builds list \
+          --app-id ${{ secrets.ASC_APP_ID }} \
+          --output json 2>/dev/null | \
+          python3 -c "
+        import sys, json
+        try:
+            builds = json.load(sys.stdin)
+            nums = [int(b.get('version','0')) for b in builds if b.get('version','').isdigit()]
+            print(max(nums) + 1 if nums else 1)
+        except:
+            print(1)
+        " || echo "1")
+        echo "BUILD_NUMBER=$LATEST" >> $GITHUB_ENV
+        echo "Build number will be: $LATEST"
+
+    # ==============================================
+    # 10. MATCH — fetch signing identity (signed modes only)
     # ==============================================
     - name: Install certificates (Match readonly)
       if: ${{ env.MODE != 'unsigned' }}
@@ -197,7 +229,7 @@ jobs:
           --readonly
 
     # ==============================================
-    # 9a. BUILD — unsigned (sideload)
+    # 11a. BUILD — unsigned (sideload)
     # ==============================================
     - name: Build unsigned IPA
       if: ${{ env.MODE == 'unsigned' }}
@@ -211,68 +243,52 @@ jobs:
         ./scripts/build_unsigned_ipa.sh "$SCHEME" "${GITHUB_WORKSPACE}/build"
 
     # ==============================================
-    # 9b. BUILD — signed (TestFlight / App Store)
+    # 11b. BUILD — signed (TestFlight / App Store)
+    #      Gym uses Match-installed signing identity
+    #      CURRENT_PROJECT_VERSION injected for TestFlight build number
     # ==============================================
     - name: Build signed IPA
       if: ${{ env.MODE != 'unsigned' }}
+      env:
+        MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
       run: |
         mkdir -p build
         cd core_project
         fastlane gym \
-          --scheme           "$SCHEME" \
-          --output_directory "${GITHUB_WORKSPACE}/build" \
-          --export_method    app-store \
+          --scheme                "$SCHEME" \
+          --output_directory      "${GITHUB_WORKSPACE}/build" \
+          --export_method         app-store \
+          --xcargs                "CURRENT_PROJECT_VERSION=${{ env.BUILD_NUMBER }} MARKETING_VERSION=${{ env.APP_VERSION }}" \
+          --skip_package_validation \
           --clean
 
     # ==============================================
-    # 10. VERSION TAG
+    # 12. VERSION TAG
     # ==============================================
     - name: Tag build version
       run: |
         SHORT_SHA=$(git -C core_project rev-parse --short HEAD)
-        echo "BUILD_VERSION=$(date +%Y%m%d.%H%M)-${SHORT_SHA}" >> $GITHUB_ENV
-
-    # ==============================================
-    # 11. INSTALL asc-cli (signed modes only)
-    #     Uses readori/asc-cli via tddworks/tap
-    # ==============================================
-    - name: Install asc-cli
-      if: ${{ env.MODE != 'unsigned' }}
-      run: |
-        brew tap tddworks/tap
-        brew install asccli
-
-    # ==============================================
-    # 12. AUTHENTICATE asc-cli
-    #     Correct flag: --private-key-path (not --p8-path)
-    # ==============================================
-    - name: Authenticate asc-cli
-      if: ${{ env.MODE != 'unsigned' }}
-      run: |
-        asc auth login \
-          --key-id          ${{ secrets.ASC_KEY_ID }} \
-          --issuer-id       ${{ secrets.ASC_ISSUER_ID }} \
-          --private-key-path ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
+        BN="${BUILD_NUMBER:-0}"
+        echo "BUILD_TAG=${APP_VERSION:-1.0.0}($BN)-${SHORT_SHA}" >> $GITHUB_ENV
 
     # ==============================================
     # 13. UPLOAD TO TESTFLIGHT
-    #     Correct command: asc builds upload (plural)
-    #     Required: --app-id, --file, --version, --build-number
+    #     asc builds upload (plural) with all required params
     # ==============================================
     - name: Upload to TestFlight
       if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
       run: |
         IPA=$(find build -name "*.ipa" | head -1)
-        echo "Uploading: $IPA  |  version: $BUILD_VERSION"
+        echo "Uploading: $IPA  |  tag: $BUILD_TAG"
         asc builds upload \
-          --app-id      ${{ secrets.ASC_APP_ID }} \
-          --file        "$IPA" \
-          --version     "${{ github.event.inputs.app_version }}" \
-          --build-number "${{ github.event.inputs.build_number }}"
+          --app-id       ${{ secrets.ASC_APP_ID }} \
+          --file         "$IPA" \
+          --version      "${{ env.APP_VERSION }}" \
+          --build-number "${{ env.BUILD_NUMBER }}"
 
     # ==============================================
     # 14. SUBMIT FOR REVIEW (submit only)
-    #     Gets latest version-id then submits
+    #     Lists versions, finds READY_FOR_REVIEW or latest, submits
     # ==============================================
     - name: Submit for App Store review
       if: ${{ env.MODE == 'submit' }}
@@ -283,8 +299,11 @@ jobs:
           python3 -c "
         import sys, json
         versions = json.load(sys.stdin)
-        ready = [v for v in versions if v.get('appStoreState') == 'READY_FOR_REVIEW']
-        print(ready[0]['id'] if ready else versions[0]['id'])
+        # Prefer READY_FOR_REVIEW, fall back to first entry
+        ordered = sorted(versions, key=lambda v: (
+            0 if v.get('appStoreState') == 'READY_FOR_REVIEW' else 1
+        ))
+        print(ordered[0]['id'])
         ")
         echo "Submitting version-id: $VERSION_ID"
         asc versions submit --version-id "$VERSION_ID"
@@ -295,7 +314,7 @@ jobs:
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: readori-${{ env.BUILD_VERSION || github.run_number }}
+        name: readori-${{ env.BUILD_TAG || github.run_number }}
         retention-days: 7
         if-no-files-found: warn
         path: build/*.ipa
