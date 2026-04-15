@@ -1,25 +1,30 @@
-name: Readori CI v6 (AI + Auto Ops)
+name: Readori CI v6 (Stable Industrial)
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        default: unsigned
+        description: "unsigned | testflight | submit | screenshots | ai-screenshots"
+        default: "unsigned"
         type: choice
-        options: [unsigned, testflight, submit, screenshots, ai-screenshots]
+        options:
+          - unsigned
+          - testflight
+          - submit
+          - screenshots
+          - ai-screenshots
 
       app_scheme:
-        default: Readori
+        default: "Readori"
         type: string
 
       app_version:
-        default: 1.0.0
+        default: "1.0.0"
         type: string
 
-      generate_ai_screenshots:
-        default: "yes"
-        type: choice
-        options: ["yes", "no"]
+      beta_notes:
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -36,7 +41,7 @@ jobs:
     steps:
 
     # =========================
-    # SSH (双 repo)
+    # SSH
     # =========================
     - name: Setup SSH
       run: |
@@ -46,9 +51,9 @@ jobs:
         ssh-keyscan github.com >> ~/.ssh/known_hosts
 
     # =========================
-    # Clone app repo
+    # Clone repo
     # =========================
-    - name: Clone app repo
+    - name: Clone repository
       run: |
         git clone --depth=1 git@github.com:readori/readori.git core_project
 
@@ -69,6 +74,7 @@ jobs:
       if: ${{ env.MODE != 'unsigned' }}
       run: |
         mkdir -p ~/.appstoreconnect/private_keys
+
         echo "${{ secrets.ASC_PRIVATE_KEY }}" > ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
 
         asc auth login \
@@ -77,29 +83,20 @@ jobs:
           --private-key-path ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
 
     # =========================
-    # BUILD NUMBER
+    # Build number (FIXED - no heredoc)
     # =========================
-    - name: Build number
+    - name: Generate build number
       if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
       run: |
-        BN=$(asc builds list --app-id ${{ secrets.ASC_APP_ID }} --output json | python3 - << 'PY'
-import sys, json
-b=json.load(sys.stdin)
-nums=[]
-for i in b:
-    v=i.get("buildNumber")
-    if v and str(v).isdigit():
-        nums.append(int(v))
-print(max(nums)+1 if nums else 1)
-PY
-)
+        BN=$(asc builds list --app-id ${{ secrets.ASC_APP_ID }} --output json | python3 -c "import sys,json; b=json.load(sys.stdin); nums=[int(x.get('buildNumber')) for x in b if x.get('buildNumber') and str(x.get('buildNumber')).isdigit()]; print(max(nums)+1 if nums else 1)")
         echo "BUILD_NUMBER=$BN" >> $GITHUB_ENV
+        echo "Build number = $BN"
 
     # =========================
-    # MATCH (关键：只读模式)
+    # Match (CRITICAL: readonly ONLY)
     # =========================
-    - name: Match (readonly)
-      if: ${{ env.MODE != 'unsigned' }}
+    - name: Install certificates (match readonly)
+      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
       env:
         MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
       run: |
@@ -107,12 +104,11 @@ PY
 
         fastlane match appstore \
           --git_url git@github.com:readori/readori-certificates.git \
-          --readonly \
           --type appstore \
-          --app_identifier com.readori.app
+          --readonly
 
     # =========================
-    # BUILD
+    # Build IPA
     # =========================
     - name: Build IPA
       run: |
@@ -131,9 +127,9 @@ PY
         fi
 
     # =========================
-    # UPLOAD
+    # Upload build
     # =========================
-    - name: Upload
+    - name: Upload build
       if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
       run: |
         IPA=$(find build -name "*.ipa" | head -1)
@@ -145,78 +141,54 @@ PY
           --build-number "$BUILD_NUMBER"
 
     # =========================
-    # SUBMIT
+    # Wait build ready (FIXED python one-liner)
     # =========================
-    - name: Submit
+    - name: Wait build ready
+      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
+      run: |
+        for i in {1..20}; do
+          ID=$(asc builds list --app-id ${{ secrets.ASC_APP_ID }} --output json | python3 -c "import sys,json; b=json.load(sys.stdin); t='${BUILD_NUMBER}'; m=[x for x in b if str(x.get('buildNumber') or x.get('version'))==t]; print(m[0]['id'] if m else '')")
+
+          if [[ -n "$ID" ]]; then
+            echo "BUILD_ID=$ID" >> $GITHUB_ENV
+            echo "Found build: $ID"
+            exit 0
+          fi
+
+          echo "Waiting build..."
+          sleep 15
+        done
+
+        echo "Build not found"
+        exit 1
+
+    # =========================
+    # Beta notes
+    # =========================
+    - name: Beta notes
+      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
+      run: |
+        if [[ -n "${{ github.event.inputs.beta_notes }}" ]]; then
+          asc builds update-beta-notes \
+            --build-id "$BUILD_ID" \
+            --whats-new "${{ github.event.inputs.beta_notes }}"
+        fi
+
+    # =========================
+    # Submit App Store
+    # =========================
+    - name: Submit app
       if: ${{ env.MODE == 'submit' }}
       run: |
-        VERSION_ID=$(asc versions list --app-id ${{ secrets.ASC_APP_ID }} --output json | python3 - << 'PY'
-import sys,json
-v=json.load(sys.stdin)
-print(v[0]['id'] if v else '')
-PY
-)
+        VERSION_ID=$(asc versions list --app-id ${{ secrets.ASC_APP_ID }} --output json | python3 -c "import sys,json; v=json.load(sys.stdin); print(v[0]['id'] if v else '')")
 
         asc versions submit --version-id "$VERSION_ID"
 
     # =========================
-    # 🤖 AI SCREENSHOT GENERATION
-    # =========================
-    - name: AI Screenshot Generator (mock)
-      if: ${{ env.MODE == 'ai-screenshots' }}
-      run: |
-        mkdir -p core_project/screenshots/en-US/iPhone_6.5
-
-        python3 - << 'PY'
-from PIL import Image, ImageDraw
-
-for i in range(1,6):
-    img = Image.new("RGB", (1290, 2796), (20*i, 30, 60))
-    d = ImageDraw.Draw(img)
-    d.text((100,100), f"Readori Screen {i}", fill=(255,255,255))
-    img.save(f"core_project/screenshots/en-US/iPhone_6.5/{i}.png")
-
-print("AI screenshots generated")
-PY
-
-    # =========================
-    # SCREENSHOTS UPLOAD
-    # =========================
-    - name: Upload screenshots
-      if: ${{ env.MODE == 'screenshots' || env.MODE == 'ai-screenshots' }}
-      run: |
-        SCREENSHOTS_DIR="core_project/screenshots"
-
-        VERSION_ID=$(asc versions list --app-id ${{ secrets.ASC_APP_ID }} --output json | python3 - << 'PY'
-import sys,json
-v=json.load(sys.stdin)
-print(v[0]['id'] if v else '')
-PY
-)
-
-        for locale in "$SCREENSHOTS_DIR"/*; do
-          for device in "$locale"/*; do
-
-            SET_ID=$(asc screenshot-sets create \
-              --version-id "$VERSION_ID" \
-              --locale "$(basename $locale)" \
-              --display-target "$(basename $device)" \
-              --output json | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
-
-            for img in "$device"/*.png; do
-              asc screenshots upload \
-                --set-id "$SET_ID" \
-                --file "$img"
-            done
-
-          done
-        done
-
-    # =========================
-    # ARTIFACT
+    # Upload artifact
     # =========================
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: build
+        name: readori-build
         path: build/*.ipa
