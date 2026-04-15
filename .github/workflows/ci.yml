@@ -246,22 +246,41 @@ jobs:
         echo "Build number will be: $LATEST"
 
     # ==============================================
-    # 10. MATCH — fetch signing identity (testflight / submit only)
+    # 10. IMPORT CERTIFICATE — keychain (replaces fastlane match)
+    #     IOS_CERTIFICATE: base64-encoded .p12 distribution cert
+    #     Provisioning handled automatically via -allowProvisioningUpdates
     # ==============================================
-    - name: Install certificates (Match readonly)
+    - name: Import signing certificate
       if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
       env:
-        MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
-        FL_NO_UPDATE_ACTION: "true"
+        IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
+        IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+        ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
       run: |
-        cd core_project
-        fastlane match appstore \
-          --git_url        git@github-certs:readori/readori-certificates.git \
-          --type           appstore \
-          --app_identifier com.readori.app \
-          --team_id        ${{ secrets.ASC_TEAM_ID }} \
-          --api_key_path   /tmp/asc_api_key.json \
-          --readonly
+        # Create a dedicated keychain so we don't pollute the system keychain
+        security create-keychain -p "" build.keychain
+        security list-keychains -s build.keychain login.keychain
+        security default-keychain -s build.keychain
+        security unlock-keychain -p "" build.keychain
+        security set-keychain-settings -t 3600 -u build.keychain
+
+        # Decode and import the distribution certificate
+        echo "$IOS_CERTIFICATE" | base64 --decode > /tmp/cert.p12
+        security import /tmp/cert.p12 \
+          -k build.keychain \
+          -P "$IOS_CERTIFICATE_PASSWORD" \
+          -T /usr/bin/codesign \
+          -T /usr/bin/security
+        security set-key-partition-list \
+          -S apple-tool:,apple:,codesign: \
+          -s -k "" build.keychain
+        rm -f /tmp/cert.p12
+        echo "=== Signing identities ==="
+        security find-identity -v -p codesigning build.keychain | head -5
+
+        # Copy ASC key for use by xcodebuild -authenticationKeyPath
+        mkdir -p /tmp/asc_keys
+        cp ~/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8 /tmp/asc_keys/
 
     # ==============================================
     # 11a. BUILD — unsigned (sideload)
@@ -278,23 +297,86 @@ jobs:
         ./scripts/build_unsigned_ipa.sh "$SCHEME" "${GITHUB_WORKSPACE}/build"
 
     # ==============================================
-    # 11b. BUILD — signed (TestFlight / App Store)
-    #      Gym uses Match-installed signing identity
+    # 11b. BUILD — signed (Xcode Automatic Signing + allowProvisioningUpdates)
+    #      xcodebuild archive → exportArchive; no fastlane match / gym
     # ==============================================
-    - name: Build signed IPA
+    - name: Build signed IPA (Automatic Signing)
       if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
       env:
-        MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+        ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
       run: |
-        mkdir -p build
-        cd core_project
-        fastlane gym \
-          --scheme                "$SCHEME" \
-          --output_directory      "${GITHUB_WORKSPACE}/build" \
-          --export_method         app-store \
-          --xcargs                "CURRENT_PROJECT_VERSION=${{ env.BUILD_NUMBER }} MARKETING_VERSION=${{ env.APP_VERSION }}" \
-          --skip_package_validation \
-          --clean
+        mkdir -p "$GITHUB_WORKSPACE/build/export"
+        ARCHIVE="$GITHUB_WORKSPACE/build/Readori.xcarchive"
+        AUTH_KEY="/tmp/asc_keys/AuthKey_${ASC_KEY_ID}.p8"
+
+        # Write ExportOptions.plist
+        cat > /tmp/ExportOptions.plist << PLIST
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict>
+          <key>method</key><string>app-store</string>
+          <key>signingStyle</key><string>automatic</string>
+          <key>teamID</key><string>${ASC_TEAM_ID}</string>
+          <key>destination</key><string>export</string>
+        </dict></plist>
+        PLIST
+
+        # Archive (Automatic Signing + allowProvisioningUpdates)
+        cd "$GITHUB_WORKSPACE/core_project"
+        set -o pipefail
+        xcodebuild archive \
+          -scheme                    "$SCHEME" \
+          -configuration             Release \
+          -sdk                       iphoneos \
+          -destination               "generic/platform=iOS" \
+          -jobs                      1 \
+          -archivePath               "$ARCHIVE" \
+          -allowProvisioningUpdates \
+          -authenticationKeyPath     "$AUTH_KEY" \
+          -authenticationKeyID       "$ASC_KEY_ID" \
+          -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+          -skipPackagePluginValidation \
+          -skipMacroValidation \
+          -onlyUsePackageVersionsFromResolvedFile \
+          CODE_SIGN_STYLE=Automatic \
+          DEVELOPMENT_TEAM="$ASC_TEAM_ID" \
+          TARGETED_DEVICE_FAMILY=1 \
+          GENERATE_INFOPLIST_FILE=NO \
+          INFOPLIST_FILE="Readori/Supporting/Info.plist" \
+          CURRENT_PROJECT_VERSION="${{ env.BUILD_NUMBER }}" \
+          MARKETING_VERSION="${{ env.APP_VERSION }}" \
+          ASSETCATALOG_COMPILER_APPICON_NAME=AppIcon \
+          ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS=YES \
+          ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOLS=NO \
+          COMPILER_INDEX_STORE_ENABLE=NO \
+          ENABLE_TESTABILITY=NO \
+          2>&1 | tee /tmp/archive.log
+        if [[ ! -d "$ARCHIVE" ]]; then
+          echo "ERROR: archive not created. Last 80 log lines:"
+          tail -80 /tmp/archive.log; exit 1
+        fi
+        echo "Archive OK: $ARCHIVE"
+
+        # Export archive → IPA
+        xcodebuild -exportArchive \
+          -archivePath               "$ARCHIVE" \
+          -exportPath                "$GITHUB_WORKSPACE/build/export" \
+          -exportOptionsPlist        /tmp/ExportOptions.plist \
+          -allowProvisioningUpdates \
+          -authenticationKeyPath     "$AUTH_KEY" \
+          -authenticationKeyID       "$ASC_KEY_ID" \
+          -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+          2>&1 | tee /tmp/export.log
+
+        IPA=$(find "$GITHUB_WORKSPACE/build/export" -name "*.ipa" | head -1)
+        if [[ -z "$IPA" ]]; then
+          echo "ERROR: no IPA in build/export. Export log:"
+          tail -60 /tmp/export.log; exit 1
+        fi
+        echo "IPA=$IPA" >> $GITHUB_ENV
+        echo "Built: $IPA  ($(du -h "$IPA" | cut -f1))"
 
     # ==============================================
     # 12. VERSION TAG
@@ -329,25 +411,30 @@ jobs:
       env:
         BETA_NOTES: ${{ github.event.inputs.beta_notes }}
       run: |
-        # Wait briefly for ASC to index the new build
+        # Wait for ASC to index the new build
         sleep 30
         BUILD_ID=$(asc builds list \
           --app-id ${{ secrets.ASC_APP_ID }} \
           --output json 2>/dev/null | \
           python3 -c "
-        import sys, json
-        builds = json.load(sys.stdin)
-        target = '${{ env.BUILD_NUMBER }}'
-        match = next((b for b in builds if b.get('version') == target), None)
-        print(match['id'] if match else '')
-        " || echo "")
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    builds = data['data'] if isinstance(data, dict) and 'data' in data else data
+    target = '${BUILD_NUMBER}'
+    match = next((b for b in builds if str(b.get('version','')) == target), None)
+    print(match['id'] if match else '')
+except Exception as e:
+    print('', file=sys.stderr)
+" || echo "")
         if [[ -n "$BUILD_ID" ]]; then
           asc builds update-beta-notes \
-            --build-id   "$BUILD_ID" \
-            --whats-new  "$BETA_NOTES"
+            --build-id "$BUILD_ID" \
+            --locale   en-US \
+            --notes    "$BETA_NOTES" || true
           echo "Beta notes updated for build $BUILD_ID"
         else
-          echo "Warning: could not find build ${{ env.BUILD_NUMBER }} in ASC — skipping beta notes"
+          echo "Warning: could not find build ${BUILD_NUMBER} in ASC — skipping beta notes"
         fi
 
     # ==============================================
@@ -355,62 +442,181 @@ jobs:
     #     Runs after build is indexed in ASC
     # ==============================================
     - name: Update What's New (version localizations)
-      if: ${{ env.MODE == 'submit' && (github.event.inputs.whats_new_en != '' || github.event.inputs.whats_new_zh_hans != '') }}
+      if: ${{ (env.MODE == 'testflight' || env.MODE == 'submit') && (github.event.inputs.whats_new_en != '' || github.event.inputs.whats_new_zh_hans != '') }}
       run: |
-        # Fetch the version currently in PREPARE_FOR_SUBMISSION or READY_FOR_REVIEW
+        # Fetch version in PREPARE_FOR_SUBMISSION, READY_FOR_REVIEW, or DEVELOPER_REJECTED
         VERSION_ID=$(asc versions list \
           --app-id ${{ secrets.ASC_APP_ID }} \
-          --output json | \
+          --output json 2>/dev/null | \
           python3 -c "
-        import sys, json
-        versions = json.load(sys.stdin)
-        ordered = sorted(versions, key=lambda v: (
-            0 if v.get('appStoreState') in ('PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW') else 1
-        ))
-        print(ordered[0]['id'] if ordered else '')
-        ")
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    versions = data['data'] if isinstance(data, dict) and 'data' in data else data
+    ordered = sorted(versions, key=lambda v: (
+        0 if v.get('appStoreState') in ('PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW','DEVELOPER_REJECTED') else 1
+    ))
+    print(ordered[0]['id'] if ordered else '')
+except: print('')
+" || echo "")
 
         if [[ -z "$VERSION_ID" ]]; then
-          echo "Warning: no version found in PREPARE_FOR_SUBMISSION — skipping What's New"
-          exit 0
+          echo "No editable version found in ASC — creating version ${{ env.APP_VERSION }}"
+          VERSION_ID=$(asc versions create \
+            --app-id  ${{ secrets.ASC_APP_ID }} \
+            --version "${{ env.APP_VERSION }}" \
+            --platform ios \
+            --output json 2>/dev/null | \
+            python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('id', d.get('data',{}).get('id','')))" \
+            || echo "")
         fi
 
-        # Fetch all version localizations and update in one step
-        export LOCALIZATIONS=$(asc version-localizations list \
-          --version-id "$VERSION_ID" \
-          --output json)
+        if [[ -z "$VERSION_ID" ]]; then
+          echo "Warning: could not get/create version — skipping What's New"
+          exit 0
+        fi
+        echo "VERSION_ID=$VERSION_ID" >> $GITHUB_ENV
+        echo "Version: $VERSION_ID"
 
-        # Update each locale that has input text
+        # Fetch localizations and update What's New per locale
         python3 - << 'PYEOF'
-        import subprocess, json, os, sys
+import subprocess, json, os, sys
 
-        localizations = json.loads(os.environ.get('LOCALIZATIONS', '[]'))
-        locale_map = {
-            'en-US':   os.environ.get('INPUT_WHATS_NEW_EN', ''),
-            'zh-Hans': os.environ.get('INPUT_WHATS_NEW_ZH_HANS', ''),
-            'zh-Hant': os.environ.get('INPUT_WHATS_NEW_ZH_HANT', ''),
-        }
+version_id = os.environ.get('VERSION_ID', '')
+if not version_id:
+    print('No VERSION_ID'); sys.exit(0)
 
-        for loc in localizations:
-            locale = loc.get('locale', '')
-            loc_id = loc.get('id', '')
-            text = locale_map.get(locale, '')
-            if text and loc_id:
-                result = subprocess.run(
-                    ['asc', 'version-localizations', 'update',
-                     '--localization-id', loc_id,
-                     '--whats-new', text],
-                    capture_output=True, text=True
-                )
-                if result.returncode == 0:
-                    print(f"  ✓ {locale} What's New updated")
-                else:
-                    print(f"  ✗ {locale} failed: {result.stderr.strip()}", file=sys.stderr)
-        PYEOF
+locale_map = {
+    'en-US':   os.environ.get('INPUT_WHATS_NEW_EN', ''),
+    'zh-Hans': os.environ.get('INPUT_WHATS_NEW_ZH_HANS', ''),
+    'zh-Hant': os.environ.get('INPUT_WHATS_NEW_ZH_HANT', ''),
+}
+
+r = subprocess.run(
+    ['asc', 'version-localizations', 'list', '--version-id', version_id, '--output', 'json'],
+    capture_output=True, text=True
+)
+if r.returncode != 0:
+    print(f'Failed to list localizations: {r.stderr[:200]}'); sys.exit(0)
+
+try:
+    data = json.loads(r.stdout)
+    locs = data['data'] if isinstance(data, dict) and 'data' in data else data
+except Exception as e:
+    print(f'JSON parse error: {e}'); sys.exit(0)
+
+for loc in locs:
+    locale = loc.get('locale', '')
+    loc_id = loc.get('id', '')
+    text = locale_map.get(locale, '')
+    if text and loc_id:
+        res = subprocess.run(
+            ['asc', 'version-localizations', 'update', '--localization-id', loc_id, '--whats-new', text],
+            capture_output=True, text=True
+        )
+        status = '✓' if res.returncode == 0 else '✗'
+        print(f'  {status} {locale}: {text[:60]}')
+        if res.returncode != 0:
+            print(f'    error: {res.stderr[:200]}')
+PYEOF
       env:
         INPUT_WHATS_NEW_EN: ${{ github.event.inputs.whats_new_en }}
         INPUT_WHATS_NEW_ZH_HANS: ${{ github.event.inputs.whats_new_zh_hans }}
         INPUT_WHATS_NEW_ZH_HANT: ${{ github.event.inputs.whats_new_zh_hant }}
+
+    # ==============================================
+    # 15.5 UPDATE APP STORE LISTING METADATA
+    #      auto-fills name, subtitle, description, privacy URL
+    # ==============================================
+    - name: Update App Store listing metadata
+      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
+      continue-on-error: true
+      run: |
+        if [[ -z "${VERSION_ID:-}" ]]; then
+          echo "No VERSION_ID from previous step — fetching now"
+          VERSION_ID=$(asc versions list \
+            --app-id ${{ secrets.ASC_APP_ID }} \
+            --output json 2>/dev/null | \
+            python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    versions = data['data'] if isinstance(data, dict) and 'data' in data else data
+    ordered = sorted(versions, key=lambda v: (
+        0 if v.get('appStoreState') in ('PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW') else 1
+    ))
+    print(ordered[0]['id'] if ordered else '')
+except: print('')
+" || echo "")
+        fi
+
+        APP_INFO_ID=$(asc app-infos list \
+          --app-id ${{ secrets.ASC_APP_ID }} \
+          --output json 2>/dev/null | \
+          python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    items = data['data'] if isinstance(data, dict) and 'data' in data else data
+    print(items[0]['id'] if items else '')
+except: print('')
+" || echo "")
+        export APP_INFO_ID
+        python3 - << 'PYEOF'
+import subprocess, json, os, sys
+
+app_info_id = os.environ.get('APP_INFO_ID', '')
+if not app_info_id:
+    print('No APP_INFO_ID set'); sys.exit(0)
+
+# Metadata from APP_STORE_METADATA_LOCALE_SNIPPETS.md
+METADATA = {
+    'en-US': {
+        'name':       'Readori',
+        'subtitle':   'Immersive Reading Companion',
+        'privacyPolicyUrl': 'https://readori.github.io/privacy.html',
+    },
+    'zh-Hans': {
+        'name':       'Readori',
+        'subtitle':   '\u6c89\u6d78\u5f0f\u9605\u8bfb\u4f34\u4fa3',
+        'privacyPolicyUrl': 'https://readori.github.io/privacy.html',
+    },
+    'zh-Hant': {
+        'name':       'Readori',
+        'subtitle':   '\u6c89\u6d78\u5f0f\u95b1\u8b80\u5925\u4f34',
+        'privacyPolicyUrl': 'https://readori.github.io/privacy.html',
+    },
+}
+
+r = subprocess.run(
+    ['asc', 'app-info-localizations', 'list', '--app-info-id', app_info_id, '--output', 'json'],
+    capture_output=True, text=True
+)
+if r.returncode != 0:
+    print(f'Failed to list app-info-localizations: {r.stderr[:200]}'); sys.exit(0)
+
+try:
+    data = json.loads(r.stdout)
+    locs = data['data'] if isinstance(data, dict) and 'data' in data else data
+except Exception as e:
+    print(f'JSON parse error: {e}'); sys.exit(0)
+
+for loc in locs:
+    locale = loc.get('locale', '')
+    loc_id = loc.get('id', '')
+    meta = METADATA.get(locale)
+    if not meta or not loc_id:
+        continue
+    args = ['asc', 'app-info-localizations', 'update', '--localization-id', loc_id,
+            '--name', meta['name'],
+            '--subtitle', meta['subtitle'],
+            '--privacy-policy-url', meta['privacyPolicyUrl']]
+    res = subprocess.run(args, capture_output=True, text=True)
+    status = '\u2713' if res.returncode == 0 else '\u2717'
+    print(f'  {status} {locale}: name/subtitle/privacy updated')
+    if res.returncode != 0:
+        print(f'    error: {res.stderr[:200]}')
+PYEOF
 
     # ==============================================
     # 16. SUBMIT FOR REVIEW (submit only)
@@ -420,26 +626,137 @@ jobs:
       run: |
         VERSION_ID=$(asc versions list \
           --app-id ${{ secrets.ASC_APP_ID }} \
-          --output json | \
+          --output json 2>/dev/null | \
           python3 -c "
-        import sys, json
-        versions = json.load(sys.stdin)
-        ordered = sorted(versions, key=lambda v: (
-            0 if v.get('appStoreState') == 'READY_FOR_REVIEW' else 1
-        ))
-        print(ordered[0]['id'])
-        ")
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    versions = data['data'] if isinstance(data, dict) and 'data' in data else data
+    ordered = sorted(versions, key=lambda v: (
+        0 if v.get('appStoreState') == 'READY_FOR_REVIEW' else 1
+    ))
+    print(ordered[0]['id'] if ordered else '')
+except: print('')
+" || echo "")
+        if [[ -z "$VERSION_ID" ]]; then
+          echo "No version in READY_FOR_REVIEW — skipping submit"
+          exit 0
+        fi
         echo "Submitting version-id: $VERSION_ID"
         asc versions submit --version-id "$VERSION_ID"
 
     # ==============================================
+    # 16.5 AUTO-CAPTURE SIMULATOR SCREENSHOTS
+    #       (screenshots mode, when no pre-staged screenshots exist)
+    #       Boots iPhone simulator, installs debug build, captures screens
+    # ==============================================
+    - name: Auto-capture simulator screenshots
+      if: ${{ env.MODE == 'screenshots' }}
+      continue-on-error: true
+      run: |
+        SCREENSHOTS_DIR="$GITHUB_WORKSPACE/screenshots_captured"
+        TARGET_DIR="core_project/screenshots"
+
+        # Skip auto-capture if screenshots already exist
+        if [[ -d "$TARGET_DIR" ]] && [[ -n "$(ls -A "$TARGET_DIR" 2>/dev/null)" ]]; then
+          echo "Pre-staged screenshots found at $TARGET_DIR — skipping auto-capture"
+          exit 0
+        fi
+
+        # Find a suitable iPhone simulator
+        UDID=$(xcrun simctl list devices available --json | \
+          python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+prefer = ['iPhone 16 Pro Max','iPhone 15 Pro Max','iPhone 14 Pro Max','iPhone 13 Pro Max']
+for name in prefer:
+    for rt, devs in data.get('devices',{}).items():
+        for d in devs:
+            if name in d.get('name','') and d.get('isAvailable'):
+                print(d['udid'])
+                raise SystemExit
+" 2>/dev/null || echo "")
+        if [[ -z "$UDID" ]]; then
+          echo "No suitable iPhone simulator found — skipping auto-capture"
+          exit 0
+        fi
+        echo "Using simulator: $UDID"
+
+        # Boot simulator
+        xcrun simctl boot "$UDID" 2>/dev/null || true
+        sleep 8
+
+        # Build debug app for simulator
+        cd "$GITHUB_WORKSPACE/core_project"
+        xcodebuild build \
+          -scheme                    "$SCHEME" \
+          -sdk                       iphonesimulator \
+          -destination               "platform=iOS Simulator,id=$UDID" \
+          -jobs                      1 \
+          -skipPackagePluginValidation \
+          -skipMacroValidation \
+          -onlyUsePackageVersionsFromResolvedFile \
+          GENERATE_INFOPLIST_FILE=NO \
+          INFOPLIST_FILE="Readori/Supporting/Info.plist" \
+          CODE_SIGN_IDENTITY="" \
+          CODE_SIGNING_REQUIRED=NO \
+          COMPILER_INDEX_STORE_ENABLE=NO \
+          ENABLE_TESTABILITY=NO \
+          CONFIGURATION_BUILD_DIR="/tmp/sim_build" \
+          2>&1 | grep -E "^(error:|Build succeeded|BUILD FAILED)" || true
+
+        APP_PATH=$(find /tmp/sim_build -maxdepth 2 -name "*.app" | grep -v Test | head -1)
+        if [[ -z "$APP_PATH" ]]; then
+          echo "No simulator .app found — skipping auto-capture"
+          exit 0
+        fi
+        echo "App: $APP_PATH"
+
+        # Install and launch
+        xcrun simctl install "$UDID" "$APP_PATH"
+        xcrun simctl launch  "$UDID" com.readori.app 2>/dev/null || true
+        sleep 6
+
+        # Capture screenshots for each device locale
+        mkdir -p "$SCREENSHOTS_DIR/en-US/APP_IPHONE_67"
+        mkdir -p "$SCREENSHOTS_DIR/zh-Hans/APP_IPHONE_67"
+
+        xcrun simctl io "$UDID" screenshot \
+          "$SCREENSHOTS_DIR/en-US/APP_IPHONE_67/01_main.png" 2>/dev/null || true
+
+        # Tap Explore tab (bottom tab bar, 2nd item from left, approx coords)
+        xcrun simctl io "$UDID" tap 108 940 2>/dev/null || true
+        sleep 3
+        xcrun simctl io "$UDID" screenshot \
+          "$SCREENSHOTS_DIR/en-US/APP_IPHONE_67/02_explore.png" 2>/dev/null || true
+
+        # Tap Settings tab
+        xcrun simctl io "$UDID" tap 322 940 2>/dev/null || true
+        sleep 3
+        xcrun simctl io "$UDID" screenshot \
+          "$SCREENSHOTS_DIR/en-US/APP_IPHONE_67/03_settings.png" 2>/dev/null || true
+
+        # Copy en-US screenshots to zh-Hans (same app, different locale metadata)
+        if [[ -d "$SCREENSHOTS_DIR/en-US/APP_IPHONE_67" ]]; then
+          cp -r "$SCREENSHOTS_DIR/en-US/APP_IPHONE_67/"*.png \
+            "$SCREENSHOTS_DIR/zh-Hans/APP_IPHONE_67/" 2>/dev/null || true
+        fi
+
+        # Move captured screenshots to expected location
+        if [[ -n "$(ls -A "$SCREENSHOTS_DIR" 2>/dev/null)" ]]; then
+          mv "$SCREENSHOTS_DIR" "$TARGET_DIR"
+          echo "Auto-captured screenshots saved to $TARGET_DIR"
+          find "$TARGET_DIR" -name '*.png' | sort
+        fi
+
+    # ==============================================
     # 17. SCREENSHOTS UPLOAD (screenshots mode)
-    #     Expects screenshots pre-staged in core_project/screenshots/
-    #     Structure: screenshots/<locale>/<device>/<filename>.png
-    #     e.g. screenshots/en-US/iPhone_6.5/01_home.png
+    #     Directory: screenshots/<locale>/<display-type>/<filename>.png
+    #     display-type = ASC enum e.g. APP_IPHONE_67, APP_IPHONE_65
     # ==============================================
     - name: Upload App Store screenshots
       if: ${{ env.MODE == 'screenshots' }}
+      continue-on-error: true
       run: |
         SCREENSHOTS_DIR="core_project/screenshots"
         if [[ ! -d "$SCREENSHOTS_DIR" ]]; then
@@ -447,71 +764,117 @@ jobs:
           exit 0
         fi
 
-        # Get screenshot sets for the app version
-        VERSION_ID=$(asc versions list \
-          --app-id ${{ secrets.ASC_APP_ID }} \
-          --output json | \
-          python3 -c "
-        import sys, json
-        versions = json.load(sys.stdin)
-        ordered = sorted(versions, key=lambda v: (
-            0 if v.get('appStoreState') in ('PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW') else 1
-        ))
-        print(ordered[0]['id'] if ordered else '')
-        ")
-
+        # Resolve editable version
+        if [[ -z "${VERSION_ID:-}" ]]; then
+          VERSION_ID=$(asc versions list \
+            --app-id ${{ secrets.ASC_APP_ID }} \
+            --output json 2>/dev/null | \
+            python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    versions = data['data'] if isinstance(data, dict) and 'data' in data else data
+    ordered = sorted(versions, key=lambda v: (
+        0 if v.get('appStoreState') in ('PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW') else 1
+    ))
+    print(ordered[0]['id'] if ordered else '')
+except: print('')
+" || echo "")
+        fi
         if [[ -z "$VERSION_ID" ]]; then
           echo "No editable version found — cannot upload screenshots"
           exit 1
         fi
+        echo "Uploading screenshots to version-id: $VERSION_ID"
 
-        echo "Target version-id: $VERSION_ID"
+        # Build locale → localization-id map and export for Python
+        LOCS_JSON=$(asc version-localizations list \
+          --version-id "$VERSION_ID" --output json 2>/dev/null || echo '{}')
+        export LOCS_JSON
+        export VERSION_ID
 
-        # Iterate locales (directory names = locale codes)
-        for locale_dir in "$SCREENSHOTS_DIR"/*/; do
-          locale=$(basename "$locale_dir")
-          echo "Processing locale: $locale"
+        python3 - << 'PYEOF'
+import subprocess, json, os, glob, sys
 
-          # Find or create screenshot set for this locale + display type
-          for device_dir in "$locale_dir"*/; do
-            device=$(basename "$device_dir")
-            echo "  Device: $device"
+screenshots_dir = 'core_project/screenshots'
+locs_json = os.environ.get('LOCS_JSON', '{}')
+try:
+    data = json.loads(locs_json)
+    locs = data['data'] if isinstance(data, dict) and 'data' in data else data
+except:
+    locs = []
 
-            # Create screenshot set
-            SET_ID=$(asc screenshot-sets create \
-              --version-id     "$VERSION_ID" \
-              --locale         "$locale" \
-              --display-target "$device" \
-              --output json 2>/dev/null | \
-              python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('id',''))" \
-              || echo "")
+locale_to_id = {loc.get('locale',''): loc.get('id','') for loc in locs}
+print(f'Known localizations: {list(locale_to_id.keys())}')
 
-            if [[ -z "$SET_ID" ]]; then
-              # Fetch existing set
-              SET_ID=$(asc screenshot-sets list \
-                --version-id     "$VERSION_ID" \
-                --locale         "$locale" \
-                --display-target "$device" \
-                --output json 2>/dev/null | \
-                python3 -c "import sys,json; sets=json.load(sys.stdin); print(sets[0]['id'] if sets else '')" \
-                || echo "")
-            fi
+errors = 0
+for locale_dir in sorted(glob.glob(f'{screenshots_dir}/*/')):
+    locale = os.path.basename(locale_dir.rstrip('/'))
+    loc_id = locale_to_id.get(locale, '')
+    if not loc_id:
+        print(f'  skip {locale}: no localization ID found')
+        continue
+    print(f'  Locale: {locale}  (loc_id={loc_id})')
 
-            if [[ -z "$SET_ID" ]]; then
-              echo "  Warning: could not get/create set for $locale/$device — skipping"
-              continue
-            fi
+    for device_dir in sorted(glob.glob(f'{locale_dir}*/')):
+        display_type = os.path.basename(device_dir.rstrip('/'))
+        print(f'    display-type: {display_type}')
 
-            # Upload all PNGs in sorted order
-            for img in $(ls "$device_dir"*.png 2>/dev/null | sort); do
-              echo "    Uploading $(basename "$img")..."
-              asc screenshots upload \
-                --set-id "$SET_ID" \
-                --file   "$img"
-            done
-          done
-        done
-        echo "Screenshots upload complete"
+        # Create screenshot set
+        r = subprocess.run(
+            ['asc', 'screenshot-sets', 'create',
+             '--localization-id', loc_id,
+             '--display-type', display_type,
+             '--output', 'json'],
+            capture_output=True, text=True
+        )
+        if r.returncode == 0:
+            try:
+                d = json.loads(r.stdout)
+                set_id = (d.get('data') or d).get('id', '') if isinstance(d, dict) else ''
+            except:
+                set_id = ''
+        else:
+            set_id = ''
+
+        # If create failed, try fetching existing set
+        if not set_id:
+            r2 = subprocess.run(
+                ['asc', 'screenshot-sets', 'list',
+                 '--localization-id', loc_id,
+                 '--output', 'json'],
+                capture_output=True, text=True
+            )
+            try:
+                d2 = json.loads(r2.stdout)
+                sets = d2['data'] if isinstance(d2, dict) and 'data' in d2 else d2
+                match = next((s for s in sets if s.get('screenshotDisplayType') == display_type), None)
+                set_id = match['id'] if match else ''
+            except:
+                set_id = ''
+
+        if not set_id:
+            print(f'    WARNING: could not create/find set for {display_type}')
+            errors += 1
+            continue
+
+        # Upload each PNG in sorted order
+        imgs = sorted(glob.glob(f'{device_dir}*.png'))
+        for img in imgs:
+            r3 = subprocess.run(
+                ['asc', 'screenshots', 'upload', '--set-id', set_id, '--file', img],
+                capture_output=True, text=True
+            )
+            status = '\u2713' if r3.returncode == 0 else '\u2717'
+            print(f'      {status} {os.path.basename(img)}')
+            if r3.returncode != 0:
+                print(f'        error: {r3.stderr[:200]}')
+                errors += 1
+
+print(f'Done. Errors: {errors}')
+if errors > 0:
+    sys.exit(1)
+PYEOF
 
     # ==============================================
     # 18. SUBSCRIPTION GROUPS — diagnostic list
@@ -542,4 +905,6 @@ jobs:
         name: readori-${{ env.BUILD_TAG || github.run_number }}
         retention-days: 7
         if-no-files-found: warn
-        path: build/*.ipa
+        path: |
+          build/*.ipa
+          build/export/*.ipa
