@@ -106,13 +106,13 @@ jobs:
       run: |
         mkdir -p ~/.appstoreconnect/private_keys
 
-        # Decode private key
-        echo "$ASC_PRIVATE_KEY_B64" | base64 --decode \
+        # Write private key (stored as raw PEM in secret)
+        printf '%s' "$ASC_PRIVATE_KEY_B64" \
           > ~/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8
 
         # Build Fastlane-compatible API key JSON
         python3 - << PYEOF
-        import json, os, base64
+        import json, os
 
         key_path = os.path.expanduser(
             f"~/.appstoreconnect/private_keys/AuthKey_{os.environ['ASC_KEY_ID']}.p8"
