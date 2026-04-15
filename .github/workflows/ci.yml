@@ -245,18 +245,18 @@ jobs:
         echo "BUILD_NUMBER=$LATEST" >> $GITHUB_ENV
         echo "Build number will be: $LATEST"
 
-            # ==============================================
-            # 10. IMPORT CERTIFICATE — keychain (replaces fastlane match)
-            #     IOS_CERTIFICATE: base64-encoded .p12 distribution cert
-            #     Provisioning handled automatically via -allowProvisioningUpdates
-            # ==============================================
-            - name: Import signing certificate
-              if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
-              env:
+    # ==============================================
+    # 10. IMPORT CERTIFICATE — keychain (replaces fastlane match)
+    #     IOS_CERTIFICATE: base64-encoded .p12 distribution cert
+    #     Provisioning handled automatically via -allowProvisioningUpdates
+    # ==============================================
+    - name: Import signing certificate
+      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
+      env:
         IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
         IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
         ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
-              run: |
+      run: |
         # Create a dedicated keychain so we don't pollute the system keychain
         security create-keychain -p "" build.keychain
         security list-keychains -s build.keychain login.keychain
@@ -282,31 +282,31 @@ jobs:
         mkdir -p /tmp/asc_keys
         cp ~/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8 /tmp/asc_keys/
 
-            # ==============================================
-            # 11a. BUILD — unsigned (sideload)
-            # ==============================================
-            - name: Build unsigned IPA
-              if: ${{ env.MODE == 'unsigned' }}
-              env:
+    # ==============================================
+    # 11a. BUILD — unsigned (sideload)
+    # ==============================================
+    - name: Build unsigned IPA
+      if: ${{ env.MODE == 'unsigned' }}
+      env:
         ALLOW_WRAPPED_APP: "1"
         APP_BUNDLE_IDENTIFIER: "com.readori.app"
-              run: |
+      run: |
         mkdir -p build
         cd core_project
         chmod +x scripts/build_unsigned_ipa.sh
         ./scripts/build_unsigned_ipa.sh "$SCHEME" "${GITHUB_WORKSPACE}/build"
 
-            # ==============================================
-            # 11b. BUILD — signed (Xcode Automatic Signing + allowProvisioningUpdates)
-            #      xcodebuild archive → exportArchive; no fastlane match / gym
-            # ==============================================
-            - name: Build signed IPA (Automatic Signing)
-              if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
-              env:
+    # ==============================================
+    # 11b. BUILD — signed (Xcode Automatic Signing + allowProvisioningUpdates)
+    #      xcodebuild archive → exportArchive; no fastlane match / gym
+    # ==============================================
+    - name: Build signed IPA (Automatic Signing)
+      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
+      env:
         ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
         ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
-              run: |
+      run: |
         mkdir -p "$GITHUB_WORKSPACE/build/export"
         ARCHIVE="$GITHUB_WORKSPACE/build/Readori.xcarchive"
         AUTH_KEY="/tmp/asc_keys/AuthKey_${ASC_KEY_ID}.p8"
@@ -378,22 +378,22 @@ jobs:
         echo "IPA=$IPA" >> $GITHUB_ENV
         echo "Built: $IPA  ($(du -h "$IPA" | cut -f1))"
 
-            # ==============================================
-            # 12. VERSION TAG
-            # ==============================================
-            - name: Tag build version
-              if: ${{ env.MODE != 'screenshots' }}
-              run: |
+    # ==============================================
+    # 12. VERSION TAG
+    # ==============================================
+    - name: Tag build version
+      if: ${{ env.MODE != 'screenshots' }}
+      run: |
         SHORT_SHA=$(git -C core_project rev-parse --short HEAD)
         BN="${BUILD_NUMBER:-0}"
         echo "BUILD_TAG=${APP_VERSION:-1.0.0}($BN)-${SHORT_SHA}" >> $GITHUB_ENV
 
-            # ==============================================
-            # 13. UPLOAD TO TESTFLIGHT
-            # ==============================================
-            - name: Upload to TestFlight
-              if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
-              run: |
+    # ==============================================
+    # 13. UPLOAD TO TESTFLIGHT
+    # ==============================================
+    - name: Upload to TestFlight
+      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
+      run: |
         IPA=$(find build -name "*.ipa" | head -1)
         echo "Uploading: $IPA  |  tag: $BUILD_TAG"
         asc builds upload \
@@ -402,15 +402,15 @@ jobs:
           --version      "${{ env.APP_VERSION }}" \
           --build-number "${{ env.BUILD_NUMBER }}"
 
-            # ==============================================
-            # 14. BETA NOTES — update TestFlight test notes
-            #     Runs after upload so the build is known to ASC
-            # ==============================================
-            - name: Update TestFlight beta notes
-              if: ${{ (env.MODE == 'testflight' || env.MODE == 'submit') && github.event.inputs.beta_notes != '' }}
-              env:
+    # ==============================================
+    # 14. BETA NOTES — update TestFlight test notes
+    #     Runs after upload so the build is known to ASC
+    # ==============================================
+    - name: Update TestFlight beta notes
+      if: ${{ (env.MODE == 'testflight' || env.MODE == 'submit') && github.event.inputs.beta_notes != '' }}
+      env:
         BETA_NOTES: ${{ github.event.inputs.beta_notes }}
-              run: |
+      run: |
         # Wait for ASC to index the new build
         sleep 30
         BUILD_ID=$(asc builds list \
@@ -481,43 +481,43 @@ jobs:
         # Fetch localizations and update What's New per locale
         python3 - << 'PYEOF'
         import subprocess, json, os, sys
-        
+
         version_id = os.environ.get('VERSION_ID', '')
         if not version_id:
             print('No VERSION_ID'); sys.exit(0)
-        
+
         locale_map = {
             'en-US':   os.environ.get('INPUT_WHATS_NEW_EN', ''),
             'zh-Hans': os.environ.get('INPUT_WHATS_NEW_ZH_HANS', ''),
             'zh-Hant': os.environ.get('INPUT_WHATS_NEW_ZH_HANT', ''),
         }
-        
+
         r = subprocess.run(
             ['asc', 'version-localizations', 'list', '--version-id', version_id, '--output', 'json'],
             capture_output=True, text=True
         )
         if r.returncode != 0:
             print(f'Failed to list localizations: {r.stderr[:200]}'); sys.exit(0)
-        
+
         try:
             data = json.loads(r.stdout)
             locs = data['data'] if isinstance(data, dict) and 'data' in data else data
         except Exception as e:
             print(f'JSON parse error: {e}'); sys.exit(0)
-        
+
         for loc in locs:
             locale = loc.get('locale', '')
             loc_id = loc.get('id', '')
             text = locale_map.get(locale, '')
             if text and loc_id:
-                res = subprocess.run(
-                    ['asc', 'version-localizations', 'update', '--localization-id', loc_id, '--whats-new', text],
-                    capture_output=True, text=True
-                )
-                status = '✓' if res.returncode == 0 else '✗'
-                print(f'  {status} {locale}: {text[:60]}')
-                if res.returncode != 0:
-                    print(f'    error: {res.stderr[:200]}')
+        res = subprocess.run(
+            ['asc', 'version-localizations', 'update', '--localization-id', loc_id, '--whats-new', text],
+            capture_output=True, text=True
+        )
+        status = '✓' if res.returncode == 0 else '✗'
+        print(f'  {status} {locale}: {text[:60]}')
+        if res.returncode != 0:
+            print(f'    error: {res.stderr[:200]}')
         PYEOF
       env:
         INPUT_WHATS_NEW_EN: ${{ github.event.inputs.whats_new_en }}
@@ -564,58 +564,58 @@ jobs:
         export APP_INFO_ID
         python3 - << 'PYEOF'
         import subprocess, json, os, sys
-        
+
         app_info_id = os.environ.get('APP_INFO_ID', '')
         if not app_info_id:
             print('No APP_INFO_ID set'); sys.exit(0)
-        
+
         # Metadata from APP_STORE_METADATA_LOCALE_SNIPPETS.md
         METADATA = {
             'en-US': {
-                'name':       'Readori',
-                'subtitle':   'Immersive Reading Companion',
-                'privacyPolicyUrl': 'https://readori.github.io/privacy.html',
+        'name':       'Readori',
+        'subtitle':   'Immersive Reading Companion',
+        'privacyPolicyUrl': 'https://readori.github.io/privacy.html',
             },
             'zh-Hans': {
-                'name':       'Readori',
-                'subtitle':   '\u6c89\u6d78\u5f0f\u9605\u8bfb\u4f34\u4fa3',
-                'privacyPolicyUrl': 'https://readori.github.io/privacy.html',
+        'name':       'Readori',
+        'subtitle':   '\u6c89\u6d78\u5f0f\u9605\u8bfb\u4f34\u4fa3',
+        'privacyPolicyUrl': 'https://readori.github.io/privacy.html',
             },
             'zh-Hant': {
-                'name':       'Readori',
-                'subtitle':   '\u6c89\u6d78\u5f0f\u95b1\u8b80\u5925\u4f34',
-                'privacyPolicyUrl': 'https://readori.github.io/privacy.html',
+        'name':       'Readori',
+        'subtitle':   '\u6c89\u6d78\u5f0f\u95b1\u8b80\u5925\u4f34',
+        'privacyPolicyUrl': 'https://readori.github.io/privacy.html',
             },
         }
-        
+
         r = subprocess.run(
             ['asc', 'app-info-localizations', 'list', '--app-info-id', app_info_id, '--output', 'json'],
             capture_output=True, text=True
         )
         if r.returncode != 0:
             print(f'Failed to list app-info-localizations: {r.stderr[:200]}'); sys.exit(0)
-        
+
         try:
             data = json.loads(r.stdout)
             locs = data['data'] if isinstance(data, dict) and 'data' in data else data
         except Exception as e:
             print(f'JSON parse error: {e}'); sys.exit(0)
-        
+
         for loc in locs:
             locale = loc.get('locale', '')
             loc_id = loc.get('id', '')
             meta = METADATA.get(locale)
             if not meta or not loc_id:
-                continue
+        continue
             args = ['asc', 'app-info-localizations', 'update', '--localization-id', loc_id,
-                    '--name', meta['name'],
-                    '--subtitle', meta['subtitle'],
-                    '--privacy-policy-url', meta['privacyPolicyUrl']]
+            '--name', meta['name'],
+            '--subtitle', meta['subtitle'],
+            '--privacy-policy-url', meta['privacyPolicyUrl']]
             res = subprocess.run(args, capture_output=True, text=True)
             status = '\u2713' if res.returncode == 0 else '\u2717'
             print(f'  {status} {locale}: name/subtitle/privacy updated')
             if res.returncode != 0:
-                print(f'    error: {res.stderr[:200]}')
+        print(f'    error: {res.stderr[:200]}')
         PYEOF
 
     # ==============================================
@@ -795,7 +795,7 @@ jobs:
 
         python3 - << 'PYEOF'
         import subprocess, json, os, glob, sys
-        
+
         screenshots_dir = 'core_project/screenshots'
         locs_json = os.environ.get('LOCS_JSON', '{}')
         try:
@@ -803,74 +803,74 @@ jobs:
             locs = data['data'] if isinstance(data, dict) and 'data' in data else data
         except:
             locs = []
-        
+
         locale_to_id = {loc.get('locale',''): loc.get('id','') for loc in locs}
         print(f'Known localizations: {list(locale_to_id.keys())}')
-        
+
         errors = 0
         for locale_dir in sorted(glob.glob(f'{screenshots_dir}/*/')):
             locale = os.path.basename(locale_dir.rstrip('/'))
             loc_id = locale_to_id.get(locale, '')
             if not loc_id:
-                print(f'  skip {locale}: no localization ID found')
-                continue
+        print(f'  skip {locale}: no localization ID found')
+        continue
             print(f'  Locale: {locale}  (loc_id={loc_id})')
-        
+
             for device_dir in sorted(glob.glob(f'{locale_dir}*/')):
-                display_type = os.path.basename(device_dir.rstrip('/'))
-                print(f'    display-type: {display_type}')
-        
-                # Create screenshot set
-                r = subprocess.run(
-                    ['asc', 'screenshot-sets', 'create',
-                     '--localization-id', loc_id,
-                     '--display-type', display_type,
-                     '--output', 'json'],
-                    capture_output=True, text=True
-                )
-                if r.returncode == 0:
-                    try:
-                        d = json.loads(r.stdout)
-                        set_id = (d.get('data') or d).get('id', '') if isinstance(d, dict) else ''
-                    except:
-                        set_id = ''
-                else:
-                    set_id = ''
-        
-                # If create failed, try fetching existing set
-                if not set_id:
-                    r2 = subprocess.run(
-                        ['asc', 'screenshot-sets', 'list',
-                         '--localization-id', loc_id,
-                         '--output', 'json'],
-                        capture_output=True, text=True
-                    )
-                    try:
-                        d2 = json.loads(r2.stdout)
-                        sets = d2['data'] if isinstance(d2, dict) and 'data' in d2 else d2
-                        match = next((s for s in sets if s.get('screenshotDisplayType') == display_type), None)
-                        set_id = match['id'] if match else ''
-                    except:
-                        set_id = ''
-        
-                if not set_id:
-                    print(f'    WARNING: could not create/find set for {display_type}')
-                    errors += 1
-                    continue
-        
-                # Upload each PNG in sorted order
-                imgs = sorted(glob.glob(f'{device_dir}*.png'))
-                for img in imgs:
-                    r3 = subprocess.run(
-                        ['asc', 'screenshots', 'upload', '--set-id', set_id, '--file', img],
-                        capture_output=True, text=True
-                    )
-                    status = '\u2713' if r3.returncode == 0 else '\u2717'
-                    print(f'      {status} {os.path.basename(img)}')
-                    if r3.returncode != 0:
-                        print(f'        error: {r3.stderr[:200]}')
-                        errors += 1
-        
+        display_type = os.path.basename(device_dir.rstrip('/'))
+        print(f'    display-type: {display_type}')
+
+        # Create screenshot set
+        r = subprocess.run(
+            ['asc', 'screenshot-sets', 'create',
+             '--localization-id', loc_id,
+             '--display-type', display_type,
+             '--output', 'json'],
+            capture_output=True, text=True
+        )
+        if r.returncode == 0:
+            try:
+                d = json.loads(r.stdout)
+                set_id = (d.get('data') or d).get('id', '') if isinstance(d, dict) else ''
+            except:
+                set_id = ''
+        else:
+            set_id = ''
+
+        # If create failed, try fetching existing set
+        if not set_id:
+            r2 = subprocess.run(
+                ['asc', 'screenshot-sets', 'list',
+                 '--localization-id', loc_id,
+                 '--output', 'json'],
+                capture_output=True, text=True
+            )
+            try:
+                d2 = json.loads(r2.stdout)
+                sets = d2['data'] if isinstance(d2, dict) and 'data' in d2 else d2
+                match = next((s for s in sets if s.get('screenshotDisplayType') == display_type), None)
+                set_id = match['id'] if match else ''
+            except:
+                set_id = ''
+
+        if not set_id:
+            print(f'    WARNING: could not create/find set for {display_type}')
+            errors += 1
+            continue
+
+        # Upload each PNG in sorted order
+        imgs = sorted(glob.glob(f'{device_dir}*.png'))
+        for img in imgs:
+            r3 = subprocess.run(
+                ['asc', 'screenshots', 'upload', '--set-id', set_id, '--file', img],
+                capture_output=True, text=True
+            )
+            status = '\u2713' if r3.returncode == 0 else '\u2717'
+            print(f'      {status} {os.path.basename(img)}')
+            if r3.returncode != 0:
+                print(f'        error: {r3.stderr[:200]}')
+                errors += 1
+
         print(f'Done. Errors: {errors}')
         if errors > 0:
             sys.exit(1)
@@ -895,13 +895,13 @@ jobs:
             print(f\"  {g.get('referenceName','?')}  id={g.get('id','?')}\")
         " || echo "(no subscription groups or error)"
 
-            # ==============================================
-            # 19. UPLOAD ARTIFACT (unsigned + signed modes)
-            # ==============================================
-            - name: Upload artifact
-              if: ${{ env.MODE != 'screenshots' }}
-              uses: actions/upload-artifact@v4
-              with:
+    # ==============================================
+    # 19. UPLOAD ARTIFACT (unsigned + signed modes)
+    # ==============================================
+    - name: Upload artifact
+      if: ${{ env.MODE != 'screenshots' }}
+      uses: actions/upload-artifact@v4
+      with:
         name: readori-${{ env.BUILD_TAG || github.run_number }}
         retention-days: 7
         if-no-files-found: warn
