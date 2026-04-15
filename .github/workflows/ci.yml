@@ -1,15 +1,24 @@
 name: Readori CI
 
-# Unified pipeline — three modes via single dispatch:
+# Unified pipeline — four modes via single dispatch:
 #   unsigned   → sideload / local testing (no signing, no ASC)
 #   testflight → signed IPA + upload to TestFlight (build number auto-incremented)
 #   submit     → signed IPA + upload + submit for App Store review
+#   screenshots → upload App Store screenshots via asc-cli
+#
+# Full asc-cli automation:
+#   - Auto build number increment
+#   - TestFlight upload + beta notes
+#   - App Store submission
+#   - What's New (version localizations) update
+#   - Screenshots upload per locale
+#   - Subscription groups list (diagnostic)
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "unsigned = sideload | testflight = upload TF | submit = App Store review"
+        description: "unsigned = sideload | testflight = upload TF | submit = App Store review | screenshots = upload screenshots"
         required: false
         default: "unsigned"
         type: choice
@@ -17,6 +26,7 @@ on:
           - unsigned
           - testflight
           - submit
+          - screenshots
 
       app_scheme:
         description: "xcodebuild scheme"
@@ -43,6 +53,30 @@ on:
         description: "Marketing version string (e.g. 1.2.0) — required for testflight/submit"
         required: false
         default: "1.0.0"
+        type: string
+
+      whats_new_en:
+        description: "What's New text (English) — for testflight/submit"
+        required: false
+        default: ""
+        type: string
+
+      whats_new_zh_hans:
+        description: "What's New text (Simplified Chinese) — for testflight/submit"
+        required: false
+        default: ""
+        type: string
+
+      whats_new_zh_hant:
+        description: "What's New text (Traditional Chinese) — for testflight/submit"
+        required: false
+        default: ""
+        type: string
+
+      beta_notes:
+        description: "TestFlight beta test notes (English)"
+        required: false
+        default: ""
         type: string
 
 permissions:
@@ -112,9 +146,10 @@ jobs:
         xcode-version: ${{ github.event.inputs.xcode_version }}
 
     # ==============================================
-    # 4. SPM CACHE + RESOLVE
+    # 4. SPM CACHE + RESOLVE (skip for screenshots-only mode)
     # ==============================================
     - name: Cache Swift packages
+      if: ${{ env.MODE != 'screenshots' }}
       uses: actions/cache@v4
       with:
         path: |
@@ -125,20 +160,21 @@ jobs:
         restore-keys: spm-${{ runner.os }}-
 
     - name: Resolve Swift packages
+      if: ${{ env.MODE != 'screenshots' }}
       run: cd core_project && swift package resolve
 
     # ==============================================
-    # 5. ICON GENERATION (optional)
+    # 5. ICON GENERATION (optional, skip for screenshots)
     # ==============================================
     - name: Generate icons
-      if: ${{ github.event.inputs.generate_icons == 'yes' }}
+      if: ${{ github.event.inputs.generate_icons == 'yes' && env.MODE != 'screenshots' }}
       run: |
         if [[ -f "core_project/scripts/generate_icons.swift" ]]; then
           swift core_project/scripts/generate_icons.swift "${GITHUB_WORKSPACE}/core_project"
         fi
 
     # ==============================================
-    # 6. INSTALL FASTLANE + asc-cli (signed modes only)
+    # 6. INSTALL FASTLANE + asc-cli (signed + screenshots modes)
     # ==============================================
     - name: Install tools (Fastlane + asc-cli)
       if: ${{ env.MODE != 'unsigned' }}
@@ -148,7 +184,7 @@ jobs:
         brew install asccli
 
     # ==============================================
-    # 7. ASC API KEY JSON (signed modes only)
+    # 7. ASC API KEY JSON (signed + screenshots modes)
     #    ASC_PRIVATE_KEY stored as raw PEM in secret
     # ==============================================
     - name: Setup ASC API key
@@ -177,8 +213,7 @@ jobs:
         PYEOF
 
     # ==============================================
-    # 8. AUTHENTICATE asc-cli (signed modes only)
-    #    Flag: --private-key-path (not --p8-path)
+    # 8. AUTHENTICATE asc-cli
     # ==============================================
     - name: Authenticate asc-cli
       if: ${{ env.MODE != 'unsigned' }}
@@ -189,11 +224,11 @@ jobs:
           --private-key-path ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
 
     # ==============================================
-    # 9. AUTO BUILD NUMBER (signed modes only)
+    # 9. AUTO BUILD NUMBER (testflight / submit only)
     #    Fetches latest TestFlight build number and increments by 1
     # ==============================================
     - name: Auto-increment build number
-      if: ${{ env.MODE != 'unsigned' }}
+      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
       run: |
         LATEST=$(asc builds list \
           --app-id ${{ secrets.ASC_APP_ID }} \
@@ -211,10 +246,10 @@ jobs:
         echo "Build number will be: $LATEST"
 
     # ==============================================
-    # 10. MATCH — fetch signing identity (signed modes only)
+    # 10. MATCH — fetch signing identity (testflight / submit only)
     # ==============================================
     - name: Install certificates (Match readonly)
-      if: ${{ env.MODE != 'unsigned' }}
+      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
       env:
         MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
         FL_NO_UPDATE_ACTION: "true"
@@ -245,10 +280,9 @@ jobs:
     # ==============================================
     # 11b. BUILD — signed (TestFlight / App Store)
     #      Gym uses Match-installed signing identity
-    #      CURRENT_PROJECT_VERSION injected for TestFlight build number
     # ==============================================
     - name: Build signed IPA
-      if: ${{ env.MODE != 'unsigned' }}
+      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
       env:
         MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
       run: |
@@ -266,6 +300,7 @@ jobs:
     # 12. VERSION TAG
     # ==============================================
     - name: Tag build version
+      if: ${{ env.MODE != 'screenshots' }}
       run: |
         SHORT_SHA=$(git -C core_project rev-parse --short HEAD)
         BN="${BUILD_NUMBER:-0}"
@@ -273,7 +308,6 @@ jobs:
 
     # ==============================================
     # 13. UPLOAD TO TESTFLIGHT
-    #     asc builds upload (plural) with all required params
     # ==============================================
     - name: Upload to TestFlight
       if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
@@ -287,8 +321,98 @@ jobs:
           --build-number "${{ env.BUILD_NUMBER }}"
 
     # ==============================================
-    # 14. SUBMIT FOR REVIEW (submit only)
-    #     Lists versions, finds READY_FOR_REVIEW or latest, submits
+    # 14. BETA NOTES — update TestFlight test notes
+    #     Runs after upload so the build is known to ASC
+    # ==============================================
+    - name: Update TestFlight beta notes
+      if: ${{ (env.MODE == 'testflight' || env.MODE == 'submit') && github.event.inputs.beta_notes != '' }}
+      run: |
+        # Wait briefly for ASC to index the new build
+        sleep 30
+        BUILD_ID=$(asc builds list \
+          --app-id ${{ secrets.ASC_APP_ID }} \
+          --output json 2>/dev/null | \
+          python3 -c "
+        import sys, json
+        builds = json.load(sys.stdin)
+        target = '${{ env.BUILD_NUMBER }}'
+        match = next((b for b in builds if b.get('version') == target), None)
+        print(match['id'] if match else '')
+        " || echo "")
+        if [[ -n "$BUILD_ID" ]]; then
+          asc builds update-beta-notes \
+            --build-id   "$BUILD_ID" \
+            --whats-new  "${{ github.event.inputs.beta_notes }}"
+          echo "Beta notes updated for build $BUILD_ID"
+        else
+          echo "Warning: could not find build ${{ env.BUILD_NUMBER }} in ASC — skipping beta notes"
+        fi
+
+    # ==============================================
+    # 15. WHAT'S NEW — update version localizations
+    #     Runs after build is indexed in ASC
+    # ==============================================
+    - name: Update What's New (version localizations)
+      if: ${{ env.MODE == 'submit' && (github.event.inputs.whats_new_en != '' || github.event.inputs.whats_new_zh_hans != '') }}
+      run: |
+        # Fetch the version currently in PREPARE_FOR_SUBMISSION or READY_FOR_REVIEW
+        VERSION_ID=$(asc versions list \
+          --app-id ${{ secrets.ASC_APP_ID }} \
+          --output json | \
+          python3 -c "
+        import sys, json
+        versions = json.load(sys.stdin)
+        ordered = sorted(versions, key=lambda v: (
+            0 if v.get('appStoreState') in ('PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW') else 1
+        ))
+        print(ordered[0]['id'] if ordered else '')
+        ")
+
+        if [[ -z "$VERSION_ID" ]]; then
+          echo "Warning: no version found in PREPARE_FOR_SUBMISSION — skipping What's New"
+          exit 0
+        fi
+
+        # Fetch all version localizations for this version
+        LOCALIZATIONS=$(asc version-localizations list \
+          --version-id "$VERSION_ID" \
+          --output json)
+
+        # Update each locale that has input text
+        python3 - << 'PYEOF'
+        import subprocess, json, os, sys
+
+        localizations = json.loads(os.environ.get('LOCALIZATIONS', '[]'))
+        locale_map = {
+            'en-US':   os.environ.get('INPUT_WHATS_NEW_EN', ''),
+            'zh-Hans': os.environ.get('INPUT_WHATS_NEW_ZH_HANS', ''),
+            'zh-Hant': os.environ.get('INPUT_WHATS_NEW_ZH_HANT', ''),
+        }
+
+        for loc in localizations:
+            locale = loc.get('locale', '')
+            loc_id = loc.get('id', '')
+            text = locale_map.get(locale, '')
+            if text and loc_id:
+                result = subprocess.run(
+                    ['asc', 'version-localizations', 'update',
+                     '--localization-id', loc_id,
+                     '--whats-new', text],
+                    capture_output=True, text=True
+                )
+                if result.returncode == 0:
+                    print(f"  ✓ {locale} What's New updated")
+                else:
+                    print(f"  ✗ {locale} failed: {result.stderr.strip()}", file=sys.stderr)
+        PYEOF
+      env:
+        LOCALIZATIONS: ${{ steps.fetch-localizations.outputs.json }}
+        INPUT_WHATS_NEW_EN: ${{ github.event.inputs.whats_new_en }}
+        INPUT_WHATS_NEW_ZH_HANS: ${{ github.event.inputs.whats_new_zh_hans }}
+        INPUT_WHATS_NEW_ZH_HANT: ${{ github.event.inputs.whats_new_zh_hant }}
+
+    # ==============================================
+    # 16. SUBMIT FOR REVIEW (submit only)
     # ==============================================
     - name: Submit for App Store review
       if: ${{ env.MODE == 'submit' }}
@@ -299,7 +423,6 @@ jobs:
           python3 -c "
         import sys, json
         versions = json.load(sys.stdin)
-        # Prefer READY_FOR_REVIEW, fall back to first entry
         ordered = sorted(versions, key=lambda v: (
             0 if v.get('appStoreState') == 'READY_FOR_REVIEW' else 1
         ))
@@ -309,9 +432,110 @@ jobs:
         asc versions submit --version-id "$VERSION_ID"
 
     # ==============================================
-    # 15. UPLOAD ARTIFACT (always)
+    # 17. SCREENSHOTS UPLOAD (screenshots mode)
+    #     Expects screenshots pre-staged in core_project/screenshots/
+    #     Structure: screenshots/<locale>/<device>/<filename>.png
+    #     e.g. screenshots/en-US/iPhone_6.5/01_home.png
+    # ==============================================
+    - name: Upload App Store screenshots
+      if: ${{ env.MODE == 'screenshots' }}
+      run: |
+        SCREENSHOTS_DIR="core_project/screenshots"
+        if [[ ! -d "$SCREENSHOTS_DIR" ]]; then
+          echo "No screenshots directory found at $SCREENSHOTS_DIR — skipping"
+          exit 0
+        fi
+
+        # Get screenshot sets for the app version
+        VERSION_ID=$(asc versions list \
+          --app-id ${{ secrets.ASC_APP_ID }} \
+          --output json | \
+          python3 -c "
+        import sys, json
+        versions = json.load(sys.stdin)
+        ordered = sorted(versions, key=lambda v: (
+            0 if v.get('appStoreState') in ('PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW') else 1
+        ))
+        print(ordered[0]['id'] if ordered else '')
+        ")
+
+        if [[ -z "$VERSION_ID" ]]; then
+          echo "No editable version found — cannot upload screenshots"
+          exit 1
+        fi
+
+        echo "Target version-id: $VERSION_ID"
+
+        # Iterate locales (directory names = locale codes)
+        for locale_dir in "$SCREENSHOTS_DIR"/*/; do
+          locale=$(basename "$locale_dir")
+          echo "Processing locale: $locale"
+
+          # Find or create screenshot set for this locale + display type
+          for device_dir in "$locale_dir"*/; do
+            device=$(basename "$device_dir")
+            echo "  Device: $device"
+
+            # Create screenshot set
+            SET_ID=$(asc screenshot-sets create \
+              --version-id     "$VERSION_ID" \
+              --locale         "$locale" \
+              --display-target "$device" \
+              --output json 2>/dev/null | \
+              python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('id',''))" \
+              || echo "")
+
+            if [[ -z "$SET_ID" ]]; then
+              # Fetch existing set
+              SET_ID=$(asc screenshot-sets list \
+                --version-id     "$VERSION_ID" \
+                --locale         "$locale" \
+                --display-target "$device" \
+                --output json 2>/dev/null | \
+                python3 -c "import sys,json; sets=json.load(sys.stdin); print(sets[0]['id'] if sets else '')" \
+                || echo "")
+            fi
+
+            if [[ -z "$SET_ID" ]]; then
+              echo "  Warning: could not get/create set for $locale/$device — skipping"
+              continue
+            fi
+
+            # Upload all PNGs in sorted order
+            for img in $(ls "$device_dir"*.png 2>/dev/null | sort); do
+              echo "    Uploading $(basename "$img")..."
+              asc screenshots upload \
+                --set-id "$SET_ID" \
+                --file   "$img"
+            done
+          done
+        done
+        echo "Screenshots upload complete"
+
+    # ==============================================
+    # 18. SUBSCRIPTION GROUPS — diagnostic list
+    #     Runs in testflight/submit modes to confirm IAP setup
+    # ==============================================
+    - name: List subscription groups (diagnostic)
+      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
+      continue-on-error: true
+      run: |
+        echo "=== Subscription Groups ==="
+        asc subscription-groups list \
+          --app-id ${{ secrets.ASC_APP_ID }} \
+          --output json | \
+          python3 -c "
+        import sys, json
+        groups = json.load(sys.stdin)
+        for g in groups:
+            print(f\"  {g.get('referenceName','?')}  id={g.get('id','?')}\")
+        " || echo "(no subscription groups or error)"
+
+    # ==============================================
+    # 19. UPLOAD ARTIFACT (unsigned + signed modes)
     # ==============================================
     - name: Upload artifact
+      if: ${{ env.MODE != 'screenshots' }}
       uses: actions/upload-artifact@v4
       with:
         name: readori-${{ env.BUILD_TAG || github.run_number }}
