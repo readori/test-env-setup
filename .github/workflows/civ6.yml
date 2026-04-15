@@ -1,4 +1,4 @@
-name: Readori CI v6 (AI Industrial Stable)
+name: Readori CI v6 (Stable Industrial)
 
 on:
   workflow_dispatch:
@@ -41,7 +41,7 @@ jobs:
     steps:
 
     # =========================
-    # SSH
+    # SSH SETUP
     # =========================
     - name: Setup SSH
       run: |
@@ -51,14 +51,14 @@ jobs:
         ssh-keyscan github.com >> ~/.ssh/known_hosts
 
     # =========================
-    # Clone
+    # CLONE REPO
     # =========================
     - name: Clone repository
       run: |
         git clone --depth=1 git@github.com:readori/readori.git core_project
 
     # =========================
-    # Install tools
+    # INSTALL TOOLS
     # =========================
     - name: Install tools
       if: ${{ env.MODE != 'unsigned' }}
@@ -68,13 +68,12 @@ jobs:
         brew install asccli
 
     # =========================
-    # ASC auth
+    # ASC AUTH
     # =========================
     - name: ASC auth
       if: ${{ env.MODE != 'unsigned' }}
       run: |
         mkdir -p ~/.appstoreconnect/private_keys
-
         echo "${{ secrets.ASC_PRIVATE_KEY }}" > ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
 
         asc auth login \
@@ -83,32 +82,22 @@ jobs:
           --private-key-path ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
 
     # =========================
-    # Build number
+    # BUILD NUMBER
     # =========================
     - name: Generate build number
       if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
       run: |
-        BN=$(asc builds list --app-id ${{ secrets.ASC_APP_ID }} --output json \
-        | python3 - << 'EOF'
-import sys, json
-data = json.load(sys.stdin)
-
-nums = []
-for b in data:
-    v = b.get("buildNumber") or b.get("version")
-    if v and str(v).isdigit():
-        nums.append(int(v))
-
-print(max(nums)+1 if nums else 1)
-EOF
-)
+        BN=$(asc builds list --app-id ${{ secrets.ASC_APP_ID }} --output json | python3 -c "import sys,json; b=json.load(sys.stdin); nums=[int(x.get('buildNumber')) for x in b if x.get('buildNumber') and str(x.get('buildNumber')).isdigit()]; print(max(nums)+1 if nums else 1)")
         echo "BUILD_NUMBER=$BN" >> $GITHUB_ENV
+        echo "BUILD_NUMBER=$BN"
 
     # =========================
-    # Match
+    # MATCH (CERTS)
     # =========================
-    - name: Match certificates
+    - name: Install certificates
       if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
+      env:
+        MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
       run: |
         cd core_project
 
@@ -118,27 +107,30 @@ EOF
           --readonly
 
     # =========================
-    # Build IPA
+    # BUILD IPA (FIXED SAFE BLOCK)
     # =========================
     - name: Build IPA
+      shell: bash
       run: |
+        set -e
+
         mkdir -p build
         cd core_project
 
         if [[ "$MODE" == "unsigned" ]]; then
           chmod +x scripts/build_unsigned_ipa.sh
           ./scripts/build_unsigned_ipa.sh "$SCHEME" "$GITHUB_WORKSPACE/build"
-        else
-          fastlane gym \
-            --scheme "$SCHEME" \
-            --output_directory "$GITHUB_WORKSPACE/build" \
-            --export_method app-store \
-            --clean \
-            --xcargs "CURRENT_PROJECT_VERSION=${BUILD_NUMBER} MARKETING_VERSION=${APP_VERSION}"
+          exit 0
         fi
 
+        fastlane gym \
+          --scheme "$SCHEME" \
+          --output_directory "$GITHUB_WORKSPACE/build" \
+          --export_method app-store \
+          --xcargs "CURRENT_PROJECT_VERSION=${BUILD_NUMBER} MARKETING_VERSION=${APP_VERSION}"
+
     # =========================
-    # Upload IPA
+    # UPLOAD IPA
     # =========================
     - name: Upload build
       if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
@@ -152,27 +144,17 @@ EOF
           --build-number "$BUILD_NUMBER"
 
     # =========================
-    # Wait build ready
+    # WAIT BUILD READY (FIXED SAFE LOOP)
     # =========================
     - name: Wait build ready
       if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
       run: |
         for i in {1..20}; do
-          ID=$(asc builds list --app-id ${{ secrets.ASC_APP_ID }} --output json \
-          | python3 - << 'EOF'
-import sys, json, os
-data = json.load(sys.stdin)
-target = os.environ.get("BUILD_NUMBER")
-
-for b in data:
-    if str(b.get("buildNumber") or b.get("version")) == str(target):
-        print(b.get("id",""))
-        break
-EOF
-)
+          ID=$(asc builds list --app-id ${{ secrets.ASC_APP_ID }} --output json | python3 -c "import sys,json; b=json.load(sys.stdin); t='${BUILD_NUMBER}'; m=[x for x in b if str(x.get('buildNumber') or x.get('version'))==t]; print(m[0]['id'] if m else '')")
 
           if [[ -n "$ID" ]]; then
             echo "BUILD_ID=$ID" >> $GITHUB_ENV
+            echo "FOUND BUILD: $ID"
             exit 0
           fi
 
@@ -180,10 +162,11 @@ EOF
           sleep 15
         done
 
+        echo "FAILED: build not found"
         exit 1
 
     # =========================
-    # Beta notes
+    # BETA NOTES
     # =========================
     - name: Beta notes
       if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
@@ -195,119 +178,75 @@ EOF
         fi
 
     # =========================
-    # Submit
+    # SUBMIT APP
     # =========================
     - name: Submit app
       if: ${{ env.MODE == 'submit' }}
       run: |
-        VERSION_ID=$(asc versions list --app-id ${{ secrets.ASC_APP_ID }} --output json \
-        | python3 - << 'EOF'
-import sys, json
-v = json.load(sys.stdin)
-print(v[0]["id"] if v else "")
-EOF
-)
+        VERSION_ID=$(asc versions list --app-id ${{ secrets.ASC_APP_ID }} --output json | python3 -c "import sys,json; v=json.load(sys.stdin); print(v[0]['id'] if v else '')")
 
         asc versions submit --version-id "$VERSION_ID"
 
     # =========================
-    # AI Screenshots
+    # AI SCREENSHOTS (PLACEHOLDER SAFE)
     # =========================
-    - name: AI Screenshot generation
+    - name: AI Screenshots (placeholder)
       if: ${{ env.MODE == 'ai-screenshots' }}
       run: |
-        python3 - << 'EOF'
-import os, json
-
-root = "core_project/screenshots"
-os.makedirs("build", exist_ok=True)
-
-result = {}
-
-if os.path.exists(root):
-    for locale in os.listdir(root):
-        lp = os.path.join(root, locale)
-        if not os.path.isdir(lp):
-            continue
-
-        result[locale] = {}
-
-        for device in os.listdir(lp):
-            dp = os.path.join(lp, device)
-            if not os.path.isdir(dp):
-                continue
-
-            files = sorted([f for f in os.listdir(dp) if f.endswith(".png")])
-
-            result[locale][device] = [
-                {
-                    "file": f,
-                    "title": f.replace(".png","").replace("_"," "),
-                    "ai_caption": f"Showcase feature: {f}"
-                }
-                for f in files
-            ]
-
-with open("build/ai_screenshots.json","w") as f:
-    json.dump(result,f,indent=2)
-
-print("AI screenshots generated")
-EOF
+        echo "AI screenshot pipeline placeholder"
+        mkdir -p core_project/screenshots/en-US/iPhone_6.7
+        echo "NO IMAGE GENERATION IN CI YET"
 
     # =========================
-    # Upload screenshots
+    # SCREENSHOTS UPLOAD
     # =========================
     - name: Upload screenshots
-      if: ${{ env.MODE == 'screenshots' || env.MODE == 'ai-screenshots' }}
+      if: ${{ env.MODE == 'screenshots' }}
       run: |
         SCREENSHOTS_DIR="core_project/screenshots"
 
-        VERSION_ID=$(asc versions list --app-id ${{ secrets.ASC_APP_ID }} --output json \
-        | python3 - << 'EOF'
-import sys,json
-v=json.load(sys.stdin)
-print(v[0]["id"] if v else "")
-EOF
-)
+        if [[ ! -d "$SCREENSHOTS_DIR" ]]; then
+          echo "No screenshots directory"
+          exit 0
+        fi
 
-        for locale in "$SCREENSHOTS_DIR"/*; do
-          [ -d "$locale" ] || continue
-          locale_name=$(basename "$locale")
+        VERSION_ID=$(asc versions list --app-id ${{ secrets.ASC_APP_ID }} --output json | python3 -c "import sys,json; v=json.load(sys.stdin); print(v[0]['id'] if v else '')")
 
-          for device in "$locale"/*; do
-            [ -d "$device" ] || continue
-            device_name=$(basename "$device")
+        for locale_dir in "$SCREENSHOTS_DIR"/*/; do
+          locale=$(basename "$locale_dir")
+
+          for device_dir in "$locale_dir"*/; do
+            device=$(basename "$device_dir")
 
             SET_ID=$(asc screenshot-sets create \
               --version-id "$VERSION_ID" \
-              --locale "$locale_name" \
-              --display-target "$device_name" \
-              --output json 2>/dev/null \
-              | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" \
-              || true)
+              --locale "$locale" \
+              --display-target "$device" \
+              --output json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('id',''))" || true)
 
             if [[ -z "$SET_ID" ]]; then
               SET_ID=$(asc screenshot-sets list \
                 --version-id "$VERSION_ID" \
-                --locale "$locale_name" \
-                --display-target "$device_name" \
-                --output json \
-                | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['id'] if d else '')")
+                --locale "$locale" \
+                --display-target "$device" \
+                --output json | python3 -c "import sys,json; s=json.load(sys.stdin); print(s[0]['id'] if s else '')")
             fi
 
-            for img in $(ls "$device"/*.png 2>/dev/null | sort); do
+            for img in $(ls "$device_dir"*.png 2>/dev/null | sort); do
               asc screenshots upload \
                 --set-id "$SET_ID" \
                 --file "$img"
             done
+
           done
         done
 
     # =========================
-    # Artifact
+    # ARTIFACT
     # =========================
     - name: Upload artifact
       uses: actions/upload-artifact@v4
+      if: ${{ env.MODE != 'screenshots' }}
       with:
-        name: readori-build
-        path: build/**
+        name: readori-build-v6
+        path: build/*.ipa
