@@ -307,11 +307,16 @@ jobs:
         '
 
           echo "--- Fastlane get_certificates (find/create distribution cert) ---"
+          # Determine keychain path (macOS appends -db suffix)
+          KEYCHAIN_PATH="${HOME}/Library/Keychains/build.keychain-db"
+          if [[ ! -f "$KEYCHAIN_PATH" ]]; then
+            KEYCHAIN_PATH=$(security list-keychains | grep build.keychain | tr -d '"' | tr -d ' ' | head -1)
+          fi
+          echo "Keychain path: $KEYCHAIN_PATH"
           fastlane run get_certificates \
             api_key_path:/tmp/fastlane_api_key.json \
             platform:ios \
-            generate_apple_certs:true \
-            keychain_name:build.keychain \
+            keychain_path:"$KEYCHAIN_PATH" \
             keychain_password:"" \
             output_path:/tmp/certs || echo "Warning: Fastlane get_certificates failed"
 
@@ -334,8 +339,6 @@ jobs:
             platform:ios \
             app_identifier:com.readori.app \
             force:true \
-            keychain_name:build.keychain \
-            keychain_password:"" \
             output_path:/tmp/profiles || echo "Warning: Fastlane get_provisioning_profile failed"
 
           # Install the downloaded profile
