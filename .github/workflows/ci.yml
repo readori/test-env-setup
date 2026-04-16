@@ -845,9 +845,14 @@ jobs:
               echo "Copying SPM resource bundle: $RESOURCE_DIR"
               cp -R "$RESOURCE_DIR" "$APP_PATH/" || true
               # Hoist .lproj directories to app root (iOS requires them at bundle root for localization)
+              # Skip old_* dirs — invalid locale names cause App Store warning 90176
               for LPROJ in "$RESOURCE_DIR"/*.lproj; do
                 if [[ -d "$LPROJ" ]]; then
                   LPROJ_NAME=$(basename "$LPROJ")
+                  if [[ "$LPROJ_NAME" == old_* ]]; then
+                    echo "  Skipping $LPROJ_NAME (invalid locale name)"
+                    continue
+                  fi
                   echo "  Hoisting $LPROJ_NAME to app root"
                   cp -R "$LPROJ" "$APP_PATH/$LPROJ_NAME"
                 fi
