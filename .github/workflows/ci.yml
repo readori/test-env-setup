@@ -733,7 +733,6 @@ jobs:
             CODE_SIGN_STYLE=Manual
             CODE_SIGN_IDENTITY="iPhone Distribution"
             DEVELOPMENT_TEAM="$ASC_TEAM_ID"
-            PROVISIONING_PROFILE_SPECIFIER="${PROFILE_UUID}"
           )
         else
           ARCHIVE_ARGS+=(
