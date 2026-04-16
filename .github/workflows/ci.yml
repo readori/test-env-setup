@@ -775,8 +775,9 @@ jobs:
           echo "Wrapped .app at: $APP_PATH"
 
         # Always ensure required plist fields (whether found or wrapped)
-        XCODE_VER=$(xcodebuild -version | head -1 | sed 's/Xcode //')
-        XCODE_BUILD=$(xcodebuild -version | tail -1 | sed 's/Build version //')
+        XCODE_OUTPUT=$(xcodebuild -version 2>/dev/null || true)
+        XCODE_VER=$(echo "$XCODE_OUTPUT" | head -1 | sed 's/Xcode //')
+        XCODE_BUILD=$(echo "$XCODE_OUTPUT" | tail -1 | sed 's/Build version //')
         SDK_VER=$(xcrun --show-sdk-version --sdk iphoneos)
         SDK_NAME="iphoneos${SDK_VER}"
 
