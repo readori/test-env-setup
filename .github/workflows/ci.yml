@@ -337,8 +337,14 @@ jobs:
             keychain_password:"" \
             output_path:/tmp/profiles || echo "Warning: Fastlane get_provisioning_profile failed"
 
-          # Install the downloaded profile (Fastlane might install it automatically)
+          # Install the downloaded profile
+          # Fastlane sigh may install it automatically to ~/Library/MobileDevice/Provisioning Profiles/
+          # Also check output_path and the standard install location
           PROFILE_FILE=$(find /tmp/profiles -name "*.mobileprovision" 2>/dev/null | head -1)
+          if [[ -z "$PROFILE_FILE" ]]; then
+            # Fastlane installs profiles here automatically
+            PROFILE_FILE=$(ls -t ~/Library/MobileDevice/Provisioning\ Profiles/*.mobileprovision 2>/dev/null | head -1)
+          fi
           if [[ -n "$PROFILE_FILE" ]]; then
             mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
             PROFILE_UUID=""
@@ -347,9 +353,29 @@ jobs:
             fi
             rm -f /tmp/profile_plist.xml
             if [[ -n "$PROFILE_UUID" ]]; then
-              cp "$PROFILE_FILE" ~/Library/MobileDevice/Provisioning\ Profiles/${PROFILE_UUID}.mobileprovision
+              # Ensure it's in the standard location
+              cp "$PROFILE_FILE" ~/Library/MobileDevice/Provisioning\ Profiles/${PROFILE_UUID}.mobileprovision 2>/dev/null || true
               echo "Fastlane profile installed: ${PROFILE_UUID}"
               echo "PROFILE_UUID=${PROFILE_UUID}" >> $GITHUB_ENV
+            fi
+          else
+            echo "Warning: No provisioning profile found after Fastlane sigh"
+            # Fallback: install profile from IOS_PROVISIONING_PROFILE secret
+            if [[ -n "$IOS_PROVISIONING_PROFILE" ]]; then
+              echo "Installing provisioning profile from secret as fallback..."
+              mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+              echo "$IOS_PROVISIONING_PROFILE" | tr -d ' \n\r' | base64 --decode > /tmp/profile.mobileprovision
+              PROFILE_UUID=""
+              if security cms -D -i /tmp/profile.mobileprovision > /tmp/profile_plist.xml 2>/dev/null; then
+                PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /tmp/profile_plist.xml 2>/dev/null || true)
+              fi
+              rm -f /tmp/profile_plist.xml
+              if [[ -n "$PROFILE_UUID" ]]; then
+                cp /tmp/profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/${PROFILE_UUID}.mobileprovision
+                echo "Secret profile installed: ${PROFILE_UUID}"
+                echo "PROFILE_UUID=${PROFILE_UUID}" >> $GITHUB_ENV
+              fi
+              rm -f /tmp/profile.mobileprovision
             fi
           fi
         else
