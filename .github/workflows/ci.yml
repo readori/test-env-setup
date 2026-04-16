@@ -289,6 +289,9 @@ jobs:
         if [[ "$IMPORTED" != "true" ]]; then
           echo "=== Cert import failed. Creating distribution cert via ASC REST API ==="
 
+          # Disable set -e in fallback block (best-effort, should not abort script)
+          set +e
+
           AUTH_KEY_PATH="/tmp/asc_keys/AuthKey_${ASC_KEY_ID}.p8"
           export AUTH_KEY_PATH
           mkdir -p /tmp/asc_keys
@@ -297,6 +300,26 @@ jobs:
           echo "Key file written: $(wc -c < "$AUTH_KEY_PATH") bytes"
           # Verify key format
           head -1 "$AUTH_KEY_PATH"
+
+          # Debug: verify asc-cli can actually make API calls with the same key
+          echo "--- Testing asc-cli API access ---"
+          ASC_TEST=$(asc builds list --app-id "$ASC_APP_ID" --limit 1 2>&1) || true
+          echo "asc-cli test result: $(echo "$ASC_TEST" | head -3)"
+
+          # Debug: print env vars (first chars only)
+          echo "ASC_KEY_ID: ${ASC_KEY_ID:0:4}..."
+          echo "ASC_ISSUER_ID: ${ASC_ISSUER_ID:0:8}..."
+          echo "Key file first 40 char: $(head -c 40 "$AUTH_KEY_PATH")"
+          echo "Key file lines: $(wc -l < "$AUTH_KEY_PATH")"
+
+          # Check /tmp/asc_api_key.json exists and has correct format
+          echo "--- asc_api_key.json check ---"
+          if [[ -f /tmp/asc_api_key.json ]]; then
+            echo "asc_api_key.json exists, keys:"
+            python3 -c "import json; d=json.load(open('/tmp/asc_api_key.json')); print('key_id:', d.get('key_id','MISSING')[:4]+'...'); print('issuer_id:', d.get('issuer_id','MISSING')[:8]+'...'); print('key_length:', len(d.get('key','')))" 2>&1 || true
+          else
+            echo "WARNING: /tmp/asc_api_key.json NOT FOUND"
+          fi
 
           # Generate new RSA key pair for the certificate
           openssl genrsa -out /tmp/dist_key.pem 2048 2>/dev/null
@@ -319,21 +342,30 @@ jobs:
             'aud': 'appstoreconnect-v1'
         }
         print(jwt.encode(payload, config['key'], algorithm='ES256', headers=headers))
-        " 2>/dev/null)
+        " 2>&1) || true
+          echo "Python JWT result: ${#JWT} chars, exit=$?"
+          if [[ -n "$JWT" && ${#JWT} -lt 100 ]]; then
+            echo "Python JWT output (error?): $JWT"
+            JWT=""
+          fi
 
-          # Approach 2: Fallback to Ruby if Python fails
-          if [[ -z "$JWT" || ${#JWT} -lt 100 ]]; then
-            echo "Python JWT failed, trying Ruby Spaceship..."
+          # Approach 2: Fallback to Ruby Spaceship if Python fails
+          if [[ -z "$JWT" ]]; then
+            echo "Trying Ruby Spaceship..."
             JWT=$(ruby -e '
         require "spaceship"
         token = Spaceship::ConnectAPI::Token.from_json_file("/tmp/asc_api_key.json")
         puts token.text
         ' 2>&1) || true
+            echo "Spaceship JWT result: ${#JWT} chars"
+            if [[ -n "$JWT" && ${#JWT} -lt 100 ]]; then
+              echo "Spaceship output (error?): $JWT"
+              JWT=""
+            fi
           fi
 
           # Approach 3: Ruby jwt gem manual as last resort
-          if [[ -z "$JWT" || ${#JWT} -lt 100 ]]; then
-            echo "Spaceship failed: $JWT"
+          if [[ -z "$JWT" ]]; then
             echo "Trying Ruby jwt gem..."
             JWT=$(ruby -e '
         require "jwt"
@@ -350,7 +382,12 @@ jobs:
           aud: "appstoreconnect-v1"
         }
         puts JWT.encode(payload, key, "ES256", { kid: ENV["ASC_KEY_ID"] })
-        ')
+        ' 2>&1) || true
+            echo "Ruby JWT result: ${#JWT} chars"
+            if [[ -n "$JWT" && ${#JWT} -lt 100 ]]; then
+              echo "Ruby JWT output (error?): $JWT"
+              JWT=""
+            fi
           fi
 
           echo "JWT created (${#JWT} chars)"
@@ -559,6 +596,9 @@ jobs:
             rm -f /tmp/profile.mobileprovision
           fi
         fi
+
+        # Re-enable error checking
+        set -e
 
         echo "CERT_IMPORTED=${IMPORTED}" >> $GITHUB_ENV
 
