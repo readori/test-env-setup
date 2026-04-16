@@ -671,6 +671,22 @@ jobs:
         # ── Pre-build: Strip alpha from AppIcon PNGs (Apple requires no transparency) ──
         if [[ -d "$ICONSET_DIR" ]]; then
           echo "Stripping alpha from AppIcon PNGs..."
+          # Generate icon-1024.png if missing (required for App Store marketing icon)
+          if [[ ! -f "$ICONSET_DIR/icon-1024.png" ]]; then
+            echo "icon-1024.png missing, generating from largest available icon..."
+            # Run generate_icons.swift if available
+            if [[ -f "$REPO_ROOT/scripts/generate_icons.swift" ]]; then
+              swift "$REPO_ROOT/scripts/generate_icons.swift" "$REPO_ROOT" 2>&1 || true
+            fi
+            # Fallback: scale up from icon-180.png if still missing
+            if [[ ! -f "$ICONSET_DIR/icon-1024.png" ]]; then
+              LARGEST=$(ls -S "$ICONSET_DIR"/*.png 2>/dev/null | head -1)
+              if [[ -n "$LARGEST" ]]; then
+                sips -z 1024 1024 "$LARGEST" --out "$ICONSET_DIR/icon-1024.png" 2>/dev/null || true
+                echo "Generated icon-1024.png from $LARGEST"
+              fi
+            fi
+          fi
           for png in "$ICONSET_DIR"/*.png; do
             [[ -f "$png" ]] && sips -s format png -s formatOptions 100 --setProperty hasAlpha false "$png" --out "$png" 2>/dev/null || true
           done
