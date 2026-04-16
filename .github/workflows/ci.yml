@@ -141,23 +141,33 @@ jobs:
     # ==============================================
     - name: List available Xcode versions
       run: |
-        echo "=== All installed Xcode versions ==="
-        ls -d /Applications/Xcode*.app 2>/dev/null || true
+        echo "=== All installed Xcode versions (with build IDs) ==="
+        for xc in /Applications/Xcode*.app; do
+          xc_ver=$("$xc/Contents/Developer/usr/bin/xcodebuild" -version 2>/dev/null | tr '\n' ' ' || true)
+          sdk_build=$(
+            DEVELOPER_DIR="$xc/Contents/Developer" \
+            xcrun --show-sdk-build-version --sdk iphoneos 2>/dev/null || echo 'N/A'
+          )
+          sdk_ver=$(
+            DEVELOPER_DIR="$xc/Contents/Developer" \
+            xcrun --show-sdk-version --sdk iphoneos 2>/dev/null || echo 'N/A'
+          )
+          # Check for beta indicator in version plist
+          is_beta=""
+          if plutil -p "$xc/Contents/version.plist" 2>/dev/null | grep -qi beta; then
+            is_beta=" [BETA]"
+          fi
+          echo "  $xc → $xc_ver | SDK $sdk_ver ($sdk_build)$is_beta"
+        done
         echo ""
-        echo "=== Current default Xcode ==="
+        echo "=== Current default ==="
         xcode-select -p 2>/dev/null || true
         xcodebuild -version 2>/dev/null || true
-        echo ""
-        echo "=== DTXcode from each Xcode ==="
-        for xc in /Applications/Xcode*.app; do
-          ver=$("$xc/Contents/Developer/usr/bin/xcodebuild" -version 2>/dev/null | head -2 || true)
-          echo "  $xc → $ver"
-        done
 
     - name: Select Xcode (16+ required for App Store)
       uses: maxim-lobanov/setup-xcode@v1
       with:
-        xcode-version: ${{ github.event.inputs.xcode_version || '16.4' }}
+        xcode-version: ${{ github.event.inputs.xcode_version || '16.3' }}
 
     # ==============================================
     # 4. SPM CACHE + RESOLVE (skip for screenshots-only mode)
@@ -847,9 +857,14 @@ jobs:
         XCODE_VER=$(echo "$XCODE_OUTPUT" | head -1 | sed 's/Xcode //')
         XCODE_BUILD=$(echo "$XCODE_OUTPUT" | tail -1 | sed 's/Build version //')
         SDK_VER=$(xcrun --show-sdk-version --sdk iphoneos)
+        SDK_BUILD=$(xcrun --show-sdk-build-version --sdk iphoneos)
         SDK_NAME="iphoneos${SDK_VER}"
+        OS_BUILD=$(sw_vers -buildVersion)
 
-        echo "Injecting DT* fields: Xcode=$XCODE_VER Build=$XCODE_BUILD SDK=$SDK_NAME"
+        echo "Injecting DT* fields:"
+        echo "  Xcode=$XCODE_VER  XcodeBuild=$XCODE_BUILD"
+        echo "  SDK=$SDK_NAME  SDKBuild=$SDK_BUILD"
+        echo "  macOS Build=$OS_BUILD"
         PB="/usr/libexec/PlistBuddy"
         PLIST="$APP_PATH/Info.plist"
 
@@ -860,6 +875,8 @@ jobs:
         $PB -c "Add :DTPlatformVersion string $SDK_VER" "$PLIST"
         $PB -c "Delete :DTSDKName" "$PLIST" 2>/dev/null || true
         $PB -c "Add :DTSDKName string $SDK_NAME" "$PLIST"
+        $PB -c "Delete :DTSDKBuild" "$PLIST" 2>/dev/null || true
+        $PB -c "Add :DTSDKBuild string $SDK_BUILD" "$PLIST"
         $PB -c "Delete :DTXcode" "$PLIST" 2>/dev/null || true
         $PB -c "Add :DTXcode string $(echo $XCODE_VER | tr -d '.')" "$PLIST"
         $PB -c "Delete :DTXcodeBuild" "$PLIST" 2>/dev/null || true
@@ -867,7 +884,7 @@ jobs:
         $PB -c "Delete :DTCompiler" "$PLIST" 2>/dev/null || true
         $PB -c "Add :DTCompiler string com.apple.compilers.llvm.clang.1_0" "$PLIST"
         $PB -c "Delete :DTPlatformBuild" "$PLIST" 2>/dev/null || true
-        $PB -c "Add :DTPlatformBuild string $XCODE_BUILD" "$PLIST"
+        $PB -c "Add :DTPlatformBuild string $SDK_BUILD" "$PLIST"
         $PB -c "Delete :BuildMachineOSBuild" "$PLIST" 2>/dev/null || true
         $PB -c "Add :BuildMachineOSBuild string $(sw_vers -buildVersion)" "$PLIST"
         $PB -c "Delete :MinimumOSVersion" "$PLIST" 2>/dev/null || true
