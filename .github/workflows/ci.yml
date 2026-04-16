@@ -822,6 +822,9 @@ jobs:
             fi
           done
 
+          # Remove old_* lproj dirs (invalid locale names cause warning 90176)
+          find "$APP_PATH" -type d -name 'old_*' -exec rm -rf {} + 2>/dev/null || true
+
           echo "Wrapped .app at: $APP_PATH"
 
         # Always ensure required plist fields (whether found or wrapped)
@@ -863,6 +866,15 @@ jobs:
         # UIRequiresFullScreen
         $PB -c "Delete :UIRequiresFullScreen" "$PLIST" 2>/dev/null || true
         $PB -c "Add :UIRequiresFullScreen bool true" "$PLIST"
+
+        # CFBundleSupportedPlatforms (required: single-element array)
+        $PB -c "Delete :CFBundleSupportedPlatforms" "$PLIST" 2>/dev/null || true
+        $PB -c "Add :CFBundleSupportedPlatforms array" "$PLIST"
+        $PB -c "Add :CFBundleSupportedPlatforms:0 string iPhoneOS" "$PLIST"
+
+        # LSSupportsOpeningDocumentsInPlace (required when CFBundleDocumentTypes exists)
+        $PB -c "Delete :LSSupportsOpeningDocumentsInPlace" "$PLIST" 2>/dev/null || true
+        $PB -c "Add :LSSupportsOpeningDocumentsInPlace bool true" "$PLIST"
 
         fi
 
