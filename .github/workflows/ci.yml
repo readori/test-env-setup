@@ -695,48 +695,36 @@ jobs:
           SIGN_STYLE="automatic"
         fi
 
-        # Write ExportOptions.plist
+        # Write ExportOptions.plist using PlistBuddy (no heredoc to avoid YAML issues)
+        printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict/>\n</plist>\n' > /tmp/ExportOptions.plist
+
+        # Detect Xcode version for method key
+        XCODE_VER=$(xcodebuild -version | head -1 | sed 's/Xcode //')
+        XCODE_MAJOR=$(echo "$XCODE_VER" | cut -d. -f1)
+        echo "Xcode version: $XCODE_VER (major=$XCODE_MAJOR)"
+
+        # Xcode 16+ uses 'app-store-connect', Xcode 15 uses 'app-store'
+        if [[ "$XCODE_MAJOR" -ge 16 ]]; then
+          EXPORT_METHOD="app-store-connect"
+        else
+          EXPORT_METHOD="app-store"
+        fi
+        echo "Export method: $EXPORT_METHOD"
+
+        /usr/libexec/PlistBuddy -c "Add :method string $EXPORT_METHOD" /tmp/ExportOptions.plist
+        /usr/libexec/PlistBuddy -c "Add :teamID string ${ASC_TEAM_ID}" /tmp/ExportOptions.plist
+        /usr/libexec/PlistBuddy -c "Add :uploadBitcode bool false" /tmp/ExportOptions.plist
+        /usr/libexec/PlistBuddy -c "Add :uploadSymbols bool true" /tmp/ExportOptions.plist
+        /usr/libexec/PlistBuddy -c "Add :stripSwiftSymbols bool true" /tmp/ExportOptions.plist
+        /usr/libexec/PlistBuddy -c "Add :manageAppVersionAndBuildNumber bool false" /tmp/ExportOptions.plist
+
         if [[ "$SIGN_STYLE" == "manual" ]]; then
-          cat > /tmp/ExportOptions.plist << 'EXPORTEOF'
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0">
-        <dict>
-          <key>method</key>
-          <string>app-store</string>
-          <key>signingStyle</key>
-          <string>manual</string>
-          <key>uploadBitcode</key>
-          <false/>
-          <key>stripSwiftSymbols</key>
-          <true/>
-          <key>uploadSymbols</key>
-          <true/>
-        </dict>
-        </plist>
-        EXPORTEOF
-          # Inject teamID and provisioning profiles into plist
-          /usr/libexec/PlistBuddy -c "Add :teamID string ${ASC_TEAM_ID}" /tmp/ExportOptions.plist
+          /usr/libexec/PlistBuddy -c "Add :signingStyle string manual" /tmp/ExportOptions.plist
           /usr/libexec/PlistBuddy -c "Add :provisioningProfiles dict" /tmp/ExportOptions.plist
           /usr/libexec/PlistBuddy -c "Add :provisioningProfiles:com.readori.app string ${PROFILE_UUID}" /tmp/ExportOptions.plist
         else
-          cat > /tmp/ExportOptions.plist << 'EXPORTEOF'
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0">
-        <dict>
-          <key>method</key>
-          <string>app-store</string>
-          <key>signingStyle</key>
-          <string>automatic</string>
-          <key>destination</key>
-          <string>export</string>
-          <key>uploadBitcode</key>
-          <false/>
-        </dict>
-        </plist>
-        EXPORTEOF
-          /usr/libexec/PlistBuddy -c "Add :teamID string ${ASC_TEAM_ID}" /tmp/ExportOptions.plist
+          /usr/libexec/PlistBuddy -c "Add :signingStyle string automatic" /tmp/ExportOptions.plist
+          /usr/libexec/PlistBuddy -c "Add :destination string export" /tmp/ExportOptions.plist
         fi
 
         echo "=== ExportOptions.plist ==="
