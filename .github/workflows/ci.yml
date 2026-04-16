@@ -304,13 +304,28 @@ jobs:
             -subj "/CN=iOS Distribution" 2>/dev/null
           CSR_CONTENT=$(openssl req -in /tmp/dist.csr -outform DER | base64 | tr -d '\n')
 
-          # Create JWT using Ruby (jwt gem comes with Fastlane)
+          # Create JWT using Fastlane's Spaceship (same JWT impl asc-cli uses)
+          # Step 7 already created /tmp/asc_api_key.json
           JWT=$(ruby -e '
+        require "spaceship"
+        token = Spaceship::ConnectAPI::Token.from_json_file("/tmp/asc_api_key.json")
+        puts token.text
+        ' 2>/dev/null)
+
+          # Fallback: Generate JWT manually if Spaceship fails
+          if [[ -z "$JWT" || ${#JWT} -lt 100 ]]; then
+            echo "Spaceship JWT failed, trying manual generation..."
+            JWT=$(ruby -e '
         require "jwt"
         require "openssl"
         key_path = ENV["AUTH_KEY_PATH"]
         raw = File.read(key_path)
-        STDERR.puts "Key file: #{raw.length} bytes, starts with: #{raw[0..30]}"
+        STDERR.puts "Key file: #{raw.length} bytes"
+        # Ensure PEM format
+        unless raw.include?("-----BEGIN")
+          raw = "-----BEGIN PRIVATE KEY-----\n#{raw.strip}\n-----END PRIVATE KEY-----\n"
+          STDERR.puts "Added PEM headers"
+        end
         key = OpenSSL::PKey::EC.new(raw)
         STDERR.puts "Key loaded: #{key.group.curve_name}"
         payload = {
@@ -323,6 +338,7 @@ jobs:
         STDERR.puts "JWT length: #{token.length}"
         puts token
         ')
+          fi
 
           echo "JWT created (${#JWT} chars)"
 
