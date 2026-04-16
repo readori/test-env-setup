@@ -292,7 +292,11 @@ jobs:
           AUTH_KEY_PATH="/tmp/asc_keys/AuthKey_${ASC_KEY_ID}.p8"
           export AUTH_KEY_PATH
           mkdir -p /tmp/asc_keys
-          cp ~/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8 "$AUTH_KEY_PATH" 2>/dev/null || true
+          # Write key directly from env var (don't rely on copy from step 7)
+          printf '%s' "$ASC_PRIVATE_KEY" > "$AUTH_KEY_PATH"
+          echo "Key file written: $(wc -c < "$AUTH_KEY_PATH") bytes"
+          # Verify key format
+          head -1 "$AUTH_KEY_PATH"
 
           # Generate new RSA key pair for the certificate
           openssl genrsa -out /tmp/dist_key.pem 2048 2>/dev/null
@@ -304,14 +308,20 @@ jobs:
           JWT=$(ruby -e '
         require "jwt"
         require "openssl"
-        key = OpenSSL::PKey::EC.new(File.read(ENV["AUTH_KEY_PATH"]))
+        key_path = ENV["AUTH_KEY_PATH"]
+        raw = File.read(key_path)
+        STDERR.puts "Key file: #{raw.length} bytes, starts with: #{raw[0..30]}"
+        key = OpenSSL::PKey::EC.new(raw)
+        STDERR.puts "Key loaded: #{key.group.curve_name}"
         payload = {
           iss: ENV["ASC_ISSUER_ID"],
           iat: Time.now.to_i,
           exp: Time.now.to_i + 1200,
           aud: "appstoreconnect-v1"
         }
-        puts JWT.encode(payload, key, "ES256", { kid: ENV["ASC_KEY_ID"] })
+        token = JWT.encode(payload, key, "ES256", { kid: ENV["ASC_KEY_ID"] })
+        STDERR.puts "JWT length: #{token.length}"
+        puts token
         ')
 
           echo "JWT created (${#JWT} chars)"
@@ -513,9 +523,11 @@ jobs:
         echo "=== Final signing identities ==="
         security find-identity -v -p codesigning build.keychain | head -5
 
-        # Copy ASC key for xcodebuild
+        # Ensure ASC key for xcodebuild
         mkdir -p /tmp/asc_keys
-        cp ~/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8 /tmp/asc_keys/ 2>/dev/null || true
+        if [[ ! -f "/tmp/asc_keys/AuthKey_${ASC_KEY_ID}.p8" ]]; then
+          printf '%s' "$ASC_PRIVATE_KEY" > "/tmp/asc_keys/AuthKey_${ASC_KEY_ID}.p8"
+        fi
 
     # ==============================================
     # 11a. BUILD — unsigned (sideload)
