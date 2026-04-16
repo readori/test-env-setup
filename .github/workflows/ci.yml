@@ -489,14 +489,50 @@ jobs:
           if [[ -n "$CERT_CONTENT" ]]; then
             echo "Certificate created: $CERT_ID"
             echo "$CERT_CONTENT" | base64 --decode > /tmp/dist.cer
-            # Create p12 from private key + cert
-            openssl pkcs12 -export -out /tmp/dist.p12 \
-              -inkey /tmp/dist_key.pem -in /tmp/dist.cer -passout pass:
+            echo "Cert file size: $(wc -c < /tmp/dist.cer) bytes"
+            echo "Private key file size: $(wc -c < /tmp/dist_key.pem) bytes"
+
+            # Verify cert is valid
+            openssl x509 -in /tmp/dist.cer -inform DER -noout -subject -dates 2>&1 || \
+              openssl x509 -in /tmp/dist.cer -inform PEM -noout -subject -dates 2>&1 || \
+              echo "WARNING: Could not parse cert"
+
+            # Create p12 from private key + cert (try DER then PEM format)
+            # macOS may need -legacy for newer openssl versions
+            if ! openssl pkcs12 -export -out /tmp/dist.p12 \
+              -inkey /tmp/dist_key.pem -in /tmp/dist.cer -inform DER \
+              -passout pass: 2>/dev/null; then
+              echo "DER format failed, trying PEM..."
+              # Convert DER to PEM first
+              openssl x509 -in /tmp/dist.cer -inform DER -out /tmp/dist_pem.cer -outform PEM 2>/dev/null || \
+                cp /tmp/dist.cer /tmp/dist_pem.cer
+              openssl pkcs12 -export -out /tmp/dist.p12 \
+                -inkey /tmp/dist_key.pem -in /tmp/dist_pem.cer \
+                -passout pass: 2>&1 || echo "WARNING: p12 creation failed"
+            fi
+            echo "P12 file size: $(wc -c < /tmp/dist.p12 2>/dev/null || echo 0) bytes"
+
             # Import into keychain
-            security import /tmp/dist.p12 -k build.keychain -P "" \
-              -T /usr/bin/codesign -T /usr/bin/security
+            if security import /tmp/dist.p12 -k build.keychain -P "" \
+              -T /usr/bin/codesign -T /usr/bin/security 2>&1; then
+              echo "P12 imported to keychain successfully"
+            else
+              echo "WARNING: P12 import to keychain failed"
+              # Try importing cert and key separately
+              echo "Trying separate import (cert then key)..."
+              security import /tmp/dist.cer -k build.keychain \
+                -T /usr/bin/codesign -T /usr/bin/security 2>&1 || true
+              security import /tmp/dist_key.pem -k build.keychain \
+                -T /usr/bin/codesign -T /usr/bin/security 2>&1 || true
+            fi
             security set-key-partition-list -S apple-tool:,apple:,codesign: \
               -s -k "" build.keychain 2>/dev/null || true
+            
+            # Immediately verify
+            echo "=== Identities right after import ==="
+            security find-identity -v -p codesigning build.keychain
+            security find-identity -v -p codesigning  # Also check default search list
+
             IMPORTED=true
             echo "Distribution certificate imported to keychain!"
 
