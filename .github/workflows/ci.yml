@@ -285,104 +285,109 @@ jobs:
 
         security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" build.keychain 2>/dev/null || true
 
-        # --- Fallback: use Fastlane to auto-create/find cert + profile ---
+        # --- Fallback: create cert via ASC REST API directly ---
         if [[ "$IMPORTED" != "true" ]]; then
-          echo "=== Cert import failed. Using Fastlane to find/create distribution cert ==="
+          echo "=== Cert import failed. Creating distribution cert via ASC REST API ==="
 
-          # Create Fastlane API key JSON
           AUTH_KEY_PATH="/tmp/asc_keys/AuthKey_${ASC_KEY_ID}.p8"
           export AUTH_KEY_PATH
           mkdir -p /tmp/asc_keys
           cp ~/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8 "$AUTH_KEY_PATH" 2>/dev/null || true
 
-          ruby -e '
-        require "json"
-        key_path = ENV.fetch("AUTH_KEY_PATH", "/tmp/asc_keys/AuthKey_" + ENV["ASC_KEY_ID"] + ".p8")
-        key_content = File.read(key_path)
-        key = {
-          "key_id" => ENV["ASC_KEY_ID"],
-          "issuer_id" => ENV["ASC_ISSUER_ID"],
-          "key" => key_content,
-          "in_house" => false
+          # Generate new RSA key pair for the certificate
+          openssl genrsa -out /tmp/dist_key.pem 2048 2>/dev/null
+          openssl req -new -key /tmp/dist_key.pem -out /tmp/dist.csr \
+            -subj "/CN=iOS Distribution" 2>/dev/null
+          CSR_CONTENT=$(openssl req -in /tmp/dist.csr -outform DER | base64 | tr -d '\n')
+
+          # Create JWT using Ruby (jwt gem comes with Fastlane)
+          JWT=$(ruby -e '
+        require "jwt"
+        require "openssl"
+        key = OpenSSL::PKey::EC.new(File.read(ENV["AUTH_KEY_PATH"]))
+        payload = {
+          iss: ENV["ASC_ISSUER_ID"],
+          iat: Time.now.to_i,
+          exp: Time.now.to_i + 1200,
+          aud: "appstoreconnect-v1"
         }
-        File.write("/tmp/fastlane_api_key.json", JSON.pretty_generate(key))
-        '
+        puts JWT.encode(payload, key, "ES256", { kid: ENV["ASC_KEY_ID"] })
+        ')
 
-          echo "--- Fastlane get_certificates (find/create distribution cert) ---"
-          # Determine keychain path (macOS appends -db suffix)
-          KEYCHAIN_PATH="${HOME}/Library/Keychains/build.keychain-db"
-          if [[ ! -f "$KEYCHAIN_PATH" ]]; then
-            KEYCHAIN_PATH=$(security list-keychains | grep build.keychain | tr -d '"' | tr -d ' ' | head -1)
-          fi
-          echo "Keychain path: $KEYCHAIN_PATH"
-          fastlane run get_certificates \
-            api_key_path:/tmp/fastlane_api_key.json \
-            platform:ios \
-            keychain_path:"$KEYCHAIN_PATH" \
-            keychain_password:"" \
-            output_path:/tmp/certs || echo "Warning: Fastlane get_certificates failed"
+          echo "JWT created (${#JWT} chars)"
 
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" build.keychain 2>/dev/null || true
+          # Create new iOS Distribution certificate via REST API
+          echo "--- Creating iOS Distribution certificate ---"
+          CERT_RESPONSE=$(curl -s -X POST \
+            "https://api.appstoreconnect.apple.com/v1/certificates" \
+            -H "Authorization: Bearer $JWT" \
+            -H "Content-Type: application/json" \
+            -d "{\"data\":{\"type\":\"certificates\",\"attributes\":{\"csrContent\":\"${CSR_CONTENT}\",\"certificateType\":\"IOS_DISTRIBUTION\"}}}")
 
-          # Check if a signing identity is now available
-          # Count actual cert entries (lines starting with number + parenthesis)
-          CERT_COUNT=$(security find-identity -v -p codesigning build.keychain | grep -c '^[[:space:]]*[0-9]*)' || echo "0")
-          echo "Found $CERT_COUNT signing identities after Fastlane cert"
-          security find-identity -v -p codesigning build.keychain
-          if [[ "$CERT_COUNT" -gt 0 ]]; then
+          CERT_CONTENT=$(echo "$CERT_RESPONSE" | ruby -e '
+        require "json"
+        data = JSON.parse(STDIN.read)
+        content = data.dig("data", "attributes", "certificateContent")
+        if content
+          puts content
+        else
+          STDERR.puts "API error: #{data.dig("errors", 0, "detail") || data.to_json[0..200]}"
+          puts ""
+        end
+        ')
+
+          if [[ -n "$CERT_CONTENT" ]]; then
+            echo "$CERT_CONTENT" | base64 --decode > /tmp/dist.cer
+            # Create p12 from private key + cert
+            openssl pkcs12 -export -out /tmp/dist.p12 \
+              -inkey /tmp/dist_key.pem -in /tmp/dist.cer -passout pass:
+            # Import into keychain
+            security import /tmp/dist.p12 -k build.keychain -P "" \
+              -T /usr/bin/codesign -T /usr/bin/security
+            security set-key-partition-list -S apple-tool:,apple:,codesign: \
+              -s -k "" build.keychain 2>/dev/null || true
             IMPORTED=true
-            echo "Distribution certificate obtained via Fastlane"
+            echo "Distribution certificate created and imported via ASC REST API!"
+          else
+            echo "Failed to create certificate via REST API. Trying to use existing..."
+            # Try to find and download existing certs
+            EXISTING=$(curl -s \
+              "https://api.appstoreconnect.apple.com/v1/certificates?filter%5BcertificateType%5D=IOS_DISTRIBUTION" \
+              -H "Authorization: Bearer $JWT")
+            echo "$EXISTING" | ruby -e '
+        require "json"
+        data = JSON.parse(STDIN.read)
+        certs = data["data"] || []
+        STDERR.puts "Found #{certs.length} existing iOS Distribution certificates"
+        certs.each { |c| STDERR.puts "  - #{c["id"]}: #{c.dig("attributes","name")}" }
+        '
           fi
 
-          # Also get a matching provisioning profile via Fastlane
-          echo "--- Fastlane get_provisioning_profile ---"
-          fastlane run get_provisioning_profile \
-            api_key_path:/tmp/fastlane_api_key.json \
-            platform:ios \
-            app_identifier:com.readori.app \
-            force:true \
-            output_path:/tmp/profiles || echo "Warning: Fastlane get_provisioning_profile failed"
+          # Clean up sensitive files
+          rm -f /tmp/dist_key.pem /tmp/dist.csr /tmp/dist.cer /tmp/dist.p12
 
-          # Install the downloaded profile
-          # Fastlane sigh may install it automatically to ~/Library/MobileDevice/Provisioning Profiles/
-          # Also check output_path and the standard install location
-          PROFILE_FILE=$(find /tmp/profiles -name "*.mobileprovision" 2>/dev/null | head -1)
-          if [[ -z "$PROFILE_FILE" ]]; then
-            # Fastlane installs profiles here automatically
-            PROFILE_FILE=$(ls -t ~/Library/MobileDevice/Provisioning\ Profiles/*.mobileprovision 2>/dev/null | head -1)
-          fi
-          if [[ -n "$PROFILE_FILE" ]]; then
+          # Check signing identities
+          echo "=== Signing identities after REST API cert creation ==="
+          security find-identity -v -p codesigning build.keychain
+          CERT_COUNT=$(security find-identity -v -p codesigning build.keychain | grep -c '^[[:space:]]*[0-9]*)' || echo "0")
+          echo "Found $CERT_COUNT signing identities"
+
+          # Install provisioning profile from secret
+          if [[ -n "$IOS_PROVISIONING_PROFILE" ]]; then
+            echo "Installing provisioning profile from secret..."
             mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+            echo "$IOS_PROVISIONING_PROFILE" | tr -d ' \n\r' | base64 --decode > /tmp/profile.mobileprovision
             PROFILE_UUID=""
-            if security cms -D -i "$PROFILE_FILE" > /tmp/profile_plist.xml 2>/dev/null; then
+            if security cms -D -i /tmp/profile.mobileprovision > /tmp/profile_plist.xml 2>/dev/null; then
               PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /tmp/profile_plist.xml 2>/dev/null || true)
             fi
             rm -f /tmp/profile_plist.xml
             if [[ -n "$PROFILE_UUID" ]]; then
-              # Ensure it's in the standard location
-              cp "$PROFILE_FILE" ~/Library/MobileDevice/Provisioning\ Profiles/${PROFILE_UUID}.mobileprovision 2>/dev/null || true
-              echo "Fastlane profile installed: ${PROFILE_UUID}"
+              cp /tmp/profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/${PROFILE_UUID}.mobileprovision
+              echo "Profile installed: ${PROFILE_UUID}"
               echo "PROFILE_UUID=${PROFILE_UUID}" >> $GITHUB_ENV
             fi
-          else
-            echo "Warning: No provisioning profile found after Fastlane sigh"
-            # Fallback: install profile from IOS_PROVISIONING_PROFILE secret
-            if [[ -n "$IOS_PROVISIONING_PROFILE" ]]; then
-              echo "Installing provisioning profile from secret as fallback..."
-              mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-              echo "$IOS_PROVISIONING_PROFILE" | tr -d ' \n\r' | base64 --decode > /tmp/profile.mobileprovision
-              PROFILE_UUID=""
-              if security cms -D -i /tmp/profile.mobileprovision > /tmp/profile_plist.xml 2>/dev/null; then
-                PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /tmp/profile_plist.xml 2>/dev/null || true)
-              fi
-              rm -f /tmp/profile_plist.xml
-              if [[ -n "$PROFILE_UUID" ]]; then
-                cp /tmp/profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/${PROFILE_UUID}.mobileprovision
-                echo "Secret profile installed: ${PROFILE_UUID}"
-                echo "PROFILE_UUID=${PROFILE_UUID}" >> $GITHUB_ENV
-              fi
-              rm -f /tmp/profile.mobileprovision
-            fi
+            rm -f /tmp/profile.mobileprovision
           fi
         else
           # Cert import succeeded — install provisioning profile from secret
