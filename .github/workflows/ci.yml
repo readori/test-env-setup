@@ -412,7 +412,28 @@ jobs:
 
           echo "JWT created (${#JWT} chars)"
 
-          # Create new iOS Distribution certificate via REST API
+          # === STEP A: Revoke ALL existing iOS Distribution certs first ===
+          echo "--- Revoking all existing iOS Distribution certs ---"
+          EXISTING=$(curl -s \
+            "https://api.appstoreconnect.apple.com/v1/certificates?filter%5BcertificateType%5D=IOS_DISTRIBUTION" \
+            -H "Authorization: Bearer $JWT")
+          CERT_IDS_TO_REVOKE=$(echo "$EXISTING" | ruby -e '
+        require "json"
+        data = JSON.parse(STDIN.read)
+        certs = data["data"] || []
+        STDERR.puts "Found #{certs.length} existing iOS Distribution certs"
+        certs.each { |c| puts c["id"] }
+        ')
+          while IFS= read -r CID; do
+            [[ -z "$CID" ]] && continue
+            echo "Revoking cert: $CID"
+            curl -s -X DELETE \
+              "https://api.appstoreconnect.apple.com/v1/certificates/${CID}" \
+              -H "Authorization: Bearer $JWT" || true
+          done <<< "$CERT_IDS_TO_REVOKE"
+          sleep 2
+
+          # === STEP B: Create new iOS Distribution certificate ===
           echo "--- Creating iOS Distribution certificate ---"
           CERT_RESPONSE=$(curl -s -X POST \
             "https://api.appstoreconnect.apple.com/v1/certificates" \
@@ -432,60 +453,10 @@ jobs:
         else
           err = data.dig("errors", 0, "detail") || "unknown"
           STDERR.puts "API error: #{err}"
-          # If cert already exists at max, try to list existing ones
-          if err.include?("maximum number")
-            STDERR.puts "Max certs reached — will try to revoke oldest"
-          end
           puts "CERT_ID="
           puts "CERT_CONTENT="
         end
         ')
-
-          # If cert creation failed (max certs), revoke oldest and retry
-          if [[ -z "$CERT_ID" ]]; then
-            echo "Trying to revoke oldest cert and retry..."
-            EXISTING=$(curl -s \
-              "https://api.appstoreconnect.apple.com/v1/certificates?filter%5BcertificateType%5D=IOS_DISTRIBUTION" \
-              -H "Authorization: Bearer $JWT")
-            OLDEST_ID=$(echo "$EXISTING" | ruby -e '
-        require "json"
-        data = JSON.parse(STDIN.read)
-        certs = data["data"] || []
-        STDERR.puts "Found #{certs.length} existing iOS Distribution certs"
-        if certs.any?
-          oldest = certs.min_by { |c| c.dig("attributes","expirationDate") || "" }
-          puts oldest["id"]
-        end
-        ')
-            if [[ -n "$OLDEST_ID" ]]; then
-              echo "Revoking cert: $OLDEST_ID"
-              curl -s -X DELETE \
-                "https://api.appstoreconnect.apple.com/v1/certificates/${OLDEST_ID}" \
-                -H "Authorization: Bearer $JWT"
-              sleep 2
-              # Retry cert creation
-              CERT_RESPONSE=$(curl -s -X POST \
-                "https://api.appstoreconnect.apple.com/v1/certificates" \
-                -H "Authorization: Bearer $JWT" \
-                -H "Content-Type: application/json" \
-                -d "{\"data\":{\"type\":\"certificates\",\"attributes\":{\"csrContent\":\"${CSR_CONTENT}\",\"certificateType\":\"IOS_DISTRIBUTION\"}}}")
-              eval $(echo "$CERT_RESPONSE" | ruby -e '
-        require "json"
-        data = JSON.parse(STDIN.read)
-        cert_id = data.dig("data", "id")
-        content = data.dig("data", "attributes", "certificateContent")
-        if cert_id && content
-          puts "CERT_ID=#{cert_id}"
-          puts "CERT_CONTENT=#{content}"
-        else
-          STDERR.puts "Retry failed: #{data.dig("errors", 0, "detail") || data.to_json[0..200]}"
-          puts "CERT_ID="
-          puts "CERT_CONTENT="
-        end
-        ')
-            fi
-          fi
-
           if [[ -n "$CERT_CONTENT" ]]; then
             echo "Certificate created: $CERT_ID"
             echo "$CERT_CONTENT" | base64 --decode > /tmp/dist.cer
@@ -497,18 +468,22 @@ jobs:
               openssl x509 -in /tmp/dist.cer -inform PEM -noout -subject -dates 2>&1 || \
               echo "WARNING: Could not parse cert"
 
-            # Create p12 from private key + cert (try DER then PEM format)
-            # macOS may need -legacy for newer openssl versions
+            # Create p12 from private key + cert
+            # Use -legacy flag for macOS Security framework compatibility (OpenSSL 3.x)
             if ! openssl pkcs12 -export -out /tmp/dist.p12 \
               -inkey /tmp/dist_key.pem -in /tmp/dist.cer -inform DER \
-              -passout pass: 2>/dev/null; then
-              echo "DER format failed, trying PEM..."
-              # Convert DER to PEM first
+              -passout pass: -legacy 2>/dev/null; then
+              echo "DER+legacy failed, trying PEM+legacy..."
               openssl x509 -in /tmp/dist.cer -inform DER -out /tmp/dist_pem.cer -outform PEM 2>/dev/null || \
                 cp /tmp/dist.cer /tmp/dist_pem.cer
-              openssl pkcs12 -export -out /tmp/dist.p12 \
+              if ! openssl pkcs12 -export -out /tmp/dist.p12 \
                 -inkey /tmp/dist_key.pem -in /tmp/dist_pem.cer \
-                -passout pass: 2>&1 || echo "WARNING: p12 creation failed"
+                -passout pass: -legacy 2>&1; then
+                echo "Legacy failed, trying without -legacy..."
+                openssl pkcs12 -export -out /tmp/dist.p12 \
+                  -inkey /tmp/dist_key.pem -in /tmp/dist_pem.cer \
+                  -passout pass: 2>&1 || echo "WARNING: p12 creation failed"
+              fi
             fi
             echo "P12 file size: $(wc -c < /tmp/dist.p12 2>/dev/null || echo 0) bytes"
 
@@ -685,10 +660,14 @@ jobs:
         AUTH_KEY="/tmp/asc_keys/AuthKey_${ASC_KEY_ID}.p8"
 
         # Determine signing style
-        # ALWAYS use automatic signing when API key is available (more reliable than manual)
-        # Xcode handles cert + profile management via -allowProvisioningUpdates
-        echo "Using AUTOMATIC signing with allowProvisioningUpdates (API key verified)"
-        SIGN_STYLE="automatic"
+        # Use manual signing when we have a valid cert+profile (more reliable for export)
+        if [[ "${CERT_IMPORTED:-false}" == "true" && -n "${PROFILE_UUID:-}" ]]; then
+          echo "Using MANUAL signing (cert imported + profile ${PROFILE_UUID})"
+          SIGN_STYLE="manual"
+        else
+          echo "Using AUTOMATIC signing with allowProvisioningUpdates"
+          SIGN_STYLE="automatic"
+        fi
 
         # Write ExportOptions.plist using PlistBuddy (no heredoc to avoid YAML issues)
         printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict/>\n</plist>\n' > /tmp/ExportOptions.plist
@@ -708,12 +687,19 @@ jobs:
 
         /usr/libexec/PlistBuddy -c "Add :method string $EXPORT_METHOD" /tmp/ExportOptions.plist
         /usr/libexec/PlistBuddy -c "Add :teamID string ${ASC_TEAM_ID}" /tmp/ExportOptions.plist
-        /usr/libexec/PlistBuddy -c "Add :signingStyle string automatic" /tmp/ExportOptions.plist
         /usr/libexec/PlistBuddy -c "Add :uploadBitcode bool false" /tmp/ExportOptions.plist
         /usr/libexec/PlistBuddy -c "Add :uploadSymbols bool true" /tmp/ExportOptions.plist
         /usr/libexec/PlistBuddy -c "Add :stripSwiftSymbols bool true" /tmp/ExportOptions.plist
         /usr/libexec/PlistBuddy -c "Add :manageAppVersionAndBuildNumber bool false" /tmp/ExportOptions.plist
-        /usr/libexec/PlistBuddy -c "Add :destination string export" /tmp/ExportOptions.plist
+
+        if [[ "$SIGN_STYLE" == "manual" ]]; then
+          /usr/libexec/PlistBuddy -c "Add :signingStyle string manual" /tmp/ExportOptions.plist
+          /usr/libexec/PlistBuddy -c "Add :provisioningProfiles dict" /tmp/ExportOptions.plist
+          /usr/libexec/PlistBuddy -c "Add :provisioningProfiles:com.readori.app string ${PROFILE_UUID}" /tmp/ExportOptions.plist
+        else
+          /usr/libexec/PlistBuddy -c "Add :signingStyle string automatic" /tmp/ExportOptions.plist
+          /usr/libexec/PlistBuddy -c "Add :destination string export" /tmp/ExportOptions.plist
+        fi
 
         echo "=== ExportOptions.plist ==="
         cat /tmp/ExportOptions.plist
@@ -742,15 +728,23 @@ jobs:
           ENABLE_TESTABILITY=NO
         )
 
-        # Always use automatic signing with API key
-        ARCHIVE_ARGS+=(
-          -allowProvisioningUpdates
-          -authenticationKeyPath "$AUTH_KEY"
-          -authenticationKeyID "$ASC_KEY_ID"
-          -authenticationKeyIssuerID "$ASC_ISSUER_ID"
-          CODE_SIGN_STYLE=Automatic
-          DEVELOPMENT_TEAM="$ASC_TEAM_ID"
-        )
+        if [[ "$SIGN_STYLE" == "manual" ]]; then
+          ARCHIVE_ARGS+=(
+            CODE_SIGN_STYLE=Manual
+            CODE_SIGN_IDENTITY="iPhone Distribution"
+            DEVELOPMENT_TEAM="$ASC_TEAM_ID"
+            PROVISIONING_PROFILE_SPECIFIER="${PROFILE_UUID}"
+          )
+        else
+          ARCHIVE_ARGS+=(
+            -allowProvisioningUpdates
+            -authenticationKeyPath "$AUTH_KEY"
+            -authenticationKeyID "$ASC_KEY_ID"
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+            CODE_SIGN_STYLE=Automatic
+            DEVELOPMENT_TEAM="$ASC_TEAM_ID"
+          )
+        fi
 
         xcodebuild archive "${ARCHIVE_ARGS[@]}" 2>&1 | tee /tmp/archive.log
         if [[ ! -d "$ARCHIVE" ]]; then
@@ -759,16 +753,26 @@ jobs:
         fi
         echo "Archive OK: $ARCHIVE"
 
+        # Verify archive is properly signed
+        echo "=== Archive signing verification ==="
+        codesign -dvv "$ARCHIVE/Products/Applications/Readori.app" 2>&1 || echo "WARNING: codesign verification failed"
+        echo "=== Embedded provisioning profile ==="
+        security cms -D -i "$ARCHIVE/Products/Applications/Readori.app/embedded.mobileprovision" 2>/dev/null | head -30 || echo "No embedded provisioning profile found"
+
         # Export archive → IPA
         EXPORT_ARGS=(
           -archivePath "$ARCHIVE"
           -exportPath "$GITHUB_WORKSPACE/build/export"
           -exportOptionsPlist /tmp/ExportOptions.plist
-          -allowProvisioningUpdates
-          -authenticationKeyPath "$AUTH_KEY"
-          -authenticationKeyID "$ASC_KEY_ID"
-          -authenticationKeyIssuerID "$ASC_ISSUER_ID"
         )
+        if [[ "$SIGN_STYLE" == "automatic" ]]; then
+          EXPORT_ARGS+=(
+            -allowProvisioningUpdates
+            -authenticationKeyPath "$AUTH_KEY"
+            -authenticationKeyID "$ASC_KEY_ID"
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          )
+        fi
 
         xcodebuild -exportArchive "${EXPORT_ARGS[@]}" 2>&1 | tee /tmp/export.log
 
