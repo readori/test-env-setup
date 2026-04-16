@@ -684,16 +684,11 @@ jobs:
         ARCHIVE="$GITHUB_WORKSPACE/build/Readori.xcarchive"
         AUTH_KEY="/tmp/asc_keys/AuthKey_${ASC_KEY_ID}.p8"
 
-        # Determine signing style based on what's available
-        # Need BOTH cert AND profile for manual signing
-        if [[ "${CERT_IMPORTED:-false}" == "true" && -n "${PROFILE_UUID:-}" ]]; then
-          echo "Using MANUAL signing (cert imported + profile ${PROFILE_UUID})"
-          SIGN_STYLE="manual"
-        else
-          echo "Using AUTOMATIC signing with allowProvisioningUpdates"
-          echo "  CERT_IMPORTED=${CERT_IMPORTED:-false}, PROFILE_UUID=${PROFILE_UUID:-<empty>}"
-          SIGN_STYLE="automatic"
-        fi
+        # Determine signing style
+        # ALWAYS use automatic signing when API key is available (more reliable than manual)
+        # Xcode handles cert + profile management via -allowProvisioningUpdates
+        echo "Using AUTOMATIC signing with allowProvisioningUpdates (API key verified)"
+        SIGN_STYLE="automatic"
 
         # Write ExportOptions.plist using PlistBuddy (no heredoc to avoid YAML issues)
         printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict/>\n</plist>\n' > /tmp/ExportOptions.plist
@@ -713,19 +708,12 @@ jobs:
 
         /usr/libexec/PlistBuddy -c "Add :method string $EXPORT_METHOD" /tmp/ExportOptions.plist
         /usr/libexec/PlistBuddy -c "Add :teamID string ${ASC_TEAM_ID}" /tmp/ExportOptions.plist
+        /usr/libexec/PlistBuddy -c "Add :signingStyle string automatic" /tmp/ExportOptions.plist
         /usr/libexec/PlistBuddy -c "Add :uploadBitcode bool false" /tmp/ExportOptions.plist
         /usr/libexec/PlistBuddy -c "Add :uploadSymbols bool true" /tmp/ExportOptions.plist
         /usr/libexec/PlistBuddy -c "Add :stripSwiftSymbols bool true" /tmp/ExportOptions.plist
         /usr/libexec/PlistBuddy -c "Add :manageAppVersionAndBuildNumber bool false" /tmp/ExportOptions.plist
-
-        if [[ "$SIGN_STYLE" == "manual" ]]; then
-          /usr/libexec/PlistBuddy -c "Add :signingStyle string manual" /tmp/ExportOptions.plist
-          /usr/libexec/PlistBuddy -c "Add :provisioningProfiles dict" /tmp/ExportOptions.plist
-          /usr/libexec/PlistBuddy -c "Add :provisioningProfiles:com.readori.app string ${PROFILE_UUID}" /tmp/ExportOptions.plist
-        else
-          /usr/libexec/PlistBuddy -c "Add :signingStyle string automatic" /tmp/ExportOptions.plist
-          /usr/libexec/PlistBuddy -c "Add :destination string export" /tmp/ExportOptions.plist
-        fi
+        /usr/libexec/PlistBuddy -c "Add :destination string export" /tmp/ExportOptions.plist
 
         echo "=== ExportOptions.plist ==="
         cat /tmp/ExportOptions.plist
@@ -754,22 +742,15 @@ jobs:
           ENABLE_TESTABILITY=NO
         )
 
-        if [[ "$SIGN_STYLE" == "manual" ]]; then
-          ARCHIVE_ARGS+=(
-            CODE_SIGN_STYLE=Manual
-            DEVELOPMENT_TEAM="$ASC_TEAM_ID"
-            PROVISIONING_PROFILE_SPECIFIER="${PROFILE_UUID}"
-          )
-        else
-          ARCHIVE_ARGS+=(
-            -allowProvisioningUpdates
-            -authenticationKeyPath "$AUTH_KEY"
-            -authenticationKeyID "$ASC_KEY_ID"
-            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
-            CODE_SIGN_STYLE=Automatic
-            DEVELOPMENT_TEAM="$ASC_TEAM_ID"
-          )
-        fi
+        # Always use automatic signing with API key
+        ARCHIVE_ARGS+=(
+          -allowProvisioningUpdates
+          -authenticationKeyPath "$AUTH_KEY"
+          -authenticationKeyID "$ASC_KEY_ID"
+          -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          CODE_SIGN_STYLE=Automatic
+          DEVELOPMENT_TEAM="$ASC_TEAM_ID"
+        )
 
         xcodebuild archive "${ARCHIVE_ARGS[@]}" 2>&1 | tee /tmp/archive.log
         if [[ ! -d "$ARCHIVE" ]]; then
@@ -783,15 +764,11 @@ jobs:
           -archivePath "$ARCHIVE"
           -exportPath "$GITHUB_WORKSPACE/build/export"
           -exportOptionsPlist /tmp/ExportOptions.plist
+          -allowProvisioningUpdates
+          -authenticationKeyPath "$AUTH_KEY"
+          -authenticationKeyID "$ASC_KEY_ID"
+          -authenticationKeyIssuerID "$ASC_ISSUER_ID"
         )
-        if [[ "$SIGN_STYLE" == "automatic" ]]; then
-          EXPORT_ARGS+=(
-            -allowProvisioningUpdates
-            -authenticationKeyPath "$AUTH_KEY"
-            -authenticationKeyID "$ASC_KEY_ID"
-            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
-          )
-        fi
 
         xcodebuild -exportArchive "${EXPORT_ARGS[@]}" 2>&1 | tee /tmp/export.log
 
