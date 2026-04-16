@@ -1183,7 +1183,7 @@ jobs:
             loc_id = loc.get('id', '')
             meta = METADATA.get(locale)
             if not meta or not loc_id:
-        continue
+                continue
             args = ['asc', 'app-info-localizations', 'update', '--localization-id', loc_id,
             '--name', meta['name'],
             '--subtitle', meta['subtitle'],
@@ -1192,7 +1192,7 @@ jobs:
             status = '\u2713' if res.returncode == 0 else '\u2717'
             print(f'  {status} {locale}: name/subtitle/privacy updated')
             if res.returncode != 0:
-        print(f'    error: {res.stderr[:200]}')
+                print(f'    error: {res.stderr[:200]}')
         PYEOF
 
     # ==============================================
@@ -1467,9 +1467,13 @@ jobs:
           --output json | \
           python3 -c "
         import sys, json
-        groups = json.load(sys.stdin)
+        data = json.load(sys.stdin)
+        groups = data['data'] if isinstance(data, dict) and 'data' in data else (data if isinstance(data, list) else [])
         for g in groups:
-            print(f\"  {g.get('referenceName','?')}  id={g.get('id','?')}\")
+            if isinstance(g, dict):
+                print(f\"  {g.get('referenceName','?')}  id={g.get('id','?')}\")
+            else:
+                print(f'  {g}')
         " || echo "(no subscription groups or error)"
 
     # ==============================================
