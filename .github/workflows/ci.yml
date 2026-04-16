@@ -764,6 +764,25 @@ jobs:
             [[ -f "$ICONSET_DIR/icon-180.png" ]] && cp "$ICONSET_DIR/icon-180.png" "$APP_PATH/AppIcon60x60@3x.png"
           fi
 
+          # Copy compiled Assets.car from build products (contains AppIcon + other assets)
+          ASSETS_CAR=$(find "$DERIVED_DATA" -name "Assets.car" ! -path "*/SourcePackages/*" | head -1)
+          if [[ -n "$ASSETS_CAR" ]]; then
+            cp "$ASSETS_CAR" "$APP_PATH/Assets.car"
+            echo "Copied Assets.car from: $ASSETS_CAR"
+          else
+            echo "No Assets.car found. Compiling asset catalog manually..."
+            ASSETS_XCASSETS="$REPO_ROOT/Readori/Resources/Assets.xcassets"
+            if [[ -d "$ASSETS_XCASSETS" ]]; then
+              xcrun actool "$ASSETS_XCASSETS" \
+                --compile "$APP_PATH" \
+                --platform iphoneos \
+                --minimum-deployment-target 16.0 \
+                --app-icon AppIcon \
+                --output-partial-info-plist /tmp/assetcatalog_partial.plist \
+                2>&1 || echo "WARNING: actool failed"
+            fi
+          fi
+
           # Copy SPM resources (lproj folders, Fonts, etc.)
           for RESOURCE_DIR in "$PRODUCT_DIR"/${SCHEME}_${SCHEME}.bundle "$PRODUCT_DIR"/Readori_Readori.bundle; do
             if [[ -d "$RESOURCE_DIR" ]]; then
