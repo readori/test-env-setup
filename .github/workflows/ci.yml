@@ -297,10 +297,12 @@ jobs:
 
           ruby -e '
         require "json"
+        key_path = ENV.fetch("AUTH_KEY_PATH", "/tmp/asc_keys/AuthKey_" + ENV["ASC_KEY_ID"] + ".p8")
+        key_content = File.read(key_path)
         key = {
           "key_id" => ENV["ASC_KEY_ID"],
           "issuer_id" => ENV["ASC_ISSUER_ID"],
-          "key_filepath" => ENV.fetch("AUTH_KEY_PATH", "/tmp/asc_keys/AuthKey_" + ENV["ASC_KEY_ID"] + ".p8"),
+          "key" => key_content,
           "in_house" => false
         }
         File.write("/tmp/fastlane_api_key.json", JSON.pretty_generate(key))
