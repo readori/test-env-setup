@@ -1024,6 +1024,47 @@ jobs:
         echo "BUILD_TAG=${APP_VERSION:-1.0.0}($BN)-${SHORT_SHA}" >> $GITHUB_ENV
 
     # ==============================================
+    # 12.5 VERIFY APP ICON in .app bundle
+    #      Ensures icon-1024 and AppIcon assets are present
+    # ==============================================
+    - name: Verify App Icon in bundle
+      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
+      continue-on-error: true
+      run: |
+        APP_BUNDLE=$(find build -maxdepth 3 -name "*.app" -type d | head -1)
+        if [[ -z "$APP_BUNDLE" ]]; then
+          echo "WARNING: No .app bundle found for icon verification"
+          exit 0
+        fi
+        echo "=== App Icon Verification ==="
+        echo "Bundle: $APP_BUNDLE"
+        # Check for icon files at app root
+        ICON_COUNT=$(find "$APP_BUNDLE" -maxdepth 1 -name "AppIcon*" -o -name "icon-*" | wc -l)
+        echo "Icon files at root: $ICON_COUNT"
+        find "$APP_BUNDLE" -maxdepth 1 -name "AppIcon*" -o -name "icon-*" | sort
+        # Check for Assets.car (compiled asset catalog with AppIcon)
+        if [[ -f "$APP_BUNDLE/Assets.car" ]]; then
+          echo "Assets.car: PRESENT ($(stat -f%z "$APP_BUNDLE/Assets.car" 2>/dev/null || echo 'size unknown') bytes)"
+          # List AppIcon entries in asset catalog
+          xcrun --sdk iphoneos assetutil --info "$APP_BUNDLE/Assets.car" 2>/dev/null | \
+            python3 -c "
+        import sys, json
+        try:
+            data = json.load(sys.stdin)
+            icons = [e for e in data if 'AppIcon' in str(e.get('Name','')) or 'icon' in str(e.get('Name','')).lower()]
+            if icons:
+                print(f'AppIcon entries in Assets.car: {len(icons)}')
+                for i in icons[:5]:
+                    print(f'  {i.get(\"Name\",\"?\")}  {i.get(\"RenditionName\",\"\")}  {i.get(\"SizeOnDisk\",\"\")}')
+            else:
+                print('WARNING: No AppIcon entries found in Assets.car!')
+        except: print('Could not parse Assets.car info')
+        " || echo "assetutil not available"
+        else
+          echo "WARNING: Assets.car NOT FOUND in app bundle!"
+        fi
+
+    # ==============================================
     # 13. UPLOAD TO TESTFLIGHT
     # ==============================================
     - name: Upload to TestFlight
@@ -1055,10 +1096,19 @@ jobs:
     #     Runs after upload so the build is known to ASC
     # ==============================================
     - name: Update TestFlight beta notes
-      if: ${{ (env.MODE == 'testflight' || env.MODE == 'submit') && github.event.inputs.beta_notes != '' }}
+      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
       env:
         BETA_NOTES: ${{ github.event.inputs.beta_notes }}
       run: |
+        # Auto-generate beta notes from recent git commits if not provided
+        if [[ -z "$BETA_NOTES" ]]; then
+          cd "$GITHUB_WORKSPACE/core_project"
+          RECENT=$(git log --oneline -5 2>/dev/null | head -5 || echo "New build")
+          BETA_NOTES="Build ${BUILD_NUMBER}\n\nRecent changes:\n${RECENT}"
+          cd "$GITHUB_WORKSPACE"
+          echo "Auto-generated beta notes from git log"
+        fi
+
         # Wait for ASC to index the new build
         sleep 30
         BUILD_ID=$(asc builds list \
@@ -1090,7 +1140,7 @@ jobs:
     #     Runs after build is indexed in ASC
     # ==============================================
     - name: Update What's New (version localizations)
-      if: ${{ (env.MODE == 'testflight' || env.MODE == 'submit') && (github.event.inputs.whats_new_en != '' || github.event.inputs.whats_new_zh_hans != '') }}
+      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
       run: |
         # Fetch version in PREPARE_FOR_SUBMISSION, READY_FOR_REVIEW, or DEVELOPER_REJECTED
         VERSION_ID=$(asc versions list \
@@ -1168,9 +1218,9 @@ jobs:
             print(f'    error: {res.stderr[:200]}')
         PYEOF
       env:
-        INPUT_WHATS_NEW_EN: ${{ github.event.inputs.whats_new_en }}
-        INPUT_WHATS_NEW_ZH_HANS: ${{ github.event.inputs.whats_new_zh_hans }}
-        INPUT_WHATS_NEW_ZH_HANT: ${{ github.event.inputs.whats_new_zh_hant }}
+        INPUT_WHATS_NEW_EN: ${{ github.event.inputs.whats_new_en || 'Bug fixes and performance improvements.' }}
+        INPUT_WHATS_NEW_ZH_HANS: ${{ github.event.inputs.whats_new_zh_hans || '修复问题并优化体验。' }}
+        INPUT_WHATS_NEW_ZH_HANT: ${{ github.event.inputs.whats_new_zh_hant || '修復問題並優化體驗。' }}
 
     # ==============================================
     # 15.5 UPDATE APP STORE LISTING METADATA
@@ -1267,6 +1317,185 @@ jobs:
         PYEOF
 
     # ==============================================
+    # 15.6 UPDATE VERSION DESCRIPTION / KEYWORDS / PROMO
+    #      Fills App Store description, keywords, promotional text,
+    #      and support URL on the editable version localizations.
+    # ==============================================
+    - name: Update App Store description and keywords
+      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
+      continue-on-error: true
+      run: |
+        if [[ -z "${VERSION_ID:-}" ]]; then
+          VERSION_ID=$(asc versions list \
+            --app-id ${{ secrets.ASC_APP_ID }} \
+            --output json 2>/dev/null | \
+            python3 -c "
+        import sys, json
+        try:
+            data = json.load(sys.stdin)
+            versions = data['data'] if isinstance(data, dict) and 'data' in data else data
+            ordered = sorted(versions, key=lambda v: (
+        0 if v.get('appStoreState') in ('PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW') else 1
+            ))
+            print(ordered[0]['id'] if ordered else '')
+        except: print('')
+        " || echo "")
+        fi
+        if [[ -z "$VERSION_ID" ]]; then
+          echo "No VERSION_ID — skipping description update"
+          exit 0
+        fi
+        export VERSION_ID
+        python3 - << 'PYEOF'
+        import subprocess, json, os, sys
+
+        version_id = os.environ.get('VERSION_ID', '')
+        if not version_id:
+            sys.exit(0)
+
+        DESC_EN = """Readori is a beautifully crafted reading companion for book lovers. Immerse yourself in long-form reading with a distraction-free interface, customizable themes, and seamless cross-device sync via iCloud.
+
+        Discover Free Public Domain Books
+        Browse thousands of copyright-free classics from Project Gutenberg, Standard Ebooks (CC0), and ManyBooks — all directly within the app. Download EPUB titles instantly and add them to your personal bookshelf.
+
+        Listen to Free Audiobooks
+        Stream public domain audiobooks from LibriVox — no download required. Browse by title, expand chapter lists, and enjoy section-by-section playback with a built-in mini player.
+
+        Powerful Reading Experience
+        • Customizable fonts, sizes, line spacing, and paragraph spacing
+        • Light, Dark, and System reading themes with full color customization
+        • Paginated or scrolling reading modes
+        • Real-time reading progress tracking and bookmarks
+        • Text-to-Speech (TTS) with sentence highlighting and auto page-turn
+
+        Smart Book Management
+        • Import EPUB and TXT files locally
+        • Organize your bookshelf with search, sort, and pinning
+        • Track reading progress with chapter-level resume
+        • Check for new chapter updates automatically
+
+        Privacy First
+        • No ads, no trackers, no account required
+        • All data stored locally on your device
+        • Optional iCloud sync using your Apple ID — no credentials collected"""
+
+        DESC_ZH_HANS = """Readori 是一款为阅读爱好者精心打造的沉浸式阅读应用。无干扰界面、可自定义主题，通过 iCloud 实现跨设备无缝同步。
+
+        发现免费公共领域书籍
+        浏览来自 Project Gutenberg、Standard Ebooks（CC0 授权）和 ManyBooks 的数万本无版权经典著作，所有书籍均可直接下载 EPUB 格式，一键添加到个人书架。
+
+        收听免费有声书
+        流式播放来自 LibriVox 的公共领域有声书，无需下载。按章节浏览，通过内置迷你播放器逐章收听。
+
+        强大的阅读体验
+        • 自定义字体、字号、行间距、段落间距
+        • 浅色、深色、跟随系统三种阅读主题，支持完整配色自定义
+        • 分页或滚动阅读模式
+        • 实时阅读进度追踪与书签功能
+        • 语音朗读（TTS）支持逐句高亮、自动翻页
+
+        智能书架管理
+        • 本地导入 EPUB 和 TXT 文件
+        • 搜索、排序、置顶，高效管理书架
+        • 章节级阅读进度记忆，随时继续
+        • 自动检查新章节更新
+
+        隐私优先
+        • 无广告、无追踪、无需注册账号
+        • 所有数据存储在本地设备
+        • 可选 iCloud 同步，使用您的 Apple ID，不收集任何凭据"""
+
+        DESC_ZH_HANT = """Readori 是一款為閱讀愛好者精心打造的沉浸式閱讀應用。無干擾介面、可自訂主題，透過 iCloud 實現跨裝置無縫同步。
+
+        探索免費公共領域書籍
+        瀏覽來自 Project Gutenberg、Standard Ebooks（CC0 授權）和 ManyBooks 的數萬本無版權經典著作，所有書籍均可直接下載 EPUB 格式，一鍵加入個人書架。
+
+        收聽免費有聲書
+        串流播放來自 LibriVox 的公共領域有聲書，無需下載。按章節瀏覽，透過內建迷你播放器逐章收聽。
+
+        強大的閱讀體驗
+        • 自訂字型、字號、行距、段落間距
+        • 淺色、深色、跟隨系統三種閱讀主題，支援完整配色自訂
+        • 分頁或捲動閱讀模式
+        • 即時閱讀進度追蹤與書籤功能
+        • 語音朗讀（TTS）支援逐句高亮、自動翻頁
+
+        智慧書架管理
+        • 本機匯入 EPUB 和 TXT 檔案
+        • 搜尋、排序、置頂，高效管理書架
+        • 章節級閱讀進度記憶，隨時繼續
+        • 自動檢查新章節更新
+
+        隱私優先
+        • 無廣告、無追蹤、無需註冊帳號
+        • 所有資料儲存在本機裝置
+        • 可選 iCloud 同步，使用您的 Apple ID，不收集任何憑據"""
+
+        # Clean up leading whitespace from heredoc indentation
+        import textwrap
+        DESC_EN = textwrap.dedent(DESC_EN).strip()
+        DESC_ZH_HANS = textwrap.dedent(DESC_ZH_HANS).strip()
+        DESC_ZH_HANT = textwrap.dedent(DESC_ZH_HANT).strip()
+
+        locale_meta = {
+            'en-US': {
+                'description': DESC_EN,
+                'keywords': 'reading,ebook,epub,audiobook,gutenberg,librivox,book reader,public domain,tts,offline reader',
+                'promotionalText': 'A focused reading app with customizable themes, smart sources, and continuity across devices.',
+                'supportUrl': 'https://readori.github.io',
+                'marketingUrl': 'https://readori.github.io',
+            },
+            'zh-Hans': {
+                'description': DESC_ZH_HANS,
+                'keywords': '\u9605\u8bfb,\u7535\u5b50\u4e66,epub,\u6709\u58f0\u4e66,\u53e4\u817e\u5821,librivox,\u4e66\u6e90,\u516c\u5171\u9886\u57df,\u6717\u8bfb,\u79bb\u7ebf\u9605\u8bfb',
+                'promotionalText': '\u4e13\u6ce8\u957f\u9605\u8bfb\u4f53\u9a8c\uff0c\u652f\u6301\u4e3b\u9898\u5b9a\u5236\u3001\u4e66\u6e90\u7ba1\u7406\u4e0e\u8de8\u8bbe\u5907\u8fde\u7eed\u9605\u8bfb\u3002',
+                'supportUrl': 'https://readori.github.io',
+                'marketingUrl': 'https://readori.github.io',
+            },
+            'zh-Hant': {
+                'description': DESC_ZH_HANT,
+                'keywords': '\u95b1\u8b80,\u96fb\u5b50\u66f8,epub,\u6709\u8072\u66f8,\u53e4\u9a30\u5821,librivox,\u66f8\u6e90,\u516c\u5171\u9818\u57df,\u6717\u8b80,\u96e2\u7dda\u95b1\u8b80',
+                'promotionalText': '\u5c08\u6ce8\u9577\u95b1\u8b80\u9ad4\u9a57\uff0c\u652f\u63f4\u4e3b\u984c\u81ea\u8a02\u3001\u66f8\u6e90\u7ba1\u7406\u8207\u8de8\u88dd\u7f6e\u63a5\u7e8c\u95b1\u8b80\u3002',
+                'supportUrl': 'https://readori.github.io',
+                'marketingUrl': 'https://readori.github.io',
+            },
+        }
+
+        # Get existing version localizations
+        r = subprocess.run(
+            ['asc', 'version-localizations', 'list', '--version-id', version_id, '--output', 'json'],
+            capture_output=True, text=True
+        )
+        if r.returncode != 0:
+            print(f'Failed to list version localizations: {r.stderr[:200]}'); sys.exit(0)
+
+        try:
+            data = json.loads(r.stdout)
+            locs = data['data'] if isinstance(data, dict) and 'data' in data else data
+        except Exception as e:
+            print(f'JSON parse error: {e}'); sys.exit(0)
+
+        for loc in locs:
+            locale = loc.get('locale', '')
+            loc_id = loc.get('id', '')
+            meta = locale_meta.get(locale)
+            if not meta or not loc_id:
+                continue
+            args = ['asc', 'version-localizations', 'update',
+                    '--localization-id', loc_id,
+                    '--description', meta['description'],
+                    '--keywords', meta['keywords'],
+                    '--promotional-text', meta['promotionalText'],
+                    '--support-url', meta['supportUrl'],
+                    '--marketing-url', meta['marketingUrl']]
+            res = subprocess.run(args, capture_output=True, text=True)
+            status = '\u2713' if res.returncode == 0 else '\u2717'
+            print(f'  {status} {locale}: description/keywords/promo/urls updated')
+            if res.returncode != 0:
+                print(f'    error: {res.stderr[:200]}')
+        PYEOF
+
+    # ==============================================
     # 16. SUBMIT FOR REVIEW (submit only)
     # ==============================================
     - name: Submit for App Store review
@@ -1299,7 +1528,7 @@ jobs:
     #       Boots iPhone simulator, installs debug build, captures screens
     # ==============================================
     - name: Auto-capture simulator screenshots
-      if: ${{ env.MODE == 'screenshots' }}
+      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' || env.MODE == 'screenshots' }}
       continue-on-error: true
       run: |
         SCREENSHOTS_DIR="$GITHUB_WORKSPACE/screenshots_captured"
@@ -1403,7 +1632,7 @@ jobs:
     #     display-type = ASC enum e.g. APP_IPHONE_67, APP_IPHONE_65
     # ==============================================
     - name: Upload App Store screenshots
-      if: ${{ env.MODE == 'screenshots' }}
+      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' || env.MODE == 'screenshots' }}
       continue-on-error: true
       run: |
         SCREENSHOTS_DIR="core_project/screenshots"
