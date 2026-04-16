@@ -310,7 +310,6 @@ jobs:
           fastlane run get_certificates \
             api_key_path:/tmp/fastlane_api_key.json \
             platform:ios \
-            type:appstore \
             generate_apple_certs:true \
             keychain_name:build.keychain \
             keychain_password:"" \
@@ -319,8 +318,11 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" build.keychain 2>/dev/null || true
 
           # Check if a signing identity is now available
-          VALID=$(security find-identity -v -p codesigning build.keychain | grep -c "valid identit" || true)
-          if [[ "$VALID" != *"0"* ]]; then
+          # Count actual cert entries (lines starting with number + parenthesis)
+          CERT_COUNT=$(security find-identity -v -p codesigning build.keychain | grep -c '^[[:space:]]*[0-9]*)' || echo "0")
+          echo "Found $CERT_COUNT signing identities after Fastlane cert"
+          security find-identity -v -p codesigning build.keychain
+          if [[ "$CERT_COUNT" -gt 0 ]]; then
             IMPORTED=true
             echo "Distribution certificate obtained via Fastlane"
           fi
@@ -330,7 +332,6 @@ jobs:
           fastlane run get_provisioning_profile \
             api_key_path:/tmp/fastlane_api_key.json \
             platform:ios \
-            type:appstore \
             app_identifier:com.readori.app \
             force:true \
             keychain_name:build.keychain \
