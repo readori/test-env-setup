@@ -225,6 +225,7 @@ jobs:
     # ==============================================
     # 9. AUTO BUILD NUMBER (testflight / submit only)
     #    Fetches latest TestFlight build number and increments by 1
+    #    Falls back to github.run_number (always unique + incrementing)
     # ==============================================
     - name: Auto-increment build number
       if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
@@ -235,12 +236,17 @@ jobs:
           python3 -c "
         import sys, json
         try:
-            builds = json.load(sys.stdin)
-            nums = [int(b.get('version','0')) for b in builds if b.get('version','').isdigit()]
-            print(max(nums) + 1 if nums else 1)
+            data = json.load(sys.stdin)
+            builds = data['data'] if isinstance(data, dict) and 'data' in data else (data if isinstance(data, list) else [])
+            nums = []
+            for b in builds:
+                v = b.get('version','') if isinstance(b, dict) else ''
+                if str(v).isdigit():
+                    nums.append(int(v))
+            print(max(nums) + 1 if nums else ${{ github.run_number }})
         except:
-            print(1)
-        " || echo "1")
+            print(${{ github.run_number }})
+        " || echo "${{ github.run_number }}")
         echo "BUILD_NUMBER=$LATEST" >> $GITHUB_ENV
         echo "Build number will be: $LATEST"
 
