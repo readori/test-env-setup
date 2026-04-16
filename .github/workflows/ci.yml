@@ -330,25 +330,26 @@ jobs:
           # Create JWT — try multiple approaches
           # Approach 1: Use Python PyJWT + cryptography (proper EC key handling)
           pip3 install PyJWT cryptography 2>/dev/null || true
-          JWT=$(python3 -c "
-import jwt, time, json, textwrap
-from cryptography.hazmat.primitives.serialization import load_pem_private_key
-with open('/tmp/asc_api_key.json') as f:
-    config = json.load(f)
-key_data = config['key']
-if '-----BEGIN' not in key_data:
-    lines = textwrap.wrap(key_data.strip(), 64)
-    key_data = '-----BEGIN PRIVATE KEY-----\\n' + '\\n'.join(lines) + '\\n-----END PRIVATE KEY-----\\n'
-private_key = load_pem_private_key(key_data.encode(), password=None)
-headers = {'kid': config['key_id']}
-payload = {
-    'iss': config['issuer_id'],
-    'iat': int(time.time()),
-    'exp': int(time.time()) + 1200,
-    'aud': 'appstoreconnect-v1'
-}
-print(jwt.encode(payload, private_key, algorithm='ES256', headers=headers))
-" 2>&1) || true
+          cat > /tmp/gen_jwt.py << 'JWTPY'
+        import jwt, time, json, textwrap
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
+        with open('/tmp/asc_api_key.json') as f:
+            config = json.load(f)
+        key_data = config['key']
+        if '-----BEGIN' not in key_data:
+            wrapped = textwrap.wrap(key_data.strip(), 64)
+            key_data = '-----BEGIN PRIVATE KEY-----\n' + '\n'.join(wrapped) + '\n-----END PRIVATE KEY-----\n'
+        private_key = load_pem_private_key(key_data.encode(), password=None)
+        headers = {'kid': config['key_id']}
+        payload = {
+            'iss': config['issuer_id'],
+            'iat': int(time.time()),
+            'exp': int(time.time()) + 1200,
+            'aud': 'appstoreconnect-v1'
+        }
+        print(jwt.encode(payload, private_key, algorithm='ES256', headers=headers))
+        JWTPY
+          JWT=$(python3 /tmp/gen_jwt.py 2>&1) || true
           echo "Python JWT result: ${#JWT} chars"
           if [[ -n "$JWT" && ${#JWT} -lt 200 ]]; then
             echo "Python JWT output (likely error): $JWT"
