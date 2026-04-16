@@ -668,6 +668,15 @@ jobs:
         mkdir -p "$EXPORT_DIR"
         rm -rf "$DERIVED_DATA"
 
+        # ── Pre-build: Strip alpha from AppIcon PNGs (Apple requires no transparency) ──
+        if [[ -d "$ICONSET_DIR" ]]; then
+          echo "Stripping alpha from AppIcon PNGs..."
+          for png in "$ICONSET_DIR"/*.png; do
+            [[ -f "$png" ]] && sips -s format png -s formatOptions 100 --setProperty hasAlpha false "$png" --out "$png" 2>/dev/null || true
+          done
+          echo "Alpha stripped from all AppIcon PNGs"
+        fi
+
         # ── Step 1: Build unsigned (with INFOPLIST_FILE for proper bundle) ──
         echo "=== Step 1: Build unsigned ==="
         cd "$REPO_ROOT"
