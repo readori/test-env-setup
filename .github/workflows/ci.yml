@@ -1208,14 +1208,14 @@ jobs:
             loc_id = loc.get('id', '')
             text = locale_map.get(locale, '')
             if text and loc_id:
-        res = subprocess.run(
-            ['asc', 'version-localizations', 'update', '--localization-id', loc_id, '--whats-new', text],
-            capture_output=True, text=True
-        )
-        status = '✓' if res.returncode == 0 else '✗'
-        print(f'  {status} {locale}: {text[:60]}')
-        if res.returncode != 0:
-            print(f'    error: {res.stderr[:200]}')
+                res = subprocess.run(
+                    ['asc', 'version-localizations', 'update', '--localization-id', loc_id, '--whats-new', text],
+                    capture_output=True, text=True
+                )
+                status = '✓' if res.returncode == 0 else '✗'
+                print(f'  {status} {locale}: {text[:60]}')
+                if res.returncode != 0:
+                    print(f'    error: {res.stderr[:200]}')
         PYEOF
       env:
         INPUT_WHATS_NEW_EN: ${{ github.event.inputs.whats_new_en || 'Bug fixes and performance improvements.' }}
@@ -1548,10 +1548,10 @@ jobs:
         prefer = ['iPhone 16 Pro Max','iPhone 15 Pro Max','iPhone 14 Pro Max','iPhone 13 Pro Max']
         for name in prefer:
             for rt, devs in data.get('devices',{}).items():
-        for d in devs:
-            if name in d.get('name','') and d.get('isAvailable'):
-                print(d['udid'])
-                raise SystemExit
+                for d in devs:
+                    if name in d.get('name','') and d.get('isAvailable'):
+                        print(d['udid'])
+                        raise SystemExit
         " 2>/dev/null || echo "")
         if [[ -z "$UDID" ]]; then
           echo "No suitable iPhone simulator found — skipping auto-capture"
@@ -1689,64 +1689,64 @@ jobs:
             locale = os.path.basename(locale_dir.rstrip('/'))
             loc_id = locale_to_id.get(locale, '')
             if not loc_id:
-        print(f'  skip {locale}: no localization ID found')
-        continue
+                print(f'  skip {locale}: no localization ID found')
+                continue
             print(f'  Locale: {locale}  (loc_id={loc_id})')
 
             for device_dir in sorted(glob.glob(f'{locale_dir}*/')):
-        display_type = os.path.basename(device_dir.rstrip('/'))
-        print(f'    display-type: {display_type}')
+                display_type = os.path.basename(device_dir.rstrip('/'))
+                print(f'    display-type: {display_type}')
 
-        # Create screenshot set
-        r = subprocess.run(
-            ['asc', 'screenshot-sets', 'create',
-             '--localization-id', loc_id,
-             '--display-type', display_type,
-             '--output', 'json'],
-            capture_output=True, text=True
-        )
-        if r.returncode == 0:
-            try:
-                d = json.loads(r.stdout)
-                set_id = (d.get('data') or d).get('id', '') if isinstance(d, dict) else ''
-            except:
-                set_id = ''
-        else:
-            set_id = ''
+                # Create screenshot set
+                r = subprocess.run(
+                    ['asc', 'screenshot-sets', 'create',
+                     '--localization-id', loc_id,
+                     '--display-type', display_type,
+                     '--output', 'json'],
+                    capture_output=True, text=True
+                )
+                if r.returncode == 0:
+                    try:
+                        d = json.loads(r.stdout)
+                        set_id = (d.get('data') or d).get('id', '') if isinstance(d, dict) else ''
+                    except:
+                        set_id = ''
+                else:
+                    set_id = ''
 
-        # If create failed, try fetching existing set
-        if not set_id:
-            r2 = subprocess.run(
-                ['asc', 'screenshot-sets', 'list',
-                 '--localization-id', loc_id,
-                 '--output', 'json'],
-                capture_output=True, text=True
-            )
-            try:
-                d2 = json.loads(r2.stdout)
-                sets = d2['data'] if isinstance(d2, dict) and 'data' in d2 else d2
-                match = next((s for s in sets if s.get('screenshotDisplayType') == display_type), None)
-                set_id = match['id'] if match else ''
-            except:
-                set_id = ''
+                # If create failed, try fetching existing set
+                if not set_id:
+                    r2 = subprocess.run(
+                        ['asc', 'screenshot-sets', 'list',
+                         '--localization-id', loc_id,
+                         '--output', 'json'],
+                        capture_output=True, text=True
+                    )
+                    try:
+                        d2 = json.loads(r2.stdout)
+                        sets = d2['data'] if isinstance(d2, dict) and 'data' in d2 else d2
+                        match = next((s for s in sets if s.get('screenshotDisplayType') == display_type), None)
+                        set_id = match['id'] if match else ''
+                    except:
+                        set_id = ''
 
-        if not set_id:
-            print(f'    WARNING: could not create/find set for {display_type}')
-            errors += 1
-            continue
+                if not set_id:
+                    print(f'    WARNING: could not create/find set for {display_type}')
+                    errors += 1
+                    continue
 
-        # Upload each PNG in sorted order
-        imgs = sorted(glob.glob(f'{device_dir}*.png'))
-        for img in imgs:
-            r3 = subprocess.run(
-                ['asc', 'screenshots', 'upload', '--set-id', set_id, '--file', img],
-                capture_output=True, text=True
-            )
-            status = '\u2713' if r3.returncode == 0 else '\u2717'
-            print(f'      {status} {os.path.basename(img)}')
-            if r3.returncode != 0:
-                print(f'        error: {r3.stderr[:200]}')
-                errors += 1
+                # Upload each PNG in sorted order
+                imgs = sorted(glob.glob(f'{device_dir}*.png'))
+                for img in imgs:
+                    r3 = subprocess.run(
+                        ['asc', 'screenshots', 'upload', '--set-id', set_id, '--file', img],
+                        capture_output=True, text=True
+                    )
+                    status = '\u2713' if r3.returncode == 0 else '\u2717'
+                    print(f'      {status} {os.path.basename(img)}')
+                    if r3.returncode != 0:
+                        print(f'        error: {r3.stderr[:200]}')
+                        errors += 1
 
         print(f'Done. Errors: {errors}')
         if errors > 0:
