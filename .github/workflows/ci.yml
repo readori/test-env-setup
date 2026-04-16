@@ -844,8 +844,24 @@ jobs:
             if [[ -d "$RESOURCE_DIR" ]]; then
               echo "Copying SPM resource bundle: $RESOURCE_DIR"
               cp -R "$RESOURCE_DIR" "$APP_PATH/" || true
+              # Hoist .lproj directories to app root (iOS requires them at bundle root for localization)
+              for LPROJ in "$RESOURCE_DIR"/*.lproj; do
+                if [[ -d "$LPROJ" ]]; then
+                  LPROJ_NAME=$(basename "$LPROJ")
+                  echo "  Hoisting $LPROJ_NAME to app root"
+                  cp -R "$LPROJ" "$APP_PATH/$LPROJ_NAME"
+                fi
+              done
+              # Also hoist Fonts directory if present
+              if [[ -d "$RESOURCE_DIR/Fonts" ]]; then
+                echo "  Hoisting Fonts to app root"
+                cp -R "$RESOURCE_DIR/Fonts" "$APP_PATH/Fonts"
+              fi
             fi
           done
+          # Verify lproj presence at app root
+          echo "=== Localization check ==="
+          ls -d "$APP_PATH"/*.lproj 2>/dev/null || echo "WARNING: No .lproj directories at app root!"
 
           # Remove old_* lproj dirs (invalid locale names cause warning 90176)
           find "$APP_PATH" -type d -name 'old_*' -exec rm -rf {} + 2>/dev/null || true
