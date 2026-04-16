@@ -166,7 +166,7 @@ jobs:
         xcodebuild -version 2>/dev/null || true
 
     - name: Select Xcode (16+ required for App Store)
-      uses: maxim-lobanov/setup-xcode@2d3a8052dfa752ea795ebd68fb0a74e2e791b044 # v1.6.0
+      uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
       with:
         xcode-version: ${{ github.event.inputs.xcode_version || '16.4' }}
 
@@ -175,7 +175,7 @@ jobs:
     # ==============================================
     - name: Cache Swift packages
       if: ${{ env.MODE != 'screenshots' }}
-      uses: actions/cache@0c907a75c2c80ebcb7f088228285e798b750cf8f # v4.2.1
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: |
           core_project/.build
@@ -1781,7 +1781,7 @@ jobs:
     # ==============================================
     - name: Upload artifact
       if: ${{ env.MODE != 'screenshots' }}
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       with:
         name: readori-${{ env.BUILD_TAG || github.run_number }}
         retention-days: 7
