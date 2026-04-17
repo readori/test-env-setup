@@ -165,7 +165,7 @@ jobs:
         xcode-select -p 2>/dev/null || true
         xcodebuild -version 2>/dev/null || true
 
-    - name: Select Xcode (16+ required for App Store)
+    - name: Select Xcode (26+ required for App Store)
       uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
       with:
         xcode-version: ${{ github.event.inputs.xcode_version || '26.0' }}
