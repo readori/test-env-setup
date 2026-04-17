@@ -35,7 +35,7 @@ on:
         type: string
 
       xcode_version:
-        description: "Xcode version (optional, e.g. 16.2)"
+        description: "Xcode version (optional, e.g. 26.0)"
         required: false
         default: ""
         type: string
@@ -168,8 +168,21 @@ jobs:
     - name: Select Xcode (16+ required for App Store)
       uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
       with:
-        xcode-version: ${{ github.event.inputs.xcode_version || '16.4' }}
+        xcode-version: ${{ github.event.inputs.xcode_version || '26.0' }}
 
+    - name: Enforce Xcode 26+ for App Store delivery
+      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
+      run: |
+        XCODE_VERSION_RAW="$(xcodebuild -version | head -n1 | awk '{print $2}')"
+        XCODE_MAJOR="${XCODE_VERSION_RAW%%.*}"
+        echo "Detected Xcode: ${XCODE_VERSION_RAW}"
+
+        if ! [[ "${XCODE_MAJOR}" =~ ^[0-9]+$ ]] || (( XCODE_MAJOR < 26 )); then
+          echo "::error::App Store uploads after 2026-04-28 require iOS 26 SDK (Xcode 26+). Current Xcode: ${XCODE_VERSION_RAW:-unknown}."
+          echo "::error::Set workflow input xcode_version to a 26.x toolchain and rerun."
+          exit 1
+        fi
+        
     # ==============================================
     # 4. SPM CACHE + RESOLVE (skip for screenshots-only mode)
     # ==============================================
