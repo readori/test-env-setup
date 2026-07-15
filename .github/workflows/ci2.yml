@@ -280,15 +280,26 @@ jobs:
     # 9. AUTO BUILD NUMBER (testflight / submit only)
     #    Fetches latest TestFlight build number and increments by 1
     #    Falls back to github.run_number (always unique + incrementing)
+    #
+    #    🐛 加固：`asc builds list` 默认分页可能不会返回全部历史 build
+    #    （尤其是 build 数量较多、或排序不是"最新在前"时），此前的逻辑一旦拿到
+    #    任何数字就直接 max()+1，可能算出一个小于"实际已用过的最大 build 号"的
+    #    值，导致上传时报 ENTITY_ERROR.ATTRIBUTE.INVALID.DUPLICATE（Apple 要求
+    #    build 号必须严格递增）。这里额外与 github.run_number 取 max 作为兜底
+    #    下限——run_number 每次工作流运行都严格递增，可以避免"算出来的号比历史
+    #    上传过的还小"这种情况，但如果历史 build 号是通过其它流水线用更大的数
+    #    字手动上传的，仍建议定期核对 App Store Connect 后台的实际最大 build 号。
     # ==============================================
     - name: Auto-increment build number
       if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
       run: |
+        RUN_NUMBER="${{ github.run_number }}"
         LATEST=$(asc builds list \
           --app-id ${{ secrets.ASC_APP_ID }} \
           --output json 2>/dev/null | \
           python3 -c "
         import sys, json
+        run_number = $RUN_NUMBER
         try:
             data = json.load(sys.stdin)
             builds = data['data'] if isinstance(data, dict) and 'data' in data else (data if isinstance(data, list) else [])
@@ -297,12 +308,16 @@ jobs:
                 v = b.get('version','') if isinstance(b, dict) else ''
                 if str(v).isdigit():
                     nums.append(int(v))
-            print(max(nums) + 1 if nums else ${{ github.run_number }})
+            from_asc = (max(nums) + 1) if nums else 0
+            # 与 run_number 取 max 兜底，避免分页缺失导致算出偏小的号
+            print(max(from_asc, run_number))
         except:
-            print(${{ github.run_number }})
-        " || echo "${{ github.run_number }}")
+            print(run_number)
+        " || echo "$RUN_NUMBER")
+        # 双重保险：若上面管道整体失败导致 LATEST 为空，回退到 run_number
+        LATEST="${LATEST:-$RUN_NUMBER}"
         echo "BUILD_NUMBER=$LATEST" >> $GITHUB_ENV
-        echo "Build number will be: $LATEST"
+        echo "Build number will be: $LATEST (from ASC or run_number fallback: $RUN_NUMBER)"
 
     # ==============================================
     # 10. IMPORT CERTIFICATE + PROVISIONING PROFILE
@@ -319,6 +334,7 @@ jobs:
         ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
         ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+        ASC_APP_ID: ${{ secrets.ASC_APP_ID }}
       run: |
         # Create a dedicated keychain
         security create-keychain -p "" build.keychain
@@ -388,7 +404,12 @@ jobs:
 
           # Create JWT — try multiple approaches
           # Approach 1: Use Python PyJWT + cryptography (proper EC key handling)
-          pip3 install PyJWT cryptography 2>/dev/null || true
+          # 🐛 加固：macOS runner 上的 Homebrew Python（3.12+）默认启用 PEP 668
+          # "externally-managed-environment" 保护，不加 --break-system-packages
+          # 会直接安装失败（仅打印 error，被 2>/dev/null 吞掉），导致这条 Python
+          # JWT 路径从一开始就注定失败，白白浪费一次重试机会。
+          pip3 install --break-system-packages PyJWT cryptography 2>/dev/null || \
+            pip3 install PyJWT cryptography 2>/dev/null || true
           cat > /tmp/gen_jwt.py << 'JWTPY'
         import jwt, time, json, textwrap
         from cryptography.hazmat.primitives.serialization import load_pem_private_key
@@ -1111,22 +1132,39 @@ jobs:
         ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
         ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+        ASC_APP_ID: ${{ secrets.ASC_APP_ID }}
       run: |
         IPA=$(find build -name "*.ipa" | head -1)
         echo "Uploading: $IPA  |  tag: ${BUILD_TAG:-unknown}"
         AUTH_KEY="/tmp/asc_keys/AuthKey_${ASC_KEY_ID}.p8"
 
-        # Use xcrun altool for TestFlight upload (works with API key auth)
-        xcrun altool --upload-app \
-          -f "$IPA" \
+        # 🐛 Bug修复：Xcode 26 起 `altool --upload-app` 已被标记为 [DEPRECATED]，
+        # 且苹果已在开发者论坛确认这是"a known Xcode 26 CLI issue"——账号下存在
+        # 多个 Bundle ID（例如同时有正式版与 .beta 变体）时，--upload-app 会选错
+        # Apple ID，报出看似无关的 ENTITY_ERROR.RELATIONSHIP.INVALID /
+        # "bundle identifier cannot be changed" 等错误导致上传失败。
+        # 改用官方推荐的 --upload-package，显式传入 --apple-id / --bundle-id /
+        # --bundle-version / --bundle-short-version-string，避免 CLI 自行猜测。
+        xcrun altool --upload-package "$IPA" \
           --type ios \
+          --apple-id "$ASC_APP_ID" \
+          --bundle-id "com.readori.app" \
+          --bundle-version "${BUILD_NUMBER}" \
+          --bundle-short-version-string "${APP_VERSION}" \
           --apiKey "$ASC_KEY_ID" \
           --apiIssuer "$ASC_ISSUER_ID" \
           2>&1 || {
-          echo "altool failed, trying Transporter..."
-          # Fallback: manual upload via App Store Connect API
-          echo "Please upload $IPA manually or set ASC_APP_ID for asc-cli upload"
-          exit 1
+          echo "altool --upload-package failed, trying legacy --upload-app as last resort..."
+          xcrun altool --upload-app \
+            -f "$IPA" \
+            --type ios \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID" \
+            2>&1 || {
+            echo "Both upload methods failed. Please upload $IPA manually via Transporter,"
+            echo "or verify ASC_APP_ID/ASC_KEY_ID/ASC_ISSUER_ID secrets are correct."
+            exit 1
+          }
         }
 
     # ==============================================
