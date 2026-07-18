@@ -1,4 +1,4 @@
-name: Readori CI2
+name: Readori CI20
 
 # Unified pipeline — four modes via single dispatch:
 #   unsigned   → sideload / local testing (no signing, no ASC)
