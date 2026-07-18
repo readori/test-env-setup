@@ -1853,17 +1853,3 @@ jobs:
             else:
                 print(f'  {g}')
         " || echo "(no subscription groups or error)"
-
-    # ==============================================
-    # 19. UPLOAD ARTIFACT (unsigned + signed modes)
-    # ==============================================
-    - name: Upload artifact
-      if: ${{ env.MODE != 'screenshots' }}
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-      with:
-        name: readori-${{ env.BUILD_TAG || github.run_number }}
-        retention-days: 7
-        if-no-files-found: warn
-        path: |
-          build/*.ipa
-          build/export/*.ipa
