@@ -1,4 +1,5 @@
-name: Readori CItest
+name: Readori CI2
+
 # Unified pipeline — four modes via single dispatch:
 #   unsigned   → sideload / local testing (no signing, no ASC)
 #   testflight → signed IPA + upload to TestFlight (build number auto-incremented)
@@ -1680,7 +1681,23 @@ jobs:
       run: |
         set +e  # best-effort: any single failure here should not fail the whole job
         SCREENSHOTS_DIR="$GITHUB_WORKSPACE/screenshots_captured"
-        TARGET_DIR="core_project/screenshots"
+        # 🐛 修复（"截图明明成功了，Upload 那一步却说 core_project/screenshots
+        # 不存在"的根因）：TARGET_DIR 之前是相对路径 "core_project/screenshots"，
+        # 在脚本靠前的位置（还没执行下面的 cd "$GITHUB_WORKSPACE/core_project"）
+        # 赋值，用在最上面"是否已有预置截图"的判断里时，相对路径是相对
+        # $GITHUB_WORKSPACE 解析的，恰好是对的。但脚本后半段 `cd` 到了
+        # core_project 目录之后，最后 `mv "$SCREENSHOTS_DIR" "$TARGET_DIR"`
+        # 时同一个相对路径字符串会相对*当前目录*（这时已经是
+        # core_project）重新解析，实际把截图挪到了
+        # core_project/core_project/screenshots 这个多套了一层的路径下——
+        # 本步骤自己最后 `find "$TARGET_DIR" ...` 打印出来的路径列表看着没错
+        # （因为用的还是同一个相对路径、同一个已经切换过的当前目录，能自洽地
+        # 找到文件），但下一个"Upload screenshots"是全新的一个 step，默认
+        # 工作目录是 $GITHUB_WORKSPACE，去查 core_project/screenshots 时，
+        # 实际内容其实在深一层的 core_project/core_project/screenshots 里，
+        # 自然找不到。改成绝对路径，不管脚本这时候的当前目录是什么，
+        # 指向的都是同一个真实位置。
+        TARGET_DIR="$GITHUB_WORKSPACE/core_project/screenshots"
         BUNDLE_ID="com.readori.app"
 
         # Skip auto-capture if screenshots already exist
@@ -1929,6 +1946,22 @@ jobs:
         else
           echo "WARNING: no screenshots were captured"
         fi
+
+    # ==============================================
+    # 16.6 PUBLISH SCREENSHOTS AS BUILD ARTIFACT
+    #      方便直接在这次 workflow run 页面里点开图看、下载查看有没有问题，
+    #      不用等它传到 App Store Connect 后台再去那边翻——即使后面上传
+    #      ASC 那一步失败/被跳过，这里也照样能看到实际截出来的图。
+    # ==============================================
+    - name: Publish captured screenshots as build artifact
+      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' || env.MODE == 'screenshots' }}
+      continue-on-error: true
+      uses: actions/upload-artifact@v4
+      with:
+        name: app-store-screenshots
+        path: core_project/screenshots/
+        if-no-files-found: warn
+        retention-days: 14
 
     # ==============================================
     # 17. SCREENSHOTS UPLOAD (screenshots mode)
