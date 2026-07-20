@@ -1681,6 +1681,21 @@ jobs:
         sleep 5
 
         cd "$GITHUB_WORKSPACE/core_project"
+        # 🐛 Bug 修复（"后台没收到截图"的根本原因）：
+        # INFOPLIST_FILE 之前用的是相对路径 "Readori/Supporting/Info.plist"。
+        # 这里是作为 xcodebuild 的全局命令行覆盖传入的，会应用到本次构建涉及的
+        # *所有* target，不只是 Readori 这个 App target——包括 ZIPFoundation 等
+        # SPM 依赖包的 target。相对路径是按"各 target 自己的 SRCROOT"解析的：
+        # 对主 App target 恰好能在 core_project 下解析到真实文件，但对
+        # ZIPFoundation（checkout 在 DerivedData/.../SourcePackages/checkouts/
+        # ZIPFoundation 下）而言，同一个相对路径在它自己的目录下根本不存在，
+        # 导致 "Build input file cannot be found" 直接构建失败——日志里
+        # "No simulator .app found — skipping auto-capture" 就是构建从未成功
+        # 的直接后果，截图步骤根本没跑起来，后台自然什么都收不到。
+        # 改成绝对路径后，无论哪个 target 解析都会指向同一个真实存在的文件，
+        # 和 11b 签名 IPA 构建步骤里一直以来的做法保持一致（那里用的就是绝对路径，
+        # 所以从未出现过这个问题）。
+        INFOPLIST_ABS="$GITHUB_WORKSPACE/core_project/Readori/Supporting/Info.plist"
         xcodebuild build \
           -scheme                    "$SCHEME" \
           -sdk                       iphonesimulator \
@@ -1690,7 +1705,7 @@ jobs:
           -skipMacroValidation \
           -onlyUsePackageVersionsFromResolvedFile \
           GENERATE_INFOPLIST_FILE=NO \
-          INFOPLIST_FILE="Readori/Supporting/Info.plist" \
+          INFOPLIST_FILE="$INFOPLIST_ABS" \
           READORI_SOCIAL_WORKER_ENDPOINT="$READORI_SOCIAL_WORKER_ENDPOINT" \
           READORI_API_SECRET="$READORI_API_SECRET" \
           CODE_SIGN_IDENTITY="" \
