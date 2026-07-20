@@ -892,9 +892,23 @@ jobs:
           fi
 
           # UIDeviceFamily
+          # 🐛 彻底修复（"ci.yml 里明明已经把 TARGETED_DEVICE_FAMILY 改成 1,2 了，
+          # 装到 iPad 上还是以 iPhone 兼容模式跑在小窗口里、四周留黑边"）：
+          # 本步骤开头的注释就写着"SPM executableTarget does NOT produce a real
+          # .app via archive"——也就是说这个"手工拼装 .app bundle"的分支，对这个
+          # 项目来说不是极少数情况下才会走到的 fallback，而是*每一次*发布构建
+          # 实际都会走的路径。Step 1 里 xcodebuild 命令行传的
+          # TARGETED_DEVICE_FAMILY="1,2" 只影响编译产物自身携带的设置，但最终
+          # 真正打进 IPA、提交给 App Store / 装到设备上的 Info.plist，是这里重新
+          # 用 PlistBuddy 拼出来的这一份——而这一份之前只写了
+          # `UIDeviceFamily:0 integer 1`（只有"1"=iPhone 这一个元素），
+          # 不管 Step 1 传了什么，这里都会无条件把它覆盖成"仅支持 iPhone"，
+          # 所以 iPad 上必然只能以兼容模式跑在小窗口里。补上 "2"（iPad）这个
+          # 元素，才是真正的 Universal（iPhone + iPad）二进制。
           /usr/libexec/PlistBuddy -c "Delete :UIDeviceFamily" "$APP_PATH/Info.plist" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily array" "$APP_PATH/Info.plist"
           /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily:0 integer 1" "$APP_PATH/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily:1 integer 2" "$APP_PATH/Info.plist"
 
           # UILaunchScreen dict
           /usr/libexec/PlistBuddy -c "Delete :UILaunchScreen" "$APP_PATH/Info.plist" 2>/dev/null || true
