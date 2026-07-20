@@ -1027,9 +1027,12 @@ jobs:
         $PB -c "Add :UIRequiredDeviceCapabilities array" "$PLIST"
         $PB -c "Add :UIRequiredDeviceCapabilities:0 string arm64" "$PLIST"
 
-        # UIRequiresFullScreen
-        $PB -c "Delete :UIRequiresFullScreen" "$PLIST" 2>/dev/null || true
-        $PB -c "Add :UIRequiresFullScreen bool true" "$PLIST"
+        # 🐛 彻底修复（Split View / Slide Over / Stage Manager 在 iPad 上失效）：
+        # 这里以前会把 UIRequiresFullScreen 强制改回 true，把源码
+        # App/Supporting/Info.plist 里特意设成的 false（配合"分屏变窄时自动降级
+        # 为单栏 + Sheet"的适配代码）又悄悄覆盖掉了。这个 key 是 App 自身的行为
+        # 声明，不是需要根据构建环境动态注入的 DT*/SDK 元数据，不应该在这里被
+        # 重置——去掉这两行，沿用从源码 Info.plist 里拷贝过来的正确值即可。
 
         # CFBundleSupportedPlatforms (required: single-element array)
         $PB -c "Delete :CFBundleSupportedPlatforms" "$PLIST" 2>/dev/null || true
