@@ -1,5 +1,4 @@
 name: Readori CItest
-
 # Unified pipeline — four modes via single dispatch:
 #   unsigned   → sideload / local testing (no signing, no ASC)
 #   testflight → signed IPA + upload to TestFlight (build number auto-incremented)
@@ -1763,14 +1762,74 @@ jobs:
         BUILD_RC=$?
         grep -E "error:|Build succeeded|BUILD FAILED" "$BUILD_LOG" || true
 
-        APP_PATH=$(find /tmp/sim_build -maxdepth 2 -name "*.app" | grep -v Test | head -1)
-        if [[ -z "$APP_PATH" ]]; then
-          echo "No simulator .app found — skipping auto-capture (xcodebuild exit=$BUILD_RC)"
+        # 🐛 彻底修复（"xcodebuild 明明 BUILD SUCCEEDED、exit=0，却依然
+        # 'No simulator .app found'"的真正根因）：
+        # 上面构建日志里 Ld 那一行清清楚楚写着 `-o /tmp/sim_build/Readori`——
+        # 构建产物是一个裸 Mach-O 可执行文件，根本不是 `.app` bundle。这和
+        # 11b 签名 IPA 那一步开头注释说的"SPM executableTarget does NOT
+        # produce a real .app via archive"是同一件事——11b 为此专门写了一整段
+        # "手工拼装 .app bundle"的逻辑（拷贝可执行文件、补 Info.plist、编译资源、
+        # 提升 .lproj 到 bundle 根目录），但这段逻辑从来没有被搬到这个截图构建
+        # 步骤里来过。之前这里只是天真地 `find /tmp/sim_build -name "*.app"`，
+        # 不管构建成不成功，这个 .app 从一开始就不可能被找到。
+        # 这里照抄 11b 的思路，针对模拟器截图的场景做了精简：可执行文件 +
+        # Info.plist（含 UIDeviceFamily=[1,2]，和前面几轮的修复保持一致）+
+        # 编译后的 Assets.car（应用内实际会显示的图片/图标）+ SPM 资源包里的
+        # .lproj（这是重中之重——没有它们，多语种截图这件事本身就无从谈起，
+        # App 里的文案不会跟着 -AppleLanguages/-AppleLocale 变化）。
+        APP_PATH="/tmp/sim_build/${SCHEME}.app"
+        rm -rf "$APP_PATH"
+        APP_BINARY="/tmp/sim_build/$SCHEME"
+        if [[ ! -f "$APP_BINARY" ]]; then
+          echo "No simulator .app found — skipping auto-capture (xcodebuild exit=$BUILD_RC, no bare executable at $APP_BINARY either)"
           echo "---- last 150 lines of $BUILD_LOG ----"
           tail -150 "$BUILD_LOG"
           exit 0
         fi
-        echo "App: $APP_PATH"
+
+        mkdir -p "$APP_PATH"
+        cp "$APP_BINARY" "$APP_PATH/$SCHEME"
+        chmod +x "$APP_PATH/$SCHEME"
+        cp "$INFOPLIST_ABS" "$APP_PATH/Info.plist"
+
+        /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $SCHEME" "$APP_PATH/Info.plist" || true
+        /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$APP_PATH/Info.plist" || true
+        /usr/libexec/PlistBuddy -c "Set :CFBundleVersion 1" "$APP_PATH/Info.plist" || true
+        /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${APP_VERSION:-1.0.0}" "$APP_PATH/Info.plist" || true
+        if [[ -n "$READORI_SOCIAL_WORKER_ENDPOINT" ]]; then
+          /usr/bin/plutil -replace READORI_SOCIAL_WORKER_ENDPOINT -string "$READORI_SOCIAL_WORKER_ENDPOINT" "$APP_PATH/Info.plist" || true
+        fi
+        if [[ -n "$READORI_API_SECRET" ]]; then
+          /usr/bin/plutil -replace READORI_API_SECRET -string "$READORI_API_SECRET" "$APP_PATH/Info.plist" || true
+        fi
+        /usr/libexec/PlistBuddy -c "Delete :UIDeviceFamily" "$APP_PATH/Info.plist" 2>/dev/null || true
+        /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily array" "$APP_PATH/Info.plist"
+        /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily:0 integer 1" "$APP_PATH/Info.plist"
+        /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily:1 integer 2" "$APP_PATH/Info.plist"
+
+        # 应用内实际显示的图片/图标（书架封面占位图等）
+        ASSETS_CAR=$(find /tmp/sim_build -maxdepth 1 -name "Assets.car" | head -1)
+        [[ -n "$ASSETS_CAR" ]] && cp "$ASSETS_CAR" "$APP_PATH/Assets.car"
+
+        # SPM 资源包：.lproj（多语种截图必须）、Fonts 等
+        for RESOURCE_DIR in "/tmp/sim_build/${SCHEME}_${SCHEME}.bundle" "/tmp/sim_build/Readori_Readori.bundle"; do
+          if [[ -d "$RESOURCE_DIR" ]]; then
+            cp -R "$RESOURCE_DIR" "$APP_PATH/" || true
+            for LPROJ in "$RESOURCE_DIR"/*.lproj; do
+              if [[ -d "$LPROJ" ]]; then
+                LPROJ_NAME=$(basename "$LPROJ")
+                [[ "$LPROJ_NAME" == old_* ]] && continue
+                cp -R "$LPROJ" "$APP_PATH/$LPROJ_NAME"
+              fi
+            done
+            if [[ -d "$RESOURCE_DIR/Fonts" ]]; then
+              cp -R "$RESOURCE_DIR/Fonts" "$APP_PATH/Fonts"
+            fi
+          fi
+        done
+
+        echo "Wrapped simulator .app at: $APP_PATH"
+        ls -d "$APP_PATH"/*.lproj 2>/dev/null || echo "WARNING: No .lproj directories at app root — localized screenshots will not work!"
 
         LOCALES="en-US zh-Hans zh-Hant"
 
