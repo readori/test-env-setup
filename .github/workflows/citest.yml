@@ -892,9 +892,23 @@ jobs:
           fi
 
           # UIDeviceFamily
+          # 🐛 彻底修复（"ci.yml 里明明已经把 TARGETED_DEVICE_FAMILY 改成 1,2 了，
+          # 装到 iPad 上还是以 iPhone 兼容模式跑在小窗口里、四周留黑边"）：
+          # 本步骤开头的注释就写着"SPM executableTarget does NOT produce a real
+          # .app via archive"——也就是说这个"手工拼装 .app bundle"的分支，对这个
+          # 项目来说不是极少数情况下才会走到的 fallback，而是*每一次*发布构建
+          # 实际都会走的路径。Step 1 里 xcodebuild 命令行传的
+          # TARGETED_DEVICE_FAMILY="1,2" 只影响编译产物自身携带的设置，但最终
+          # 真正打进 IPA、提交给 App Store / 装到设备上的 Info.plist，是这里重新
+          # 用 PlistBuddy 拼出来的这一份——而这一份之前只写了
+          # `UIDeviceFamily:0 integer 1`（只有"1"=iPhone 这一个元素），
+          # 不管 Step 1 传了什么，这里都会无条件把它覆盖成"仅支持 iPhone"，
+          # 所以 iPad 上必然只能以兼容模式跑在小窗口里。补上 "2"（iPad）这个
+          # 元素，才是真正的 Universal（iPhone + iPad）二进制。
           /usr/libexec/PlistBuddy -c "Delete :UIDeviceFamily" "$APP_PATH/Info.plist" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily array" "$APP_PATH/Info.plist"
           /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily:0 integer 1" "$APP_PATH/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily:1 integer 2" "$APP_PATH/Info.plist"
 
           # UILaunchScreen dict
           /usr/libexec/PlistBuddy -c "Delete :UILaunchScreen" "$APP_PATH/Info.plist" 2>/dev/null || true
@@ -1013,9 +1027,12 @@ jobs:
         $PB -c "Add :UIRequiredDeviceCapabilities array" "$PLIST"
         $PB -c "Add :UIRequiredDeviceCapabilities:0 string arm64" "$PLIST"
 
-        # UIRequiresFullScreen
-        $PB -c "Delete :UIRequiresFullScreen" "$PLIST" 2>/dev/null || true
-        $PB -c "Add :UIRequiresFullScreen bool true" "$PLIST"
+        # 🐛 彻底修复（Split View / Slide Over / Stage Manager 在 iPad 上失效）：
+        # 这里以前会把 UIRequiresFullScreen 强制改回 true，把源码
+        # App/Supporting/Info.plist 里特意设成的 false（配合"分屏变窄时自动降级
+        # 为单栏 + Sheet"的适配代码）又悄悄覆盖掉了。这个 key 是 App 自身的行为
+        # 声明，不是需要根据构建环境动态注入的 DT*/SDK 元数据，不应该在这里被
+        # 重置——去掉这两行，沿用从源码 Info.plist 里拷贝过来的正确值即可。
 
         # CFBundleSupportedPlatforms (required: single-element array)
         $PB -c "Delete :CFBundleSupportedPlatforms" "$PLIST" 2>/dev/null || true
@@ -1713,6 +1730,18 @@ jobs:
         # 和 11b 签名 IPA 构建步骤里一直以来的做法保持一致（那里用的就是绝对路径，
         # 所以从未出现过这个问题）。
         INFOPLIST_ABS="$GITHUB_WORKSPACE/core_project/Readori/Supporting/Info.plist"
+        # 🐛 修复（"No simulator .app found" 但日志里完全看不到任何错误信息）：
+        # 之前用 `grep -E "^(error:|Build succeeded|BUILD FAILED)"` 过滤
+        # xcodebuild 输出——但这个正则只匹配"整行以字面量 error: 开头"的行。
+        # 真实的 xcodebuild/swiftc 报错几乎从来不是这个格式：编译器级错误一般是
+        # "路径/File.swift:12:5: error: ..."（开头是文件路径，不是 error:），
+        # xcodebuild 驱动层的错误则是 "xcodebuild: error: ..."（开头是
+        # xcodebuild:，同样匹配不上 ^error:）。也就是说，无论构建因为什么原因
+        # 失败，这个过滤器几乎必然把真正的报错原文一起吞掉，只留下一片空白，
+        # 这正是排查这个问题时"看不到任何线索"的根源。改成把完整输出 tee 到
+        # 日志文件；构建成功与否都只打印一份精简摘要，但只要最终没找到 .app，
+        # 就把完整日志的尾部原样打出来，报错信息不会再被过滤掉。
+        BUILD_LOG="/tmp/sim_build.log"
         xcodebuild build \
           -scheme                    "$SCHEME" \
           -sdk                       iphonesimulator \
@@ -1726,15 +1755,20 @@ jobs:
           READORI_SOCIAL_WORKER_ENDPOINT="$READORI_SOCIAL_WORKER_ENDPOINT" \
           READORI_API_SECRET="$READORI_API_SECRET" \
           CODE_SIGN_IDENTITY="" \
+          CODE_SIGNING_ALLOWED=NO \
           CODE_SIGNING_REQUIRED=NO \
           COMPILER_INDEX_STORE_ENABLE=NO \
           ENABLE_TESTABILITY=NO \
           CONFIGURATION_BUILD_DIR="/tmp/sim_build" \
-          2>&1 | grep -E "^(error:|Build succeeded|BUILD FAILED)" || true
+          > "$BUILD_LOG" 2>&1
+        BUILD_RC=$?
+        grep -E "error:|Build succeeded|BUILD FAILED" "$BUILD_LOG" || true
 
         APP_PATH=$(find /tmp/sim_build -maxdepth 2 -name "*.app" | grep -v Test | head -1)
         if [[ -z "$APP_PATH" ]]; then
-          echo "No simulator .app found — skipping auto-capture"
+          echo "No simulator .app found — skipping auto-capture (xcodebuild exit=$BUILD_RC)"
+          echo "---- last 150 lines of $BUILD_LOG ----"
+          tail -150 "$BUILD_LOG"
           exit 0
         fi
         echo "App: $APP_PATH"
