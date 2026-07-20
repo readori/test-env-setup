@@ -1622,14 +1622,33 @@ jobs:
     # ==============================================
     # 16.5 AUTO-CAPTURE SIMULATOR SCREENSHOTS
     #       (screenshots mode, when no pre-staged screenshots exist)
-    #       Boots iPhone simulator, installs debug build, captures screens
+    #       Boots an iPhone simulator AND an iPad simulator, installs a
+    #       debug build on both, and captures screens per required locale.
+    #
+    #       🐛 修复（之前这个功能不完整，"iPhone、iPad 上架"里其实完全没有 iPad）：
+    #       1. 只处理了 iPhone 模拟器，从未启动/安装/截图 iPad 模拟器——但 App
+    #          Store 要求"支持 iPad 的 App 必须提供至少一组 iPad 截图"，否则
+    #          iPad 版本会在审核/上架时被拒或干脆没有列表图。这里补上 iPad Pro
+    #          13 英寸 (M4) 模拟器，display-type 用 App Store Connect API 实际
+    #          认的 APP_IPAD_PRO_3GEN_129（Apple 目前仍复用这个旧枚举承载新的
+    #          13 寸截图，官方 API 文档尚未新增专门枚举）。
+    #       2. Tab 栏点击坐标之前是写死的绝对像素（108,940 / 322,940），只在
+    #          "恰好是同一台 iPhone 16 Pro Max、同一个 Xcode 默认模拟器"时凑巧
+    #          管用；换一台机型/iPad 完全是另一套屏幕尺寸，点了也点不中。这里
+    #          改成按各机型真实的点尺寸（非像素）算比例坐标。
+    #       3. 之前直接把 en-US 截图复制给 zh-Hans，中文商品页配的是英文界面
+    #          截图。这里改为用 -AppleLanguages/-AppleLocale 以目标语种重启
+    #          App 后再截图，确保每个语种看到的是真正对应语言的界面。
+    #       4. 增加基本校验：截图文件如果几乎是空文件（明显失败帧），重试一次。
     # ==============================================
     - name: Auto-capture simulator screenshots
       if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' || env.MODE == 'screenshots' }}
       continue-on-error: true
       run: |
+        set +e  # best-effort: any single failure here should not fail the whole job
         SCREENSHOTS_DIR="$GITHUB_WORKSPACE/screenshots_captured"
         TARGET_DIR="core_project/screenshots"
+        BUNDLE_ID="com.readori.app"
 
         # Skip auto-capture if screenshots already exist
         if [[ -d "$TARGET_DIR" ]] && [[ -n "$(ls -A "$TARGET_DIR" 2>/dev/null)" ]]; then
@@ -1637,35 +1656,35 @@ jobs:
           exit 0
         fi
 
-        # Find a suitable iPhone simulator
-        UDID=$(xcrun simctl list devices available --json | \
-          python3 -c "
-        import sys, json
-        data = json.load(sys.stdin)
-        prefer = ['iPhone 16 Pro Max','iPhone 15 Pro Max','iPhone 14 Pro Max','iPhone 13 Pro Max']
-        for name in prefer:
-            for rt, devs in data.get('devices',{}).items():
-                for d in devs:
-                    if name in d.get('name','') and d.get('isAvailable'):
-                        print(d['udid'])
-                        raise SystemExit
-        " 2>/dev/null || echo "")
-        if [[ -z "$UDID" ]]; then
-          echo "No suitable iPhone simulator found — skipping auto-capture"
+        # ---- helper: print "udid|name" for the first available simulator matching any pattern ----
+        # 注意：这里故意写成单行 python3 -c 而不是 heredoc/多行脚本——
+        # heredoc 的结束标记必须顶格、不能带 YAML 缩进，会把这个 run block 提前截断。
+        pick_simulator() {
+          python3 -c "import json,subprocess,sys; patterns=sys.argv[1:]; data=json.loads(subprocess.run(['xcrun','simctl','list','devices','available','--json'],capture_output=True,text=True).stdout); all_devs=[d for devs in data.get('devices',{}).values() for d in devs if d.get('isAvailable')]; match=next((d for pat in patterns for d in all_devs if pat in d.get('name','')), None); print((match['udid']+'|'+match['name']) if match else '', end='')" "$@"
+        }
+
+        IPHONE_SIM=$(pick_simulator "iPhone 16 Pro Max" "iPhone 15 Pro Max" "iPhone 14 Pro Max" "iPhone 13 Pro Max")
+        IPAD_SIM=$(pick_simulator "iPad Pro 13-inch (M4)" "iPad Pro (12.9-inch) (6th generation)" "iPad Pro (12.9-inch) (5th generation)")
+
+        if [[ -z "$IPHONE_SIM" && -z "$IPAD_SIM" ]]; then
+          echo "No suitable iPhone or iPad simulator available — skipping auto-capture"
           exit 0
         fi
-        echo "Using simulator: $UDID"
+        [[ -n "$IPHONE_SIM" ]] && echo "iPhone simulator: $IPHONE_SIM" || echo "No iPhone simulator found"
+        [[ -n "$IPAD_SIM"   ]] && echo "iPad simulator:   $IPAD_SIM"   || echo "No iPad simulator found"
 
-        # Boot simulator
-        xcrun simctl boot "$UDID" 2>/dev/null || true
-        sleep 8
+        # ---- build once: a simulator .app build is arch/runtime-generic across
+        #      iPhone and iPad simulators of the same Xcode/SDK, no need to build twice ----
+        BOOT_UDID="${IPHONE_SIM%%|*}"
+        [[ -z "$BOOT_UDID" ]] && BOOT_UDID="${IPAD_SIM%%|*}"
+        xcrun simctl boot "$BOOT_UDID" 2>/dev/null || true
+        sleep 5
 
-        # Build debug app for simulator
         cd "$GITHUB_WORKSPACE/core_project"
         xcodebuild build \
           -scheme                    "$SCHEME" \
           -sdk                       iphonesimulator \
-          -destination               "platform=iOS Simulator,id=$UDID" \
+          -destination               "platform=iOS Simulator,id=$BOOT_UDID" \
           -jobs                      1 \
           -skipPackagePluginValidation \
           -skipMacroValidation \
@@ -1688,34 +1707,83 @@ jobs:
         fi
         echo "App: $APP_PATH"
 
-        # Install and launch
-        xcrun simctl install "$UDID" "$APP_PATH"
-        xcrun simctl launch  "$UDID" com.readori.app 2>/dev/null || true
-        sleep 6
+        LOCALES="en-US zh-Hans zh-Hant"
 
-        # Capture screenshots for each device locale
-        mkdir -p "$SCREENSHOTS_DIR/en-US/APP_IPHONE_67"
-        mkdir -p "$SCREENSHOTS_DIR/zh-Hans/APP_IPHONE_67"
+        # ---- helper: capture the 3-tab flow (bookshelf/explore/settings) for one device ----
+        capture_for_device() {
+          UDID="$1"; DISPLAY_NAME="$2"; DISPLAY_TYPE="$3"; WIDTH_PT="$4"; HEIGHT_PT="$5"
+          echo "=== Capturing for $DISPLAY_NAME ($DISPLAY_TYPE) udid=$UDID ==="
+          xcrun simctl boot "$UDID" 2>/dev/null || true
+          sleep 8
+          if ! xcrun simctl install "$UDID" "$APP_PATH"; then
+            echo "install failed for $DISPLAY_NAME — skipping this device"
+            return
+          fi
 
-        xcrun simctl io "$UDID" screenshot \
-          "$SCREENSHOTS_DIR/en-US/APP_IPHONE_67/01_main.png" 2>/dev/null || true
+          # 按各机型真实点尺寸算比例坐标（底部 3 个 Tab 均分），
+          # 不再写死某一台设备的绝对像素坐标。
+          TAB_Y=$(python3 -c "print(int($HEIGHT_PT * 0.965))")
+          TAB1_X=$(python3 -c "print(int($WIDTH_PT * 0.5 / 3))")
+          TAB2_X=$(python3 -c "print(int($WIDTH_PT * 1.5 / 3))")
+          TAB3_X=$(python3 -c "print(int($WIDTH_PT * 2.5 / 3))")
 
-        # Tap Explore tab (bottom tab bar, 2nd item from left, approx coords)
-        xcrun simctl io "$UDID" tap 108 940 2>/dev/null || true
-        sleep 3
-        xcrun simctl io "$UDID" screenshot \
-          "$SCREENSHOTS_DIR/en-US/APP_IPHONE_67/02_explore.png" 2>/dev/null || true
+          for LOCALE in $LOCALES; do
+            OUT_DIR="$SCREENSHOTS_DIR/$LOCALE/$DISPLAY_TYPE"
+            mkdir -p "$OUT_DIR"
 
-        # Tap Settings tab
-        xcrun simctl io "$UDID" tap 322 940 2>/dev/null || true
-        sleep 3
-        xcrun simctl io "$UDID" screenshot \
-          "$SCREENSHOTS_DIR/en-US/APP_IPHONE_67/03_settings.png" 2>/dev/null || true
+            APPLE_LANG="en"; APPLE_LOCALE="en_US"
+            case "$LOCALE" in
+              zh-Hans) APPLE_LANG="zh-Hans"; APPLE_LOCALE="zh_CN" ;;
+              zh-Hant) APPLE_LANG="zh-Hant"; APPLE_LOCALE="zh_TW" ;;
+            esac
 
-        # Copy en-US screenshots to zh-Hans (same app, different locale metadata)
-        if [[ -d "$SCREENSHOTS_DIR/en-US/APP_IPHONE_67" ]]; then
-          cp -r "$SCREENSHOTS_DIR/en-US/APP_IPHONE_67/"*.png \
-            "$SCREENSHOTS_DIR/zh-Hans/APP_IPHONE_67/" 2>/dev/null || true
+            # 以目标语种重启 App 再截图，而不是把 en-US 截图直接复制给其它语种。
+            xcrun simctl terminate "$UDID" "$BUNDLE_ID" 2>/dev/null || true
+            xcrun simctl launch "$UDID" "$BUNDLE_ID" \
+              -AppleLanguages "($APPLE_LANG)" -AppleLocale "$APPLE_LOCALE" 2>/dev/null || true
+            sleep 6
+
+            capture_one() {
+              FILE="$1"
+              xcrun simctl io "$UDID" screenshot "$FILE" 2>/dev/null || true
+              # 明显失败帧（文件几乎是空的）重试一次；不做真正的图像内容校验，
+              # 只拦截"压根没截到东西"这种最常见的失败模式。
+              if [[ ! -s "$FILE" ]] || [[ $(wc -c < "$FILE" 2>/dev/null || echo 0) -lt 2048 ]]; then
+                echo "  WARNING: $FILE looks invalid, retrying once..."
+                sleep 2
+                xcrun simctl io "$UDID" screenshot "$FILE" 2>/dev/null || true
+              fi
+            }
+
+            capture_one "$OUT_DIR/01_bookshelf.png"
+
+            xcrun simctl io "$UDID" tap "$TAB2_X" "$TAB_Y" 2>/dev/null || true
+            sleep 3
+            capture_one "$OUT_DIR/02_explore.png"
+
+            xcrun simctl io "$UDID" tap "$TAB3_X" "$TAB_Y" 2>/dev/null || true
+            sleep 3
+            capture_one "$OUT_DIR/03_settings.png"
+
+            # 回到第一个 Tab，避免下一语种从错误页面开始截图
+            xcrun simctl io "$UDID" tap "$TAB1_X" "$TAB_Y" 2>/dev/null || true
+            sleep 2
+          done
+
+          xcrun simctl shutdown "$UDID" 2>/dev/null || true
+        }
+
+        if [[ -n "$IPHONE_SIM" ]]; then
+          capture_for_device "${IPHONE_SIM%%|*}" "${IPHONE_SIM##*|}" "APP_IPHONE_67" 440 956
+        else
+          echo "Skipping iPhone screenshots (no simulator available)"
+        fi
+
+        if [[ -n "$IPAD_SIM" ]]; then
+          # iPad Pro 13" (M4): 2064x2752 px @2x → 1032x1376 pt logical resolution
+          capture_for_device "${IPAD_SIM%%|*}" "${IPAD_SIM##*|}" "APP_IPAD_PRO_3GEN_129" 1032 1376
+        else
+          echo "Skipping iPad screenshots — WARNING: App Store requires iPad screenshots for apps that support iPad"
         fi
 
         # Move captured screenshots to expected location
@@ -1723,6 +1791,8 @@ jobs:
           mv "$SCREENSHOTS_DIR" "$TARGET_DIR"
           echo "Auto-captured screenshots saved to $TARGET_DIR"
           find "$TARGET_DIR" -name '*.png' | sort
+        else
+          echo "WARNING: no screenshots were captured"
         fi
 
     # ==============================================
