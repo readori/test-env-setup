@@ -1746,7 +1746,6 @@ jobs:
           -scheme                    "$SCHEME" \
           -sdk                       iphonesimulator \
           -destination               "platform=iOS Simulator,id=$BOOT_UDID" \
-          -jobs                      1 \
           -skipPackagePluginValidation \
           -skipMacroValidation \
           -onlyUsePackageVersionsFromResolvedFile \
