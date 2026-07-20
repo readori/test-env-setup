@@ -796,6 +796,13 @@ jobs:
         # ── Step 1: Build unsigned (with INFOPLIST_FILE for proper bundle) ──
         echo "=== Step 1: Build unsigned ==="
         cd "$REPO_ROOT"
+        # 🐛 Bug 修复（"iPad 上装了最新版本，App 还是以 iPhone 兼容模式跑在小窗口里"）：
+        # 下面 TARGETED_DEVICE_FAMILY 之前是 1（仅 iPhone），作为 xcodebuild 命令行覆盖，
+        # 直接盖过了工程里任何 Universal 设置，也盖过了 Info.plist 里手工声明的
+        # UIDeviceFamily=[1,2]——不管源码里 iPad 适配（分屏/朗读横竖屏等）做得再完整，
+        # 只要打包时用的是这个值，出来的就是"仅支持 iPhone"的二进制，装到 iPad 上
+        # 自然只能以兼容模式跑在一个小号 iPhone 窗口里、四周留黑边。改成 "1,2" 才是
+        # 真正的 Universal（iPhone + iPad）构建。
         xcodebuild build \
           -scheme "$SCHEME" \
           -configuration Release \
@@ -808,7 +815,7 @@ jobs:
           CODE_SIGNING_ALLOWED=NO \
           CODE_SIGNING_REQUIRED=NO \
           CODE_SIGN_IDENTITY="" \
-          TARGETED_DEVICE_FAMILY=1 \
+          TARGETED_DEVICE_FAMILY="1,2" \
           GENERATE_INFOPLIST_FILE=NO \
           INFOPLIST_FILE="$INFO_PLIST" \
           INFOPLIST_KEY_UILaunchStoryboardName=LaunchScreen \
