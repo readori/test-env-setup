@@ -1,31 +1,40 @@
 name: Readori CItest
 
-# Unified pipeline — four modes via single dispatch:
-#   unsigned   → sideload / local testing (no signing, no ASC)
-#   testflight → signed IPA + upload to TestFlight (build number auto-incremented)
-#   submit     → signed IPA + upload + submit for App Store review
-#   screenshots → upload App Store screenshots via asc-cli
+# Unified pipeline — three modes via single dispatch:
+#   unsigned    → sideload / local testing (no signing, no ASC)
+#   testflight  → signed IPA + upload to TestFlight (build number auto-incremented)
+#   screenshots → auto-capture simulator screenshots + upload via asc-cli
+#
+# 🔄 精简（按需求去掉了原来的 submit 模式，只保留这三个）：
+#   之前 submit 模式=testflight 的全部步骤 + 额外触发一次 App Store 审核提交，
+#   现在没有单独的"提交审核"这个选项了；如果以后需要重新加回来，
+#   可以在 mode 里加回 submit，把原来"16. SUBMIT FOR REVIEW"那一步（连同它
+#   的 asc versions submit 调用）重新接回去即可，其它步骤当时就是复用
+#   testflight 的判断条件，不需要额外改动。
+#   另外 screenshots 现在是完全独立的一个模式，不再随 testflight 构建自动跑——
+#   之前 screenshots 的截图/上传步骤条件里带着 testflight（也带着已删除的
+#   submit），意味着每次 testflight 发版都会顺带截一次图，这通常不是本意
+#   （既拖慢发版流程，也没必要每次发版都重新截图）。现在只有显式选择
+#   mode=screenshots 时才会跑截图相关的步骤。
 #
 # Full asc-cli automation:
 #   - Auto build number increment
 #   - TestFlight upload + beta notes
-#   - App Store submission
 #   - What's New (version localizations) update
-#   - Screenshots upload per locale
+#   - Screenshots auto-capture + upload per locale
 #   - Subscription groups list (diagnostic)
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "unsigned = sideload | testflight = upload TF | submit = App Store review | screenshots = upload screenshots"
+        description: "unsigned = sideload | testflight = upload TF | screenshots = auto-capture + upload screenshots"
         required: false
         default: "unsigned"
         type: choice
         options:
           - unsigned
           - testflight
-          - submit
           - screenshots
 
       app_scheme:
@@ -50,25 +59,25 @@ on:
           - "no"
 
       app_version:
-        description: "Marketing version string (e.g. 1.2.0) — required for testflight/submit"
+        description: "Marketing version string (e.g. 1.2.0) — required for testflight"
         required: false
         default: "1.0.0"
         type: string
 
       whats_new_en:
-        description: "What's New text (English) — for testflight/submit"
+        description: "What's New text (English) — for testflight"
         required: false
         default: ""
         type: string
 
       whats_new_zh_hans:
-        description: "What's New text (Simplified Chinese) — for testflight/submit"
+        description: "What's New text (Simplified Chinese) — for testflight"
         required: false
         default: ""
         type: string
 
       whats_new_zh_hant:
-        description: "What's New text (Traditional Chinese) — for testflight/submit"
+        description: "What's New text (Traditional Chinese) — for testflight"
         required: false
         default: ""
         type: string
@@ -173,7 +182,7 @@ jobs:
         xcode-version: ${{ github.event.inputs.xcode_version || '26.0' }}
 
     - name: Enforce Xcode 26+ for App Store delivery
-      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
+      if: ${{ env.MODE == 'testflight' }}
       run: |
         XCODE_VERSION_RAW="$(xcodebuild -version | head -n1 | awk '{print $2}')"
         XCODE_MAJOR="${XCODE_VERSION_RAW%%.*}"
@@ -192,12 +201,12 @@ jobs:
     # 的根本原因）：这两步以前是"screenshots 模式跳过"，这在 screenshots 模式
     # 还只负责"上传已存在的截图"时是对的——那时 screenshots 模式压根不构建
     # 任何东西。但后来 16.5 Auto-capture simulator screenshots 步骤被扩展为
-    # 在 testflight/submit/screenshots 三种模式下都会跑，且它需要对
-    # iphonesimulator 跑一次完整的 `xcodebuild build`——而这条件依然只排除了
-    # screenshots 模式，导致单独跑 screenshots 模式时 SPM 依赖图从未被解析，
-    # 16.5 里的模拟器构建因此直接失败（构建产物目录里自然找不到 .app），
-    # 于是永远落到"No simulator .app found — skipping auto-capture"分支，
-    # screenshots 目录不会被创建，后面的上传步骤也就跟着被跳过。
+    # screenshots 模式下也要对 iphonesimulator 跑一次完整的
+    # `xcodebuild build`——而这条件依然把 screenshots 模式排除在外，导致单独跑
+    # screenshots 模式时 SPM 依赖图从未被解析，16.5 里的模拟器构建因此直接
+    # 失败（构建产物目录里自然找不到 .app），于是永远落到
+    # "No simulator .app found — skipping auto-capture"分支，screenshots
+    # 目录不会被创建，后面的上传步骤也就跟着被跳过。
     # 现在任何模式都会解析一次 SPM 依赖，构建才有可能成功。
     # ==============================================
     - name: Cache Swift packages
@@ -298,7 +307,7 @@ jobs:
           --private-key-path ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
 
     # ==============================================
-    # 9. AUTO BUILD NUMBER (testflight / submit only)
+    # 9. AUTO BUILD NUMBER (testflight only)
     #    Fetches latest TestFlight build number and increments by 1
     #    Falls back to github.run_number (always unique + incrementing)
     #
@@ -312,7 +321,7 @@ jobs:
     #    字手动上传的，仍建议定期核对 App Store Connect 后台的实际最大 build 号。
     # ==============================================
     - name: Auto-increment build number
-      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
+      if: ${{ env.MODE == 'testflight' }}
       run: |
         RUN_NUMBER="${{ github.run_number }}"
         LATEST=$(asc builds list \
@@ -347,7 +356,7 @@ jobs:
     #     to auto-create a distribution cert + profile.
     # ==============================================
     - name: Import signing certificate
-      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
+      if: ${{ env.MODE == 'testflight' }}
       env:
         IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
         IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
@@ -751,7 +760,7 @@ jobs:
     #      Strategy: build unsigned → wrap executable → codesign → package IPA
     # ==============================================
     - name: Build signed IPA (SPM manual sign)
-      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
+      if: ${{ env.MODE == 'testflight' }}
       env:
         ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
         ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
@@ -1142,7 +1151,7 @@ jobs:
     #      Ensures icon-1024 and AppIcon assets are present
     # ==============================================
     - name: Verify App Icon in bundle
-      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
+      if: ${{ env.MODE == 'testflight' }}
       continue-on-error: true
       run: |
         APP_BUNDLE=$(find build -maxdepth 3 -name "*.app" -type d | head -1)
@@ -1182,7 +1191,7 @@ jobs:
     # 13. UPLOAD TO TESTFLIGHT
     # ==============================================
     - name: Upload to TestFlight
-      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
+      if: ${{ env.MODE == 'testflight' }}
       env:
         ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
         ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
@@ -1227,7 +1236,7 @@ jobs:
     #     Runs after upload so the build is known to ASC
     # ==============================================
     - name: Update TestFlight beta notes
-      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
+      if: ${{ env.MODE == 'testflight' }}
       env:
         BETA_NOTES: ${{ github.event.inputs.beta_notes }}
       run: |
@@ -1271,7 +1280,7 @@ jobs:
     #     Runs after build is indexed in ASC
     # ==============================================
     - name: Update What's New (version localizations)
-      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
+      if: ${{ env.MODE == 'testflight' }}
       run: |
         # Fetch version in PREPARE_FOR_SUBMISSION, READY_FOR_REVIEW, or DEVELOPER_REJECTED
         VERSION_ID=$(asc versions list \
@@ -1358,7 +1367,7 @@ jobs:
     #      auto-fills name, subtitle, description, privacy URL
     # ==============================================
     - name: Update App Store listing metadata
-      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
+      if: ${{ env.MODE == 'testflight' }}
       continue-on-error: true
       run: |
         if [[ -z "${VERSION_ID:-}" ]]; then
@@ -1453,7 +1462,7 @@ jobs:
     #      and support URL on the editable version localizations.
     # ==============================================
     - name: Update App Store description and keywords
-      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
+      if: ${{ env.MODE == 'testflight' }}
       continue-on-error: true
       run: |
         if [[ -z "${VERSION_ID:-}" ]]; then
@@ -1627,33 +1636,6 @@ jobs:
         PYEOF
 
     # ==============================================
-    # 16. SUBMIT FOR REVIEW (submit only)
-    # ==============================================
-    - name: Submit for App Store review
-      if: ${{ env.MODE == 'submit' }}
-      run: |
-        VERSION_ID=$(asc versions list \
-          --app-id ${{ secrets.ASC_APP_ID }} \
-          --output json 2>/dev/null | \
-          python3 -c "
-        import sys, json
-        try:
-            data = json.load(sys.stdin)
-            versions = data['data'] if isinstance(data, dict) and 'data' in data else data
-            ordered = sorted(versions, key=lambda v: (
-        0 if v.get('appStoreState') == 'READY_FOR_REVIEW' else 1
-            ))
-            print(ordered[0]['id'] if ordered else '')
-        except: print('')
-        " || echo "")
-        if [[ -z "$VERSION_ID" ]]; then
-          echo "No version in READY_FOR_REVIEW — skipping submit"
-          exit 0
-        fi
-        echo "Submitting version-id: $VERSION_ID"
-        asc versions submit --version-id "$VERSION_ID"
-
-    # ==============================================
     # 16.5 AUTO-CAPTURE SIMULATOR SCREENSHOTS
     #       (screenshots mode, when no pre-staged screenshots exist)
     #       Boots an iPhone simulator AND an iPad simulator, installs a
@@ -1676,7 +1658,7 @@ jobs:
     #       4. 增加基本校验：截图文件如果几乎是空文件（明显失败帧），重试一次。
     # ==============================================
     - name: Auto-capture simulator screenshots
-      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' || env.MODE == 'screenshots' }}
+      if: ${{ env.MODE == 'screenshots' }}
       continue-on-error: true
       run: |
         set +e  # best-effort: any single failure here should not fail the whole job
@@ -1963,7 +1945,7 @@ jobs:
     #      ASC 那一步失败/被跳过，这里也照样能看到实际截出来的图。
     # ==============================================
     - name: Publish captured screenshots as build artifact
-      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' || env.MODE == 'screenshots' }}
+      if: ${{ env.MODE == 'screenshots' }}
       continue-on-error: true
       uses: actions/upload-artifact@v4
       with:
@@ -1978,7 +1960,7 @@ jobs:
     #     display-type = ASC enum e.g. APP_IPHONE_67, APP_IPHONE_65
     # ==============================================
     - name: Upload App Store screenshots
-      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' || env.MODE == 'screenshots' }}
+      if: ${{ env.MODE == 'screenshots' }}
       continue-on-error: true
       run: |
         SCREENSHOTS_DIR="core_project/screenshots"
@@ -2101,10 +2083,10 @@ jobs:
 
     # ==============================================
     # 18. SUBSCRIPTION GROUPS — diagnostic list
-    #     Runs in testflight/submit modes to confirm IAP setup
+    #     Runs in testflight mode to confirm IAP setup
     # ==============================================
     - name: List subscription groups (diagnostic)
-      if: ${{ env.MODE == 'testflight' || env.MODE == 'submit' }}
+      if: ${{ env.MODE == 'testflight' }}
       continue-on-error: true
       run: |
         echo "=== Subscription Groups ==="
