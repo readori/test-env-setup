@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "unsigned = sideload | testflight = upload TF | screenshots = auto-capture + upload screenshots"
+        description: "unsigned = sideload | testflight = upload TF | screenshots = auto-capture + publish as GitHub artifact"
         required: false
         default: "unsigned"
         type: choice
@@ -200,7 +200,7 @@ jobs:
     # 6. INSTALL FASTLANE + asc-cli (signed + screenshots modes)
     # ==============================================
     - name: Install tools (Fastlane + asc-cli)
-      if: ${{ env.MODE != 'unsigned' }}
+      if: ${{ env.MODE == 'testflight' }}
       run: |
         brew install fastlane
         brew tap tddworks/tap
@@ -223,7 +223,7 @@ jobs:
     # 7. ASC API KEY JSON (signed + screenshots modes)
     # ==============================================
     - name: Setup ASC API key
-      if: ${{ env.MODE != 'unsigned' }}
+      if: ${{ env.MODE == 'testflight' }}
       env:
         ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
         ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
@@ -251,7 +251,7 @@ jobs:
     # 8. AUTHENTICATE asc-cli
     # ==============================================
     - name: Authenticate asc-cli
-      if: ${{ env.MODE != 'unsigned' }}
+      if: ${{ env.MODE == 'testflight' }}
       run: |
         asc auth login \
           --key-id           ${{ secrets.ASC_KEY_ID }} \
@@ -1565,131 +1565,6 @@ jobs:
         retention-days: 14
 
     # ==============================================
-    # 17. SCREENSHOTS UPLOAD (screenshots mode)
-    # ==============================================
-    - name: Upload App Store screenshots
-      if: ${{ env.MODE == 'screenshots' }}
-      continue-on-error: true
-      run: |
-        SCREENSHOTS_DIR="core_project/screenshots"
-        if [[ ! -d "$SCREENSHOTS_DIR" ]]; then
-          echo "No screenshots directory found at $SCREENSHOTS_DIR — skipping"
-          exit 0
-        fi
-
-        # Resolve editable version
-        if [[ -z "${VERSION_ID:-}" ]]; then
-          VERSION_ID=$(asc versions list \
-            --app-id ${{ secrets.ASC_APP_ID }} \
-            --output json 2>/dev/null | \
-            python3 -c "
-        import sys, json
-        try:
-            data = json.load(sys.stdin)
-            versions = data['data'] if isinstance(data, dict) and 'data' in data else data
-            ordered = sorted(versions, key=lambda v: (
-        0 if v.get('appStoreState') in ('PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW') else 1
-            ))
-            print(ordered[0]['id'] if ordered else '')
-        except: print('')
-        " || echo "")
-        fi
-        if [[ -z "$VERSION_ID" ]]; then
-          echo "No editable version found — cannot upload screenshots"
-          exit 1
-        fi
-        echo "Uploading screenshots to version-id: $VERSION_ID"
-
-        # Build locale → localization-id map and export for Python
-        LOCS_JSON=$(asc version-localizations list \
-          --version-id "$VERSION_ID" --output json 2>/dev/null || echo '{}')
-        export LOCS_JSON
-        export VERSION_ID
-
-        python3 - << 'PYEOF'
-        import subprocess, json, os, glob, sys
-
-        screenshots_dir = 'core_project/screenshots'
-        locs_json = os.environ.get('LOCS_JSON', '{}')
-        try:
-            data = json.loads(locs_json)
-            locs = data['data'] if isinstance(data, dict) and 'data' in data else data
-        except:
-            locs = []
-
-        locale_to_id = {loc.get('locale',''): loc.get('id','') for loc in locs}
-        print(f'Known localizations: {list(locale_to_id.keys())}')
-
-        errors = 0
-        for locale_dir in sorted(glob.glob(f'{screenshots_dir}/*/')):
-            locale = os.path.basename(locale_dir.rstrip('/'))
-            loc_id = locale_to_id.get(locale, '')
-            if not loc_id:
-                print(f'  skip {locale}: no localization ID found')
-                continue
-            print(f'  Locale: {locale}  (loc_id={loc_id})')
-
-            for device_dir in sorted(glob.glob(f'{locale_dir}*/')):
-                display_type = os.path.basename(device_dir.rstrip('/'))
-                print(f'    display-type: {display_type}')
-
-                # Create screenshot set
-                r = subprocess.run(
-                    ['asc', 'screenshot-sets', 'create',
-                     '--localization-id', loc_id,
-                     '--display-type', display_type,
-                     '--output', 'json'],
-                    capture_output=True, text=True
-                )
-                if r.returncode == 0:
-                    try:
-                        d = json.loads(r.stdout)
-                        set_id = (d.get('data') or d).get('id', '') if isinstance(d, dict) else ''
-                    except:
-                        set_id = ''
-                else:
-                    set_id = ''
-
-                # If create failed, try fetching existing set
-                if not set_id:
-                    r2 = subprocess.run(
-                        ['asc', 'screenshot-sets', 'list',
-                         '--localization-id', loc_id,
-                         '--output', 'json'],
-                        capture_output=True, text=True
-                    )
-                    try:
-                        d2 = json.loads(r2.stdout)
-                        sets = d2['data'] if isinstance(d2, dict) and 'data' in d2 else d2
-                        match = next((s for s in sets if s.get('screenshotDisplayType') == display_type), None)
-                        set_id = match['id'] if match else ''
-                    except:
-                        set_id = ''
-
-                if not set_id:
-                    print(f'    WARNING: could not create/find set for {display_type}')
-                    errors += 1
-                    continue
-
-                # Upload each PNG in sorted order
-                imgs = sorted(glob.glob(f'{device_dir}*.png'))
-                for img in imgs:
-                    r3 = subprocess.run(
-                        ['asc', 'screenshots', 'upload', '--set-id', set_id, '--file', img],
-                        capture_output=True, text=True
-                    )
-                    status = '\u2713' if r3.returncode == 0 else '\u2717'
-                    print(f'      {status} {os.path.basename(img)}')
-                    if r3.returncode != 0:
-                        print(f'        error: {r3.stderr[:200]}')
-                        errors += 1
-
-        print(f'Done. Errors: {errors}')
-        if errors > 0:
-            sys.exit(1)
-        PYEOF
-
-    # ==============================================
     # 18. SUBSCRIPTION GROUPS — diagnostic list
     # ==============================================
     - name: List subscription groups (diagnostic)
@@ -1710,3 +1585,16 @@ jobs:
             else:
                 print(f'  {g}')
         " || echo "(no subscription groups or error)"
+
+    # ==============================================
+    # 19. UPLOAD ARTIFACT (unsigned export)
+    # ==============================================
+    - name: Upload unsigned artifact
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: readori-unsigned-${{ env.BUILD_TAG || github.run_number }}
+        retention-days: 7
+        if-no-files-found: warn
+        path: |
+          build/*.ipa
+          /tmp/sim_build/Readori.app
