@@ -1848,7 +1848,7 @@ jobs:
         echo "Wrapped simulator .app at: $APP_PATH"
         ls -d "$APP_PATH"/*.lproj 2>/dev/null || echo "WARNING: No .lproj directories at app root — localized screenshots will not work!"
 
-        LOCALES="en-US zh-Hans zh-Hant"
+        LOCALES="en-US"
 
         # 🐛 彻底修复（iPhone/iPad 自动截图此前一直不正常的两个根因）：
         #
@@ -1906,7 +1906,13 @@ jobs:
               SIMCTL_CHILD_READORI_SCREENSHOT_TAB="$TAB" \
               xcrun simctl launch "$UDID" "$BUNDLE_ID" \
                 -AppleLanguages "($APPLE_LANG)" -AppleLocale "$APPLE_LOCALE" 2>/dev/null || true
-              sleep 6
+              # "reader" 启动后要多做一次本地文件导入 + 后台分章解析才能打开阅读器，
+              # 比单纯切 Tab 慢，多给几秒缓冲。
+              if [[ "$TAB" == "reader" ]]; then
+                sleep 9
+              else
+                sleep 6
+              fi
               xcrun simctl io "$UDID" screenshot "$FILE" 2>/dev/null || true
               # 明显失败帧（文件几乎是空的）重试一次；不做真正的图像内容校验，
               # 只拦截"压根没截到东西"这种最常见的失败模式。
@@ -1917,9 +1923,12 @@ jobs:
               fi
             }
 
-            capture_one "bookshelf" "$OUT_DIR/01_bookshelf.png"
-            capture_one "explore"   "$OUT_DIR/02_explore.png"
-            capture_one "settings"  "$OUT_DIR/03_settings.png"
+            capture_one "bookshelf"       "$OUT_DIR/01_bookshelf.png"
+            capture_one "reader"          "$OUT_DIR/02_reader.png"
+            capture_one "explore"         "$OUT_DIR/03_explore.png"
+            capture_one "settings"        "$OUT_DIR/04_settings.png"
+            capture_one "pro"             "$OUT_DIR/05_pro.png"
+            capture_one "personalization" "$OUT_DIR/06_personalization.png"
           done
 
           xcrun simctl shutdown "$UDID" 2>/dev/null || true
