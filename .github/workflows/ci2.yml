@@ -1200,6 +1200,11 @@ jobs:
           echo "Warning: could not get/create version — skipping What's New"
           exit 0
         fi
+        # 🐛 修复（"What's New 完全没更新，Python 那边打印 No VERSION_ID"的根因）：
+        # 写入 $GITHUB_ENV 只在*下一个* step 才会生效，本 step 里后面紧接着起的
+        # python3 子进程读不到——用 export 让同一个 shell 里后续起的子进程也能
+        # 拿到这个变量，$GITHUB_ENV 依然保留写入，给后面步骤复用。
+        export VERSION_ID
         echo "VERSION_ID=$VERSION_ID" >> $GITHUB_ENV
         echo "Version: $VERSION_ID"
 
@@ -1585,16 +1590,3 @@ jobs:
             else:
                 print(f'  {g}')
         " || echo "(no subscription groups or error)"
-
-    # ==============================================
-    # 19. UPLOAD ARTIFACT (unsigned export)
-    # ==============================================
-    - name: Upload unsigned artifact
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-      with:
-        name: readori-${{ env.BUILD_TAG || github.run_number }}
-        retention-days: 7
-        if-no-files-found: warn
-        path: |
-          build/*.ipa
-          build/export/*.ipa
