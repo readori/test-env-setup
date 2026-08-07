@@ -1,4 +1,4 @@
-name: CloudMail iOS
+name: Mail iOS 
 
 on:
   workflow_dispatch:
