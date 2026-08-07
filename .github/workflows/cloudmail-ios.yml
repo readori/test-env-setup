@@ -1,0 +1,362 @@
+name: CloudMail iOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      distribution:
+        description: 'Choose distribution target'
+        required: true
+        default: 'testflight'
+        type: choice
+        options:
+          - testflight
+          - sideload
+          - both
+      app_version:
+        description: 'CFBundleShortVersionString, e.g. 1.0.0'
+        required: true
+        default: '1.0.0'
+        type: string
+      build_number:
+        description: 'CFBundleVersion; blank = GitHub run number'
+        required: false
+        default: ''
+        type: string
+      release_notes:
+        description: 'Optional notes for the GitHub Sideload prerelease'
+        required: false
+        default: ''
+        type: string
+
+# contents:write is required because sideload/both can publish an IPA release
+# to THIS public workflow repository. The private source repository is only read
+# through TARGET_REPO_PAT.
+permissions:
+  contents: write
+
+concurrency:
+  group: cloudmail-ios-distribution-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ios:
+    name: Build CloudMail iOS
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    env:
+      CLOUDMAIL_APP_VERSION: ${{ inputs.app_version }}
+      CLOUDMAIL_BUILD_NUMBER: ${{ inputs.build_number != '' && inputs.build_number || github.run_number }}
+      DISTRIBUTION: ${{ inputs.distribution }}
+
+    steps:
+      # ----------------------------------------------------------------------
+      # 1. Public workflow repository -> target private source repository
+      # ----------------------------------------------------------------------
+      - name: Checkout Target Private Repository
+        uses: actions/checkout@v4
+        with:
+          # 目标私有仓库路径：用户名/仓库名 或 组织名/仓库名
+          repository: 'readori/CloudMail'
+          # 分支名称
+          ref: 'main'
+          # 使用配置了权限的 PAT
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          # 存放路径（点表示直接拉取到当前工作目录）
+          path: './'
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Verify private repository checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Private source commit: $(git rev-parse --short HEAD)"
+
+          test -d mail-ios || {
+            echo '::error::Private repository was checked out, but mail-ios/ was not found.'
+            exit 1
+          }
+
+          test -f mail-ios/CloudMail.xcodeproj/project.pbxproj || {
+            echo '::error::mail-ios/CloudMail.xcodeproj was not found.'
+            exit 1
+          }
+
+      # ----------------------------------------------------------------------
+      # 2. Xcode / SDK
+      # ----------------------------------------------------------------------
+      - name: Select Xcode 26+
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          select_xcode() {
+            local app="$1"
+            if [[ -d "$app/Contents/Developer" ]]; then
+              sudo xcode-select -s "$app/Contents/Developer"
+              echo "Selected Xcode: $app"
+              return 0
+            fi
+            return 1
+          }
+
+          select_xcode /Applications/Xcode_26.6.app || \
+          select_xcode /Applications/Xcode_26.5.app || \
+          select_xcode /Applications/Xcode_26.4.app || \
+          select_xcode /Applications/Xcode_26.3.app || \
+          select_xcode /Applications/Xcode_26.2.app || \
+          select_xcode /Applications/Xcode_26.1.app || \
+          select_xcode /Applications/Xcode_26.app || \
+          select_xcode /Applications/Xcode.app || {
+            echo '::error::No Xcode installation was found on this runner.'
+            ls -1 /Applications | grep '^Xcode' || true
+            exit 1
+          }
+
+          XCODE_VERSION="$(xcodebuild -version | awk 'NR==1 {print $2}')"
+          XCODE_MAJOR="${XCODE_VERSION%%.*}"
+
+          if ! [[ "$XCODE_MAJOR" =~ ^[0-9]+$ ]] || (( XCODE_MAJOR < 26 )); then
+            echo "::error::CloudMail distribution requires Xcode 26+. Selected: $XCODE_VERSION"
+            exit 1
+          fi
+
+          xcodebuild -version
+          echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "Runner architecture: $(uname -m)"
+
+      # ----------------------------------------------------------------------
+      # 3. Validate inputs / secrets
+      # ----------------------------------------------------------------------
+      - name: Validate common inputs and private repository secret
+        shell: bash
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || {
+            echo '::error::Missing Repository secret: TARGET_REPO_PAT'
+            exit 78
+          }
+
+          [[ "$CLOUDMAIL_BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::build_number must be a positive integer: $CLOUDMAIL_BUILD_NUMBER"
+            exit 64
+          }
+
+          [[ "$CLOUDMAIL_APP_VERSION" =~ ^[0-9]+([.][0-9]+){1,2}$ ]] || {
+            echo "::error::app_version must look like 1.0 or 1.0.0: $CLOUDMAIL_APP_VERSION"
+            exit 64
+          }
+
+          case "$DISTRIBUTION" in
+            testflight|sideload|both) ;;
+            *)
+              echo "::error::Unsupported distribution: $DISTRIBUTION"
+              exit 64
+              ;;
+          esac
+
+          echo "Distribution: $DISTRIBUTION"
+          echo "Version: $CLOUDMAIL_APP_VERSION ($CLOUDMAIL_BUILD_NUMBER)"
+
+      - name: Validate TestFlight signing secrets
+        if: ${{ inputs.distribution == 'testflight' || inputs.distribution == 'both' }}
+        shell: bash
+        env:
+          ASC_APP_ID: ${{ secrets.ASC_APP_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+          IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE }}
+        run: |
+          set -euo pipefail
+
+          required=(
+            ASC_APP_ID
+            ASC_ISSUER_ID
+            ASC_KEY_ID
+            ASC_PRIVATE_KEY
+            ASC_TEAM_ID
+            IOS_CERTIFICATE
+            IOS_CERTIFICATE_PASSWORD
+            IOS_PROVISIONING_PROFILE
+          )
+
+          missing=0
+          for name in "${required[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing Repository secret required for TestFlight: $name"
+              missing=1
+            fi
+          done
+          (( missing == 0 )) || exit 78
+
+          [[ "$ASC_APP_ID" =~ ^[0-9]+$ ]] || {
+            echo '::error::ASC_APP_ID must be the numeric App Store Connect Apple ID.'
+            exit 64
+          }
+
+      # ----------------------------------------------------------------------
+      # 4. Private project QA / Xcode preflight
+      # ----------------------------------------------------------------------
+      - name: Normalize repository script permissions
+        working-directory: mail-ios
+        shell: bash
+        run: chmod +x scripts/*.sh || true
+
+      - name: Static iOS QA
+        working-directory: mail-ios
+        shell: bash
+        run: /bin/bash scripts/phase11_static_qa.sh
+
+      - name: Resolve Swift packages and validate Xcode project
+        working-directory: mail-ios
+        shell: bash
+        run: /bin/bash scripts/ci_xcode_preflight.sh
+
+      # ----------------------------------------------------------------------
+      # 5A. Optional Sideload IPA
+      #     Unsigned IPA; does NOT require Apple distribution signing secrets.
+      # ----------------------------------------------------------------------
+      - name: Build Sideload IPA
+        id: sideload
+        if: ${{ inputs.distribution == 'sideload' || inputs.distribution == 'both' }}
+        working-directory: mail-ios
+        shell: bash
+        run: /bin/bash scripts/ci_build_sideload_ipa.sh
+
+      - name: Verify Sideload IPA
+        if: ${{ inputs.distribution == 'sideload' || inputs.distribution == 'both' }}
+        shell: bash
+        env:
+          IPA_PATH: ${{ steps.sideload.outputs.ipa_path }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${IPA_PATH:-}" || ! -f "$IPA_PATH" ]]; then
+            echo "::error::Sideload IPA was not produced: ${IPA_PATH:-<empty>}"
+            exit 65
+          fi
+          echo "Sideload IPA: $IPA_PATH"
+          ls -lh "$IPA_PATH"
+
+      # Publish the Sideload IPA to the PUBLIC workflow repository, not to the
+      # checked-out private source repository. --repo is intentionally explicit.
+      - name: Publish Sideload IPA to GitHub Release
+        if: ${{ inputs.distribution == 'sideload' || inputs.distribution == 'both' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IPA_PATH: ${{ steps.sideload.outputs.ipa_path }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+          PUBLIC_RELEASE_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          RELEASE_TAG="cloudmail-sideload-v${CLOUDMAIL_APP_VERSION}-b${CLOUDMAIL_BUILD_NUMBER}-run${GITHUB_RUN_NUMBER}"
+          RELEASE_TITLE="CloudMail Sideload v${CLOUDMAIL_APP_VERSION} (${CLOUDMAIL_BUILD_NUMBER})"
+          SOURCE_COMMIT="$(git rev-parse --short HEAD)"
+
+          NOTES_FILE="$RUNNER_TEMP/cloudmail-sideload-release-notes.md"
+          {
+            echo "CloudMail iOS sideload IPA"
+            echo
+            echo "- Version: \`${CLOUDMAIL_APP_VERSION}\`"
+            echo "- Build: \`${CLOUDMAIL_BUILD_NUMBER}\`"
+            echo "- Private source: \`readori/CloudMail@main\`"
+            echo "- Source commit: \`${SOURCE_COMMIT}\`"
+            echo "- GitHub workflow run: \`${GITHUB_RUN_NUMBER}\`"
+            echo
+            echo '> This is a sideload build and is not an App Store/TestFlight distribution package.'
+            if [[ -n "${RELEASE_NOTES:-}" ]]; then
+              echo
+              echo '## Notes'
+              echo
+              printf '%s\n' "$RELEASE_NOTES"
+            fi
+          } > "$NOTES_FILE"
+
+          gh release create "$RELEASE_TAG" \
+            "$IPA_PATH" \
+            --repo "$PUBLIC_RELEASE_REPO" \
+            --title "$RELEASE_TITLE" \
+            --notes-file "$NOTES_FILE" \
+            --prerelease \
+            --target "$GITHUB_SHA"
+
+          echo "Sideload Release: https://github.com/${PUBLIC_RELEASE_REPO}/releases/tag/${RELEASE_TAG}" >> "$GITHUB_STEP_SUMMARY"
+
+      # ----------------------------------------------------------------------
+      # 5B. Optional TestFlight package
+      # ----------------------------------------------------------------------
+      - name: Archive and export signed App Store IPA
+        id: appstore
+        if: ${{ inputs.distribution == 'testflight' || inputs.distribution == 'both' }}
+        working-directory: mail-ios
+        shell: bash
+        env:
+          # Existing Repository secret -> CloudMail build script variable
+          APPLE_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+          IOS_DISTRIBUTION_CERT_P12_BASE64: ${{ secrets.IOS_CERTIFICATE }}
+          IOS_DISTRIBUTION_CERT_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE }}
+        run: /bin/bash scripts/ci_archive_ipa.sh appstore
+
+      - name: Upload IPA to TestFlight
+        if: ${{ inputs.distribution == 'testflight' || inputs.distribution == 'both' }}
+        working-directory: mail-ios
+        shell: bash
+        env:
+          APPSTORE_CONNECT_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          APPSTORE_CONNECT_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          APPSTORE_CONNECT_APP_ID: ${{ secrets.ASC_APP_ID }}
+          ASC_PRIVATE_KEY_SECRET: ${{ secrets.ASC_PRIVATE_KEY }}
+          IPA_PATH: ${{ steps.appstore.outputs.ipa_path }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${IPA_PATH:-}" || ! -f "$IPA_PATH" ]]; then
+            echo "::error::Signed App Store IPA was not produced: ${IPA_PATH:-<empty>}"
+            exit 65
+          fi
+
+          # ASC_PRIVATE_KEY supports:
+          #   1) raw multiline .p8 text
+          #   2) base64 encoded .p8 content
+          if [[ "$ASC_PRIVATE_KEY_SECRET" == *"BEGIN PRIVATE KEY"* ]]; then
+            APPSTORE_CONNECT_API_KEY_P8_BASE64="$(printf '%s' "$ASC_PRIVATE_KEY_SECRET" | /usr/bin/base64 | tr -d '\r\n')"
+          else
+            APPSTORE_CONNECT_API_KEY_P8_BASE64="$(printf '%s' "$ASC_PRIVATE_KEY_SECRET" | tr -d '\r\n')"
+          fi
+          export APPSTORE_CONNECT_API_KEY_P8_BASE64
+
+          /bin/bash scripts/ci_upload_testflight.sh "$IPA_PATH"
+
+      # ----------------------------------------------------------------------
+      # 6. Summary
+      # ----------------------------------------------------------------------
+      - name: Distribution summary
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          {
+            echo '## CloudMail iOS distribution completed'
+            echo
+            echo "- Mode: \`${DISTRIBUTION}\`"
+            echo "- Version: \`${CLOUDMAIL_APP_VERSION}\`"
+            echo "- Build: \`${CLOUDMAIL_BUILD_NUMBER}\`"
+            echo "- Private source: \`readori/CloudMail@main\`"
+            echo "- Source commit: \`$(git rev-parse --short HEAD)\`"
+            if [[ "$DISTRIBUTION" == 'testflight' || "$DISTRIBUTION" == 'both' ]]; then
+              echo '- TestFlight: upload submitted to App Store Connect.'
+            fi
+            if [[ "$DISTRIBUTION" == 'sideload' || "$DISTRIBUTION" == 'both' ]]; then
+              echo '- Sideload: IPA published as a prerelease in this public GitHub repository.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
