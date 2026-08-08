@@ -28,7 +28,7 @@ on:
         default: ''
         type: string
       signing_bootstrap:
-        description: 'One-time only: allow Match to create/update com.readori.mail App Store signing assets (TARGET_REPO_PAT needs write access to readori-certificates)'
+        description: 'One-time only: allow Match to update
         required: false
         default: false
         type: boolean
