@@ -27,6 +27,11 @@ on:
         required: false
         default: ''
         type: string
+      signing_bootstrap:
+        description: 'One-time only: allow Match to create/update com.readori.mail App Store signing assets (TARGET_REPO_PAT needs write access to readori-certificates)'
+        required: false
+        default: false
+        type: boolean
 
 # contents:write is required because sideload/both can publish an IPA release
 # to THIS public workflow repository. The private source repository is only read
@@ -166,6 +171,11 @@ jobs:
               exit 64
               ;;
           esac
+
+          if [[ '${{ inputs.signing_bootstrap }}' == 'true' && "$DISTRIBUTION" == 'sideload' ]]; then
+            echo '::error::signing_bootstrap only applies to testflight or both.'
+            exit 64
+          fi
 
           echo "Distribution: $DISTRIBUTION"
           echo "Version: $CLOUDMAIL_APP_VERSION ($CLOUDMAIL_BUILD_NUMBER)"
@@ -339,6 +349,10 @@ jobs:
             ls-remote https://github.com/readori/readori-certificates.git HEAD >/dev/null
           echo 'TARGET_REPO_PAT can read readori/readori-certificates.'
 
+          if [[ '${{ inputs.signing_bootstrap }}' == 'true' ]]; then
+            echo '::notice::Match bootstrap requested. TARGET_REPO_PAT must have Contents: Read and write on readori/readori-certificates.'
+          fi
+
       - name: Install pinned Fastlane
         if: ${{ inputs.distribution == 'testflight' || inputs.distribution == 'both' }}
         working-directory: mail-ios
@@ -360,6 +374,7 @@ jobs:
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
           MATCH_GIT_URL: https://github.com/readori/readori-certificates.git
           MATCH_GIT_BASIC_AUTHORIZATION: ${{ env.MATCH_GIT_BASIC_AUTHORIZATION }}
+          MATCH_READONLY: ${{ inputs.signing_bootstrap && 'false' || 'true' }}
           ASC_APP_ID: ${{ secrets.CFMAIL_ASC_APP_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
