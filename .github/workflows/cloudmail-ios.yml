@@ -28,7 +28,7 @@ on:
         default: ''
         type: string
       signing_bootstrap:
-        description: 'One-time only: allow Match to update
+        description: 'One-time only: allow Match to update'
         required: false
         default: false
         type: boolean
