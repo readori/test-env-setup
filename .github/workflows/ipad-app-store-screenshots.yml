@@ -6,7 +6,9 @@ on:
     branches:
       - main
     paths:
-      - 'mail-ios/**'
+      - '**/mail-ios/**'
+      - '**/CloudMail.xcodeproj/**'
+      - '**/CloudMailScreenshotUITests/**'
       - '.github/workflows/ipad-app-store-screenshots.yml'
 
 permissions:
@@ -19,8 +21,8 @@ concurrency:
 jobs:
   screenshots:
     name: 13-inch iPad screenshots
-    # Important: CloudMail's pinned MailCore2 package has an x86_64 Simulator slice but not
-    # an arm64 Simulator slice. GitHub exposes macos-15-intel as the Intel hosted runner.
+    # The pinned MailCore2 XCFramework has x86_64 for iOS Simulator but not arm64.
+    # Therefore this screenshot job must run on GitHub's Intel macOS runner.
     runs-on: macos-15-intel
     timeout-minutes: 45
 
@@ -28,46 +30,258 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Locate CloudMail project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+          echo "Runner architecture: $(uname -m)"
+
+          if [[ "$(uname -m)" != "x86_64" ]]; then
+            echo "::error::This workflow requires macos-15-intel. Actual architecture: $(uname -m)"
+            exit 1
+          fi
+
+          PROJECT_FILE="$(find "$GITHUB_WORKSPACE" \
+            -type f \
+            -path '*/CloudMail.xcodeproj/project.pbxproj' \
+            -not -path '*/DerivedData/*' \
+            -print -quit)"
+
+          if [[ -z "$PROJECT_FILE" ]]; then
+            echo "::error::CloudMail.xcodeproj/project.pbxproj was not found in the repository."
+            find "$GITHUB_WORKSPACE" -maxdepth 4 -type f | sort | head -250 || true
+            exit 1
+          fi
+
+          MAIL_IOS_DIR="$(cd "$(dirname "$(dirname "$PROJECT_FILE")")" && pwd)"
+          echo "Resolved iOS project directory: $MAIL_IOS_DIR"
+
+          test -d "$MAIL_IOS_DIR/CloudMail.xcodeproj"
+
+          echo "MAIL_IOS_DIR=$MAIL_IOS_DIR" >> "$GITHUB_ENV"
+          echo "RESULT_BUNDLE=$RUNNER_TEMP/CloudMail-iPad-Screenshots.xcresult" >> "$GITHUB_ENV"
+          echo "DERIVED_DATA=$RUNNER_TEMP/CloudMail-iPad-DerivedData" >> "$GITHUB_ENV"
+          echo "EXPORTED_ATTACHMENTS=$RUNNER_TEMP/CloudMail-iPad-Attachments" >> "$GITHUB_ENV"
+          echo "SCREENSHOT_OUTPUT=$RUNNER_TEMP/CloudMail-iPad-13-inch" >> "$GITHUB_ENV"
+          echo "XCODEBUILD_LOG=$RUNNER_TEMP/CloudMail-iPad-Screenshots-xcodebuild.log" >> "$GITHUB_ENV"
+
       - name: Select Xcode 16.4
         shell: bash
         run: |
           set -euo pipefail
+
           XCODE_PATH="/Applications/Xcode_16.4.app/Contents/Developer"
           if [[ ! -d "$XCODE_PATH" ]]; then
-            echo "::error::Xcode 16.4 is required for the screenshot runner but was not found."
+            echo "::error::Xcode 16.4 was not found on this runner."
             ls -1 /Applications | grep '^Xcode' || true
             exit 1
           fi
+
           sudo xcode-select -s "$XCODE_PATH"
           xcodebuild -version
-          echo "Runner architecture: $(uname -m)"
+          xcrun simctl list runtimes
 
       - name: Generate app icon assets
-        working-directory: mail-ios
         shell: bash
-        run: /bin/bash scripts/generate_cfmail_app_icon.sh
+        run: |
+          set -euo pipefail
+          cd "$MAIL_IOS_DIR"
 
-      - name: Validate screenshot automation contract
-        working-directory: mail-ios
-        shell: bash
-        run: python3 scripts/test_demo_screenshot_contract.py
+          # Do not use a hard-coded GitHub repository path.
+          if [[ -f scripts/generate_cfmail_app_icon.sh ]]; then
+            /bin/bash scripts/generate_cfmail_app_icon.sh
+          else
+            echo "generate_cfmail_app_icon.sh not present; continuing with committed assets."
+          fi
 
-      - name: Generate 13-inch iPad screenshots
-        working-directory: mail-ios
+      - name: Boot 13-inch iPad and run screenshot UI test
         shell: bash
-        env:
-          SCREENSHOT_RESULT_BUNDLE: ${{ runner.temp }}/CloudMail-iPad-Screenshots.xcresult
-          SCREENSHOT_EXPORTED_ATTACHMENTS: ${{ runner.temp }}/CloudMail-iPad-Attachments
-          SCREENSHOT_OUTPUT_DIR: ${{ github.workspace }}/mail-ios/AppStoreScreenshots/iPad-13-inch
-          SCREENSHOT_DERIVED_DATA: ${{ runner.temp }}/CloudMail-iPad-DerivedData
-        run: /bin/bash scripts/ci_ipad_screenshots.sh
+        run: |
+          set -euo pipefail
+          cd "$MAIL_IOS_DIR"
+
+          rm -rf "$RESULT_BUNDLE" "$DERIVED_DATA" "$EXPORTED_ATTACHMENTS" "$SCREENSHOT_OUTPUT"
+          mkdir -p "$EXPORTED_ATTACHMENTS" "$SCREENSHOT_OUTPUT"
+
+          DEVICE_TYPE_ID="$(xcrun simctl list devicetypes -j | python3 -c '
+          import json, sys
+          items = json.load(sys.stdin)["devicetypes"]
+          preferred = [x for x in items if x["name"] == "iPad Pro 13-inch (M4)"]
+          if not preferred:
+              preferred = [x for x in items if x["name"].startswith("iPad Pro 13-inch")]
+          if not preferred:
+              raise SystemExit("No 13-inch iPad Pro Simulator device type is installed")
+          print(preferred[0]["identifier"])
+          ')"
+
+          RUNTIME_ID="$(xcrun simctl list runtimes -j | python3 -c '
+          import json, sys
+          items = [x for x in json.load(sys.stdin)["runtimes"] if x.get("isAvailable", False)]
+          preferred = [x for x in items if x.get("identifier") == "com.apple.CoreSimulator.SimRuntime.iOS-18-5"]
+          if not preferred:
+              preferred = [x for x in items if x.get("identifier", "").startswith("com.apple.CoreSimulator.SimRuntime.iOS-18-")]
+          if not preferred:
+              raise SystemExit("No iOS 18 Simulator runtime is installed")
+          def version_tuple(item):
+              return tuple(int(p) for p in item.get("version", "0").split(".") if p.isdigit())
+          preferred.sort(key=version_tuple, reverse=True)
+          print(preferred[0]["identifier"])
+          ')"
+
+          SIMULATOR_NAME="CloudMail App Store Screenshot iPad"
+          UDID="$(xcrun simctl create "$SIMULATOR_NAME" "$DEVICE_TYPE_ID" "$RUNTIME_ID")"
+          echo "SIMULATOR_UDID=$UDID" >> "$GITHUB_ENV"
+
+          cleanup() {
+            xcrun simctl shutdown "$UDID" >/dev/null 2>&1 || true
+            xcrun simctl delete "$UDID" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl ui "$UDID" appearance light || true
+          xcrun simctl status_bar "$UDID" override \
+            --time '9:41' \
+            --batteryState charged \
+            --batteryLevel 100 \
+            --wifiBars 3 \
+            --cellularBars 4 >/dev/null 2>&1 || true
+
+          echo "Simulator UDID: $UDID"
+          echo "Device type: $DEVICE_TYPE_ID"
+          echo "Runtime: $RUNTIME_ID"
+          echo "Host architecture: $(uname -m)"
+          echo "Forcing iOS Simulator architecture: x86_64"
+
+          BUILD_ARCH_ARGS=(
+            "ARCHS=x86_64"
+            "ONLY_ACTIVE_ARCH=YES"
+            "EXCLUDED_ARCHS[sdk=iphonesimulator*]=arm64"
+          )
+
+          # Diagnostic output: verify Xcode resolves the app/test build as x86_64.
+          arch -x86_64 xcodebuild -showBuildSettings \
+            -project CloudMail.xcodeproj \
+            -scheme CloudMail \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$UDID" \
+            "${BUILD_ARCH_ARGS[@]}" \
+            | grep -E '^[[:space:]]+(ARCHS|CURRENT_ARCH|NATIVE_ARCH|NATIVE_ARCH_ACTUAL|ONLY_ACTIVE_ARCH|EXCLUDED_ARCHS) =' \
+            || true
+
+          set +e
+          arch -x86_64 xcodebuild test \
+            -project CloudMail.xcodeproj \
+            -scheme CloudMail \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$UDID" \
+            -derivedDataPath "$DERIVED_DATA" \
+            -resultBundlePath "$RESULT_BUNDLE" \
+            -only-testing:CloudMailScreenshotUITests/CloudMailScreenshotUITests/testGenerateAppStoreScreenshots \
+            "${BUILD_ARCH_ARGS[@]}" \
+            2>&1 | tee "$XCODEBUILD_LOG"
+          XCODE_STATUS=${PIPESTATUS[0]}
+          set -e
+
+          if [[ $XCODE_STATUS -ne 0 ]]; then
+            echo "::error::xcodebuild screenshot UI test failed with exit code $XCODE_STATUS"
+            exit "$XCODE_STATUS"
+          fi
+
+      - name: Export and normalize screenshots
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf "$EXPORTED_ATTACHMENTS" "$SCREENSHOT_OUTPUT"
+          mkdir -p "$EXPORTED_ATTACHMENTS" "$SCREENSHOT_OUTPUT"
+
+          xcrun xcresulttool export attachments \
+            --path "$RESULT_BUNDLE" \
+            --output-path "$EXPORTED_ATTACHMENTS"
+
+          python3 - "$EXPORTED_ATTACHMENTS" "$SCREENSHOT_OUTPUT" <<'PY'
+          import re
+          import shutil
+          import sys
+          from pathlib import Path
+
+          source = Path(sys.argv[1])
+          output = Path(sys.argv[2])
+          output.mkdir(parents=True, exist_ok=True)
+
+          expected = [
+              "01_Inbox",
+              "02_Message_Detail",
+              "03_Compose",
+              "04_Settings",
+              "05_Account",
+              "06_Pro",
+          ]
+
+          def token(value: str) -> str:
+              return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+          pngs = sorted(p for p in source.rglob("*") if p.is_file() and p.suffix.lower() == ".png")
+          if not pngs:
+              raise SystemExit(f"No PNG screenshot attachments found under {source}")
+
+          used = set()
+          missing = []
+          for name in expected:
+              key = token(name)
+              matches = [p for p in pngs if p not in used and key in token(p.stem)]
+              if not matches:
+                  missing.append(name)
+                  continue
+              chosen = matches[0]
+              used.add(chosen)
+              target = output / f"{name}.png"
+              shutil.copy2(chosen, target)
+              print(f"{chosen} -> {target}")
+
+          if missing:
+              print("Missing screenshots: " + ", ".join(missing), file=sys.stderr)
+              print("Available exported PNGs:", file=sys.stderr)
+              for p in pngs:
+                  print(f"  - {p}", file=sys.stderr)
+              raise SystemExit(3)
+          PY
+
+          expected_width=2064
+          expected_height=2752
+          count=0
+
+          for image in "$SCREENSHOT_OUTPUT"/*.png; do
+            width="$(sips -g pixelWidth "$image" | awk '/pixelWidth/{print $2}')"
+            height="$(sips -g pixelHeight "$image" | awk '/pixelHeight/{print $2}')"
+
+            if [[ "$width" != "$expected_width" || "$height" != "$expected_height" ]]; then
+              echo "::error file=$image::Expected ${expected_width}x${expected_height}, got ${width}x${height}."
+              exit 1
+            fi
+
+            echo "Validated $(basename "$image"): ${width}x${height}"
+            count=$((count + 1))
+          done
+
+          if [[ $count -ne 6 ]]; then
+            echo "::error::Expected 6 App Store screenshots, found $count."
+            exit 1
+          fi
+
+          echo "Generated screenshots:"
+          find "$SCREENSHOT_OUTPUT" -maxdepth 1 -type f -name '*.png' -print | sort
 
       - name: Upload 13-inch iPad PNGs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: CloudMail-iPad-13-inch-App-Store-Screenshots
-          path: mail-ios/AppStoreScreenshots/iPad-13-inch/*.png
+          path: ${{ runner.temp }}/CloudMail-iPad-13-inch/*.png
           if-no-files-found: warn
           retention-days: 30
 
@@ -77,5 +291,14 @@ jobs:
         with:
           name: CloudMail-iPad-Screenshot-xcresult
           path: ${{ runner.temp }}/CloudMail-iPad-Screenshots.xcresult
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload xcodebuild log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CloudMail-iPad-Screenshot-build-log
+          path: ${{ runner.temp }}/CloudMail-iPad-Screenshots-xcodebuild.log
           if-no-files-found: warn
           retention-days: 14
