@@ -1,147 +1,606 @@
-name: iPad App Store Screenshots
+name: CloudMail iOS
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - '**/mail-ios/**'
-      - '**/CloudMail.xcodeproj/**'
-      - '**/CloudMailScreenshotUITests/**'
-      - '.github/workflows/ipad-app-store-screenshots.yml'
+    inputs:
+      distribution:
+        description: 'Choose distribution target'
+        required: true
+        default: 'testflight'
+        type: choice
+        options:
+          - testflight
+          - sideload
+          - both
+          - screenshots
+      app_version:
+        description: 'CFBundleShortVersionString, e.g. 1.0.0'
+        required: true
+        default: '1.0.0'
+        type: string
+      build_number:
+        description: 'CFBundleVersion; 01 is normalized to 1; blank = GitHub run number'
+        required: false
+        default: ''
+        type: string
+      release_notes:
+        description: 'Optional notes for the GitHub Sideload prerelease'
+        required: false
+        default: ''
+        type: string
+      signing_bootstrap:
+        description: 'One-time only: allow Match to update'
+        required: false
+        default: false
+        type: boolean
+      generate_ipad_screenshots:
+        description: 'Also generate App Store 13-inch iPad screenshots in parallel'
+        required: false
+        default: false
+        type: boolean
 
+# contents:write is required because sideload/both can publish an IPA release
+# to THIS public workflow repository. The private source repository is only read
+# through TARGET_REPO_PAT.
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: cloudmail-ipad-screenshots-${{ github.ref }}
-  cancel-in-progress: true
+  group: cloudmail-ios-distribution-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  screenshots:
-    name: 13-inch iPad screenshots
-    # The pinned MailCore2 XCFramework has x86_64 for iOS Simulator but not arm64.
-    # Therefore this screenshot job must run on GitHub's Intel macOS runner.
-    runs-on: macos-15-intel
-    timeout-minutes: 45
+  ios:
+    name: Build CloudMail iOS
+    if: ${{ inputs.distribution != 'screenshots' }}
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    env:
+      CLOUDMAIL_APP_VERSION: ${{ inputs.app_version }}
+      CLOUDMAIL_BUILD_NUMBER: ${{ inputs.build_number != '' && inputs.build_number || github.run_number }}
+      DISTRIBUTION: ${{ inputs.distribution }}
 
     steps:
-      - name: Checkout
+      # ----------------------------------------------------------------------
+      # 1. Public workflow repository -> target private source repository
+      # ----------------------------------------------------------------------
+      - name: Checkout Target Private Repository
         uses: actions/checkout@v4
+        with:
+          # 目标私有仓库路径：用户名/仓库名 或 组织名/仓库名
+          repository: 'readori/CloudMail'
+          # 分支名称
+          ref: 'main'
+          # 使用配置了权限的 PAT
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          # 存放路径（点表示直接拉取到当前工作目录）
+          path: './'
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
 
-      - name: Locate CloudMail project
+      - name: Verify private repository checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Private source commit: $(git rev-parse --short HEAD)"
+
+          test -d mail-ios || {
+            echo '::error::Private repository was checked out, but mail-ios/ was not found.'
+            exit 1
+          }
+
+          test -f mail-ios/CloudMail.xcodeproj/project.pbxproj || {
+            echo '::error::mail-ios/CloudMail.xcodeproj was not found.'
+            exit 1
+          }
+
+      # ----------------------------------------------------------------------
+      # 2. Xcode / SDK
+      # ----------------------------------------------------------------------
+      - name: Select Xcode 26+
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+          select_xcode() {
+            local app="$1"
+            if [[ -d "$app/Contents/Developer" ]]; then
+              sudo xcode-select -s "$app/Contents/Developer"
+              echo "Selected Xcode: $app"
+              return 0
+            fi
+            return 1
+          }
+
+          select_xcode /Applications/Xcode_26.6.app || \
+          select_xcode /Applications/Xcode_26.5.app || \
+          select_xcode /Applications/Xcode_26.4.app || \
+          select_xcode /Applications/Xcode_26.3.app || \
+          select_xcode /Applications/Xcode_26.2.app || \
+          select_xcode /Applications/Xcode_26.1.app || \
+          select_xcode /Applications/Xcode_26.app || \
+          select_xcode /Applications/Xcode.app || {
+            echo '::error::No Xcode installation was found on this runner.'
+            ls -1 /Applications | grep '^Xcode' || true
+            exit 1
+          }
+
+          XCODE_VERSION="$(xcodebuild -version | awk 'NR==1 {print $2}')"
+          XCODE_MAJOR="${XCODE_VERSION%%.*}"
+
+          if ! [[ "$XCODE_MAJOR" =~ ^[0-9]+$ ]] || (( XCODE_MAJOR < 26 )); then
+            echo "::error::CloudMail distribution requires Xcode 26+. Selected: $XCODE_VERSION"
+            exit 1
+          fi
+
+          xcodebuild -version
+          echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "Runner architecture: $(uname -m)"
+
+      # ----------------------------------------------------------------------
+      # 3. Validate inputs / secrets
+      # ----------------------------------------------------------------------
+      - name: Validate common inputs and private repository secret
+        shell: bash
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || {
+            echo '::error::Missing Repository secret: TARGET_REPO_PAT'
+            exit 78
+          }
+
+          source mail-ios/scripts/ci_version_utils.sh
+          RAW_BUILD_NUMBER="$CLOUDMAIL_BUILD_NUMBER"
+          if ! NORMALIZED_BUILD_NUMBER="$(normalize_positive_build_number "$RAW_BUILD_NUMBER")"; then
+            echo "::error::build_number must be a positive integer greater than zero: $RAW_BUILD_NUMBER"
+            exit 64
+          fi
+          if [[ "$NORMALIZED_BUILD_NUMBER" != "$RAW_BUILD_NUMBER" ]]; then
+            echo "::notice::Normalized build_number $RAW_BUILD_NUMBER -> $NORMALIZED_BUILD_NUMBER"
+          fi
+          CLOUDMAIL_BUILD_NUMBER="$NORMALIZED_BUILD_NUMBER"
+          echo "CLOUDMAIL_BUILD_NUMBER=$CLOUDMAIL_BUILD_NUMBER" >> "$GITHUB_ENV"
+
+          [[ "$CLOUDMAIL_APP_VERSION" =~ ^[0-9]+([.][0-9]+){1,2}$ ]] || {
+            echo "::error::app_version must look like 1.0 or 1.0.0: $CLOUDMAIL_APP_VERSION"
+            exit 64
+          }
+
+          case "$DISTRIBUTION" in
+            testflight|sideload|both) ;;
+            *)
+              echo "::error::Unsupported distribution: $DISTRIBUTION"
+              exit 64
+              ;;
+          esac
+
+          if [[ '${{ inputs.signing_bootstrap }}' == 'true' && "$DISTRIBUTION" == 'sideload' ]]; then
+            echo '::error::signing_bootstrap only applies to testflight or both.'
+            exit 64
+          fi
+
+          echo "Distribution: $DISTRIBUTION"
+          echo "Version: $CLOUDMAIL_APP_VERSION ($CLOUDMAIL_BUILD_NUMBER)"
+
+      - name: Validate TestFlight Match secrets
+        if: ${{ inputs.distribution == 'testflight' || inputs.distribution == 'both' }}
+        shell: bash
+        env:
+          ASC_APP_ID: ${{ secrets.CFMAIL_ASC_APP_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          APNS_BUNDLE_ID: ${{ secrets.APNS_BUNDLE_ID }}
+          APNS_TEAM_ID: ${{ secrets.APNS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          required=(
+            ASC_APP_ID
+            ASC_ISSUER_ID
+            ASC_KEY_ID
+            ASC_PRIVATE_KEY
+            ASC_TEAM_ID
+            MATCH_PASSWORD
+          )
+
+          missing=0
+          for name in "${required[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing Repository secret required for TestFlight/Match: $name"
+              missing=1
+            fi
+          done
+          (( missing == 0 )) || exit 78
+
+          [[ "$ASC_APP_ID" =~ ^[0-9]+$ ]] || {
+            echo '::error::ASC_APP_ID must be the numeric App Store Connect Apple ID.'
+            exit 64
+          }
+
+          if [[ -n "${APNS_BUNDLE_ID:-}" && "$APNS_BUNDLE_ID" != 'com.readori.mail' ]]; then
+            echo "::error::APNS_BUNDLE_ID must be com.readori.mail, got: $APNS_BUNDLE_ID"
+            exit 78
+          fi
+
+          if [[ -n "${APNS_TEAM_ID:-}" && "$APNS_TEAM_ID" != "$ASC_TEAM_ID" ]]; then
+            echo '::error::APNS_TEAM_ID must match ASC_TEAM_ID.'
+            exit 78
+          fi
+
+      # ----------------------------------------------------------------------
+      # 4. Private project QA / Xcode preflight
+      # ----------------------------------------------------------------------
+      - name: Normalize repository script permissions
+        working-directory: mail-ios
+        shell: bash
+        run: chmod +x scripts/*.sh || true
+
+      - name: Generate CF Mail App Icon
+        working-directory: mail-ios
+        shell: bash
+        run: /bin/bash scripts/generate_cfmail_app_icon.sh
+
+      - name: Static iOS QA
+        working-directory: mail-ios
+        shell: bash
+        run: /bin/bash scripts/phase11_static_qa.sh
+
+      - name: Resolve Swift packages and validate Xcode project
+        working-directory: mail-ios
+        shell: bash
+        run: /bin/bash scripts/ci_xcode_preflight.sh
+
+      # ----------------------------------------------------------------------
+      # 5A. Optional Sideload IPA
+      #     Unsigned IPA; does NOT require Apple distribution signing secrets.
+      # ----------------------------------------------------------------------
+      - name: Build Sideload IPA
+        id: sideload
+        if: ${{ inputs.distribution == 'sideload' || inputs.distribution == 'both' }}
+        working-directory: mail-ios
+        shell: bash
+        run: /bin/bash scripts/ci_build_sideload_ipa.sh
+
+      - name: Verify Sideload IPA
+        if: ${{ inputs.distribution == 'sideload' || inputs.distribution == 'both' }}
+        shell: bash
+        env:
+          IPA_PATH: ${{ steps.sideload.outputs.ipa_path }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${IPA_PATH:-}" || ! -f "$IPA_PATH" ]]; then
+            echo "::error::Sideload IPA was not produced: ${IPA_PATH:-<empty>}"
+            exit 65
+          fi
+          echo "Sideload IPA: $IPA_PATH"
+          ls -lh "$IPA_PATH"
+
+      # Publish the Sideload IPA to the PUBLIC workflow repository, not to the
+      # checked-out private source repository. --repo is intentionally explicit.
+      - name: Publish Sideload IPA to GitHub Release
+        if: ${{ inputs.distribution == 'sideload' || inputs.distribution == 'both' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IPA_PATH: ${{ steps.sideload.outputs.ipa_path }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+          PUBLIC_RELEASE_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          RELEASE_TAG="cloudmail-sideload-v${CLOUDMAIL_APP_VERSION}-b${CLOUDMAIL_BUILD_NUMBER}-run${GITHUB_RUN_NUMBER}"
+          RELEASE_TITLE="CloudMail Sideload v${CLOUDMAIL_APP_VERSION} (${CLOUDMAIL_BUILD_NUMBER})"
+          SOURCE_COMMIT="$(git rev-parse --short HEAD)"
+
+          NOTES_FILE="$RUNNER_TEMP/cloudmail-sideload-release-notes.txt"
+          {
+            echo "CloudMail iOS sideload IPA"
+            echo
+            echo "- Version: \`${CLOUDMAIL_APP_VERSION}\`"
+            echo "- Build: \`${CLOUDMAIL_BUILD_NUMBER}\`"
+            echo "- Private source: \`readori/CloudMail@main\`"
+            echo "- Source commit: \`${SOURCE_COMMIT}\`"
+            echo "- GitHub workflow run: \`${GITHUB_RUN_NUMBER}\`"
+            echo
+            echo '> This is a sideload build and is not an App Store/TestFlight distribution package.'
+            if [[ -n "${RELEASE_NOTES:-}" ]]; then
+              echo
+              echo '## Notes'
+              echo
+              printf '%s\n' "$RELEASE_NOTES"
+            fi
+          } > "$NOTES_FILE"
+
+          gh release create "$RELEASE_TAG" \
+            "$IPA_PATH" \
+            --repo "$PUBLIC_RELEASE_REPO" \
+            --title "$RELEASE_TITLE" \
+            --notes-file "$NOTES_FILE" \
+            --prerelease \
+            --target "$GITHUB_SHA"
+
+          echo "Sideload Release: https://github.com/${PUBLIC_RELEASE_REPO}/releases/tag/${RELEASE_TAG}" >> "$GITHUB_STEP_SUMMARY"
+
+      # ----------------------------------------------------------------------
+      # 5B. Optional TestFlight package — Fastlane Match is the signing source
+      #     of truth. Legacy IOS_PROVISIONING_PROFILE is intentionally not used:
+      #     it can point at another App ID (for example com.readori.app).
+      # ----------------------------------------------------------------------
+      - name: Configure Fastlane Match HTTPS authentication
+        if: ${{ inputs.distribution == 'testflight' || inputs.distribution == 'both' }}
+        shell: bash
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || {
+            echo '::error::Missing Repository secret: TARGET_REPO_PAT'
+            exit 78
+          }
+
+          MATCH_AUTH="$(printf '%s:%s' 'readori' "$TARGET_REPO_PAT" | base64 | tr -d '\n')"
+          echo "::add-mask::$MATCH_AUTH"
+          echo "MATCH_GIT_BASIC_AUTHORIZATION=$MATCH_AUTH" >> "$GITHUB_ENV"
+          echo "MATCH_GIT_URL=https://github.com/readori/readori-certificates.git" >> "$GITHUB_ENV"
+
+          git -c http.extraheader="AUTHORIZATION: basic $MATCH_AUTH" \
+            ls-remote https://github.com/readori/readori-certificates.git HEAD >/dev/null
+          echo 'TARGET_REPO_PAT can read readori/readori-certificates.'
+
+          if [[ '${{ inputs.signing_bootstrap }}' == 'true' ]]; then
+            echo '::notice::Match bootstrap requested. TARGET_REPO_PAT must have Contents: Read and write on readori/readori-certificates.'
+          fi
+
+      - name: Install pinned Fastlane
+        if: ${{ inputs.distribution == 'testflight' || inputs.distribution == 'both' }}
+        working-directory: mail-ios
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle config set path vendor/bundle
+          bundle install --jobs 4 --retry 3
+          bundle exec fastlane --version
+
+      - name: Build and upload TestFlight with Fastlane Match
+        id: testflight
+        if: ${{ inputs.distribution == 'testflight' || inputs.distribution == 'both' }}
+        working-directory: mail-ios
+        shell: bash
+        env:
+          CI: 'true'
+          CLOUDMAIL_BUNDLE_ID: com.readori.mail
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          MATCH_GIT_URL: https://github.com/readori/readori-certificates.git
+          MATCH_GIT_BASIC_AUTHORIZATION: ${{ env.MATCH_GIT_BASIC_AUTHORIZATION }}
+          MATCH_READONLY: ${{ inputs.signing_bootstrap && 'false' || 'true' }}
+          ASC_APP_ID: ${{ secrets.CFMAIL_ASC_APP_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+          APNS_BUNDLE_ID: ${{ secrets.APNS_BUNDLE_ID }}
+          APNS_TEAM_ID: ${{ secrets.APNS_TEAM_ID }}
+          CLOUDMAIL_RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          set -euo pipefail
+          bundle exec fastlane ios testflight
+
+      # ----------------------------------------------------------------------
+      # 6. Summary
+      # ----------------------------------------------------------------------
+      - name: Distribution summary
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          {
+            echo '## CloudMail iOS distribution completed'
+            echo
+            echo "- Mode: \`${DISTRIBUTION}\`"
+            echo "- Version: \`${CLOUDMAIL_APP_VERSION}\`"
+            echo "- Build: \`${CLOUDMAIL_BUILD_NUMBER}\`"
+            echo "- Private source: \`readori/CloudMail@main\`"
+            echo "- Source commit: \`$(git rev-parse --short HEAD)\`"
+            if [[ "$DISTRIBUTION" == 'testflight' || "$DISTRIBUTION" == 'both' ]]; then
+              echo '- TestFlight: upload submitted to App Store Connect.'
+            fi
+            if [[ "$DISTRIBUTION" == 'sideload' || "$DISTRIBUTION" == 'both' ]]; then
+              echo '- Sideload: IPA published as a prerelease in this public GitHub repository.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------------------------------
+  # 7. App Store 13-inch iPad screenshots
+  #
+  # MailCore2 in the private project contains an x86_64 iOS Simulator slice,
+  # but not the arm64 Simulator slice required by macos-15 (Apple Silicon).
+  # Keep the distribution job above on macos-15; only this Simulator job uses
+  # GitHub's Intel runner.
+  # --------------------------------------------------------------------------
+  screenshots:
+    name: Generate 13-inch iPad App Store screenshots
+    if: ${{ inputs.distribution == 'screenshots' || inputs.generate_ipad_screenshots }}
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    permissions:
+      contents: read
+
+    env:
+      RESULT_BUNDLE: ${{ runner.temp }}/CloudMail-iPad-Screenshots.xcresult
+      DERIVED_DATA: ${{ runner.temp }}/CloudMail-iPad-DerivedData
+      EXPORTED_ATTACHMENTS: ${{ runner.temp }}/CloudMail-iPad-Attachments
+      SCREENSHOT_OUTPUT: ${{ runner.temp }}/CloudMail-iPad-13-inch
+      XCODEBUILD_LOG: ${{ runner.temp }}/CloudMail-iPad-Screenshots-xcodebuild.log
+
+    steps:
+      - name: Checkout Target Private Repository for screenshots
+        uses: actions/checkout@v4
+        with:
+          repository: 'readori/CloudMail'
+          ref: 'main'
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: './'
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Verify screenshot source and Intel runner
+        shell: bash
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || {
+            echo '::error::Missing Repository secret: TARGET_REPO_PAT'
+            exit 78
+          }
+
+          echo "Private source commit: $(git rev-parse --short HEAD)"
           echo "Runner architecture: $(uname -m)"
 
           if [[ "$(uname -m)" != "x86_64" ]]; then
-            echo "::error::This workflow requires macos-15-intel. Actual architecture: $(uname -m)"
-            exit 1
+            echo "::error::Screenshot job requires macos-15-intel/x86_64, got: $(uname -m)"
+            exit 65
           fi
 
-          PROJECT_FILE="$(find "$GITHUB_WORKSPACE" \
-            -type f \
-            -path '*/CloudMail.xcodeproj/project.pbxproj' \
-            -not -path '*/DerivedData/*' \
-            -print -quit)"
+          test -f mail-ios/CloudMail.xcodeproj/project.pbxproj || {
+            echo '::error::mail-ios/CloudMail.xcodeproj was not found in readori/CloudMail.'
+            exit 66
+          }
 
-          if [[ -z "$PROJECT_FILE" ]]; then
-            echo "::error::CloudMail.xcodeproj/project.pbxproj was not found in the repository."
-            find "$GITHUB_WORKSPACE" -maxdepth 4 -type f | sort | head -250 || true
-            exit 1
-          fi
+          test -f mail-ios/CloudMailScreenshotUITests/CloudMailScreenshotUITests.swift || {
+            echo '::error::CloudMailScreenshotUITests is missing. Commit the Demo Mode/UI screenshot test project changes first.'
+            exit 66
+          }
 
-          MAIL_IOS_DIR="$(cd "$(dirname "$(dirname "$PROJECT_FILE")")" && pwd)"
-          echo "Resolved iOS project directory: $MAIL_IOS_DIR"
-
-          test -d "$MAIL_IOS_DIR/CloudMail.xcodeproj"
-
-          echo "MAIL_IOS_DIR=$MAIL_IOS_DIR" >> "$GITHUB_ENV"
-          echo "RESULT_BUNDLE=$RUNNER_TEMP/CloudMail-iPad-Screenshots.xcresult" >> "$GITHUB_ENV"
-          echo "DERIVED_DATA=$RUNNER_TEMP/CloudMail-iPad-DerivedData" >> "$GITHUB_ENV"
-          echo "EXPORTED_ATTACHMENTS=$RUNNER_TEMP/CloudMail-iPad-Attachments" >> "$GITHUB_ENV"
-          echo "SCREENSHOT_OUTPUT=$RUNNER_TEMP/CloudMail-iPad-13-inch" >> "$GITHUB_ENV"
-          echo "XCODEBUILD_LOG=$RUNNER_TEMP/CloudMail-iPad-Screenshots-xcodebuild.log" >> "$GITHUB_ENV"
-
-      - name: Select Xcode 16.4
+      - name: Select Xcode 26 on Intel
         shell: bash
         run: |
           set -euo pipefail
 
-          XCODE_PATH="/Applications/Xcode_16.4.app/Contents/Developer"
-          if [[ ! -d "$XCODE_PATH" ]]; then
-            echo "::error::Xcode 16.4 was not found on this runner."
+          select_xcode() {
+            local app="$1"
+            if [[ -d "$app/Contents/Developer" ]]; then
+              sudo xcode-select -s "$app/Contents/Developer"
+              echo "Selected Xcode: $app"
+              return 0
+            fi
+            return 1
+          }
+
+          # macos-15-intel currently carries Xcode 26.x. Prefer the newest
+          # installed version but stay on Xcode 26 because CloudMail requires it.
+          select_xcode /Applications/Xcode_26.6.app || \
+          select_xcode /Applications/Xcode_26.5.app || \
+          select_xcode /Applications/Xcode_26.4.app || \
+          select_xcode /Applications/Xcode_26.3.app || \
+          select_xcode /Applications/Xcode_26.2.app || \
+          select_xcode /Applications/Xcode_26.1.1.app || \
+          select_xcode /Applications/Xcode_26.1.app || \
+          select_xcode /Applications/Xcode_26.0.1.app || \
+          select_xcode /Applications/Xcode_26.app || {
+            echo '::error::No Xcode 26 installation was found on macos-15-intel.'
             ls -1 /Applications | grep '^Xcode' || true
             exit 1
+          }
+
+          XCODE_VERSION="$(xcodebuild -version | awk 'NR==1 {print $2}')"
+          XCODE_MAJOR="${XCODE_VERSION%%.*}"
+          if ! [[ "$XCODE_MAJOR" =~ ^[0-9]+$ ]] || (( XCODE_MAJOR != 26 )); then
+            echo "::error::Screenshot job requires Xcode 26.x, selected: $XCODE_VERSION"
+            exit 1
           fi
 
-          sudo xcode-select -s "$XCODE_PATH"
           xcodebuild -version
+          echo "Simulator SDK: $(xcrun --sdk iphonesimulator --show-sdk-version)"
           xcrun simctl list runtimes
 
-      - name: Generate app icon assets
+      - name: Prepare CloudMail screenshot project
+        working-directory: mail-ios
         shell: bash
         run: |
           set -euo pipefail
-          cd "$MAIL_IOS_DIR"
 
-          # Do not use a hard-coded GitHub repository path.
+          chmod +x scripts/*.sh || true
+
           if [[ -f scripts/generate_cfmail_app_icon.sh ]]; then
             /bin/bash scripts/generate_cfmail_app_icon.sh
-          else
-            echo "generate_cfmail_app_icon.sh not present; continuing with committed assets."
           fi
 
-      - name: Boot 13-inch iPad and run screenshot UI test
+          # Resolve SwiftPM under the Intel/Xcode-26 environment before the UI
+          # test so package errors are separated from simulator/test failures.
+          xcodebuild -resolvePackageDependencies \
+            -project CloudMail.xcodeproj \
+            -scheme CloudMail
+
+      - name: Create 13-inch iPad Simulator
+        id: simulator
         shell: bash
         run: |
           set -euo pipefail
-          cd "$MAIL_IOS_DIR"
-
-          rm -rf "$RESULT_BUNDLE" "$DERIVED_DATA" "$EXPORTED_ATTACHMENTS" "$SCREENSHOT_OUTPUT"
-          mkdir -p "$EXPORTED_ATTACHMENTS" "$SCREENSHOT_OUTPUT"
 
           DEVICE_TYPE_ID="$(xcrun simctl list devicetypes -j | python3 -c '
           import json, sys
           items = json.load(sys.stdin)["devicetypes"]
-          preferred = [x for x in items if x["name"] == "iPad Pro 13-inch (M4)"]
-          if not preferred:
-              preferred = [x for x in items if x["name"].startswith("iPad Pro 13-inch")]
-          if not preferred:
-              raise SystemExit("No 13-inch iPad Pro Simulator device type is installed")
-          print(preferred[0]["identifier"])
+          names = [
+              "iPad Pro 13-inch (M4)",
+              "iPad Pro 13-inch (M5)",
+          ]
+          for name in names:
+              for item in items:
+                  if item.get("name") == name:
+                      print(item["identifier"])
+                      raise SystemExit(0)
+          for item in items:
+              if item.get("name", "").startswith("iPad Pro 13-inch"):
+                  print(item["identifier"])
+                  raise SystemExit(0)
+          raise SystemExit("No iPad Pro 13-inch Simulator device type is installed")
           ')"
 
           RUNTIME_ID="$(xcrun simctl list runtimes -j | python3 -c '
-          import json, sys
-          items = [x for x in json.load(sys.stdin)["runtimes"] if x.get("isAvailable", False)]
-          preferred = [x for x in items if x.get("identifier") == "com.apple.CoreSimulator.SimRuntime.iOS-18-5"]
-          if not preferred:
-              preferred = [x for x in items if x.get("identifier", "").startswith("com.apple.CoreSimulator.SimRuntime.iOS-18-")]
-          if not preferred:
-              raise SystemExit("No iOS 18 Simulator runtime is installed")
+          import json, re, sys
+          items = [
+              x for x in json.load(sys.stdin)["runtimes"]
+              if x.get("isAvailable", False)
+              and x.get("identifier", "").startswith("com.apple.CoreSimulator.SimRuntime.iOS-")
+          ]
+          if not items:
+              raise SystemExit("No available iOS Simulator runtime is installed")
+
           def version_tuple(item):
-              return tuple(int(p) for p in item.get("version", "0").split(".") if p.isdigit())
-          preferred.sort(key=version_tuple, reverse=True)
-          print(preferred[0]["identifier"])
+              raw = item.get("version", "0")
+              return tuple(int(x) for x in re.findall(r"\d+", raw))
+
+          # Xcode 26 on the current Intel image has iOS 26.x runtimes.
+          ios26 = [x for x in items if version_tuple(x) and version_tuple(x)[0] == 26]
+          candidates = ios26 or items
+          candidates.sort(key=version_tuple, reverse=True)
+          print(candidates[0]["identifier"])
           ')"
 
-          SIMULATOR_NAME="CloudMail App Store Screenshot iPad"
+          SIMULATOR_NAME="CloudMail App Store Screenshot iPad ${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           UDID="$(xcrun simctl create "$SIMULATOR_NAME" "$DEVICE_TYPE_ID" "$RUNTIME_ID")"
+
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
           echo "SIMULATOR_UDID=$UDID" >> "$GITHUB_ENV"
 
-          cleanup() {
-            xcrun simctl shutdown "$UDID" >/dev/null 2>&1 || true
-            xcrun simctl delete "$UDID" >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
+          echo "Simulator UDID: $UDID"
+          echo "Device type: $DEVICE_TYPE_ID"
+          echo "Runtime: $RUNTIME_ID"
 
           xcrun simctl boot "$UDID"
           xcrun simctl bootstatus "$UDID" -b
+
           xcrun simctl ui "$UDID" appearance light || true
           xcrun simctl status_bar "$UDID" override \
             --time '9:41' \
@@ -150,11 +609,19 @@ jobs:
             --wifiBars 3 \
             --cellularBars 4 >/dev/null 2>&1 || true
 
-          echo "Simulator UDID: $UDID"
-          echo "Device type: $DEVICE_TYPE_ID"
-          echo "Runtime: $RUNTIME_ID"
-          echo "Host architecture: $(uname -m)"
-          echo "Forcing iOS Simulator architecture: x86_64"
+      - name: Run Demo Mode screenshot UI tests
+        working-directory: mail-ios
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf \
+            "$RESULT_BUNDLE" \
+            "$DERIVED_DATA" \
+            "$EXPORTED_ATTACHMENTS" \
+            "$SCREENSHOT_OUTPUT"
+
+          mkdir -p "$EXPORTED_ATTACHMENTS" "$SCREENSHOT_OUTPUT"
 
           BUILD_ARCH_ARGS=(
             "ARCHS=x86_64"
@@ -162,12 +629,16 @@ jobs:
             "EXCLUDED_ARCHS[sdk=iphonesimulator*]=arm64"
           )
 
-          # Diagnostic output: verify Xcode resolves the app/test build as x86_64.
+          echo "Host architecture: $(uname -m)"
+          echo "Forcing iOS Simulator architecture: x86_64"
+
+          # Print the resolved architecture before the real test. If MailCore2
+          # ever changes, this makes architecture regressions obvious in logs.
           arch -x86_64 xcodebuild -showBuildSettings \
             -project CloudMail.xcodeproj \
             -scheme CloudMail \
             -configuration Debug \
-            -destination "platform=iOS Simulator,id=$UDID" \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
             "${BUILD_ARCH_ARGS[@]}" \
             | grep -E '^[[:space:]]+(ARCHS|CURRENT_ARCH|NATIVE_ARCH|NATIVE_ARCH_ACTUAL|ONLY_ACTIVE_ARCH|EXCLUDED_ARCHS) =' \
             || true
@@ -177,21 +648,23 @@ jobs:
             -project CloudMail.xcodeproj \
             -scheme CloudMail \
             -configuration Debug \
-            -destination "platform=iOS Simulator,id=$UDID" \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
             -derivedDataPath "$DERIVED_DATA" \
             -resultBundlePath "$RESULT_BUNDLE" \
+            -parallel-testing-enabled NO \
             -only-testing:CloudMailScreenshotUITests/CloudMailScreenshotUITests/testGenerateAppStoreScreenshots \
             "${BUILD_ARCH_ARGS[@]}" \
             2>&1 | tee "$XCODEBUILD_LOG"
+
           XCODE_STATUS=${PIPESTATUS[0]}
           set -e
 
           if [[ $XCODE_STATUS -ne 0 ]]; then
-            echo "::error::xcodebuild screenshot UI test failed with exit code $XCODE_STATUS"
+            echo "::error::Screenshot UI test failed with xcodebuild exit code $XCODE_STATUS"
             exit "$XCODE_STATUS"
           fi
 
-      - name: Export and normalize screenshots
+      - name: Export and validate App Store screenshots
         shell: bash
         run: |
           set -euo pipefail
@@ -225,18 +698,27 @@ jobs:
           def token(value: str) -> str:
               return re.sub(r"[^a-z0-9]+", "", value.lower())
 
-          pngs = sorted(p for p in source.rglob("*") if p.is_file() and p.suffix.lower() == ".png")
+          pngs = sorted(
+              p for p in source.rglob("*")
+              if p.is_file() and p.suffix.lower() == ".png"
+          )
+
           if not pngs:
-              raise SystemExit(f"No PNG screenshot attachments found under {source}")
+              raise SystemExit(f"No PNG attachments were exported from {source}")
 
           used = set()
           missing = []
+
           for name in expected:
               key = token(name)
-              matches = [p for p in pngs if p not in used and key in token(p.stem)]
+              matches = [
+                  p for p in pngs
+                  if p not in used and key in token(p.stem)
+              ]
               if not matches:
                   missing.append(name)
                   continue
+
               chosen = matches[0]
               used.add(chosen)
               target = output / f"{name}.png"
@@ -244,61 +726,68 @@ jobs:
               print(f"{chosen} -> {target}")
 
           if missing:
-              print("Missing screenshots: " + ", ".join(missing), file=sys.stderr)
-              print("Available exported PNGs:", file=sys.stderr)
-              for p in pngs:
-                  print(f"  - {p}", file=sys.stderr)
+              print(
+                  "Missing named screenshot attachments: " + ", ".join(missing),
+                  file=sys.stderr,
+              )
+              print("Exported PNG files:", file=sys.stderr)
+              for item in pngs:
+                  print(f"  - {item}", file=sys.stderr)
               raise SystemExit(3)
           PY
 
-          expected_width=2064
-          expected_height=2752
-          count=0
+          EXPECTED_WIDTH=2064
+          EXPECTED_HEIGHT=2752
+          COUNT=0
 
           for image in "$SCREENSHOT_OUTPUT"/*.png; do
-            width="$(sips -g pixelWidth "$image" | awk '/pixelWidth/{print $2}')"
-            height="$(sips -g pixelHeight "$image" | awk '/pixelHeight/{print $2}')"
+            WIDTH="$(sips -g pixelWidth "$image" | awk '/pixelWidth/{print $2}')"
+            HEIGHT="$(sips -g pixelHeight "$image" | awk '/pixelHeight/{print $2}')"
 
-            if [[ "$width" != "$expected_width" || "$height" != "$expected_height" ]]; then
-              echo "::error file=$image::Expected ${expected_width}x${expected_height}, got ${width}x${height}."
+            if [[ "$WIDTH" != "$EXPECTED_WIDTH" || "$HEIGHT" != "$EXPECTED_HEIGHT" ]]; then
+              echo "::error file=$image::Expected ${EXPECTED_WIDTH}x${EXPECTED_HEIGHT}, got ${WIDTH}x${HEIGHT}."
               exit 1
             fi
 
-            echo "Validated $(basename "$image"): ${width}x${height}"
-            count=$((count + 1))
+            echo "Validated $(basename "$image"): ${WIDTH}x${HEIGHT}"
+            COUNT=$((COUNT + 1))
           done
 
-          if [[ $count -ne 6 ]]; then
-            echo "::error::Expected 6 App Store screenshots, found $count."
+          if [[ "$COUNT" -ne 6 ]]; then
+            echo "::error::Expected 6 screenshots, found $COUNT."
             exit 1
           fi
 
-          echo "Generated screenshots:"
-          find "$SCREENSHOT_OUTPUT" -maxdepth 1 -type f -name '*.png' -print | sort
+          ls -lh "$SCREENSHOT_OUTPUT"/*.png
 
-      - name: Upload 13-inch iPad PNGs
-        if: always()
+      - name: Upload 13-inch iPad App Store PNGs
         uses: actions/upload-artifact@v4
         with:
           name: CloudMail-iPad-13-inch-App-Store-Screenshots
           path: ${{ runner.temp }}/CloudMail-iPad-13-inch/*.png
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
 
-      - name: Upload screenshot test result
+      - name: Cleanup Simulator
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: CloudMail-iPad-Screenshot-xcresult
-          path: ${{ runner.temp }}/CloudMail-iPad-Screenshots.xcresult
-          if-no-files-found: warn
-          retention-days: 14
+        shell: bash
+        run: |
+          if [[ -n "${SIMULATOR_UDID:-}" ]]; then
+            xcrun simctl shutdown "$SIMULATOR_UDID" >/dev/null 2>&1 || true
+            xcrun simctl delete "$SIMULATOR_UDID" >/dev/null 2>&1 || true
+          fi
 
-      - name: Upload xcodebuild log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: CloudMail-iPad-Screenshot-build-log
-          path: ${{ runner.temp }}/CloudMail-iPad-Screenshots-xcodebuild.log
-          if-no-files-found: warn
-          retention-days: 14
+      - name: Screenshot summary
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          {
+            echo '## CloudMail 13-inch iPad screenshots completed'
+            echo
+            echo '- Private source: `readori/CloudMail@main`'
+            echo "- Source commit: \`$(git rev-parse --short HEAD)\`"
+            echo '- Simulator architecture: `x86_64`'
+            echo '- Artifact: `CloudMail-iPad-13-inch-App-Store-Screenshots`'
+            echo '- Expected size: `2064 × 2752 px`'
+          } >> "$GITHUB_STEP_SUMMARY"
+
