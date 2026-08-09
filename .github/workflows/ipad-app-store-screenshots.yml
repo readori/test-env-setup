@@ -1,0 +1,81 @@
+name: iPad App Store Screenshots
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'mail-ios/**'
+      - '.github/workflows/ipad-app-store-screenshots.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudmail-ipad-screenshots-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  screenshots:
+    name: 13-inch iPad screenshots
+    # Important: CloudMail's pinned MailCore2 package has an x86_64 Simulator slice but not
+    # an arm64 Simulator slice. GitHub exposes macos-15-intel as the Intel hosted runner.
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 16.4
+        shell: bash
+        run: |
+          set -euo pipefail
+          XCODE_PATH="/Applications/Xcode_16.4.app/Contents/Developer"
+          if [[ ! -d "$XCODE_PATH" ]]; then
+            echo "::error::Xcode 16.4 is required for the screenshot runner but was not found."
+            ls -1 /Applications | grep '^Xcode' || true
+            exit 1
+          fi
+          sudo xcode-select -s "$XCODE_PATH"
+          xcodebuild -version
+          echo "Runner architecture: $(uname -m)"
+
+      - name: Generate app icon assets
+        working-directory: mail-ios
+        shell: bash
+        run: /bin/bash scripts/generate_cfmail_app_icon.sh
+
+      - name: Validate screenshot automation contract
+        working-directory: mail-ios
+        shell: bash
+        run: python3 scripts/test_demo_screenshot_contract.py
+
+      - name: Generate 13-inch iPad screenshots
+        working-directory: mail-ios
+        shell: bash
+        env:
+          SCREENSHOT_RESULT_BUNDLE: ${{ runner.temp }}/CloudMail-iPad-Screenshots.xcresult
+          SCREENSHOT_EXPORTED_ATTACHMENTS: ${{ runner.temp }}/CloudMail-iPad-Attachments
+          SCREENSHOT_OUTPUT_DIR: ${{ github.workspace }}/mail-ios/AppStoreScreenshots/iPad-13-inch
+          SCREENSHOT_DERIVED_DATA: ${{ runner.temp }}/CloudMail-iPad-DerivedData
+        run: /bin/bash scripts/ci_ipad_screenshots.sh
+
+      - name: Upload 13-inch iPad PNGs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CloudMail-iPad-13-inch-App-Store-Screenshots
+          path: mail-ios/AppStoreScreenshots/iPad-13-inch/*.png
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload screenshot test result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CloudMail-iPad-Screenshot-xcresult
+          path: ${{ runner.temp }}/CloudMail-iPad-Screenshots.xcresult
+          if-no-files-found: warn
+          retention-days: 14
