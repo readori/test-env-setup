@@ -434,11 +434,11 @@ jobs:
       contents: read
 
     env:
-      RESULT_BUNDLE: ${{ runner.temp }}/CloudMail-iPad-Screenshots.xcresult
-      DERIVED_DATA: ${{ runner.temp }}/CloudMail-iPad-DerivedData
-      EXPORTED_ATTACHMENTS: ${{ runner.temp }}/CloudMail-iPad-Attachments
-      SCREENSHOT_OUTPUT: ${{ runner.temp }}/CloudMail-iPad-13-inch
-      XCODEBUILD_LOG: ${{ runner.temp }}/CloudMail-iPad-Screenshots-xcodebuild.log
+      RESULT_BUNDLE: /tmp/CloudMail-iPad-Screenshots.xcresult
+      DERIVED_DATA: /tmp/CloudMail-iPad-DerivedData
+      EXPORTED_ATTACHMENTS: /tmp/CloudMail-iPad-Attachments
+      SCREENSHOT_OUTPUT: /tmp/CloudMail-iPad-13-inch
+      XCODEBUILD_LOG: /tmp/CloudMail-iPad-Screenshots-xcodebuild.log
 
     steps:
       - name: Checkout Target Private Repository for screenshots
@@ -764,7 +764,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: CloudMail-iPad-13-inch-App-Store-Screenshots
-          path: ${{ runner.temp }}/CloudMail-iPad-13-inch/*.png
+          path: /tmp/CloudMail-iPad-13-inch/*.png
           if-no-files-found: error
           retention-days: 30
 
