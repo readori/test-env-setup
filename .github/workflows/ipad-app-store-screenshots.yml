@@ -677,6 +677,7 @@ jobs:
             --output-path "$EXPORTED_ATTACHMENTS"
 
           python3 - "$EXPORTED_ATTACHMENTS" "$SCREENSHOT_OUTPUT" <<'PY'
+          import json
           import re
           import shutil
           import sys
@@ -698,42 +699,91 @@ jobs:
           def token(value: str) -> str:
               return re.sub(r"[^a-z0-9]+", "", value.lower())
 
-          pngs = sorted(
-              p for p in source.rglob("*")
-              if p.is_file() and p.suffix.lower() == ".png"
-          )
+          manifest_path = source / "manifest.json"
+          if not manifest_path.is_file():
+              raise SystemExit(
+                  f"xcresulttool exported attachments but manifest.json is missing: {manifest_path}"
+              )
 
-          if not pngs:
-              raise SystemExit(f"No PNG attachments were exported from {source}")
+          with manifest_path.open("r", encoding="utf-8") as fh:
+              manifest = json.load(fh)
 
-          used = set()
-          missing = []
+          # Xcode 26 exports attachment payloads with UUID filenames. The names
+          # assigned by XCTAttachment (01_Inbox, 02_Message_Detail, ...) live in
+          # manifest.json as suggestedHumanReadableName, while exportedFileName
+          # points at the real UUID-named file on disk.
+          mappings = []
+          for test_entry in manifest if isinstance(manifest, list) else []:
+              if not isinstance(test_entry, dict):
+                  continue
+              for attachment in test_entry.get("attachments", []):
+                  if not isinstance(attachment, dict):
+                      continue
 
-          for name in expected:
-              key = token(name)
-              matches = [
-                  p for p in pngs
-                  if p not in used and key in token(p.stem)
+                  exported_name = str(attachment.get("exportedFileName", "")).strip()
+                  suggested_name = str(
+                      attachment.get("suggestedHumanReadableName", "")
+                  ).strip()
+
+                  if not exported_name or not suggested_name:
+                      continue
+
+                  exported_path = source / exported_name
+                  if not exported_path.is_file():
+                      print(
+                          f"Warning: manifest references missing attachment: "
+                          f"{exported_name} ({suggested_name})",
+                          file=sys.stderr,
+                      )
+                      continue
+
+                  if exported_path.suffix.lower() != ".png":
+                      continue
+
+                  mappings.append((suggested_name, exported_path))
+
+          if not mappings:
+              raise SystemExit(
+                  f"No PNG attachment mappings were found in {manifest_path}"
+              )
+
+          print("Attachment mappings from manifest.json:")
+          for suggested_name, exported_path in mappings:
+              print(f"  {suggested_name} -> {exported_path.name}")
+
+          copied = {}
+          for expected_name in expected:
+              key = token(expected_name)
+              candidates = [
+                  (suggested_name, exported_path)
+                  for suggested_name, exported_path in mappings
+                  if key in token(suggested_name)
               ]
-              if not matches:
-                  missing.append(name)
+
+              if not candidates:
                   continue
 
-              chosen = matches[0]
-              used.add(chosen)
-              target = output / f"{name}.png"
-              shutil.copy2(chosen, target)
-              print(f"{chosen} -> {target}")
+              # There should be one screenshot for each deterministic name. If
+              # retries ever create duplicates, prefer the last manifest entry.
+              suggested_name, exported_path = candidates[-1]
+              target = output / f"{expected_name}.png"
+              shutil.copy2(exported_path, target)
+              copied[expected_name] = target
+              print(f"Copied {suggested_name} -> {target.name}")
 
+          missing = [name for name in expected if name not in copied]
           if missing:
               print(
-                  "Missing named screenshot attachments: " + ", ".join(missing),
+                  "Missing screenshots after manifest mapping: "
+                  + ", ".join(missing),
                   file=sys.stderr,
               )
-              print("Exported PNG files:", file=sys.stderr)
-              for item in pngs:
-                  print(f"  - {item}", file=sys.stderr)
+              print("Suggested PNG attachment names:", file=sys.stderr)
+              for suggested_name, _ in mappings:
+                  print(f"  - {suggested_name}", file=sys.stderr)
               raise SystemExit(3)
+
+          print(f"Successfully mapped all {len(copied)} App Store screenshots.")
           PY
 
           EXPECTED_WIDTH=2064
