@@ -36,7 +36,7 @@ on:
         default: false
         type: boolean
       auto_repair_signing:
-        description: 'Automatically repair a stale App Store provisioning profile once when App Attest/APNs entitlements changed'
+        description: 'Automatically repair a stale App Store provisioning profile once when APNs/signing entitlements changed'
         required: false
         default: true
         type: boolean
@@ -415,8 +415,8 @@ jobs:
           APP_ATTEST="$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.devicecheck.appattest-environment' "$RELEASE_ENTITLEMENTS" 2>/dev/null || true)"
           APNS_ENV="$(/usr/libexec/PlistBuddy -c 'Print :aps-environment' "$RELEASE_ENTITLEMENTS" 2>/dev/null || true)"
 
-          [[ "$APP_ATTEST" == 'production' ]] || {
-            echo "::error::Release entitlement com.apple.developer.devicecheck.appattest-environment must be production; got: ${APP_ATTEST:-missing}"
+          [[ -z "$APP_ATTEST" ]] || {
+            echo "::error::Release App Attest environment entitlement must be omitted for TestFlight/App Store signing; got: $APP_ATTEST"
             exit 65
           }
           [[ "$APNS_ENV" == 'production' ]] || {
@@ -424,10 +424,11 @@ jobs:
             exit 65
           }
 
-          # The public distribution repository owns provisioning-profile
-          # validation/repair. Do not couple this workflow to private Fastfile
-          # implementation details or a specific private-repository revision.
-          echo 'Private release entitlements: App Attest=production, APNs=production.'
+          # App Attest Environment is intentionally omitted. Apple uses sandbox
+          # when the environment entitlement is absent during development, and
+          # TestFlight/App Store distributions use production regardless of this
+          # entitlement. APNs remains provisioning-profile authorized.
+          echo 'Private release entitlements: App Attest environment omitted, APNs=production.'
 
       - name: Install pinned Fastlane
         if: ${{ inputs.distribution == 'testflight' || inputs.distribution == 'both' || inputs.distribution == 'archive' }}
@@ -530,7 +531,7 @@ jobs:
               attest="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.devicecheck.appattest-environment' "$plist" 2>/dev/null || true)"
               apns="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:aps-environment' "$plist" 2>/dev/null || true)"
 
-              if [[ "$attest" == 'production' && "$apns" == 'production' ]]; then
+              if [[ "$apns" == 'production' ]]; then
                 valid_path="$profile"
                 echo "VALID|$name|$attest|$apns|$profile"
                 return 0
@@ -562,14 +563,14 @@ jobs:
             case "$kind" in
               VALID)
                 echo "Provisioning profile verified: ${name:-unknown}"
-                echo "  App Attest: $attest"
+                echo "  App Attest profile entry: ${attest:-absent (allowed)}"
                 echo "  APNs: $apns"
                 echo "  Path: $path"
                 return 0
                 ;;
               STALE)
                 echo "::warning::Installed App Store profile is stale: ${name:-unknown}"
-                echo "::warning::App Attest=${attest:-missing}, APNs=${apns:-missing}"
+                echo "::warning::APNs=${apns:-missing}; App Attest profile entry=${attest:-absent (allowed)}"
                 return 1
                 ;;
               *)
@@ -613,12 +614,12 @@ jobs:
           run_match false true
 
           if ! verify_or_report; then
-            echo '::error::A fresh App Store profile still lacks App Attest=production and/or APNs=production.'
-            echo '::error::Confirm App Attest and Push Notifications are enabled for Apple Developer App ID com.readori.mail, then rerun.'
+            echo '::error::A fresh App Store profile still lacks APNs=production.'
+            echo '::error::Confirm Push Notifications are enabled for Apple Developer App ID com.readori.mail, then rerun.'
             exit 65
           fi
 
-          echo 'Provisioning profile repaired and verified before CloudMail Archive/TestFlight.'
+          echo 'Provisioning profile APNs signing repaired and verified before CloudMail Archive/TestFlight.'
 
       - name: Build signed Archive / upload TestFlight with Fastlane Match
         id: appstore
