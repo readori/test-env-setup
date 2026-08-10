@@ -393,7 +393,7 @@ jobs:
             echo 'Match repository write permission dry-run: PASS'
           fi
 
-      - name: Verify App Attest and Match profile-refresh contract
+      - name: Verify release entitlements from private source
         if: ${{ inputs.distribution == 'testflight' || inputs.distribution == 'both' || inputs.distribution == 'archive' }}
         working-directory: mail-ios
         shell: bash
@@ -424,28 +424,10 @@ jobs:
             exit 65
           }
 
-          grep -q 'validate_match_profile_entitlements!' "$FASTFILE" || {
-            echo '::error::Private source Fastfile is too old: provisioning-profile entitlement validation is missing. Update readori/CloudMail main to r6 or newer.'
-            exit 65
-          }
-          grep -q 'run_cloudmail_match' "$FASTFILE" || {
-            echo '::error::Private source Fastfile is too old: stale-profile self-repair is missing. Update readori/CloudMail main to r7 or newer.'
-            exit 65
-          }
-          grep -q 'MATCH_AUTO_REPAIR_STALE_PROFILE' "$FASTFILE" || {
-            echo '::error::Private source Fastfile is too old: MATCH_AUTO_REPAIR_STALE_PROFILE support is missing. Update readori/CloudMail main to r7 or newer.'
-            exit 65
-          }
-          grep -q 'force: true' "$FASTFILE" || {
-            echo '::error::Private source Fastfile is too old: provisioning-profile force refresh is missing. Update readori/CloudMail main to r7 or newer.'
-            exit 65
-          }
-
-          if [[ -f scripts/test_app_attest_contract.py ]]; then
-            python3 scripts/test_app_attest_contract.py
-          fi
-
-          echo 'Release signing source contract: App Attest=production, APNs=production, Match refresh/validation present.'
+          # The public distribution repository owns provisioning-profile
+          # validation/repair. Do not couple this workflow to private Fastfile
+          # implementation details or a specific private-repository revision.
+          echo 'Private release entitlements: App Attest=production, APNs=production.'
 
       - name: Install pinned Fastlane
         if: ${{ inputs.distribution == 'testflight' || inputs.distribution == 'both' || inputs.distribution == 'archive' }}
@@ -456,6 +438,187 @@ jobs:
           bundle config set path vendor/bundle
           bundle install --jobs 4 --retry 3
           bundle exec fastlane --version
+
+      - name: Preflight and repair App Store provisioning profile
+        if: ${{ inputs.distribution == 'testflight' || inputs.distribution == 'both' || inputs.distribution == 'archive' }}
+        working-directory: mail-ios
+        shell: bash
+        env:
+          CLOUDMAIL_BUNDLE_ID: com.readori.mail
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          MATCH_GIT_URL: https://github.com/readori/readori-certificates.git
+          MATCH_GIT_BASIC_AUTHORIZATION: ${{ env.MATCH_GIT_BASIC_AUTHORIZATION }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+          SIGNING_BOOTSTRAP: ${{ inputs.signing_bootstrap && 'true' || 'false' }}
+          AUTO_REPAIR_SIGNING: ${{ inputs.auto_repair_signing && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+
+          API_KEY_JSON="$RUNNER_TEMP/cloudmail-asc-api-key.json"
+          PROFILE_SCAN_DIR="$RUNNER_TEMP/cloudmail-profile-scan"
+          mkdir -p "$PROFILE_SCAN_DIR"
+          trap 'rm -f "$API_KEY_JSON"; rm -rf "$PROFILE_SCAN_DIR"' EXIT
+
+          python3 - "$API_KEY_JSON" <<'PY'
+          import json
+          import os
+          import sys
+
+          path = sys.argv[1]
+          payload = {
+              "key_id": os.environ["ASC_KEY_ID"],
+              "issuer_id": os.environ["ASC_ISSUER_ID"],
+              "key": os.environ["ASC_PRIVATE_KEY"],
+              "in_house": False,
+          }
+          with open(path, "w", encoding="utf-8") as fh:
+              json.dump(payload, fh)
+          PY
+          chmod 600 "$API_KEY_JSON"
+
+          run_match() {
+            local readonly="$1"
+            local force="$2"
+            local args=(
+              bundle exec fastlane match appstore
+              --app_identifier "$CLOUDMAIL_BUNDLE_ID"
+              --git_url "$MATCH_GIT_URL"
+              --git_basic_authorization "$MATCH_GIT_BASIC_AUTHORIZATION"
+              --team_id "$ASC_TEAM_ID"
+              --api_key_path "$API_KEY_JSON"
+              --shallow_clone true
+              --clone_branch_directly false
+              --readonly "$readonly"
+            )
+            if [[ "$force" == 'true' ]]; then
+              args+=(--force true)
+            fi
+
+            echo "Running Match: readonly=$readonly force=$force"
+            "${args[@]}"
+          }
+
+          profile_status() {
+            local valid_path=''
+            local stale_path=''
+            local stale_name=''
+            local stale_attest=''
+            local stale_apns=''
+            local profile plist app_id name attest apns
+
+            shopt -s nullglob
+            local candidates=(
+              "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/"*.mobileprovision
+              "$HOME/Library/MobileDevice/Provisioning Profiles/"*.mobileprovision
+            )
+            shopt -u nullglob
+
+            for profile in "${candidates[@]}"; do
+              [[ -f "$profile" ]] || continue
+              plist="$PROFILE_SCAN_DIR/$(basename "$profile").plist"
+              if ! /usr/bin/security cms -D -i "$profile" > "$plist" 2>/dev/null; then
+                continue
+              fi
+
+              app_id="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$plist" 2>/dev/null || true)"
+              [[ "$app_id" == *".$CLOUDMAIL_BUNDLE_ID" ]] || continue
+
+              name="$(/usr/libexec/PlistBuddy -c 'Print :Name' "$plist" 2>/dev/null || true)"
+              attest="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.devicecheck.appattest-environment' "$plist" 2>/dev/null || true)"
+              apns="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:aps-environment' "$plist" 2>/dev/null || true)"
+
+              if [[ "$attest" == 'production' && "$apns" == 'production' ]]; then
+                valid_path="$profile"
+                echo "VALID|$name|$attest|$apns|$profile"
+                return 0
+              fi
+
+              stale_path="$profile"
+              stale_name="$name"
+              stale_attest="$attest"
+              stale_apns="$apns"
+            done
+
+            if [[ -n "$stale_path" ]]; then
+              echo "STALE|$stale_name|${stale_attest:-missing}|${stale_apns:-missing}|$stale_path"
+              return 1
+            fi
+
+            echo 'MISSING||||'
+            return 2
+          }
+
+          verify_or_report() {
+            local status
+            set +e
+            status="$(profile_status)"
+            local rc=$?
+            set -e
+
+            IFS='|' read -r kind name attest apns path <<< "$status"
+            case "$kind" in
+              VALID)
+                echo "Provisioning profile verified: ${name:-unknown}"
+                echo "  App Attest: $attest"
+                echo "  APNs: $apns"
+                echo "  Path: $path"
+                return 0
+                ;;
+              STALE)
+                echo "::warning::Installed App Store profile is stale: ${name:-unknown}"
+                echo "::warning::App Attest=${attest:-missing}, APNs=${apns:-missing}"
+                return 1
+                ;;
+              *)
+                echo '::warning::No installed App Store provisioning profile for com.readori.mail was located.'
+                return 1
+                ;;
+            esac
+          }
+
+          # First install the existing Match assets read-only. This is the normal
+          # path and does not mutate the certificates repository.
+          run_match true false
+
+          if verify_or_report; then
+            echo 'Existing Match App Store profile is compatible with CloudMail release entitlements.'
+            exit 0
+          fi
+
+          if [[ "$SIGNING_BOOTSTRAP" != 'true' && "$AUTO_REPAIR_SIGNING" != 'true' ]]; then
+            echo '::error::Provisioning profile is stale and automatic repair is disabled.'
+            echo '::error::Rerun with auto_repair_signing=true or signing_bootstrap=true.'
+            exit 65
+          fi
+
+          echo '::notice::Refreshing ONLY the App Store provisioning profile with Match force=true.'
+
+          # A refresh writes the updated encrypted profile back to the Match
+          # repository. Verify write access only when repair is actually needed.
+          PROBE_DIR="$(mktemp -d)"
+          CERT_REPO_URL="$MATCH_GIT_URL"
+          git -c http.extraheader="AUTHORIZATION: basic $MATCH_GIT_BASIC_AUTHORIZATION"             clone --depth=1 "$CERT_REPO_URL" "$PROBE_DIR" >/dev/null 2>&1
+          PROBE_REF="refs/heads/__cloudmail_match_repair_probe_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          if ! git -C "$PROBE_DIR"             -c http.extraheader="AUTHORIZATION: basic $MATCH_GIT_BASIC_AUTHORIZATION"             push --dry-run origin "HEAD:$PROBE_REF" >/dev/null 2>&1; then
+            rm -rf "$PROBE_DIR"
+            echo '::error::Provisioning profile repair requires write access to readori/readori-certificates.'
+            echo '::error::Give MATCH_REPO_PAT (preferred) Contents: Read and write, then rerun.'
+            exit 78
+          fi
+          rm -rf "$PROBE_DIR"
+
+          run_match false true
+
+          if ! verify_or_report; then
+            echo '::error::A fresh App Store profile still lacks App Attest=production and/or APNs=production.'
+            echo '::error::Confirm App Attest and Push Notifications are enabled for Apple Developer App ID com.readori.mail, then rerun.'
+            exit 65
+          fi
+
+          echo 'Provisioning profile repaired and verified before CloudMail Archive/TestFlight.'
 
       - name: Build signed Archive / upload TestFlight with Fastlane Match
         id: appstore
