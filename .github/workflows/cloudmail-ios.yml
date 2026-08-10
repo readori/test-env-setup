@@ -35,6 +35,11 @@ on:
         required: false
         default: false
         type: boolean
+      auto_repair_signing:
+        description: 'Automatically repair a stale App Store provisioning profile once when App Attest/APNs entitlements changed'
+        required: false
+        default: true
+        type: boolean
 
 # Default to read-only. The iOS job receives contents:write only because
 # sideload/both can publish an IPA prerelease to THIS public workflow repository.
@@ -423,8 +428,16 @@ jobs:
             echo '::error::Private source Fastfile is too old: provisioning-profile entitlement validation is missing. Update readori/CloudMail main to r6 or newer.'
             exit 65
           }
-          grep -Fq 'options[:force] = true unless readonly' "$FASTFILE" || {
-            echo '::error::Private source Fastfile is too old: signing_bootstrap does not force App Store profile regeneration. Update readori/CloudMail main to r6 or newer.'
+          grep -q 'run_cloudmail_match' "$FASTFILE" || {
+            echo '::error::Private source Fastfile is too old: stale-profile self-repair is missing. Update readori/CloudMail main to r7 or newer.'
+            exit 65
+          }
+          grep -q 'MATCH_AUTO_REPAIR_STALE_PROFILE' "$FASTFILE" || {
+            echo '::error::Private source Fastfile is too old: MATCH_AUTO_REPAIR_STALE_PROFILE support is missing. Update readori/CloudMail main to r7 or newer.'
+            exit 65
+          }
+          grep -q 'force: true' "$FASTFILE" || {
+            echo '::error::Private source Fastfile is too old: provisioning-profile force refresh is missing. Update readori/CloudMail main to r7 or newer.'
             exit 65
           }
 
@@ -456,6 +469,7 @@ jobs:
           MATCH_GIT_URL: https://github.com/readori/readori-certificates.git
           MATCH_GIT_BASIC_AUTHORIZATION: ${{ env.MATCH_GIT_BASIC_AUTHORIZATION }}
           MATCH_READONLY: ${{ inputs.signing_bootstrap && 'false' || 'true' }}
+          MATCH_AUTO_REPAIR_STALE_PROFILE: ${{ inputs.auto_repair_signing && 'true' || 'false' }}
           ASC_APP_ID: ${{ secrets.CFMAIL_ASC_APP_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
