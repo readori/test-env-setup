@@ -789,14 +789,24 @@ jobs:
         # ── Step 4: Code sign ──
         echo "=== Step 4: Code signing ==="
 
-        # Find the signing identity
-        SIGN_ID=$(security find-identity -v -p codesigning "$READORI_KEYCHAIN_PATH" | grep "iPhone Distribution" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+        # Find the signing identity.
+        # IMPORTANT: do not probe "iPhone Distribution" first with grep under
+        # `set -euo pipefail`; modern Match assets are normally named
+        # "Apple Distribution", and a no-match grep would terminate the step
+        # before the fallback could run.
+        echo "Available code-signing identities:"
+        security find-identity -v -p codesigning "$READORI_KEYCHAIN_PATH" || true
+
+        SIGN_ID="$(
+          security find-identity -v -p codesigning "$READORI_KEYCHAIN_PATH" 2>/dev/null |
+            awk -F'"' '
+              /Apple Distribution|iPhone Distribution/ && first == "" { first = $2 }
+              END { print first }
+            '
+        )"
+
         if [[ -z "$SIGN_ID" ]]; then
-          SIGN_ID=$(security find-identity -v -p codesigning "$READORI_KEYCHAIN_PATH" | grep "Apple Distribution" | head -1 | sed 's/.*"\(.*\)".*/\1/')
-        fi
-        if [[ -z "$SIGN_ID" ]]; then
-          echo "ERROR: No distribution signing identity found in keychain"
-          security find-identity -v -p codesigning "$READORI_KEYCHAIN_PATH"
+          echo "::error::No Apple Distribution signing identity found in Match keychain: $READORI_KEYCHAIN_PATH"
           exit 1
         fi
         echo "Signing identity: $SIGN_ID"
