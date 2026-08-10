@@ -238,15 +238,27 @@ jobs:
         ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
         MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
         MATCH_REPO_PAT: ${{ secrets.MATCH_REPO_PAT }}
+        TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
       run: |
         set -euo pipefail
         missing=()
-        for name in ASC_KEY_ID ASC_ISSUER_ID ASC_PRIVATE_KEY ASC_APP_ID ASC_TEAM_ID MATCH_PASSWORD MATCH_REPO_PAT; do
+        for name in ASC_KEY_ID ASC_ISSUER_ID ASC_PRIVATE_KEY ASC_APP_ID ASC_TEAM_ID MATCH_PASSWORD; do
           [[ -n "${!name:-}" ]] || missing+=("$name")
         done
         if (( ${#missing[@]} )); then
           echo "::error::Missing TestFlight / Match secrets: ${missing[*]}"
           exit 1
+        fi
+
+        CERT_REPO_PAT="${MATCH_REPO_PAT:-${TARGET_REPO_PAT:-}}"
+        if [[ -z "$CERT_REPO_PAT" ]]; then
+          echo "::error::Missing certificate-repository access token."
+          echo "::error::Configure MATCH_REPO_PAT (preferred) or TARGET_REPO_PAT with read access to readori/readori-certificates."
+          exit 1
+        fi
+
+        if [[ -z "${MATCH_REPO_PAT:-}" ]]; then
+          echo "::notice::MATCH_REPO_PAT is not configured; falling back to TARGET_REPO_PAT for readori/readori-certificates."
         fi
         if ! [[ "$APP_VERSION" =~ ^[0-9]+(\.[0-9]+){1,2}([-.][0-9A-Za-z.-]+)?$ ]]; then
           echo "::error::Invalid app_version: $APP_VERSION"
@@ -332,6 +344,7 @@ jobs:
       env:
         MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
         MATCH_REPO_PAT: ${{ secrets.MATCH_REPO_PAT }}
+        TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
         ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
       run: |
         set -euo pipefail
@@ -346,8 +359,16 @@ jobs:
 
         echo "READORI_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
-        # Match repo uses a dedicated least-privilege PAT.
-        MATCH_AUTH="$(printf '%s:%s' 'readori' "$MATCH_REPO_PAT" | base64 | tr -d '\n')"
+        # Prefer a dedicated least-privilege Match PAT. For compatibility with
+        # the CloudMail CI, fall back to TARGET_REPO_PAT when MATCH_REPO_PAT
+        # has not been configured in this workflow repository.
+        CERT_REPO_PAT="${MATCH_REPO_PAT:-${TARGET_REPO_PAT:-}}"
+        [[ -n "$CERT_REPO_PAT" ]] || {
+          echo "::error::MATCH_REPO_PAT or TARGET_REPO_PAT is required for readori/readori-certificates."
+          exit 1
+        }
+
+        MATCH_AUTH="$(printf '%s:%s' 'readori' "$CERT_REPO_PAT" | base64 | tr -d '\n')"
         echo "::add-mask::$MATCH_AUTH"
 
         git -c http.extraheader="AUTHORIZATION: basic $MATCH_AUTH" \
