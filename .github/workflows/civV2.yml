@@ -84,7 +84,6 @@ jobs:
       SCHEME: ${{ github.event.inputs.app_scheme }}
       APP_VERSION: ${{ github.event.inputs.app_version }}
       READORI_SOCIAL_WORKER_ENDPOINT: ${{ secrets.READORI_SOCIAL_WORKER_ENDPOINT }}
-      PRO_LEASE_PUBLIC_KEY: ${{ vars.PRO_LEASE_PUBLIC_KEY != '' && vars.PRO_LEASE_PUBLIC_KEY || secrets.PRO_LEASE_PUBLIC_KEY }}
 
     steps:
 
@@ -227,6 +226,63 @@ jobs:
         fi
         asc --version
         echo "asc: $(command -v asc)"
+
+    - name: Resolve Pro Lease public key
+      env:
+        PRO_LEASE_PUBLIC_KEY_VAR: ${{ vars.PRO_LEASE_PUBLIC_KEY }}
+        PRO_LEASE_PUBLIC_KEY_SECRET: ${{ secrets.PRO_LEASE_PUBLIC_KEY }}
+      run: |
+        set -euo pipefail
+
+        echo "GitHub environment: production"
+        if [[ -n "${PRO_LEASE_PUBLIC_KEY_VAR:-}" ]]; then
+          echo "PRO_LEASE_PUBLIC_KEY via vars context: FOUND"
+        else
+          echo "PRO_LEASE_PUBLIC_KEY via vars context: NOT FOUND"
+        fi
+
+        if [[ -n "${PRO_LEASE_PUBLIC_KEY_SECRET:-}" ]]; then
+          echo "PRO_LEASE_PUBLIC_KEY via secrets context: FOUND"
+        else
+          echo "PRO_LEASE_PUBLIC_KEY via secrets context: NOT FOUND"
+        fi
+
+        KEY="${PRO_LEASE_PUBLIC_KEY_VAR:-${PRO_LEASE_PUBLIC_KEY_SECRET:-}}"
+        KEY="$(printf '%s' "$KEY" | tr -d '\r\n[:space:]')"
+
+        if [[ -z "$KEY" ]]; then
+          if [[ "${MODE:-}" == "testflight" ]]; then
+            echo "::error::PRO_LEASE_PUBLIC_KEY is not visible to this workflow."
+            echo "::error::Add it to the GitHub repository that RUNS this workflow:"
+            echo "::error::Settings → Secrets and variables → Actions → Variables → PRO_LEASE_PUBLIC_KEY"
+            echo "::error::Alternatively add it to Environment 'production', because this job uses environment: production."
+            echo "::error::Do not add the public key only to the Bot repository or only to the private source repository."
+            exit 1
+          fi
+          echo "::notice::PRO_LEASE_PUBLIC_KEY is not configured; continuing because MODE is not testflight."
+          exit 0
+        fi
+
+        # The generator emits a Base64-encoded 65-byte uncompressed P-256 public key.
+        KEY="$KEY" python3 - <<'PY'
+        import base64, os, sys
+        value = os.environ["KEY"]
+        try:
+            raw = base64.b64decode(value, validate=True)
+        except Exception as exc:
+            print(f"::error::PRO_LEASE_PUBLIC_KEY is not valid Base64: {exc}")
+            sys.exit(1)
+        if len(raw) != 65 or raw[0] != 0x04:
+            print(f"::error::PRO_LEASE_PUBLIC_KEY decoded shape is invalid: expected 65-byte uncompressed P-256 key, got {len(raw)} bytes.")
+            sys.exit(1)
+        print(f"PRO_LEASE_PUBLIC_KEY validation: PASS ({len(raw)} decoded bytes)")
+        PY
+
+        {
+          echo "PRO_LEASE_PUBLIC_KEY<<EOF"
+          echo "$KEY"
+          echo "EOF"
+        } >> "$GITHUB_ENV"
 
     - name: Validate TestFlight / Match secrets
       if: ${{ env.MODE == 'testflight' }}
@@ -505,7 +561,6 @@ jobs:
         ALLOW_WRAPPED_APP: "1"
         APP_BUNDLE_IDENTIFIER: "com.readori.app"
         READORI_SOCIAL_WORKER_ENDPOINT: ${{ secrets.READORI_SOCIAL_WORKER_ENDPOINT }}
-        PRO_LEASE_PUBLIC_KEY: ${{ vars.PRO_LEASE_PUBLIC_KEY != '' && vars.PRO_LEASE_PUBLIC_KEY || secrets.PRO_LEASE_PUBLIC_KEY }}
       run: |
         mkdir -p build
         cd core_project
