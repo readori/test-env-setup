@@ -84,7 +84,7 @@ jobs:
       SCHEME: ${{ github.event.inputs.app_scheme }}
       APP_VERSION: ${{ github.event.inputs.app_version }}
       READORI_SOCIAL_WORKER_ENDPOINT: ${{ secrets.READORI_SOCIAL_WORKER_ENDPOINT }}
-      READORI_API_SECRET: ${{ secrets.READORI_API_SECRET }}
+      PRO_LEASE_PUBLIC_KEY: ${{ vars.PRO_LEASE_PUBLIC_KEY != '' && vars.PRO_LEASE_PUBLIC_KEY || secrets.PRO_LEASE_PUBLIC_KEY }}
 
     steps:
 
@@ -262,6 +262,10 @@ jobs:
         fi
         if ! [[ "$APP_VERSION" =~ ^[0-9]+(\.[0-9]+){1,2}([-.][0-9A-Za-z.-]+)?$ ]]; then
           echo "::error::Invalid app_version: $APP_VERSION"
+          exit 1
+        fi
+        if [[ -z "${PRO_LEASE_PUBLIC_KEY:-}" ]]; then
+          echo "::error::Missing PRO_LEASE_PUBLIC_KEY repository variable/secret. Generate it with bot/scripts/generate-pro-lease-key.mjs."
           exit 1
         fi
 
@@ -501,7 +505,7 @@ jobs:
         ALLOW_WRAPPED_APP: "1"
         APP_BUNDLE_IDENTIFIER: "com.readori.app"
         READORI_SOCIAL_WORKER_ENDPOINT: ${{ secrets.READORI_SOCIAL_WORKER_ENDPOINT }}
-        READORI_API_SECRET: ${{ secrets.READORI_API_SECRET }}
+        PRO_LEASE_PUBLIC_KEY: ${{ vars.PRO_LEASE_PUBLIC_KEY != '' && vars.PRO_LEASE_PUBLIC_KEY || secrets.PRO_LEASE_PUBLIC_KEY }}
       run: |
         mkdir -p build
         cd core_project
@@ -581,7 +585,7 @@ jobs:
           CURRENT_PROJECT_VERSION="${{ env.BUILD_NUMBER }}" \
           MARKETING_VERSION="${{ env.APP_VERSION }}" \
           READORI_SOCIAL_WORKER_ENDPOINT="$READORI_SOCIAL_WORKER_ENDPOINT" \
-          READORI_API_SECRET="$READORI_API_SECRET" \
+          PRO_LEASE_PUBLIC_KEY="$PRO_LEASE_PUBLIC_KEY" \
           ASSETCATALOG_COMPILER_APPICON_NAME=AppIcon \
           ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS=YES \
           ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOLS=NO \
@@ -636,8 +640,8 @@ jobs:
           if [[ -n "$READORI_SOCIAL_WORKER_ENDPOINT" ]]; then
             /usr/bin/plutil -replace READORI_SOCIAL_WORKER_ENDPOINT -string "$READORI_SOCIAL_WORKER_ENDPOINT" "$APP_PATH/Info.plist" || true
           fi
-          if [[ -n "$READORI_API_SECRET" ]]; then
-            /usr/bin/plutil -replace READORI_API_SECRET -string "$READORI_API_SECRET" "$APP_PATH/Info.plist" || true
+          if [[ -n "${PRO_LEASE_PUBLIC_KEY:-}" ]]; then
+            /usr/bin/plutil -replace PRO_LEASE_PUBLIC_KEY -string "$PRO_LEASE_PUBLIC_KEY" "$APP_PATH/Info.plist" || true
           fi
 
           # UIDeviceFamily
@@ -1248,7 +1252,7 @@ jobs:
           GENERATE_INFOPLIST_FILE=NO \
           INFOPLIST_FILE="$INFOPLIST_ABS" \
           READORI_SOCIAL_WORKER_ENDPOINT="$READORI_SOCIAL_WORKER_ENDPOINT" \
-          READORI_API_SECRET="$READORI_API_SECRET" \
+          PRO_LEASE_PUBLIC_KEY="$PRO_LEASE_PUBLIC_KEY" \
           CODE_SIGN_IDENTITY="" \
           CODE_SIGNING_ALLOWED=NO \
           CODE_SIGNING_REQUIRED=NO \
@@ -1282,8 +1286,8 @@ jobs:
         if [[ -n "$READORI_SOCIAL_WORKER_ENDPOINT" ]]; then
           /usr/bin/plutil -replace READORI_SOCIAL_WORKER_ENDPOINT -string "$READORI_SOCIAL_WORKER_ENDPOINT" "$APP_PATH/Info.plist" || true
         fi
-        if [[ -n "$READORI_API_SECRET" ]]; then
-          /usr/bin/plutil -replace READORI_API_SECRET -string "$READORI_API_SECRET" "$APP_PATH/Info.plist" || true
+        if [[ -n "${PRO_LEASE_PUBLIC_KEY:-}" ]]; then
+          /usr/bin/plutil -replace PRO_LEASE_PUBLIC_KEY -string "$PRO_LEASE_PUBLIC_KEY" "$APP_PATH/Info.plist" || true
         fi
         /usr/libexec/PlistBuddy -c "Delete :UIDeviceFamily" "$APP_PATH/Info.plist" 2>/dev/null || true
         /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily array" "$APP_PATH/Info.plist"
