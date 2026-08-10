@@ -31,19 +31,19 @@ on:
         default: ''
         type: string
       signing_bootstrap:
-        description: 'One-time only: allow Match to update App Store signing assets'
+        description: 'One-time only: force Match to regenerate/update the App Store profile after Apple capability changes (for example App Attest); certificate-repo write access required'
         required: false
         default: false
         type: boolean
 
-# contents:write is required because sideload/both can publish an IPA release
-# to THIS public workflow repository. The private source repository is only read
-# through TARGET_REPO_PAT.
+# Default to read-only. The iOS job receives contents:write only because
+# sideload/both can publish an IPA prerelease to THIS public workflow repository.
+# Private source and Match repositories use dedicated PATs.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: cloudmail-ios-distribution-${{ github.ref }}
+  group: cloudmail-ios-${{ github.ref }}-${{ inputs.distribution }}
   cancel-in-progress: false
 
 jobs:
@@ -53,6 +53,8 @@ jobs:
   ios:
     name: Build CloudMail iOS
     if: ${{ inputs.distribution == 'testflight' || inputs.distribution == 'sideload' || inputs.distribution == 'both' || inputs.distribution == 'archive' }}
+    permissions:
+      contents: write
     runs-on: macos-15
     timeout-minutes: 90
 
@@ -66,7 +68,7 @@ jobs:
       # 1. Public workflow repository -> target private source repository
       # ----------------------------------------------------------------------
       - name: Checkout Target Private Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: 'readori/CloudMail'
           ref: 'main'
@@ -334,6 +336,7 @@ jobs:
         shell: bash
         env:
           TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          MATCH_REPO_PAT: ${{ secrets.MATCH_REPO_PAT }}
         run: |
           set -euo pipefail
 
@@ -342,18 +345,94 @@ jobs:
             exit 78
           }
 
-          MATCH_AUTH="$(printf '%s:%s' 'readori' "$TARGET_REPO_PAT" | base64 | tr -d '\n')"
+          # Least-privilege preferred path: MATCH_REPO_PAT is scoped to the
+          # certificates repository. Keep TARGET_REPO_PAT fallback so existing
+          # installations do not break immediately.
+          CERT_REPO_PAT="${MATCH_REPO_PAT:-$TARGET_REPO_PAT}"
+          [[ -n "$CERT_REPO_PAT" ]] || {
+            echo '::error::Missing MATCH_REPO_PAT (or fallback TARGET_REPO_PAT) for Match repository access.'
+            exit 78
+          }
+
+          if [[ -z "${MATCH_REPO_PAT:-}" ]]; then
+            echo '::notice::MATCH_REPO_PAT is not configured; falling back to TARGET_REPO_PAT for the Match repository. A dedicated MATCH_REPO_PAT is recommended.'
+          fi
+
+          MATCH_AUTH="$(printf '%s:%s' 'readori' "$CERT_REPO_PAT" | base64 | tr -d '\n')"
           echo "::add-mask::$MATCH_AUTH"
           echo "MATCH_GIT_BASIC_AUTHORIZATION=$MATCH_AUTH" >> "$GITHUB_ENV"
           echo "MATCH_GIT_URL=https://github.com/readori/readori-certificates.git" >> "$GITHUB_ENV"
 
+          CERT_REPO_URL='https://github.com/readori/readori-certificates.git'
           git -c http.extraheader="AUTHORIZATION: basic $MATCH_AUTH" \
-            ls-remote https://github.com/readori/readori-certificates.git HEAD >/dev/null
-          echo 'TARGET_REPO_PAT can read readori/readori-certificates.'
+            ls-remote "$CERT_REPO_URL" HEAD >/dev/null
+          echo 'Match token can read readori/readori-certificates.'
 
           if [[ '${{ inputs.signing_bootstrap }}' == 'true' ]]; then
-            echo '::notice::Match bootstrap requested. TARGET_REPO_PAT must have Contents: Read and write on readori/readori-certificates.'
+            echo '::notice::Match bootstrap requested: a fresh App Store provisioning profile will be forced after Apple capability changes.'
+
+            # Verify write permission without modifying the remote repository.
+            PROBE_DIR="$(mktemp -d)"
+            trap 'rm -rf "$PROBE_DIR"' EXIT
+            git -c http.extraheader="AUTHORIZATION: basic $MATCH_AUTH" \
+              clone --depth=1 "$CERT_REPO_URL" "$PROBE_DIR" >/dev/null 2>&1
+
+            PROBE_REF="refs/heads/__cloudmail_match_permission_probe_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+            if ! git -C "$PROBE_DIR" \
+              -c http.extraheader="AUTHORIZATION: basic $MATCH_AUTH" \
+              push --dry-run origin "HEAD:$PROBE_REF" >/dev/null 2>&1; then
+              echo '::error::signing_bootstrap=true requires write access to readori/readori-certificates.'
+              echo '::error::Give MATCH_REPO_PAT (preferred) or TARGET_REPO_PAT Contents: Read and write for that repository, then rerun.'
+              exit 78
+            fi
+            echo 'Match repository write permission dry-run: PASS'
           fi
+
+      - name: Verify App Attest and Match profile-refresh contract
+        if: ${{ inputs.distribution == 'testflight' || inputs.distribution == 'both' || inputs.distribution == 'archive' }}
+        working-directory: mail-ios
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_ENTITLEMENTS='CloudMailRelease.entitlements'
+          FASTFILE='fastlane/Fastfile'
+
+          test -f "$RELEASE_ENTITLEMENTS" || {
+            echo "::error::Missing $RELEASE_ENTITLEMENTS in private source checkout."
+            exit 66
+          }
+          test -f "$FASTFILE" || {
+            echo "::error::Missing $FASTFILE in private source checkout."
+            exit 66
+          }
+
+          APP_ATTEST="$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.devicecheck.appattest-environment' "$RELEASE_ENTITLEMENTS" 2>/dev/null || true)"
+          APNS_ENV="$(/usr/libexec/PlistBuddy -c 'Print :aps-environment' "$RELEASE_ENTITLEMENTS" 2>/dev/null || true)"
+
+          [[ "$APP_ATTEST" == 'production' ]] || {
+            echo "::error::Release entitlement com.apple.developer.devicecheck.appattest-environment must be production; got: ${APP_ATTEST:-missing}"
+            exit 65
+          }
+          [[ "$APNS_ENV" == 'production' ]] || {
+            echo "::error::Release entitlement aps-environment must be production; got: ${APNS_ENV:-missing}"
+            exit 65
+          }
+
+          grep -q 'validate_match_profile_entitlements!' "$FASTFILE" || {
+            echo '::error::Private source Fastfile is too old: provisioning-profile entitlement validation is missing. Update readori/CloudMail main to r6 or newer.'
+            exit 65
+          }
+          grep -Fq 'options[:force] = true unless readonly' "$FASTFILE" || {
+            echo '::error::Private source Fastfile is too old: signing_bootstrap does not force App Store profile regeneration. Update readori/CloudMail main to r6 or newer.'
+            exit 65
+          }
+
+          if [[ -f scripts/test_app_attest_contract.py ]]; then
+            python3 scripts/test_app_attest_contract.py
+          fi
+
+          echo 'Release signing source contract: App Attest=production, APNs=production, Match refresh/validation present.'
 
       - name: Install pinned Fastlane
         if: ${{ inputs.distribution == 'testflight' || inputs.distribution == 'both' || inputs.distribution == 'archive' }}
@@ -409,7 +488,7 @@ jobs:
 
       - name: Upload signed Archive IPA artifact
         if: ${{ inputs.distribution == 'archive' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: CloudMail-App-Store-Archive-v${{ inputs.app_version }}-b${{ env.CLOUDMAIL_BUILD_NUMBER }}
           path: ${{ steps.appstore.outputs.ipa_path }}
@@ -433,6 +512,9 @@ jobs:
             echo "- Build: \`${CLOUDMAIL_BUILD_NUMBER}\`"
             echo "- Private source: \`readori/CloudMail@main\`"
             echo "- Source commit: \`$(git rev-parse --short HEAD)\`"
+            if [[ "$DISTRIBUTION" == 'testflight' || "$DISTRIBUTION" == 'both' || "$DISTRIBUTION" == 'archive' ]]; then
+              echo "- Match bootstrap: \`${{ inputs.signing_bootstrap }}\`"
+            fi
             if [[ "$DISTRIBUTION" == 'testflight' || "$DISTRIBUTION" == 'both' ]]; then
               echo '- TestFlight: upload submitted to App Store Connect after the Release Archive Gate passed.'
             fi
@@ -464,7 +546,7 @@ jobs:
 
     steps:
       - name: Checkout Target Private Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: 'readori/CloudMail'
           ref: 'main'
@@ -565,7 +647,7 @@ jobs:
 
     steps:
       - name: Checkout Target Private Repository for screenshots
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: 'readori/CloudMail'
           ref: 'main'
@@ -935,7 +1017,7 @@ jobs:
 
       - name: Upload 13-inch iPad App Store PNGs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: CloudMail-iPad-13-inch-App-Store-Screenshots
           path: /tmp/CloudMail-iPad-13-inch/*.png
@@ -944,7 +1026,7 @@ jobs:
 
       - name: Upload screenshot test result
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: CloudMail-iPad-Screenshot-xcresult
           path: /tmp/CloudMail-iPad-Screenshots.xcresult
@@ -953,7 +1035,7 @@ jobs:
 
       - name: Upload xcodebuild log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: CloudMail-iPad-Screenshot-build-log
           path: /tmp/CloudMail-iPad-Screenshots-xcodebuild.log
