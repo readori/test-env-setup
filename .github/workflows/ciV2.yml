@@ -1,4 +1,4 @@
-name: Readori civ V2
+name: Readori ci V2
 # Unified pipeline — three modes via single dispatch:
 
 on:
