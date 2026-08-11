@@ -1,5 +1,4 @@
 name: Readori civ V2
-
 # Unified pipeline — three modes via single dispatch:
 
 on:
@@ -121,6 +120,69 @@ jobs:
         git clone --depth=50 git@github-app:readori/readori.git core_project
         echo "[clone] $(git -C core_project rev-parse --short HEAD)"
 
+    - name: Normalize accidental nested Readori overlay
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        from pathlib import Path
+        import hashlib
+        import shutil
+        import sys
+
+        project = Path("core_project")
+        target = project / "Readori"
+        nested = target / "Readori"
+
+        if not nested.exists():
+            print("Nested overlay check: PASS (no Readori/Readori directory)")
+            raise SystemExit(0)
+
+        files = [p for p in nested.rglob("*") if p.is_file()]
+        if not files:
+            print("Nested overlay directory is empty; removing it.")
+            shutil.rmtree(nested)
+            raise SystemExit(0)
+
+        conflicts = []
+        missing = []
+        identical = []
+
+        def digest(path: Path) -> str:
+            h = hashlib.sha256()
+            with path.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+
+        for duplicate in files:
+            rel = duplicate.relative_to(nested)
+            canonical = target / rel
+            if not canonical.exists():
+                missing.append((duplicate, canonical))
+                continue
+            if not canonical.is_file() or digest(duplicate) != digest(canonical):
+                conflicts.append((duplicate, canonical))
+                continue
+            identical.append((duplicate, canonical))
+
+        if missing or conflicts:
+            print("::error::Accidental nested Readori/Readori tree contains files that cannot be safely auto-removed.")
+            for duplicate, canonical in missing:
+                print(f"::error::Nested-only file: {duplicate} -> expected canonical {canonical}")
+            for duplicate, canonical in conflicts:
+                print(f"::error::Conflicting duplicate: {duplicate} != {canonical}")
+            print("::error::Merge the differing file intentionally, then delete core_project/Readori/Readori.")
+            raise SystemExit(1)
+
+        print(f"Safe duplicate overlay detected: {len(identical)} identical file(s).")
+        for duplicate, canonical in identical:
+            print(f"  remove duplicate: {duplicate}")
+            print(f"  keep canonical : {canonical}")
+
+        shutil.rmtree(nested)
+        print("Nested overlay normalized: removed core_project/Readori/Readori")
+        PY
+
     # ==============================================
     # 3. SELECT XCODE VERSION
     # ==============================================
@@ -171,7 +233,13 @@ jobs:
         }
 
         sudo xcode-select -s "$SELECTED_XCODE_APP/Contents/Developer"
-        XCODE_VERSION_RAW="$(xcodebuild -version | head -n1 | awk '{print $2}')"
+
+        # Xcode 26.3: never pipe xcodebuild -version into head/grep.
+        # A downstream command can close stdout early and make xcodebuild throw
+        # NSFileHandleOperationException ("Broken pipe") with exit code 134.
+        XCODE_VERSION_OUTPUT="$(xcodebuild -version 2>&1)"
+        XCODE_VERSION_LINE="${XCODE_VERSION_OUTPUT%%$'\n'*}"
+        XCODE_VERSION_RAW="${XCODE_VERSION_LINE#Xcode }"
         XCODE_MAJOR="${XCODE_VERSION_RAW%%.*}"
         SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version)"
 
@@ -212,9 +280,11 @@ jobs:
 
         root = Path("core_project/Readori")
         by_name = defaultdict(list)
+        ignored_parts = {".build", ".swiftpm", "DerivedData", "build"}
         for path in root.rglob("*.swift"):
-            if path.is_file():
-                by_name[path.name].append(path)
+            if not path.is_file() or any(part in ignored_parts for part in path.parts):
+                continue
+            by_name[path.name].append(path)
 
         duplicates = {name: paths for name, paths in by_name.items() if len(paths) > 1}
 
@@ -650,9 +720,6 @@ jobs:
         fi
 
         # ── Step 1: Build unsigned (with INFOPLIST_FILE for proper bundle) ──
-        # Xcode 26.3 + SwiftPM may schedule duplicate .stringsdata outputs during
-        # a normal build. Readori ships explicit Localizable.strings resources,
-        # so compiler localization extraction is disabled in CI.
         echo "=== Step 1: Build unsigned ==="
         cd "$REPO_ROOT"
         # 🐛 Bug 修复（"iPad 上装了最新版本，App 还是以 iPhone 兼容模式跑在小窗口里"）：
@@ -665,8 +732,6 @@ jobs:
           -skipPackagePluginValidation \
           -skipMacroValidation \
           -onlyUsePackageVersionsFromResolvedFile \
-          SWIFT_EMIT_LOC_STRINGS=NO \
-          LOCALIZED_STRING_SWIFTUI_SUPPORT=NO \
           CODE_SIGNING_ALLOWED=NO \
           CODE_SIGNING_REQUIRED=NO \
           CODE_SIGN_IDENTITY="" \
@@ -814,9 +879,11 @@ jobs:
           echo "Wrapped .app at: $APP_PATH"
 
         # Always ensure required plist fields (whether found or wrapped)
-        XCODE_OUTPUT=$(xcodebuild -version 2>/dev/null || true)
-        XCODE_VER=$(echo "$XCODE_OUTPUT" | head -1 | sed 's/Xcode //')
-        XCODE_BUILD=$(echo "$XCODE_OUTPUT" | tail -1 | sed 's/Build version //')
+        XCODE_OUTPUT="$(xcodebuild -version 2>/dev/null || true)"
+        XCODE_FIRST_LINE="${XCODE_OUTPUT%%$'\n'*}"
+        XCODE_LAST_LINE="${XCODE_OUTPUT##*$'\n'}"
+        XCODE_VER="${XCODE_FIRST_LINE#Xcode }"
+        XCODE_BUILD="${XCODE_LAST_LINE#Build version }"
         SDK_VER=$(xcrun --show-sdk-version --sdk iphoneos)
         SDK_BUILD=$(xcrun --show-sdk-build-version --sdk iphoneos)
         SDK_NAME="iphoneos${SDK_VER}"
@@ -1341,8 +1408,6 @@ jobs:
           -skipPackagePluginValidation \
           -skipMacroValidation \
           -onlyUsePackageVersionsFromResolvedFile \
-          SWIFT_EMIT_LOC_STRINGS=NO \
-          LOCALIZED_STRING_SWIFTUI_SUPPORT=NO \
           GENERATE_INFOPLIST_FILE=NO \
           INFOPLIST_FILE="$INFOPLIST_ABS" \
           READORI_SOCIAL_WORKER_ENDPOINT="$READORI_SOCIAL_WORKER_ENDPOINT" \
