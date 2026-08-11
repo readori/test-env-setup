@@ -203,6 +203,38 @@ jobs:
     - name: Resolve Swift packages
       run: cd core_project && swift package resolve
 
+    - name: Validate Swift source uniqueness
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        from pathlib import Path
+        from collections import defaultdict
+
+        root = Path("core_project/Readori")
+        by_name = defaultdict(list)
+        for path in root.rglob("*.swift"):
+            if path.is_file():
+                by_name[path.name].append(path)
+
+        duplicates = {name: paths for name, paths in by_name.items() if len(paths) > 1}
+
+        for target in ("HybridTextKitEngine.swift", "ReaderAdvancedPagerView.swift"):
+            paths = by_name.get(target, [])
+            print(f"[swift-source-check] {target}: {len(paths)}")
+            for path in paths:
+                print(f"  - {path}")
+
+        if duplicates:
+            print("::error::Duplicate Swift basenames exist in the Readori target.")
+            for name in sorted(duplicates):
+                print(f"::error::{name}")
+                for path in duplicates[name]:
+                    print(f"::error::  {path}")
+            raise SystemExit(1)
+
+        print(f"Swift source uniqueness: PASS ({sum(len(v) for v in by_name.values())} files)")
+        PY
+
     # ==============================================
     # 5. ICON GENERATION (optional, skip for screenshots)
     # ==============================================
@@ -618,6 +650,9 @@ jobs:
         fi
 
         # ── Step 1: Build unsigned (with INFOPLIST_FILE for proper bundle) ──
+        # Xcode 26.3 + SwiftPM may schedule duplicate .stringsdata outputs during
+        # a normal build. Readori ships explicit Localizable.strings resources,
+        # so compiler localization extraction is disabled in CI.
         echo "=== Step 1: Build unsigned ==="
         cd "$REPO_ROOT"
         # 🐛 Bug 修复（"iPad 上装了最新版本，App 还是以 iPhone 兼容模式跑在小窗口里"）：
@@ -630,6 +665,8 @@ jobs:
           -skipPackagePluginValidation \
           -skipMacroValidation \
           -onlyUsePackageVersionsFromResolvedFile \
+          SWIFT_EMIT_LOC_STRINGS=NO \
+          LOCALIZED_STRING_SWIFTUI_SUPPORT=NO \
           CODE_SIGNING_ALLOWED=NO \
           CODE_SIGNING_REQUIRED=NO \
           CODE_SIGN_IDENTITY="" \
@@ -1304,6 +1341,8 @@ jobs:
           -skipPackagePluginValidation \
           -skipMacroValidation \
           -onlyUsePackageVersionsFromResolvedFile \
+          SWIFT_EMIT_LOC_STRINGS=NO \
+          LOCALIZED_STRING_SWIFTUI_SUPPORT=NO \
           GENERATE_INFOPLIST_FILE=NO \
           INFOPLIST_FILE="$INFOPLIST_ABS" \
           READORI_SOCIAL_WORKER_ENDPOINT="$READORI_SOCIAL_WORKER_ENDPOINT" \
