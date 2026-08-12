@@ -25,6 +25,7 @@ env:
   WORKER_NAME: tcpxunine
   CUSTOM_DOMAIN: tcp.xunine.com
   SECURITY_RESOURCE_MODE: preserve
+  TURNSTILE_SITE_KEY: ${{ vars.TURNSTILE_SITE_KEY }}
   CI: true
 
 jobs:
