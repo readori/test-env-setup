@@ -98,8 +98,8 @@ jobs:
           const fs = require('node:fs');
           const contract = JSON.parse(fs.readFileSync('.deployment-contract.json', 'utf8'));
           const expected = {
-            contract: 'tcpxunine-production-v25',
-            release: 'fix25-auth-runtime',
+            contract: 'tcpxunine-production-v26',
+            release: 'fix26-manual-credential-preserve-mobile',
             source_repository: 'readori/Tcpwaybill',
             worker_name: 'tcpxunine',
             custom_domain: 'tcp.xunine.com',
@@ -231,9 +231,10 @@ jobs:
           npm run cf:bootstrap-local-owner
           npx wrangler d1 execute DB --remote --config wrangler.jsonc --file=.cloudflare/bootstrap-local-owner.sql
 
-      - name: Verify remote D1 administrator credential
+      - name: Verify remote D1 administrator account / explicit reset
         env:
           INITIAL_ADMIN_PASSWORD: ${{ secrets.INITIAL_ADMIN_PASSWORD }}
+          RESET_INITIAL_ADMIN_PASSWORD: ${{ inputs.reset_admin_password }}
         run: npm run admin-credential:verify-remote
 
       - name: Verify Vite-generated deploy configuration
@@ -256,7 +257,8 @@ jobs:
       - name: Verify local username/password edge behavior
         run: npm run auth-edge:verify
 
-      - name: Verify production administrator login
+      - name: Verify production administrator login after explicit reset
+        if: ${{ inputs.reset_admin_password == true }}
         env:
           INITIAL_ADMIN_PASSWORD: ${{ secrets.INITIAL_ADMIN_PASSWORD }}
         run: npm run admin-login:verify-production
