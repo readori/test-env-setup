@@ -12,6 +12,11 @@ on:
         description: Type DEPLOY tcpxunine to confirm production deployment
         required: true
         type: string
+      reset_admin_password:
+        description: Reset the local admin password to INITIAL_ADMIN_PASSWORD and revoke existing admin sessions
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -27,7 +32,7 @@ env:
   SECURITY_RESOURCE_MODE: preserve
   ROUTING_RESOURCE_MODE: preserve-existing-custom-domain
   TURNSTILE_SITE_KEY: ${{ vars.TURNSTILE_SITE_KEY }}
-  INITIAL_ADMIN_USERNAME: ${{ vars.INITIAL_ADMIN_USERNAME || 'admin' }}
+  INITIAL_ADMIN_USERNAME: ${{ secrets.INITIAL_ADMIN_USERNAME || vars.INITIAL_ADMIN_USERNAME || 'admin' }}
   CI: true
 
 jobs:
@@ -205,9 +210,10 @@ jobs:
           npm run cf:bootstrap-tenant
           npx wrangler d1 execute DB --remote --config wrangler.jsonc --file=.cloudflare/bootstrap-tenant.sql
 
-      - name: Bootstrap local owner account
+      - name: Bootstrap or recover local owner account
         env:
           INITIAL_ADMIN_PASSWORD: ${{ secrets.INITIAL_ADMIN_PASSWORD }}
+          RESET_INITIAL_ADMIN_PASSWORD: ${{ inputs.reset_admin_password }}
         run: |
           npm run cf:bootstrap-local-owner
           npx wrangler d1 execute DB --remote --config wrangler.jsonc --file=.cloudflare/bootstrap-local-owner.sql
