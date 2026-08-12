@@ -62,7 +62,7 @@ jobs:
           missing=0
           for name in TARGET_REPO_PAT CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN INITIAL_ADMIN_PASSWORD; do
             if [[ -z "${!name:-}" ]]; then
-              echo "::error title=Missing GitHub Actions secret::${name} is missing or is not visible to the production environment."
+              echo "::error title=Missing GitHub Actions secret::${name} is missing from this public CI repository."
               missing=1
             fi
           done
@@ -98,8 +98,8 @@ jobs:
           const fs = require('node:fs');
           const contract = JSON.parse(fs.readFileSync('.deployment-contract.json', 'utf8'));
           const expected = {
-            contract: 'tcpxunine-production-v24',
-            release: 'fix24-root-flat',
+            contract: 'tcpxunine-production-v25',
+            release: 'fix25-auth-runtime',
             source_repository: 'readori/Tcpwaybill',
             worker_name: 'tcpxunine',
             custom_domain: 'tcp.xunine.com',
@@ -115,7 +115,14 @@ jobs:
             }
           }
           const auth = fs.readFileSync('worker/lib/local-session.ts', 'utf8');
+          const password = fs.readFileSync('worker/lib/password.ts', 'utf8');
           const migration = fs.readFileSync('migrations/0003_local_accounts.sql', 'utf8');
+          if (!password.includes('PASSWORD_ITERATIONS = 100_000') || !password.includes('MAX_RUNTIME_PBKDF2_ITERATIONS = 100_000')) {
+            throw new Error('Private source is stale: fix25 Cloudflare auth runtime profile is missing.');
+          }
+          for (const marker of ['AUTH_DB_READ_FAILED', 'AUTH_SESSION_WRITE_FAILED']) {
+            if (!auth.includes(marker)) throw new Error(`Private source is stale: missing fix25 auth stage ${marker}.`);
+          }
           for (const marker of ['tcpwaybill_session', 'loginWithPassword', 'authenticateLocalSession']) {
             if (!auth.includes(marker)) throw new Error(`Private source is stale: missing local auth marker ${marker}.`);
           }
@@ -132,9 +139,9 @@ jobs:
           }
           const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
           for (const script of ['admin-credential:verify-remote', 'admin-login:verify-production', 'release:verify']) {
-            if (!pkg.scripts?.[script]) throw new Error(`Private source is stale: missing fix24 script ${script}.`);
+            if (!pkg.scripts?.[script]) throw new Error(`Private source is stale: missing fix25 script ${script}.`);
           }
-          console.log(`::notice::Private source contract verified: ${contract.contract} + fix24 root-flat credential determinism`);
+          console.log(`::notice::Private source contract verified: ${contract.contract} + fix25 auth-runtime credential determinism`);
           NODE
 
       - name: Setup Node.js
