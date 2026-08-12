@@ -11,6 +11,7 @@ on:
       confirm:
         description: Type DEPLOY tcpxunine to confirm production deployment
         required: true
+        default: DEPLOY tcpxunine
         type: string
 
 permissions:
