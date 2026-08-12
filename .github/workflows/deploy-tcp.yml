@@ -1,0 +1,173 @@
+name: Deploy Tcpwaybill 
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Private source branch, tag, or commit SHA
+        required: true
+        default: main
+        type: string
+      confirm:
+        description: Type DEPLOY tcpxunine to confirm production deployment
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tcpxunine-production
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: readori/Tcpwaybill
+  WORKER_NAME: tcpxunine
+  CUSTOM_DOMAIN: tcp.xunine.com
+  SECURITY_RESOURCE_MODE: preserve
+  CI: true
+
+jobs:
+  deploy:
+    name: Build private source and deploy tcpxunine
+    if: ${{ inputs.confirm == 'DEPLOY tcpxunine' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+
+    steps:
+      - name: Checkout private source repository
+        uses: actions/checkout@v6
+        with:
+          repository: readori/Tcpwaybill
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record private source revision
+        run: |
+          echo "::notice::Source repository: ${SOURCE_REPOSITORY}"
+          echo "::notice::Source ref requested: ${{ inputs.source_ref }}"
+          echo "::notice::Source commit: $(git rev-parse HEAD)"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Normalize Cloudflare credentials
+        env:
+          RAW_CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          RAW_CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: node scripts/normalize-cloudflare-env.mjs
+
+      - name: Verify fixed production identity
+        run: npm run production-identity:verify
+
+      - name: Verify pinned toolchain contract
+        run: npm run toolchain:verify
+
+      - name: Ensure dependency lock matches package contract
+        run: npm run lock:ensure
+
+      - name: Verify dependency lock exists
+        run: |
+          test -s package-lock.json || { echo "::error::package-lock.json was not generated."; exit 1; }
+          node -e "const l=require('./package-lock.json'); if (!l.lockfileVersion || !l.packages?.['']) process.exit(1); console.log('package-lock.json verified, lockfileVersion=' + l.lockfileVersion)"
+
+      - name: Install dependencies reproducibly
+        run: npm ci --no-audit --no-fund
+
+      - name: Generate CI Wrangler config
+        run: npm run config:ci
+
+      - name: Quality gate
+        run: npm run check
+
+      - name: Production dependency audit
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Reuse and verify existing Cloudflare resources
+        run: npm run cf:bootstrap
+
+      - name: Generate production Wrangler config
+        run: npm run config:production
+
+      - name: Verify generated production safety policy
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const config = JSON.parse(fs.readFileSync('wrangler.jsonc', 'utf8'));
+          const expected = {
+            worker: process.env.WORKER_NAME,
+            domain: process.env.CUSTOM_DOMAIN,
+          };
+          if (config.name !== expected.worker) throw new Error(`Worker mismatch: ${config.name}`);
+          if (config.workers_dev !== false) throw new Error('workers_dev must be false.');
+          if (config.preview_urls !== false) throw new Error('preview_urls must be false.');
+          if (config.vars?.APP_ENV !== 'production') throw new Error('APP_ENV must be production.');
+          if (config.vars?.DEV_AUTH_BYPASS !== 'false') throw new Error('DEV_AUTH_BYPASS must be false.');
+          if (!config.routes?.some((route) => route.pattern === expected.domain && route.custom_domain === true)) {
+            throw new Error(`Missing Custom Domain route ${expected.domain}.`);
+          }
+          if (!config.d1_databases?.[0]?.database_id || !config.r2_buckets?.[0]?.bucket_name) {
+            throw new Error('Cloudflare storage bindings are incomplete.');
+          }
+          NODE
+
+      - name: Validate production types and build
+        env:
+          TCP_WAYBILL_WRANGLER_MODE: production
+        run: npm run typecheck && npm run build
+
+      - name: Apply D1 migrations
+        run: npx wrangler d1 migrations apply DB --remote --config wrangler.jsonc
+
+      - name: Bootstrap inactive technical tenant
+        run: |
+          npm run cf:bootstrap-tenant
+          npx wrangler d1 execute DB --remote --config wrangler.jsonc --file=.cloudflare/bootstrap-tenant.sql
+
+      - name: Verify Vite-generated deploy configuration
+        run: npm run vite-output:verify
+
+      - name: Deploy existing Worker and Custom Domain
+        env:
+          WRANGLER_OUTPUT_FILE_PATH: .cloudflare/wrangler-output.ndjson
+        run: npx wrangler deploy
+
+      - name: Verify actual deployment target
+        run: npm run deploy-output:verify
+
+      - name: Synchronize runtime secrets only
+        run: npm run cf:sync-secrets
+
+      - name: Production health check
+        run: npm run health:production
+
+      - name: Deployment summary
+        run: |
+          node <<'NODE'
+          const b = require('./.cloudflare/bootstrap.json');
+          console.log(`Worker: ${b.worker_name}`);
+          console.log(`Custom Domain: https://${b.custom_domain}`);
+          console.log(`Version ID: ${process.env.DEPLOYED_WORKER_VERSION}`);
+          console.log(`D1: ${b.d1_database_name}`);
+          console.log(`R2: ${b.r2_bucket_name}`);
+          console.log('Access: reused without mutation');
+          console.log('Turnstile: reused without mutation');
+          console.log('workers.dev: disabled by production Wrangler config');
+          NODE
+
+      - name: Remove private deployment state
+        if: always()
+        working-directory: ${{ github.workspace }}
+        run: rm -rf source/.cloudflare source/wrangler.jsonc
