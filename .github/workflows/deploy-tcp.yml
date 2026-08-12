@@ -41,7 +41,8 @@ jobs:
     if: ${{ inputs.confirm == 'DEPLOY tcpxunine' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    environment: production
+    # Intentionally no GitHub Environment binding here. Repository Secrets are authoritative
+    # for the public runner, avoiding same-name Environment Secret precedence surprises.
 
     defaults:
       run:
@@ -128,7 +129,11 @@ jobs:
           for (const marker of ['/public/reservations/lookup', '/public/leads', '/admin/leads']) {
             if (!worker.includes(marker)) throw new Error(`Private source is stale: missing ${marker}.`);
           }
-          console.log(`::notice::Private source contract verified: ${contract.contract}`);
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          for (const script of ['admin-credential:verify-remote', 'admin-login:verify-production']) {
+            if (!pkg.scripts?.[script]) throw new Error(`Private source is stale: missing fix23 script ${script}.`);
+          }
+          console.log(`::notice::Private source contract verified: ${contract.contract} + fix23 credential determinism`);
           NODE
 
       - name: Setup Node.js
@@ -218,6 +223,11 @@ jobs:
           npm run cf:bootstrap-local-owner
           npx wrangler d1 execute DB --remote --config wrangler.jsonc --file=.cloudflare/bootstrap-local-owner.sql
 
+      - name: Verify remote D1 administrator credential
+        env:
+          INITIAL_ADMIN_PASSWORD: ${{ secrets.INITIAL_ADMIN_PASSWORD }}
+        run: npm run admin-credential:verify-remote
+
       - name: Verify Vite-generated deploy configuration
         run: npm run vite-output:verify
 
@@ -237,6 +247,11 @@ jobs:
 
       - name: Verify local username/password edge behavior
         run: npm run auth-edge:verify
+
+      - name: Verify production administrator login
+        env:
+          INITIAL_ADMIN_PASSWORD: ${{ secrets.INITIAL_ADMIN_PASSWORD }}
+        run: npm run admin-login:verify-production
 
       - name: Production health check
         run: npm run health:production
