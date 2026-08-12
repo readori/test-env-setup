@@ -27,7 +27,7 @@ env:
   SECURITY_RESOURCE_MODE: preserve
   ROUTING_RESOURCE_MODE: preserve-existing-custom-domain
   TURNSTILE_SITE_KEY: ${{ vars.TURNSTILE_SITE_KEY }}
-  ACCESS_APPLICATION_ID: ${{ vars.ACCESS_APPLICATION_ID }}
+  INITIAL_ADMIN_USERNAME: ${{ vars.INITIAL_ADMIN_USERNAME || 'admin' }}
   CI: true
 
 jobs:
@@ -50,10 +50,11 @@ jobs:
           TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          INITIAL_ADMIN_PASSWORD: ${{ secrets.INITIAL_ADMIN_PASSWORD }}
         run: |
           set -euo pipefail
           missing=0
-          for name in TARGET_REPO_PAT CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN; do
+          for name in TARGET_REPO_PAT CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN INITIAL_ADMIN_PASSWORD; do
             if [[ -z "${!name:-}" ]]; then
               echo "::error title=Missing GitHub Actions secret::${name} is missing or is not visible to the production environment."
               missing=1
@@ -79,39 +80,48 @@ jobs:
           echo "::notice::Source repository: ${SOURCE_REPOSITORY}"
           echo "::notice::Source ref requested: ${{ inputs.source_ref }}"
           echo "::notice::Source commit: $(git rev-parse HEAD)"
-          echo "::notice::Source subject: $(git log -1 --pretty=%s)"
 
-      - name: Verify private source is fix17-compatible
+      - name: Verify private source deployment contract
         run: |
           set -euo pipefail
           if [[ ! -f .deployment-contract.json ]]; then
-            echo "::error title=Private source is stale::The checked-out ${SOURCE_REPOSITORY}@${{ inputs.source_ref }} does not contain .deployment-contract.json. Update the private repository to fix17 before deploying."
+            echo "::error title=Private source is stale::The checked-out ${SOURCE_REPOSITORY}@${{ inputs.source_ref }} does not contain .deployment-contract.json. Update the private repository to the current integration release before deploying."
             exit 1
           fi
           node <<'NODE'
           const fs = require('node:fs');
           const contract = JSON.parse(fs.readFileSync('.deployment-contract.json', 'utf8'));
           const expected = {
-            contract: 'tcpxunine-production-v17',
+            contract: 'tcpxunine-production-v19',
             source_repository: 'readori/Tcpwaybill',
             worker_name: 'tcpxunine',
             custom_domain: 'tcp.xunine.com',
             security_resource_mode: 'preserve',
-            access_selection: 'custom-domain',
+            authentication_mode: 'local-username-password',
             workers_dev: false,
             routing_resource_mode: 'preserve-existing-custom-domain',
+            website_integration: 'xunine.com-v2',
           };
           for (const [key, value] of Object.entries(expected)) {
             if (contract[key] !== value) {
               throw new Error(`Private source contract mismatch: ${key} expected ${JSON.stringify(value)}, got ${JSON.stringify(contract[key])}`);
             }
           }
-          const bootstrap = fs.readFileSync('scripts/bootstrap-cloudflare.mjs', 'utf8');
-          for (const marker of ['ACCESS_APPLICATION_ID', 'chooseExistingAccessApplication', 'applicationProtectsHostname']) {
-            if (!bootstrap.includes(marker)) throw new Error(`Private source is stale: missing Access preserve marker ${marker}.`);
+          const auth = fs.readFileSync('worker/lib/local-session.ts', 'utf8');
+          const migration = fs.readFileSync('migrations/0003_local_accounts.sql', 'utf8');
+          for (const marker of ['tcpwaybill_session', 'loginWithPassword', 'authenticateLocalSession']) {
+            if (!auth.includes(marker)) throw new Error(`Private source is stale: missing local auth marker ${marker}.`);
           }
-          if (bootstrap.includes('SECURITY_RESOURCE_MODE=preserve requires existing Access application ${accessApplicationName}')) {
-            throw new Error('Private source is stale: legacy fixed-name Access preserve logic is still present (fix14 or older).');
+          if (!migration.includes('CREATE TABLE local_accounts') || !migration.includes('CREATE TABLE local_sessions')) {
+            throw new Error('Private source is stale: local authentication migration is missing.');
+          }
+          const webMigration = fs.readFileSync('migrations/0004_xunine_web_integration.sql', 'utf8');
+          const worker = fs.readFileSync('worker/index.ts', 'utf8');
+          if (!webMigration.includes('CREATE TABLE booking_web_details') || !webMigration.includes('CREATE TABLE public_leads')) {
+            throw new Error('Private source is stale: XUNINE website migration is missing.');
+          }
+          for (const marker of ['/public/reservations/lookup', '/public/leads', '/admin/leads']) {
+            if (!worker.includes(marker)) throw new Error(`Private source is stale: missing ${marker}.`);
           }
           console.log(`::notice::Private source contract verified: ${contract.contract}`);
           NODE
@@ -195,6 +205,13 @@ jobs:
           npm run cf:bootstrap-tenant
           npx wrangler d1 execute DB --remote --config wrangler.jsonc --file=.cloudflare/bootstrap-tenant.sql
 
+      - name: Bootstrap local owner account
+        env:
+          INITIAL_ADMIN_PASSWORD: ${{ secrets.INITIAL_ADMIN_PASSWORD }}
+        run: |
+          npm run cf:bootstrap-local-owner
+          npx wrangler d1 execute DB --remote --config wrangler.jsonc --file=.cloudflare/bootstrap-local-owner.sql
+
       - name: Verify Vite-generated deploy configuration
         run: npm run vite-output:verify
 
@@ -212,6 +229,9 @@ jobs:
       - name: Synchronize runtime secrets only
         run: npm run cf:sync-secrets
 
+      - name: Verify local username/password edge behavior
+        run: npm run auth-edge:verify
+
       - name: Production health check
         run: npm run health:production
 
@@ -224,7 +244,7 @@ jobs:
           console.log(`Version ID: ${process.env.DEPLOYED_WORKER_VERSION}`);
           console.log(`D1: ${b.d1_database_name}`);
           console.log(`R2: ${b.r2_bucket_name}`);
-          console.log('Access: reused without mutation');
+          console.log('Authentication: local username/password');
           console.log('Turnstile: reused without mutation');
           console.log('workers.dev: disabled; Custom Domain preserved outside Wrangler routes');
           NODE
