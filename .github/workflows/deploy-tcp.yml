@@ -1,4 +1,4 @@
-name: Deploy Tcpwaybill 
+name: Deploy Tcpwaybill
 
 on:
   workflow_dispatch:
@@ -41,12 +41,32 @@ jobs:
         working-directory: source
 
     steps:
+      - name: Verify deployment secrets
+        working-directory: ${{ github.workspace }}
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in TARGET_REPO_PAT CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error title=Missing GitHub Actions secret::${name} is missing or is not visible to the production environment."
+              missing=1
+            fi
+          done
+          if [[ "$missing" -ne 0 ]]; then
+            exit 1
+          fi
+          echo "::notice::Required deployment secrets are available."
+
       - name: Checkout private source repository
         uses: actions/checkout@v6
         with:
           repository: readori/Tcpwaybill
           ref: ${{ inputs.source_ref }}
-          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
           path: source
           fetch-depth: 1
           persist-credentials: false
