@@ -1,4 +1,4 @@
-name: Deploy Tcpwaybill
+name: Deploy Tcpwaybill Private Source
 
 on:
   workflow_dispatch:
@@ -26,6 +26,7 @@ env:
   CUSTOM_DOMAIN: tcp.xunine.com
   SECURITY_RESOURCE_MODE: preserve
   TURNSTILE_SITE_KEY: ${{ vars.TURNSTILE_SITE_KEY }}
+  ACCESS_APPLICATION_ID: ${{ vars.ACCESS_APPLICATION_ID }}
   CI: true
 
 jobs:
