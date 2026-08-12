@@ -98,7 +98,8 @@ jobs:
           const fs = require('node:fs');
           const contract = JSON.parse(fs.readFileSync('.deployment-contract.json', 'utf8'));
           const expected = {
-            contract: 'tcpxunine-production-v19',
+            contract: 'tcpxunine-production-v24',
+            release: 'fix24-root-flat',
             source_repository: 'readori/Tcpwaybill',
             worker_name: 'tcpxunine',
             custom_domain: 'tcp.xunine.com',
@@ -130,10 +131,10 @@ jobs:
             if (!worker.includes(marker)) throw new Error(`Private source is stale: missing ${marker}.`);
           }
           const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-          for (const script of ['admin-credential:verify-remote', 'admin-login:verify-production']) {
-            if (!pkg.scripts?.[script]) throw new Error(`Private source is stale: missing fix23 script ${script}.`);
+          for (const script of ['admin-credential:verify-remote', 'admin-login:verify-production', 'release:verify']) {
+            if (!pkg.scripts?.[script]) throw new Error(`Private source is stale: missing fix24 script ${script}.`);
           }
-          console.log(`::notice::Private source contract verified: ${contract.contract} + fix23 credential determinism`);
+          console.log(`::notice::Private source contract verified: ${contract.contract} + fix24 root-flat credential determinism`);
           NODE
 
       - name: Setup Node.js
