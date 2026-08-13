@@ -98,8 +98,8 @@ jobs:
           const fs = require('node:fs');
           const contract = JSON.parse(fs.readFileSync('.deployment-contract.json', 'utf8'));
           const expected = {
-            contract: 'tcpxunine-production-v29',
-            release: 'fix29-single-page-driver-compliance-waybill',
+            contract: 'tcpxunine-production-v32',
+            release: 'fix32-driver-operations-deep-audit',
             source_repository: 'readori/Tcpwaybill',
             worker_name: 'tcpxunine',
             custom_domain: 'tcp.xunine.com',
@@ -112,6 +112,14 @@ jobs:
             driver_compliance_mode: 'masked-last4',
             address_autocomplete_mode: 'google-places-server-proxy-la',
             waybill_document_mode: 'single-page-driver-compliance-v2',
+            app_entry_mode: 'unified-role-aware-responsive-app',
+            mobile_layout_mode: 'drawer-sidebar-breakpoint-1000',
+            driver_operations_mode: 'lifecycle-documents-tasks-incidents-offline-conflicts',
+            offline_conflict_mode: 'signed-replay-reviewed',
+            compliance_document_mode: 'r2-magic-byte-retained',
+            offline_signing_mode: 'es256-detached-client-server-verified',
+            device_identity_mode: 'random-persistent-or-volatile-fail-safe',
+            waybill_inspection_mode: 'canonical-immutable-compliance-snapshot',
           };
           for (const [key, value] of Object.entries(expected)) {
             if (contract[key] !== value) {
@@ -122,10 +130,10 @@ jobs:
           const password = fs.readFileSync('worker/lib/password.ts', 'utf8');
           const migration = fs.readFileSync('migrations/0003_local_accounts.sql', 'utf8');
           if (!password.includes('PASSWORD_ITERATIONS = 100_000') || !password.includes('MAX_RUNTIME_PBKDF2_ITERATIONS = 100_000')) {
-            throw new Error('Private source is stale: fix29 Cloudflare auth runtime profile is missing.');
+            throw new Error('Private source is stale: fix32 Cloudflare auth runtime profile is missing.');
           }
           for (const marker of ['AUTH_DB_READ_FAILED', 'AUTH_SESSION_WRITE_FAILED']) {
-            if (!auth.includes(marker)) throw new Error(`Private source is stale: missing fix29 auth stage ${marker}.`);
+            if (!auth.includes(marker)) throw new Error(`Private source is stale: missing fix32 auth stage ${marker}.`);
           }
           for (const marker of ['tcpwaybill_session', 'loginWithPassword', 'authenticateLocalSession']) {
             if (!auth.includes(marker)) throw new Error(`Private source is stale: missing local auth marker ${marker}.`);
@@ -142,11 +150,11 @@ jobs:
             if (!worker.includes(marker)) throw new Error(`Private source is stale: missing ${marker}.`);
           }
           const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-          for (const script of ['admin-credential:verify-remote', 'admin-login:verify-production', 'release:verify', 'i18n:verify', 'driver-compliance:verify', 'address-autocomplete:verify', 'waybill-single-page:verify']) {
-            if (!pkg.scripts?.[script]) throw new Error(`Private source is stale: missing fix29 script ${script}.`);
+          for (const script of ['admin-credential:verify-remote', 'admin-login:verify-production', 'release:verify', 'i18n:verify', 'driver-compliance:verify', 'address-autocomplete:verify', 'waybill-single-page:verify', 'mobile-role-print:verify', 'fix32-d1:verify', 'fix32-operations:verify', 'api-surface:verify', 'typescript-structure:verify']) {
+            if (!pkg.scripts?.[script]) throw new Error(`Private source is stale: missing fix32 script ${script}.`);
           }
-          for (const requiredFile of ['migrations/0005_driver_vehicle_compliance_details.sql', 'migrations/0006_address_autocomplete.sql', 'src/pages/DriverCompliancePage.tsx', 'src/components/AddressAutocomplete.tsx', 'scripts/verify-i18n-coverage.mjs', 'scripts/verify-driver-compliance.mjs', 'scripts/verify-address-autocomplete.mjs']) {
-            if (!fs.existsSync(requiredFile)) throw new Error(`Private source is stale: missing fix29 file ${requiredFile}.`);
+          for (const requiredFile of ['migrations/0005_driver_vehicle_compliance_details.sql', 'migrations/0006_address_autocomplete.sql', 'src/pages/DriverCompliancePage.tsx', 'src/components/AddressAutocomplete.tsx', 'src/offline/signature.ts', 'scripts/verify-i18n-coverage.mjs', 'scripts/verify-driver-compliance.mjs', 'scripts/verify-address-autocomplete.mjs', 'scripts/verify-fix32-d1.py', 'scripts/verify-fix32-operations.mjs', 'scripts/verify-api-surface.mjs', 'scripts/verify-typescript-structure.mjs', 'migrations/0008_driver_operations_and_audit.sql']) {
+            if (!fs.existsSync(requiredFile)) throw new Error(`Private source is stale: missing fix32 file ${requiredFile}.`);
           }
           const handlers = fs.readFileSync('worker/api/handlers.ts', 'utf8');
           const driversPage = fs.readFileSync('src/pages/DriversPage.tsx', 'utf8');
@@ -165,22 +173,30 @@ jobs:
             if (!openapi.includes(marker)) throw new Error(`Private source is stale: OpenAPI missing ${marker}.`);
           }
           for (const marker of ['/public/address/autocomplete', '/public/address/resolve', '/admin/settings/address-autocomplete']) {
-            if (!worker.includes(marker)) throw new Error(`Private source is stale: missing fix29 address route ${marker}.`);
+            if (!worker.includes(marker)) throw new Error(`Private source is stale: missing address route ${marker}.`);
           }
           const addressWorker = fs.readFileSync('worker/lib/address-places.ts', 'utf8');
           for (const marker of ['places.googleapis.com/v1/places:autocomplete', 'locationRestriction', 'X-Goog-Api-Key', 'PRODUCTION_PUBLIC_ORIGINS', 'ADDRESS_ORIGIN_BLOCKED', 'publicAddressPreflight', 'address_lookup_rate_limits']) {
             if (!addressWorker.includes(marker)) throw new Error(`Private source is stale: address provider missing ${marker}.`);
           }
-          if (!fs.existsSync('migrations/0007_waybill_print_profile_v2.sql')) throw new Error('Private source is stale: missing fix29 Waybill print profile migration.');
+          if (!fs.existsSync('migrations/0007_waybill_print_profile_v2.sql')) throw new Error('Private source is stale: missing Waybill print profile migration.');
           const waybill = fs.readFileSync('worker/lib/waybill.ts', 'utf8');
           const waybillUi = fs.readFileSync('src/components/WaybillDocument.tsx', 'utf8');
           for (const marker of ['driverLicenseNumberLast4', 'vehicleInsurancePolicyLast4', 'Insurance & Vehicle Compliance / 保险与车辆合规', '@page{size:Letter']) {
-            if (!waybill.includes(marker)) throw new Error(`Private source is stale: missing fix29 Waybill marker ${marker}.`);
+            if (!waybill.includes(marker)) throw new Error(`Private source is stale: missing Waybill marker ${marker}.`);
           }
           for (const marker of ['driverLicense', 'insuranceExpiration', 'registrationExpiration', 'inspectionDue', 'data-print-density']) {
-            if (!waybillUi.includes(marker)) throw new Error(`Private source is stale: missing fix29 Waybill UI marker ${marker}.`);
+            if (!waybillUi.includes(marker)) throw new Error(`Private source is stale: missing Waybill UI marker ${marker}.`);
           }
-          console.log(`::notice::Private source contract verified: ${contract.contract} + fix29 single-page compliance Waybill + bilingual driver compliance + LA address autocomplete + auth preservation`);
+          const canonical = fs.readFileSync('worker/lib/canonical.ts', 'utf8');
+          const offlineSignature = fs.readFileSync('src/offline/signature.ts', 'utf8');
+          for (const marker of ['verifyOfflinePayloadSignature', 'ECDSA', 'P-256']) {
+            if (!canonical.includes(marker)) throw new Error(`Private source is stale: missing offline server signature marker ${marker}.`);
+          }
+          for (const marker of ['verifyOfflineBundleSignature', 'getVerifiedCachedOfflineBundle', 'crypto.subtle.verify']) {
+            if (!offlineSignature.includes(marker)) throw new Error(`Private source is stale: missing offline client signature marker ${marker}.`);
+          }
+          console.log(`::notice::Private source contract verified: ${contract.contract} + fix32 operations + ES256 offline authorization + responsive mobile admin + unified /app + one-page compliance Waybill`);
           NODE
 
       - name: Setup Node.js
@@ -223,6 +239,9 @@ jobs:
 
       - name: Reuse and verify existing Cloudflare resources
         run: npm run cf:bootstrap
+
+      - name: Synchronize and verify runtime secrets before deploy
+        run: npm run cf:sync-secrets
 
       - name: Generate production Wrangler config
         run: npm run config:production
@@ -289,9 +308,6 @@ jobs:
 
       - name: Verify preserved Custom Domain after deploy
         run: npm run cf:verify-domain
-
-      - name: Synchronize runtime secrets only
-        run: npm run cf:sync-secrets
 
       - name: Verify local username/password edge behavior
         run: npm run auth-edge:verify
