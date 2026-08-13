@@ -98,8 +98,8 @@ jobs:
           const fs = require('node:fs');
           const contract = JSON.parse(fs.readFileSync('.deployment-contract.json', 'utf8'));
           const expected = {
-            contract: 'tcpxunine-production-v27',
-            release: 'fix27-bilingual-driver-compliance',
+            contract: 'tcpxunine-production-v29',
+            release: 'fix29-single-page-driver-compliance-waybill',
             source_repository: 'readori/Tcpwaybill',
             worker_name: 'tcpxunine',
             custom_domain: 'tcp.xunine.com',
@@ -110,6 +110,8 @@ jobs:
             website_integration: 'xunine.com-v2',
             i18n_mode: 'en-US+zh-CN',
             driver_compliance_mode: 'masked-last4',
+            address_autocomplete_mode: 'google-places-server-proxy-la',
+            waybill_document_mode: 'single-page-driver-compliance-v2',
           };
           for (const [key, value] of Object.entries(expected)) {
             if (contract[key] !== value) {
@@ -120,10 +122,10 @@ jobs:
           const password = fs.readFileSync('worker/lib/password.ts', 'utf8');
           const migration = fs.readFileSync('migrations/0003_local_accounts.sql', 'utf8');
           if (!password.includes('PASSWORD_ITERATIONS = 100_000') || !password.includes('MAX_RUNTIME_PBKDF2_ITERATIONS = 100_000')) {
-            throw new Error('Private source is stale: fix27 Cloudflare auth runtime profile is missing.');
+            throw new Error('Private source is stale: fix29 Cloudflare auth runtime profile is missing.');
           }
           for (const marker of ['AUTH_DB_READ_FAILED', 'AUTH_SESSION_WRITE_FAILED']) {
-            if (!auth.includes(marker)) throw new Error(`Private source is stale: missing fix27 auth stage ${marker}.`);
+            if (!auth.includes(marker)) throw new Error(`Private source is stale: missing fix29 auth stage ${marker}.`);
           }
           for (const marker of ['tcpwaybill_session', 'loginWithPassword', 'authenticateLocalSession']) {
             if (!auth.includes(marker)) throw new Error(`Private source is stale: missing local auth marker ${marker}.`);
@@ -140,11 +142,11 @@ jobs:
             if (!worker.includes(marker)) throw new Error(`Private source is stale: missing ${marker}.`);
           }
           const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-          for (const script of ['admin-credential:verify-remote', 'admin-login:verify-production', 'release:verify', 'i18n:verify', 'driver-compliance:verify']) {
-            if (!pkg.scripts?.[script]) throw new Error(`Private source is stale: missing fix27 script ${script}.`);
+          for (const script of ['admin-credential:verify-remote', 'admin-login:verify-production', 'release:verify', 'i18n:verify', 'driver-compliance:verify', 'address-autocomplete:verify', 'waybill-single-page:verify']) {
+            if (!pkg.scripts?.[script]) throw new Error(`Private source is stale: missing fix29 script ${script}.`);
           }
-          for (const requiredFile of ['migrations/0005_driver_vehicle_compliance_details.sql', 'src/pages/DriverCompliancePage.tsx', 'scripts/verify-i18n-coverage.mjs', 'scripts/verify-driver-compliance.mjs']) {
-            if (!fs.existsSync(requiredFile)) throw new Error(`Private source is stale: missing fix27 file ${requiredFile}.`);
+          for (const requiredFile of ['migrations/0005_driver_vehicle_compliance_details.sql', 'migrations/0006_address_autocomplete.sql', 'src/pages/DriverCompliancePage.tsx', 'src/components/AddressAutocomplete.tsx', 'scripts/verify-i18n-coverage.mjs', 'scripts/verify-driver-compliance.mjs', 'scripts/verify-address-autocomplete.mjs']) {
+            if (!fs.existsSync(requiredFile)) throw new Error(`Private source is stale: missing fix29 file ${requiredFile}.`);
           }
           const handlers = fs.readFileSync('worker/api/handlers.ts', 'utf8');
           const driversPage = fs.readFileSync('src/pages/DriversPage.tsx', 'utf8');
@@ -162,7 +164,23 @@ jobs:
           for (const marker of ['/admin/drivers/{driver_id}/vehicle-authorizations:', 'DriverVehicleAuthorizationWrite:', 'DriverVehicleAuthorizationResponse:']) {
             if (!openapi.includes(marker)) throw new Error(`Private source is stale: OpenAPI missing ${marker}.`);
           }
-          console.log(`::notice::Private source contract verified: ${contract.contract} + fix27 bilingual driver compliance + auth preservation`);
+          for (const marker of ['/public/address/autocomplete', '/public/address/resolve', '/admin/settings/address-autocomplete']) {
+            if (!worker.includes(marker)) throw new Error(`Private source is stale: missing fix29 address route ${marker}.`);
+          }
+          const addressWorker = fs.readFileSync('worker/lib/address-places.ts', 'utf8');
+          for (const marker of ['places.googleapis.com/v1/places:autocomplete', 'locationRestriction', 'X-Goog-Api-Key', 'PRODUCTION_PUBLIC_ORIGINS', 'ADDRESS_ORIGIN_BLOCKED', 'publicAddressPreflight', 'address_lookup_rate_limits']) {
+            if (!addressWorker.includes(marker)) throw new Error(`Private source is stale: address provider missing ${marker}.`);
+          }
+          if (!fs.existsSync('migrations/0007_waybill_print_profile_v2.sql')) throw new Error('Private source is stale: missing fix29 Waybill print profile migration.');
+          const waybill = fs.readFileSync('worker/lib/waybill.ts', 'utf8');
+          const waybillUi = fs.readFileSync('src/components/WaybillDocument.tsx', 'utf8');
+          for (const marker of ['driverLicenseNumberLast4', 'vehicleInsurancePolicyLast4', 'Insurance & Vehicle Compliance / 保险与车辆合规', '@page{size:Letter']) {
+            if (!waybill.includes(marker)) throw new Error(`Private source is stale: missing fix29 Waybill marker ${marker}.`);
+          }
+          for (const marker of ['driverLicense', 'insuranceExpiration', 'registrationExpiration', 'inspectionDue', 'data-print-density']) {
+            if (!waybillUi.includes(marker)) throw new Error(`Private source is stale: missing fix29 Waybill UI marker ${marker}.`);
+          }
+          console.log(`::notice::Private source contract verified: ${contract.contract} + fix29 single-page compliance Waybill + bilingual driver compliance + LA address autocomplete + auth preservation`);
           NODE
 
       - name: Setup Node.js
