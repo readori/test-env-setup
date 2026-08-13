@@ -98,8 +98,8 @@ jobs:
           const fs = require('node:fs');
           const contract = JSON.parse(fs.readFileSync('.deployment-contract.json', 'utf8'));
           const expected = {
-            contract: 'tcpxunine-production-v26',
-            release: 'fix26-manual-credential-preserve-mobile',
+            contract: 'tcpxunine-production-v27',
+            release: 'fix27-bilingual-driver-compliance',
             source_repository: 'readori/Tcpwaybill',
             worker_name: 'tcpxunine',
             custom_domain: 'tcp.xunine.com',
@@ -108,6 +108,8 @@ jobs:
             workers_dev: false,
             routing_resource_mode: 'preserve-existing-custom-domain',
             website_integration: 'xunine.com-v2',
+            i18n_mode: 'en-US+zh-CN',
+            driver_compliance_mode: 'masked-last4',
           };
           for (const [key, value] of Object.entries(expected)) {
             if (contract[key] !== value) {
@@ -118,10 +120,10 @@ jobs:
           const password = fs.readFileSync('worker/lib/password.ts', 'utf8');
           const migration = fs.readFileSync('migrations/0003_local_accounts.sql', 'utf8');
           if (!password.includes('PASSWORD_ITERATIONS = 100_000') || !password.includes('MAX_RUNTIME_PBKDF2_ITERATIONS = 100_000')) {
-            throw new Error('Private source is stale: fix25 Cloudflare auth runtime profile is missing.');
+            throw new Error('Private source is stale: fix27 Cloudflare auth runtime profile is missing.');
           }
           for (const marker of ['AUTH_DB_READ_FAILED', 'AUTH_SESSION_WRITE_FAILED']) {
-            if (!auth.includes(marker)) throw new Error(`Private source is stale: missing fix25 auth stage ${marker}.`);
+            if (!auth.includes(marker)) throw new Error(`Private source is stale: missing fix27 auth stage ${marker}.`);
           }
           for (const marker of ['tcpwaybill_session', 'loginWithPassword', 'authenticateLocalSession']) {
             if (!auth.includes(marker)) throw new Error(`Private source is stale: missing local auth marker ${marker}.`);
@@ -138,10 +140,29 @@ jobs:
             if (!worker.includes(marker)) throw new Error(`Private source is stale: missing ${marker}.`);
           }
           const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-          for (const script of ['admin-credential:verify-remote', 'admin-login:verify-production', 'release:verify']) {
-            if (!pkg.scripts?.[script]) throw new Error(`Private source is stale: missing fix25 script ${script}.`);
+          for (const script of ['admin-credential:verify-remote', 'admin-login:verify-production', 'release:verify', 'i18n:verify', 'driver-compliance:verify']) {
+            if (!pkg.scripts?.[script]) throw new Error(`Private source is stale: missing fix27 script ${script}.`);
           }
-          console.log(`::notice::Private source contract verified: ${contract.contract} + fix25 auth-runtime credential determinism`);
+          for (const requiredFile of ['migrations/0005_driver_vehicle_compliance_details.sql', 'src/pages/DriverCompliancePage.tsx', 'scripts/verify-i18n-coverage.mjs', 'scripts/verify-driver-compliance.mjs']) {
+            if (!fs.existsSync(requiredFile)) throw new Error(`Private source is stale: missing fix27 file ${requiredFile}.`);
+          }
+          const handlers = fs.readFileSync('worker/api/handlers.ts', 'utf8');
+          const driversPage = fs.readFileSync('src/pages/DriversPage.tsx', 'utf8');
+          const reservationDetail = fs.readFileSync('src/pages/ReservationDetailPage.tsx', 'utf8');
+          const openapi = fs.readFileSync('docs/openapi.yaml', 'utf8');
+          for (const marker of ['listDriverVehicleAuthorizations', 'updateDriverVehicleAuthorizations', 'VEHICLE_NOT_AUTHORIZED']) {
+            if (!handlers.includes(marker)) throw new Error(`Private source is stale: missing driver/vehicle authorization marker ${marker}.`);
+          }
+          for (const marker of ['vehicle-authorizations', 'authorizedVehicles']) {
+            if (!driversPage.includes(marker)) throw new Error(`Private source is stale: Drivers UI missing ${marker}.`);
+          }
+          for (const marker of ['vehicle-authorizations', 'authorizedVehicleIds', 'assignableVehicles']) {
+            if (!reservationDetail.includes(marker)) throw new Error(`Private source is stale: dispatch authorization UI missing ${marker}.`);
+          }
+          for (const marker of ['/admin/drivers/{driver_id}/vehicle-authorizations:', 'DriverVehicleAuthorizationWrite:', 'DriverVehicleAuthorizationResponse:']) {
+            if (!openapi.includes(marker)) throw new Error(`Private source is stale: OpenAPI missing ${marker}.`);
+          }
+          console.log(`::notice::Private source contract verified: ${contract.contract} + fix27 bilingual driver compliance + auth preservation`);
           NODE
 
       - name: Setup Node.js
