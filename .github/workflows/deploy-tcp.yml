@@ -11,6 +11,7 @@ on:
       confirm:
         description: Type DEPLOY tcpxunine to confirm production deployment
         required: true
+        default: DEPLOY tcpxunine
         type: string
       reset_admin_password:
         description: Reset the local admin password to INITIAL_ADMIN_PASSWORD and revoke existing admin sessions
@@ -150,10 +151,10 @@ jobs:
             if (!worker.includes(marker)) throw new Error(`Private source is stale: missing ${marker}.`);
           }
           const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-          for (const script of ['admin-credential:verify-remote', 'admin-login:verify-production', 'release:verify', 'i18n:verify', 'driver-compliance:verify', 'address-autocomplete:verify', 'waybill-single-page:verify', 'mobile-role-print:verify', 'fix32-d1:verify', 'fix32-operations:verify', 'api-surface:verify', 'typescript-structure:verify']) {
+          for (const script of ['admin-credential:verify-remote', 'admin-login:verify-production', 'release:verify', 'i18n:verify', 'driver-compliance:verify', 'address-autocomplete:verify', 'waybill-single-page:verify', 'mobile-role-print:verify', 'fix32-d1:verify', 'fix32-operations:verify', 'api-surface:verify', 'typescript-structure:verify', 'public-cors:verify']) {
             if (!pkg.scripts?.[script]) throw new Error(`Private source is stale: missing fix32 script ${script}.`);
           }
-          for (const requiredFile of ['migrations/0005_driver_vehicle_compliance_details.sql', 'migrations/0006_address_autocomplete.sql', 'src/pages/DriverCompliancePage.tsx', 'src/components/AddressAutocomplete.tsx', 'src/offline/signature.ts', 'scripts/verify-i18n-coverage.mjs', 'scripts/verify-driver-compliance.mjs', 'scripts/verify-address-autocomplete.mjs', 'scripts/verify-fix32-d1.py', 'scripts/verify-fix32-operations.mjs', 'scripts/verify-api-surface.mjs', 'scripts/verify-typescript-structure.mjs', 'migrations/0008_driver_operations_and_audit.sql']) {
+          for (const requiredFile of ['migrations/0005_driver_vehicle_compliance_details.sql', 'migrations/0006_address_autocomplete.sql', 'src/pages/DriverCompliancePage.tsx', 'src/components/AddressAutocomplete.tsx', 'src/offline/signature.ts', 'scripts/verify-i18n-coverage.mjs', 'scripts/verify-driver-compliance.mjs', 'scripts/verify-address-autocomplete.mjs', 'scripts/verify-fix32-d1.py', 'scripts/verify-fix32-operations.mjs', 'scripts/verify-api-surface.mjs', 'scripts/verify-typescript-structure.mjs', 'migrations/0008_driver_operations_and_audit.sql', 'worker/lib/public-cors.ts', 'scripts/verify-public-cors.mjs', 'src/pages/PublicManagePage.tsx']) {
             if (!fs.existsSync(requiredFile)) throw new Error(`Private source is stale: missing fix32 file ${requiredFile}.`);
           }
           const handlers = fs.readFileSync('worker/api/handlers.ts', 'utf8');
@@ -176,8 +177,15 @@ jobs:
             if (!worker.includes(marker)) throw new Error(`Private source is stale: missing address route ${marker}.`);
           }
           const addressWorker = fs.readFileSync('worker/lib/address-places.ts', 'utf8');
-          for (const marker of ['places.googleapis.com/v1/places:autocomplete', 'locationRestriction', 'X-Goog-Api-Key', 'PRODUCTION_PUBLIC_ORIGINS', 'ADDRESS_ORIGIN_BLOCKED', 'publicAddressPreflight', 'address_lookup_rate_limits']) {
+          for (const marker of ['places.googleapis.com/v1/places:autocomplete', 'locationRestriction', 'X-Goog-Api-Key', 'address_lookup_rate_limits', 'enforcePublicApiOrigin', 'publicApiCorsOrigin']) {
             if (!addressWorker.includes(marker)) throw new Error(`Private source is stale: address provider missing ${marker}.`);
+          }
+          const publicCors = fs.readFileSync('worker/lib/public-cors.ts', 'utf8');
+          for (const marker of ['XUNINE_PUBLIC_ORIGIN = "https://xunine.com"', 'PUBLIC_ORIGIN_BLOCKED', 'publicApiPreflight', 'content-type, idempotency-key']) {
+            if (!publicCors.includes(marker)) throw new Error(`Private source is stale: shared public CORS missing ${marker}.`);
+          }
+          if (publicCors.includes('https://www.xunine.com') || publicCors.includes('access-control-allow-origin", "*"')) {
+            throw new Error('Private source is stale: public CORS must allow only canonical https://xunine.com in production and must never use wildcard origins.');
           }
           if (!fs.existsSync('migrations/0007_waybill_print_profile_v2.sql')) throw new Error('Private source is stale: missing Waybill print profile migration.');
           const waybill = fs.readFileSync('worker/lib/waybill.ts', 'utf8');
