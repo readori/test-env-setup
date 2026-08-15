@@ -420,6 +420,7 @@ jobs:
     # ==============================================
     - name: Run iPhone + iPad 13 + Split View + VoiceOver UI audit
       if: ${{ github.event.inputs.run_accessibility_ui == 'yes' }}
+      timeout-minutes: 45
       shell: bash
       env:
         READORI_A11Y_OUTPUT: ${{ runner.temp }}/readori-accessibility-final
@@ -1378,49 +1379,253 @@ jobs:
     - name: Auto-capture simulator screenshots
       if: ${{ env.MODE == 'screenshots' }}
       continue-on-error: true
+      timeout-minutes: 35
+      shell: bash
+      env:
+        PRO_LEASE_PUBLIC_KEY: ${{ secrets.PRO_LEASE_PUBLIC_KEY }}
       run: |
-        set +e  # best-effort: any single failure here should not fail the whole job
+        # Best-effort capture step, but every potentially blocking Simulator command
+        # has its own timeout. The following validation step remains the hard gate.
+        set +e
+
         SCREENSHOTS_DIR="$GITHUB_WORKSPACE/screenshots_captured"
-        # 🐛 修复（"截图明明成功了，Upload 那一步却说 core_project/screenshots
         TARGET_DIR="$GITHUB_WORKSPACE/core_project/screenshots"
         BUNDLE_ID="com.readori.app"
+        BUILD_DIR="/tmp/sim_build"
+        BUILD_LOG="/tmp/sim_build.log"
+        LOCALES="en-US"
 
-        # Skip auto-capture if screenshots already exist
+        rm -rf "$SCREENSHOTS_DIR"
+
+        # Skip auto-capture if screenshots already exist.
         if [[ -d "$TARGET_DIR" ]] && [[ -n "$(ls -A "$TARGET_DIR" 2>/dev/null)" ]]; then
           echo "Pre-staged screenshots found at $TARGET_DIR — skipping auto-capture"
           exit 0
         fi
 
-        # ---- helper: print "udid|name" for the first available simulator matching any pattern ----
-        # 注意：这里故意写成单行 python3 -c 而不是 heredoc/多行脚本——
-        # heredoc 的结束标记必须顶格、不能带 YAML 缩进，会把这个 run block 提前截断。
-        pick_simulator() {
-          python3 -c "import json,subprocess,sys; patterns=sys.argv[1:]; data=json.loads(subprocess.run(['xcrun','simctl','list','devices','available','--json'],capture_output=True,text=True).stdout); all_devs=[d for devs in data.get('devices',{}).values() for d in devs if d.get('isAvailable')]; match=next((d for pat in patterns for d in all_devs if pat in d.get('name','')), None); print((match['udid']+'|'+match['name']) if match else '', end='')" "$@"
+        # ------------------------------------------------------------------
+        # macOS runner-safe timeout helper.
+        # Do not depend on GNU `timeout`/`gtimeout`; GitHub macOS runners do
+        # not guarantee coreutils. Python kills the whole process group.
+        # ------------------------------------------------------------------
+        run_with_timeout() {
+          local seconds="$1"
+          shift
+          python3 - "$seconds" "$@" <<'PY_TIMEOUT'
+        import os
+        import signal
+        import subprocess
+        import sys
+        import time
+
+        seconds = float(sys.argv[1])
+        command = sys.argv[2:]
+        if not command:
+            print("::error::run_with_timeout received no command", flush=True)
+            raise SystemExit(64)
+
+        proc = subprocess.Popen(command, start_new_session=True)
+        try:
+            raise SystemExit(proc.wait(timeout=seconds))
+        except subprocess.TimeoutExpired:
+            rendered = " ".join(command)
+            print(f"::error::Command timed out after {seconds:g}s: {rendered}", flush=True)
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait()
+            raise SystemExit(124)
+        PY_TIMEOUT
         }
 
-        IPHONE_SIM=$(pick_simulator "iPhone 17 Pro Max" "iPhone 16 Pro Max" "iPhone 15 Pro Max" "iPhone 14 Pro Max" "iPhone 13 Pro Max")
-        IPAD_SIM=$(pick_simulator "iPad Pro 13-inch (M5)" "iPad Pro 13-inch (M4)" "iPad Pro (12.9-inch) (6th generation)" "iPad Pro (12.9-inch) (5th generation)")
+        # ------------------------------------------------------------------
+        # Select a simulator from the runtime that matches the currently
+        # selected Xcode's iPhoneSimulator SDK first. This avoids accidentally
+        # choosing an identically named iPad from an older installed runtime.
+        # Output: udid|name
+        # ------------------------------------------------------------------
+        pick_simulator() {
+          python3 - "$@" <<'PY_PICK_SIM'
+        import json
+        import re
+        import subprocess
+        import sys
+
+        patterns = sys.argv[1:]
+
+        sdk = subprocess.run(
+            ["xcrun", "--sdk", "iphonesimulator", "--show-sdk-version"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        raw = subprocess.run(
+            ["xcrun", "simctl", "list", "devices", "available", "--json"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        data = json.loads(raw)
+        devices_by_runtime = data.get("devices", {})
+
+        def version_tuple(value: str):
+            nums = re.findall(r"\d+", value)
+            return tuple(int(x) for x in nums[:3])
+
+        sdk_version = version_tuple(sdk)
+        ios_runtime_ids = [
+            rid for rid in devices_by_runtime
+            if "SimRuntime.iOS-" in rid
+        ]
+
+        exact = [
+            rid for rid in ios_runtime_ids
+            if version_tuple(rid.split("SimRuntime.iOS-", 1)[1]) == sdk_version
+        ]
+        remaining = [rid for rid in ios_runtime_ids if rid not in exact]
+        remaining.sort(
+            key=lambda rid: version_tuple(rid.split("SimRuntime.iOS-", 1)[1]),
+            reverse=True,
+        )
+        ordered_runtimes = exact + remaining
+
+        for runtime_id in ordered_runtimes:
+            devices = [
+                d for d in devices_by_runtime.get(runtime_id, [])
+                if d.get("isAvailable", True)
+            ]
+            for pattern in patterns:
+                for device in devices:
+                    if pattern in device.get("name", ""):
+                        print(f"{device['udid']}|{device['name']}", end="")
+                        raise SystemExit(0)
+        PY_PICK_SIM
+        }
+
+        simulator_state() {
+          local udid="$1"
+          xcrun simctl list devices 2>/dev/null | grep -F "$udid" | head -1 || true
+        }
+
+        # ------------------------------------------------------------------
+        # Boot + wait until CoreSimulator reports the device fully ready.
+        # Fixed sleep is intentionally NOT used here.
+        # One controlled reboot is allowed if bootstatus hangs/fails.
+        # ------------------------------------------------------------------
+        ensure_simulator_ready() {
+          local udid="$1"
+          local label="$2"
+
+          echo "[$label] boot requested: $udid"
+          run_with_timeout 15 xcrun simctl boot "$udid" || true
+
+          echo "[$label] waiting for bootstatus..."
+          if run_with_timeout 90 xcrun simctl bootstatus "$udid" -b; then
+            echo "[$label] simulator ready: $(simulator_state "$udid")"
+            return 0
+          fi
+
+          echo "::warning::[$label] first bootstatus failed; rebooting simulator once"
+          run_with_timeout 15 xcrun simctl shutdown "$udid" || true
+          sleep 2
+          run_with_timeout 15 xcrun simctl boot "$udid" || true
+
+          if run_with_timeout 90 xcrun simctl bootstatus "$udid" -b; then
+            echo "[$label] simulator ready after reboot: $(simulator_state "$udid")"
+            return 0
+          fi
+
+          echo "::error::[$label] simulator failed to become ready"
+          simulator_state "$udid"
+          return 1
+        }
+
+        install_app_with_retry() {
+          local udid="$1"
+          local label="$2"
+
+          echo "[$label] removing stale app installation (if any)..."
+          run_with_timeout 15 xcrun simctl uninstall "$udid" "$BUNDLE_ID" || true
+
+          echo "[$label] installing app..."
+          if run_with_timeout 45 xcrun simctl install "$udid" "$APP_PATH"; then
+            echo "[$label] app installed"
+            return 0
+          fi
+
+          echo "::warning::[$label] install failed/timed out; rebooting and retrying once"
+          run_with_timeout 15 xcrun simctl shutdown "$udid" || true
+          sleep 2
+          ensure_simulator_ready "$udid" "$label install-retry" || return 1
+          run_with_timeout 15 xcrun simctl uninstall "$udid" "$BUNDLE_ID" || true
+
+          if run_with_timeout 45 xcrun simctl install "$udid" "$APP_PATH"; then
+            echo "[$label] app installed after retry"
+            return 0
+          fi
+
+          echo "::error::[$label] app install failed after retry"
+          return 1
+        }
+
+        IPHONE_SIM="$(pick_simulator \
+          "iPhone 17 Pro Max" \
+          "iPhone 16 Pro Max" \
+          "iPhone 15 Pro Max" \
+          "iPhone 14 Pro Max" \
+          "iPhone 13 Pro Max")"
+
+        IPAD_SIM="$(pick_simulator \
+          "iPad Pro 13-inch (M5)" \
+          "iPad Pro 13-inch (M4)" \
+          "iPad Pro (12.9-inch) (6th generation)" \
+          "iPad Pro (12.9-inch) (5th generation)")"
 
         if [[ -z "$IPHONE_SIM" && -z "$IPAD_SIM" ]]; then
-          echo "No suitable iPhone or iPad simulator available — skipping auto-capture"
-          exit 0
+          echo "::error::No suitable iPhone or iPad simulator available"
+          xcrun simctl list devices available || true
+          exit 1
         fi
-        [[ -n "$IPHONE_SIM" ]] && echo "iPhone simulator: $IPHONE_SIM" || echo "No iPhone simulator found"
-        [[ -n "$IPAD_SIM"   ]] && echo "iPad simulator:   $IPAD_SIM"   || echo "No iPad simulator found"
 
-        # ---- build once: a simulator .app build is arch/runtime-generic across
-        #      iPhone and iPad simulators of the same Xcode/SDK, no need to build twice ----
+        [[ -n "$IPHONE_SIM" ]] && echo "iPhone simulator: $IPHONE_SIM" || echo "::warning::No iPhone simulator found"
+        [[ -n "$IPAD_SIM"   ]] && echo "iPad simulator:   $IPAD_SIM"   || echo "::warning::No iPad simulator found"
+
+        # ------------------------------------------------------------------
+        # Build exactly once. The same Simulator .app can be installed on the
+        # chosen iPhone and iPad for this Xcode/SDK.
+        # ------------------------------------------------------------------
         BOOT_UDID="${IPHONE_SIM%%|*}"
-        [[ -z "$BOOT_UDID" ]] && BOOT_UDID="${IPAD_SIM%%|*}"
-        xcrun simctl boot "$BOOT_UDID" 2>/dev/null || true
-        sleep 5
+        BOOT_LABEL="iPhone build simulator"
+        if [[ -z "$BOOT_UDID" || "$BOOT_UDID" == "$IPHONE_SIM" && -z "$IPHONE_SIM" ]]; then
+          BOOT_UDID="${IPAD_SIM%%|*}"
+          BOOT_LABEL="iPad build simulator"
+        fi
+
+        if ! ensure_simulator_ready "$BOOT_UDID" "$BOOT_LABEL"; then
+          echo "::error::Unable to prepare a simulator for the screenshot build"
+          exit 1
+        fi
 
         cd "$GITHUB_WORKSPACE/core_project"
-        # 🐛 Bug 修复（"后台没收到截图"的根本原因）：
         INFOPLIST_ABS="$GITHUB_WORKSPACE/core_project/Readori/Supporting/Info.plist"
-        # 🐛 修复（"No simulator .app found" 但日志里完全看不到任何错误信息）：
-        BUILD_LOG="/tmp/sim_build.log"
-        xcodebuild build \
+
+        # Never reuse a partially written/stale simulator binary from a prior
+        # command in the same runner.
+        rm -rf "$BUILD_DIR"
+        rm -f "$BUILD_LOG"
+        mkdir -p "$BUILD_DIR"
+
+        echo "[build] compiling simulator app (hard timeout: 20 minutes)..."
+        run_with_timeout 1200 xcodebuild build \
           -scheme                    "$SCHEME" \
           -sdk                       iphonesimulator \
           -destination               "platform=iOS Simulator,id=$BOOT_UDID" \
@@ -1430,26 +1635,36 @@ jobs:
           GENERATE_INFOPLIST_FILE=NO \
           INFOPLIST_FILE="$INFOPLIST_ABS" \
           READORI_SOCIAL_WORKER_ENDPOINT="$READORI_SOCIAL_WORKER_ENDPOINT" \
-          PRO_LEASE_PUBLIC_KEY="$PRO_LEASE_PUBLIC_KEY" \
+          PRO_LEASE_PUBLIC_KEY="${PRO_LEASE_PUBLIC_KEY:-}" \
           CODE_SIGN_IDENTITY="" \
           CODE_SIGNING_ALLOWED=NO \
           CODE_SIGNING_REQUIRED=NO \
           COMPILER_INDEX_STORE_ENABLE=NO \
           ENABLE_TESTABILITY=NO \
-          CONFIGURATION_BUILD_DIR="/tmp/sim_build" \
+          CONFIGURATION_BUILD_DIR="$BUILD_DIR" \
           > "$BUILD_LOG" 2>&1
         BUILD_RC=$?
-        grep -E "error:|Build succeeded|BUILD FAILED" "$BUILD_LOG" || true
 
-        # 🐛 彻底修复（"xcodebuild 明明 BUILD SUCCEEDED、exit=0，却依然
-        APP_PATH="/tmp/sim_build/${SCHEME}.app"
-        rm -rf "$APP_PATH"
-        APP_BINARY="/tmp/sim_build/$SCHEME"
-        if [[ ! -f "$APP_BINARY" ]]; then
-          echo "No simulator .app found — skipping auto-capture (xcodebuild exit=$BUILD_RC, no bare executable at $APP_BINARY either)"
+        grep -E "error:|Build succeeded|BUILD SUCCEEDED|BUILD FAILED" "$BUILD_LOG" || true
+
+        if [[ $BUILD_RC -ne 0 ]]; then
+          echo "::error::Simulator build failed/timed out (exit=$BUILD_RC)"
           echo "---- last 150 lines of $BUILD_LOG ----"
-          tail -150 "$BUILD_LOG"
-          exit 0
+          tail -150 "$BUILD_LOG" || true
+          exit 1
+        fi
+
+        # SwiftPM executable products are emitted as a bare executable in this
+        # project; wrap it into a simulator .app and preserve resources.
+        APP_PATH="$BUILD_DIR/${SCHEME}.app"
+        APP_BINARY="$BUILD_DIR/$SCHEME"
+        rm -rf "$APP_PATH"
+
+        if [[ ! -f "$APP_BINARY" ]]; then
+          echo "::error::No simulator executable found at $APP_BINARY"
+          echo "---- last 150 lines of $BUILD_LOG ----"
+          tail -150 "$BUILD_LOG" || true
+          exit 1
         fi
 
         mkdir -p "$APP_PATH"
@@ -1461,28 +1676,28 @@ jobs:
         /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$APP_PATH/Info.plist" || true
         /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUMBER:-1}" "$APP_PATH/Info.plist" || true
         /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${APP_VERSION:-1.0.0}" "$APP_PATH/Info.plist" || true
-        if [[ -n "$READORI_SOCIAL_WORKER_ENDPOINT" ]]; then
+
+        if [[ -n "${READORI_SOCIAL_WORKER_ENDPOINT:-}" ]]; then
           /usr/bin/plutil -replace READORI_SOCIAL_WORKER_ENDPOINT -string "$READORI_SOCIAL_WORKER_ENDPOINT" "$APP_PATH/Info.plist" || true
         fi
         if [[ -n "${PRO_LEASE_PUBLIC_KEY:-}" ]]; then
           /usr/bin/plutil -replace PRO_LEASE_PUBLIC_KEY -string "$PRO_LEASE_PUBLIC_KEY" "$APP_PATH/Info.plist" || true
         fi
+
         /usr/libexec/PlistBuddy -c "Delete :UIDeviceFamily" "$APP_PATH/Info.plist" 2>/dev/null || true
         /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily array" "$APP_PATH/Info.plist"
         /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily:0 integer 1" "$APP_PATH/Info.plist"
         /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily:1 integer 2" "$APP_PATH/Info.plist"
 
-        # 应用内实际显示的图片/图标（书架封面占位图等）
-        ASSETS_CAR=$(find /tmp/sim_build -maxdepth 1 -name "Assets.car" | head -1)
+        ASSETS_CAR="$(find "$BUILD_DIR" -maxdepth 1 -name 'Assets.car' | head -1)"
         [[ -n "$ASSETS_CAR" ]] && cp "$ASSETS_CAR" "$APP_PATH/Assets.car"
 
-        # SPM 资源包：.lproj（多语种截图必须）、Fonts 等
-        for RESOURCE_DIR in "/tmp/sim_build/${SCHEME}_${SCHEME}.bundle" "/tmp/sim_build/Readori_Readori.bundle"; do
+        for RESOURCE_DIR in "$BUILD_DIR/${SCHEME}_${SCHEME}.bundle" "$BUILD_DIR/Readori_Readori.bundle"; do
           if [[ -d "$RESOURCE_DIR" ]]; then
             cp -R "$RESOURCE_DIR" "$APP_PATH/" || true
             for LPROJ in "$RESOURCE_DIR"/*.lproj; do
               if [[ -d "$LPROJ" ]]; then
-                LPROJ_NAME=$(basename "$LPROJ")
+                LPROJ_NAME="$(basename "$LPROJ")"
                 [[ "$LPROJ_NAME" == old_* ]] && continue
                 cp -R "$LPROJ" "$APP_PATH/$LPROJ_NAME"
               fi
@@ -1494,92 +1709,161 @@ jobs:
         done
 
         echo "Wrapped simulator .app at: $APP_PATH"
-        ls -d "$APP_PATH"/*.lproj 2>/dev/null || echo "WARNING: No .lproj directories at app root — localized screenshots will not work!"
+        ls -d "$APP_PATH"/*.lproj 2>/dev/null || echo "::warning::No .lproj directories at app root — localized screenshots will not work"
 
-        LOCALES="en-US"
+        # Start iPad early while iPhone capture is running. We intentionally do
+        # not block here; capture_for_device will use bootstatus before install.
+        if [[ -n "$IPHONE_SIM" && -n "$IPAD_SIM" ]]; then
+          IPAD_UDID="${IPAD_SIM%%|*}"
+          echo "[iPad prewarm] requesting boot in parallel with upcoming iPhone capture..."
+          run_with_timeout 15 xcrun simctl boot "$IPAD_UDID" || true
+        fi
 
-        # 🐛 彻底修复（iPhone/iPad 自动截图此前一直不正常的两个根因）：
-
-        # ---- helper: capture the bookshelf/explore/settings screens for one device ----
         capture_for_device() {
-          UDID="$1"; DISPLAY_NAME="$2"; DISPLAY_TYPE="$3"
-          echo "=== Capturing for $DISPLAY_NAME ($DISPLAY_TYPE) udid=$UDID ==="
-          xcrun simctl boot "$UDID" 2>/dev/null || true
-          sleep 8
-          if ! xcrun simctl install "$UDID" "$APP_PATH"; then
-            echo "install failed for $DISPLAY_NAME — skipping this device"
-            return
+          local udid="$1"
+          local display_name="$2"
+          local display_type="$3"
+          local failures=0
+
+          echo "============================================================"
+          echo "[$display_type] Capturing $display_name"
+          echo "[$display_type] udid=$udid"
+          echo "============================================================"
+
+          if ! ensure_simulator_ready "$udid" "$display_type"; then
+            echo "::error::[$display_type] simulator never became ready; skipping device"
+            return 1
+          fi
+
+          if ! install_app_with_retry "$udid" "$display_type"; then
+            echo "::error::[$display_type] installation failed; skipping device"
+            return 1
           fi
 
           for LOCALE in $LOCALES; do
-            OUT_DIR="$SCREENSHOTS_DIR/$LOCALE/$DISPLAY_TYPE"
-            mkdir -p "$OUT_DIR"
+            local out_dir="$SCREENSHOTS_DIR/$LOCALE/$display_type"
+            mkdir -p "$out_dir"
 
-            APPLE_LANG="en"; APPLE_LOCALE="en_US"
+            local apple_lang="en"
+            local apple_locale="en_US"
             case "$LOCALE" in
-              zh-Hans) APPLE_LANG="zh-Hans"; APPLE_LOCALE="zh_CN" ;;
-              zh-Hant) APPLE_LANG="zh-Hant"; APPLE_LOCALE="zh_TW" ;;
+              zh-Hans) apple_lang="zh-Hans"; apple_locale="zh_CN" ;;
+              zh-Hant) apple_lang="zh-Hant"; apple_locale="zh_TW" ;;
             esac
 
             capture_one() {
-              TAB="$1"; FILE="$2"
-              # 每张截图都用目标 Tab + 目标语种重新启动一次 App，跳过引导页
-              # 并直接停在指定 Tab 上——不点任何坐标，天然对 iPhone/iPad、
-              # 底部 Tab 栏/侧边栏布局都成立。
-              xcrun simctl terminate "$UDID" "$BUNDLE_ID" 2>/dev/null || true
-              SIMCTL_CHILD_READORI_SCREENSHOT_MODE=1 \
-              SIMCTL_CHILD_READORI_SCREENSHOT_TAB="$TAB" \
-              xcrun simctl launch "$UDID" "$BUNDLE_ID" \
-                -AppleLanguages "($APPLE_LANG)" -AppleLocale "$APPLE_LOCALE" 2>/dev/null || true
-              # "reader" 启动后要多做一次本地文件导入 + 后台分章解析才能打开阅读器，
-              # 比单纯切 Tab 慢，多给几秒缓冲。
-              if [[ "$TAB" == "reader" ]]; then
-                sleep 9
-              else
-                sleep 6
-              fi
-              xcrun simctl io "$UDID" screenshot "$FILE" 2>/dev/null || true
-              # 明显失败帧（文件几乎是空的）重试一次；不做真正的图像内容校验，
-              # 只拦截"压根没截到东西"这种最常见的失败模式。
-              if [[ ! -s "$FILE" ]] || [[ $(wc -c < "$FILE" 2>/dev/null || echo 0) -lt 2048 ]]; then
-                echo "  WARNING: $FILE looks invalid, retrying once..."
+              local tab="$1"
+              local file="$2"
+              local wait_seconds=6
+              [[ "$tab" == "reader" ]] && wait_seconds=9
+
+              echo "[$display_type][$LOCALE][$tab] terminate"
+              run_with_timeout 15 xcrun simctl terminate "$udid" "$BUNDLE_ID" || true
+
+              echo "[$display_type][$LOCALE][$tab] launch"
+              if ! run_with_timeout 30 env \
+                SIMCTL_CHILD_READORI_SCREENSHOT_MODE=1 \
+                SIMCTL_CHILD_READORI_SCREENSHOT_TAB="$tab" \
+                xcrun simctl launch "$udid" "$BUNDLE_ID" \
+                  -AppleLanguages "($apple_lang)" \
+                  -AppleLocale "$apple_locale"; then
+                echo "::warning::[$display_type][$LOCALE][$tab] first launch failed; retrying once"
+                run_with_timeout 15 xcrun simctl terminate "$udid" "$BUNDLE_ID" || true
                 sleep 2
-                xcrun simctl io "$UDID" screenshot "$FILE" 2>/dev/null || true
+                if ! run_with_timeout 30 env \
+                  SIMCTL_CHILD_READORI_SCREENSHOT_MODE=1 \
+                  SIMCTL_CHILD_READORI_SCREENSHOT_TAB="$tab" \
+                  xcrun simctl launch "$udid" "$BUNDLE_ID" \
+                    -AppleLanguages "($apple_lang)" \
+                    -AppleLocale "$apple_locale"; then
+                  echo "::error::[$display_type][$LOCALE][$tab] launch failed after retry"
+                  return 1
+                fi
               fi
+
+              echo "[$display_type][$LOCALE][$tab] waiting ${wait_seconds}s for UI"
+              sleep "$wait_seconds"
+
+              rm -f "$file"
+              echo "[$display_type][$LOCALE][$tab] screenshot -> $file"
+              if ! run_with_timeout 20 xcrun simctl io "$udid" screenshot "$file"; then
+                echo "::warning::[$display_type][$LOCALE][$tab] screenshot command failed/timed out; retrying once"
+                sleep 2
+                run_with_timeout 20 xcrun simctl io "$udid" screenshot "$file" || true
+              fi
+
+              local size=0
+              [[ -f "$file" ]] && size="$(wc -c < "$file" 2>/dev/null | tr -d ' ' || echo 0)"
+              if [[ ! -s "$file" ]] || (( ${size:-0} < 2048 )); then
+                echo "::warning::[$display_type][$LOCALE][$tab] invalid/empty screenshot; final retry"
+                sleep 2
+                rm -f "$file"
+                run_with_timeout 20 xcrun simctl io "$udid" screenshot "$file" || true
+                size=0
+                [[ -f "$file" ]] && size="$(wc -c < "$file" 2>/dev/null | tr -d ' ' || echo 0)"
+              fi
+
+              if [[ ! -s "$file" ]] || (( ${size:-0} < 2048 )); then
+                echo "::error::[$display_type][$LOCALE][$tab] screenshot still invalid after retries"
+                return 1
+              fi
+
+              local dimensions
+              dimensions="$(sips -g pixelWidth -g pixelHeight "$file" 2>/dev/null | awk '/pixelWidth/ {w=$2} /pixelHeight/ {h=$2} END {if (w && h) print w "x" h}')"
+              echo "[$display_type][$LOCALE][$tab] OK ${dimensions:-unknown} ${size} bytes"
+              return 0
             }
 
-            capture_one "bookshelf"       "$OUT_DIR/01_bookshelf.png"
-            capture_one "reader"          "$OUT_DIR/02_reader.png"
-            capture_one "explore"         "$OUT_DIR/03_explore.png"
-            capture_one "settings"        "$OUT_DIR/04_settings.png"
-            capture_one "pro"             "$OUT_DIR/05_pro.png"
-            capture_one "personalization" "$OUT_DIR/06_personalization.png"
+            capture_one "bookshelf"       "$out_dir/01_bookshelf.png"       || failures=$((failures + 1))
+            capture_one "reader"          "$out_dir/02_reader.png"          || failures=$((failures + 1))
+            capture_one "explore"         "$out_dir/03_explore.png"         || failures=$((failures + 1))
+            capture_one "settings"        "$out_dir/04_settings.png"        || failures=$((failures + 1))
+            capture_one "pro"             "$out_dir/05_pro.png"             || failures=$((failures + 1))
+            capture_one "personalization" "$out_dir/06_personalization.png" || failures=$((failures + 1))
           done
 
-          xcrun simctl shutdown "$UDID" 2>/dev/null || true
+          echo "[$display_type] shutting down simulator"
+          run_with_timeout 20 xcrun simctl shutdown "$udid" || true
+
+          if (( failures > 0 )); then
+            echo "::error::[$display_type] completed with $failures screenshot failure(s)"
+            return 1
+          fi
+
+          echo "[$display_type] all screenshots captured successfully"
+          return 0
         }
 
+        CAPTURE_RC=0
+
         if [[ -n "$IPHONE_SIM" ]]; then
-          capture_for_device "${IPHONE_SIM%%|*}" "${IPHONE_SIM##*|}" "APP_IPHONE_67"
+          capture_for_device "${IPHONE_SIM%%|*}" "${IPHONE_SIM##*|}" "APP_IPHONE_67" || CAPTURE_RC=1
         else
-          echo "Skipping iPhone screenshots (no simulator available)"
+          echo "::warning::Skipping iPhone screenshots (no simulator available)"
+          CAPTURE_RC=1
         fi
 
         if [[ -n "$IPAD_SIM" ]]; then
-          # iPad Pro 13" (M4): 2064x2752 px @2x → 1032x1376 pt logical resolution
-          capture_for_device "${IPAD_SIM%%|*}" "${IPAD_SIM##*|}" "APP_IPAD_PRO_3GEN_129"
+          capture_for_device "${IPAD_SIM%%|*}" "${IPAD_SIM##*|}" "APP_IPAD_PRO_3GEN_129" || CAPTURE_RC=1
         else
-          echo "Skipping iPad screenshots — WARNING: App Store requires iPad screenshots for apps that support iPad"
+          echo "::error::Skipping iPad screenshots — App Store requires iPad screenshots for this universal app"
+          CAPTURE_RC=1
         fi
 
-        # Move captured screenshots to expected location
-        if [[ -n "$(ls -A "$SCREENSHOTS_DIR" 2>/dev/null)" ]]; then
+        # Move captured screenshots to the path consumed by validation/upload.
+        if [[ -d "$SCREENSHOTS_DIR" ]] && [[ -n "$(ls -A "$SCREENSHOTS_DIR" 2>/dev/null)" ]]; then
+          rm -rf "$TARGET_DIR"
           mv "$SCREENSHOTS_DIR" "$TARGET_DIR"
           echo "Auto-captured screenshots saved to $TARGET_DIR"
-          find "$TARGET_DIR" -name '*.png' | sort
+          find "$TARGET_DIR" -name '*.png' -print | sort
         else
-          echo "WARNING: no screenshots were captured"
+          echo "::error::No screenshots were captured"
+          CAPTURE_RC=1
         fi
+
+        # continue-on-error keeps artifact diagnostics available; the next
+        # Validate captured screenshots step is the authoritative hard gate.
+        exit "$CAPTURE_RC"
 
     - name: Validate captured screenshots
       if: ${{ env.MODE == 'screenshots' }}
