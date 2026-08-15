@@ -1647,21 +1647,7 @@ jobs:
         " || echo "(no subscription groups or error)"
 
     # ==============================================
-    # 19. UPLOAD IPA ARTIFACT
-    # ==============================================
-    - name: Upload IPA artifact
-      if: ${{ env.MODE != 'screenshots' }}
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-      with:
-        name: readori-${{ env.BUILD_TAG || github.run_number }}
-        retention-days: 7
-        if-no-files-found: error
-        path: |
-          build/*.ipa
-          build/export/*.ipa
-
-    # ==============================================
-    # 20. CLEANUP EPHEMERAL SIGNING MATERIAL
+    # 19. CLEANUP EPHEMERAL SIGNING MATERIAL
     # ==============================================
     - name: Clean up signing material
       if: ${{ always() && env.MODE == 'testflight' }}
