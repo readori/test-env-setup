@@ -403,11 +403,6 @@ jobs:
           print("✅ Generated CI config from existing Cloudflare bindings")
           PY
 
-          pnpm wrangler deploy \
-            --dry-run \
-            --config wrangler-ci.toml \
-            --outdir .wrangler-dry-run
-
       - name: Verify required Worker secrets already exist on Cloudflare
         working-directory: ${{ github.workspace }}/cloudmail-source/mail-worker
         shell: bash
@@ -462,9 +457,47 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          # .env.release defines:
+          # VITE_OUT_DIR=../mail-worker/dist
+          # so the production frontend becomes the Worker's assets directory.
+          rm -rf "$GITHUB_WORKSPACE/cloudmail-source/mail-worker/dist"
+
           pnpm run build
+
+          test -d "$GITHUB_WORKSPACE/cloudmail-source/mail-worker/dist" || {
+            echo "::error::Frontend build completed but mail-worker/dist was not created."
+            echo "::error::Expected mail-vue/.env.release to set VITE_OUT_DIR=../mail-worker/dist"
+            exit 1
+          }
+
+          test -s "$GITHUB_WORKSPACE/cloudmail-source/mail-worker/dist/index.html" || {
+            echo "::error::mail-worker/dist/index.html is missing or empty after frontend build."
+            find "$GITHUB_WORKSPACE/cloudmail-source/mail-worker/dist" -maxdepth 2 -type f -print | sed -n '1,160p'
+            exit 1
+          }
+
+          echo "✅ Frontend assets built into mail-worker/dist"
           pnpm run e2e:smoke
-          test -f "$GITHUB_WORKSPACE/cloudmail-source/mail-worker/dist/index.html"
+
+      - name: Validate Wrangler deployment package after frontend build
+        working-directory: ${{ github.workspace }}/cloudmail-source/mail-worker
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s dist/index.html || {
+            echo "::error::Wrangler assets directory does not exist before dry-run: $(pwd)/dist"
+            exit 1
+          }
+
+          rm -rf .wrangler-dry-run
+          pnpm wrangler deploy \
+            --dry-run \
+            --config wrangler-ci.toml \
+            --outdir .wrangler-dry-run
+
+          echo "✅ Wrangler dry-run passed with frontend assets present"
 
       - name: Capture D1 recovery point before migration
         if: ${{ inputs.mode == 'deploy-and-migrate' }}
