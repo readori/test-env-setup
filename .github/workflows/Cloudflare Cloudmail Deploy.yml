@@ -6,11 +6,11 @@ on:
       mode:
         description: 'Deploy mode'
         required: true
-        default: deploy
+        default: deploy-and-migrate
         type: choice
         options:
-          - deploy
           - deploy-and-migrate
+          - deploy
       source_ref:
         description: 'Private CloudMail branch, tag, or commit SHA'
         required: true
@@ -30,4 +30,3 @@ jobs:
       source_ref: ${{ inputs.source_ref }}
       initialize_database: ${{ inputs.mode == 'deploy-and-migrate' }}
     secrets: inherit
-
