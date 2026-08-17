@@ -1,6 +1,6 @@
 name: Cloudflare Cloudmail Deploy
 
-run-name: Dispatch CloudMail ${{ inputs.mode }} @ ${{ inputs.source_ref }}
+run-name: CloudMail public CI ${{ inputs.mode }} @ ${{ inputs.source_ref }}
 
 on:
   workflow_dispatch:
@@ -23,296 +23,811 @@ permissions:
   contents: read
 
 concurrency:
-  group: cloudmail-public-dispatch
+  group: cloudmail-public-production
   cancel-in-progress: false
 
 jobs:
-  dispatch:
-    name: Trigger private CloudMail deployment
+  deploy:
+    name: Build private CloudMail source on public runner
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
     env:
-      TARGET_REPOSITORY: readori/CloudMail
-      TARGET_WORKFLOW: _deploy-cloudflare.yml
-      TARGET_WORKFLOW_REF: main
+      SOURCE_REPOSITORY: readori/CloudMail
+      SOURCE_REF: ${{ inputs.source_ref }}
       TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
-      GH_API_VERSION: '2026-03-10'
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
 
     steps:
-      - name: Validate TARGET_REPO_PAT
+      - name: Validate minimal public CI credentials
         shell: bash
         run: |
           set -euo pipefail
 
-          if [ -z "${TARGET_REPO_PAT:-}" ]; then
-            echo "::error::TARGET_REPO_PAT is missing in readori/test-env-setup."
+          missing=()
+          [ -n "${TARGET_REPO_PAT:-}" ] || missing+=("TARGET_REPO_PAT")
+          [ -n "${CLOUDFLARE_API_TOKEN:-}" ] || missing+=("CLOUDFLARE_API_TOKEN")
+          [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ] || missing+=("CLOUDFLARE_ACCOUNT_ID")
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing public CI credentials: ${missing[*]}"
+            echo "::error::Only these deployment credentials are required in the public repository."
             exit 1
           fi
 
           echo "::add-mask::$TARGET_REPO_PAT"
-          echo "Public CI repository: ${GITHUB_REPOSITORY}"
-          echo "Private target repository: ${TARGET_REPOSITORY}"
-          echo "Private target workflow: ${TARGET_WORKFLOW}"
-          echo
-          echo "TARGET_REPO_PAT requirements:"
-          echo "- Fine-grained PAT: repository readori/CloudMail + Actions: Read and write"
-          echo "- Classic PAT: repo scope"
-          echo
-          echo "Cloudflare/D1/R2/application secrets remain only in the private repository."
+          echo "::add-mask::$CLOUDFLARE_API_TOKEN"
 
-      - name: Preflight private repository and workflow access
+          echo "✅ Public runner mode"
+          echo "✅ Private repository Actions are not invoked"
+          echo "✅ Application secrets remain stored on Cloudflare"
+
+      - name: Checkout private CloudMail source
         shell: bash
         run: |
           set -euo pipefail
 
-          python3 <<'PY'
-          import json
-          import os
-          import urllib.error
-          import urllib.parse
-          import urllib.request
+          SOURCE_DIR="$GITHUB_WORKSPACE/cloudmail-source"
+          rm -rf "$SOURCE_DIR"
+          mkdir -p "$SOURCE_DIR"
 
-          token = os.environ["TARGET_REPO_PAT"].strip()
-          repository = os.environ["TARGET_REPOSITORY"].strip()
-          workflow = os.environ["TARGET_WORKFLOW"].strip()
-          api_version = os.environ["GH_API_VERSION"].strip()
+          git -C "$SOURCE_DIR" init .
+          git -C "$SOURCE_DIR" remote add origin "https://github.com/${SOURCE_REPOSITORY}.git"
 
-          owner, repo = repository.split("/", 1)
-          api_base = f"https://api.github.com/repos/{owner}/{repo}"
-          workflow_q = urllib.parse.quote(workflow, safe="")
+          AUTH_HEADER="$(printf 'x-access-token:%s' "$TARGET_REPO_PAT" | base64 | tr -d '\r\n')"
+          git -C "$SOURCE_DIR" \
+            -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH_HEADER" \
+            fetch --no-tags --prune --depth=1 origin "$SOURCE_REF"
 
-          headers = {
-              "Accept": "application/vnd.github+json",
-              "Authorization": f"Bearer {token}",
-              "X-GitHub-Api-Version": api_version,
-              "User-Agent": "CloudMail-Public-CI-Dispatcher",
+          git -C "$SOURCE_DIR" checkout --force --detach FETCH_HEAD
+          git -C "$SOURCE_DIR" remote set-url origin "https://github.com/${SOURCE_REPOSITORY}.git"
+
+          test -f "$SOURCE_DIR/mail-worker/package.json" || {
+            echo "::error::mail-worker/package.json not found in private source"
+            find "$SOURCE_DIR" -maxdepth 3 -type f | sed -n '1,160p'
+            exit 1
           }
 
-          def get(url, label):
-              req = urllib.request.Request(url, headers=headers, method="GET")
-              try:
-                  with urllib.request.urlopen(req, timeout=30) as response:
-                      raw = response.read()
-                      body = json.loads(raw.decode("utf-8")) if raw else {}
-                      print(f"✅ {label}: HTTP {response.status}")
-                      return body
-              except urllib.error.HTTPError as exc:
-                  body = exc.read().decode("utf-8", "replace")
-                  print(f"::error::{label} failed with HTTP {exc.code}")
-                  print(body[:2000])
+          test -f "$SOURCE_DIR/mail-vue/package.json" || {
+            echo "::error::mail-vue/package.json not found in private source"
+            exit 1
+          }
 
-                  if label == "Private repository access":
-                      print("::error::TARGET_REPO_PAT cannot read readori/CloudMail.")
-                      print("::error::For a fine-grained PAT, include readori/CloudMail in Repository access.")
-                  else:
-                      print("::error::TARGET_REPO_PAT cannot read the target Actions workflow.")
-                      print("::error::For a fine-grained PAT, set Actions permission to Read and write.")
-                  raise SystemExit(1)
+          echo "Private source commit: $(git -C "$SOURCE_DIR" rev-parse HEAD)"
+          echo "✅ Private source checkout completed without running private Actions"
 
-          repo_info = get(api_base, "Private repository access")
-          if repo_info.get("full_name") != repository:
-              raise SystemExit("::error::Unexpected target repository returned by GitHub API.")
-
-          workflow_info = get(
-              f"{api_base}/actions/workflows/{workflow_q}",
-              "Private workflow access",
-          )
-
-          state = workflow_info.get("state")
-          path = workflow_info.get("path")
-          print(f"Target workflow path: {path}")
-          print(f"Target workflow state: {state}")
-
-          if state != "active":
-              raise SystemExit(
-                  "::error::Private target workflow exists but is not active."
-              )
-
-          print("✅ PAT read preflight passed.")
-          print("The dispatch step additionally requires Actions: write.")
-          PY
-
-      - name: Dispatch private deployment and mirror its result
+      - name: Set up Node.js 22 and pnpm
         shell: bash
-        env:
-          DEPLOY_MODE: ${{ inputs.mode }}
-          SOURCE_REF: ${{ inputs.source_ref }}
         run: |
           set -euo pipefail
 
-          DISPATCH_ID="public-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          export DISPATCH_ID
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64) NODE_ARCH='x64' ;;
+            aarch64|arm64) NODE_ARCH='arm64' ;;
+            *) echo "::error::Unsupported runner architecture: $ARCH"; exit 1 ;;
+          esac
 
-          python3 <<'PY'
+          NODE_VERSION="22.23.2"
+          NODE_DIR="$RUNNER_TEMP/node-v${NODE_VERSION}-linux-${NODE_ARCH}"
+          ARCHIVE="node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz"
+
+          if [ ! -x "$NODE_DIR/bin/node" ]; then
+            cd "$RUNNER_TEMP"
+            curl --fail --silent --show-error --location \
+              "https://nodejs.org/dist/v${NODE_VERSION}/${ARCHIVE}" \
+              --output "$ARCHIVE"
+            curl --fail --silent --show-error --location \
+              "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt" \
+              --output SHASUMS256.txt
+            grep "  ${ARCHIVE}$" SHASUMS256.txt | sha256sum --check --strict
+            tar -xJf "$ARCHIVE"
+          fi
+
+          echo "$NODE_DIR/bin" >> "$GITHUB_PATH"
+          export PATH="$NODE_DIR/bin:$PATH"
+
+          npm install --global --prefix "$RUNNER_TEMP/pnpm" pnpm@9.15.9
+          echo "$RUNNER_TEMP/pnpm/bin" >> "$GITHUB_PATH"
+
+          export PATH="$RUNNER_TEMP/pnpm/bin:$PATH"
+          node --version
+          pnpm --version
+
+      - name: Install project dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm --dir "$GITHUB_WORKSPACE/cloudmail-source/mail-worker" install --frozen-lockfile
+          pnpm --dir "$GITHUB_WORKSPACE/cloudmail-source/mail-vue" install --frozen-lockfile
+
+      - name: Resolve existing Cloudflare Worker configuration
+        working-directory: ${{ github.workspace }}/cloudmail-source/mail-worker
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORKER_NAME="$(python3 <<'PY'
+          import tomllib
+          from pathlib import Path
+          data = tomllib.loads(Path("wrangler.toml").read_text(encoding="utf-8"))
+          name = str(data.get("name", "")).strip()
+          if not name:
+              raise SystemExit("wrangler.toml does not define a Worker name")
+          print(name)
+          PY
+          )"
+
+          echo "WORKER_NAME=$WORKER_NAME" >> "$GITHUB_ENV"
+          echo "Resolved Worker name: $WORKER_NAME"
+
+          SETTINGS_JSON="$RUNNER_TEMP/cloudmail-worker-settings.json"
+          DOMAINS_JSON="$RUNNER_TEMP/cloudmail-worker-domains.json"
+
+          curl --fail --silent --show-error \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$WORKER_NAME/settings" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Accept: application/json" \
+            > "$SETTINGS_JSON"
+
+          curl --fail --silent --show-error \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Accept: application/json" \
+            > "$DOMAINS_JSON"
+
+          python3 - "$SETTINGS_JSON" "$DOMAINS_JSON" <<'PY'
           import json
           import os
           import sys
-          import time
-          import urllib.error
-          import urllib.parse
-          import urllib.request
+          from pathlib import Path
 
-          token = os.environ["TARGET_REPO_PAT"].strip()
-          repository = os.environ["TARGET_REPOSITORY"].strip()
-          workflow = os.environ["TARGET_WORKFLOW"].strip()
-          workflow_ref = os.environ["TARGET_WORKFLOW_REF"].strip()
-          api_version = os.environ["GH_API_VERSION"].strip()
-          deploy_mode = os.environ["DEPLOY_MODE"].strip()
-          source_ref = os.environ["SOURCE_REF"].strip()
-          dispatch_id = os.environ["DISPATCH_ID"].strip()
+          settings = json.load(open(sys.argv[1], encoding="utf-8"))
+          domains = json.load(open(sys.argv[2], encoding="utf-8"))
 
-          if deploy_mode not in {"deploy", "deploy-and-migrate"}:
-              raise SystemExit(f"::error::Unsupported deploy mode: {deploy_mode}")
-          if not source_ref:
-              raise SystemExit("::error::source_ref must not be empty")
+          if not settings.get("success"):
+              raise SystemExit("::error::Unable to read existing Cloudflare Worker settings")
 
-          owner, repo = repository.split("/", 1)
-          workflow_q = urllib.parse.quote(workflow, safe="")
-          api_base = f"https://api.github.com/repos/{owner}/{repo}"
+          bindings = settings.get("result", {}).get("bindings") or []
 
-          headers = {
-              "Accept": "application/vnd.github+json",
-              "Authorization": f"Bearer {token}",
-              "X-GitHub-Api-Version": api_version,
-              "User-Agent": "CloudMail-Public-CI-Dispatcher",
-          }
-
-          def request(method, url, payload=None):
-              data = None
-              local_headers = dict(headers)
-              if payload is not None:
-                  data = json.dumps(payload).encode("utf-8")
-                  local_headers["Content-Type"] = "application/json"
-
-              req = urllib.request.Request(
-                  url,
-                  data=data,
-                  headers=local_headers,
-                  method=method,
-              )
-
-              try:
-                  with urllib.request.urlopen(req, timeout=30) as response:
-                      raw = response.read()
-                      body = json.loads(raw.decode("utf-8")) if raw else None
-                      return response.status, body
-              except urllib.error.HTTPError as exc:
-                  body = exc.read().decode("utf-8", "replace")
-                  print(f"::error::GitHub API request failed with HTTP {exc.code}")
-                  print(body[:3000])
-
-                  if exc.code == 403:
-                      print("::error::TARGET_REPO_PAT reached readori/CloudMail but is not allowed to dispatch this workflow.")
-                      print("::error::Fine-grained PAT: set Repository access = readori/CloudMail and Actions = Read and write.")
-                      print("::error::Classic PAT: use repo scope.")
-                  raise SystemExit(1)
-
-          dispatch_url = f"{api_base}/actions/workflows/{workflow_q}/dispatches"
-          payload = {
-              "ref": workflow_ref,
-              "inputs": {
-                  "mode": deploy_mode,
-                  "source_ref": source_ref,
-                  "dispatch_id": dispatch_id,
-              },
-          }
-
-          status, body = request("POST", dispatch_url, payload)
-
-          # Current GitHub API returns HTTP 200 with workflow_run_id/run URLs.
-          # Keep 204 support for compatibility with older behavior.
-          if status not in {200, 204}:
-              raise SystemExit(
-                  f"::error::Unexpected workflow dispatch response: HTTP {status}"
-              )
-
-          print(f"✅ Dispatched {repository}/{workflow}")
-          print(f"Dispatch id: {dispatch_id}")
-          print(f"Source ref: {source_ref}")
-          print(f"Mode: {deploy_mode}")
-
-          run_id = None
-          html_url = ""
-
-          if isinstance(body, dict):
-              run_id = body.get("workflow_run_id")
-              html_url = body.get("html_url") or ""
-              if run_id:
-                  print(f"GitHub returned private run id: {run_id}")
-              if html_url:
-                  print(f"Private run: {html_url}")
-
-          # Fallback for old 204/no-body behavior.
-          if not run_id:
-              expected_title = f"CloudMail Deploy - {dispatch_id}"
-              runs_url = (
-                  f"{api_base}/actions/workflows/{workflow_q}/runs"
-                  "?event=workflow_dispatch&per_page=50"
-              )
-
-              run = None
-              for attempt in range(1, 31):
-                  _, runs_body = request("GET", runs_url)
-                  for candidate in (runs_body or {}).get("workflow_runs", []):
-                      if candidate.get("display_title") == expected_title:
-                          run = candidate
-                          break
-                  if run:
-                      break
-
-                  print(f"Waiting for private run to appear ({attempt}/30)...")
-                  time.sleep(2)
-
-              if not run:
+          def one(kind, name):
+              matches = [
+                  b for b in bindings
+                  if isinstance(b, dict)
+                  and b.get("type") == kind
+                  and b.get("name") == name
+              ]
+              if len(matches) != 1:
                   raise SystemExit(
-                      "::error::Private workflow was dispatched but its run could "
-                      f"not be located. Dispatch id: {dispatch_id}"
+                      f"::error::Expected exactly one existing {kind} binding named {name!r}; "
+                      f"found {len(matches)}"
                   )
+              return matches[0]
 
-              run_id = run["id"]
-              html_url = run.get("html_url", "")
-              print(f"Private run: {html_url}")
+          d1 = one("d1", "db")
+          kv = one("kv_namespace", "kv")
 
-          run_url = f"{api_base}/actions/runs/{run_id}"
-          deadline = time.time() + (40 * 60)
+          r2_matches = [
+              b for b in bindings
+              if isinstance(b, dict)
+              and b.get("type") == "r2_bucket"
+              and b.get("name") == "r2"
+          ]
+          email_matches = [
+              b for b in bindings
+              if isinstance(b, dict)
+              and b.get("type") == "send_email"
+              and b.get("name") == "email"
+          ]
 
-          while time.time() < deadline:
-              _, current = request("GET", run_url)
-              run_status = current.get("status")
-              conclusion = current.get("conclusion")
-              current_html_url = current.get("html_url") or html_url
-              suffix = f" / {conclusion}" if conclusion else ""
+          d1_id = d1.get("database_id") or d1.get("id")
+          kv_id = kv.get("namespace_id")
 
-              print(f"Private deployment status: {run_status}{suffix}")
+          if not d1_id:
+              raise SystemExit("::error::Existing D1 binding db has no database_id")
+          if not kv_id:
+              raise SystemExit("::error::Existing KV binding kv has no namespace_id")
 
-              if run_status == "completed":
-                  summary = os.environ.get("GITHUB_STEP_SUMMARY")
-                  if summary:
-                      with open(summary, "a", encoding="utf-8") as fp:
-                          fp.write("## Private CloudMail deployment\n\n")
-                          fp.write(f"- Repository: `{repository}`\n")
-                          fp.write(f"- Source ref: `{source_ref}`\n")
-                          fp.write(f"- Mode: `{deploy_mode}`\n")
-                          fp.write(f"- Dispatch id: `{dispatch_id}`\n")
-                          if current_html_url:
-                              fp.write(f"- Private run: {current_html_url}\n")
-                          fp.write(
-                              f"- Conclusion: **{conclusion or 'unknown'}**\n"
-                          )
+          r2_bucket = ""
+          if r2_matches:
+              if len(r2_matches) != 1:
+                  raise SystemExit("::error::Multiple R2 bindings named r2 were returned")
+              r2_bucket = str(r2_matches[0].get("bucket_name") or "").strip()
+              if not r2_bucket:
+                  raise SystemExit("::error::Existing R2 binding r2 has no bucket_name")
 
-                  if conclusion != "success":
-                      raise SystemExit(
-                          "::error::Private CloudMail deployment failed with "
-                          f"conclusion={conclusion}. See: {current_html_url}"
-                      )
+          worker_name = os.environ["WORKER_NAME"]
+          custom_domains = [
+              str(item.get("hostname") or "").strip()
+              for item in (domains.get("result") or [])
+              if isinstance(item, dict)
+              and item.get("service") == worker_name
+              and str(item.get("hostname") or "").strip()
+          ]
 
-                  print("✅ Private CloudMail deployment completed successfully.")
-                  sys.exit(0)
+          env_file = Path(os.environ["GITHUB_ENV"])
+          with env_file.open("a", encoding="utf-8") as fp:
+              fp.write(f"RESOLVED_D1_DATABASE_ID={d1_id}\n")
+              fp.write(f"RESOLVED_KV_NAMESPACE_ID={kv_id}\n")
+              fp.write(f"RESOLVED_R2_BUCKET_NAME={r2_bucket}\n")
+              fp.write(f"EXISTING_SEND_EMAIL={'true' if email_matches else 'false'}\n")
+              fp.write(f"EXISTING_CUSTOM_DOMAIN={custom_domains[0] if custom_domains else ''}\n")
 
-              time.sleep(10)
+          # Secrets and dashboard vars are intentionally preserved by Cloudflare/Wrangler.
+          # Refuse to deploy if the existing Worker has an uncommon binding that this
+          # public-CI renderer does not explicitly preserve.
+          safe_types = {
+              "d1",
+              "kv_namespace",
+              "r2_bucket",
+              "send_email",
+              "secret_text",
+              "plain_text",
+              "ai",
+              "assets",
+          }
+          unexpected = sorted({
+              str(b.get("type"))
+              for b in bindings
+              if isinstance(b, dict)
+              and b.get("type")
+              and b.get("type") not in safe_types
+          })
+          if unexpected:
+              raise SystemExit(
+                  "::error::Existing Worker has binding types that this CI refuses "
+                  "to overwrite automatically: " + ", ".join(unexpected)
+              )
 
-          raise SystemExit(
-              f"::error::Timed out waiting for private deployment. See: {html_url}"
-          )
+          print("✅ Existing D1 binding discovered")
+          print("✅ Existing KV binding discovered")
+          print("✅ Existing R2 binding discovered" if r2_bucket else "ℹ️ No existing R2 binding")
+          print("✅ Existing send_email binding discovered" if email_matches else "ℹ️ No send_email binding")
+          print("✅ Existing custom domain discovered" if custom_domains else "ℹ️ No custom domain discovered")
+          print("✅ Existing binding set is safe for public-CI preservation")
           PY
+
+      - name: Resolve D1 database name and render deployment config
+        working-directory: ${{ github.workspace }}/cloudmail-source/mail-worker
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DB_LIST_FILE="$RUNNER_TEMP/cloudmail-d1-list.json"
+          pnpm wrangler d1 list --json > "$DB_LIST_FILE"
+
+          D1_DATABASE_NAME="$(
+            python3 - "$RESOLVED_D1_DATABASE_ID" "$DB_LIST_FILE" <<'PY'
+          import json
+          import sys
+
+          wanted = sys.argv[1]
+          data = json.load(open(sys.argv[2], encoding="utf-8"))
+          for row in data:
+              candidate = row.get("uuid") or row.get("id")
+              if candidate == wanted:
+                  print(row.get("name", ""))
+                  break
+          PY
+          )"
+
+          if [ -z "$D1_DATABASE_NAME" ]; then
+            echo "::error::Unable to map the existing D1 binding to a database name"
+            exit 1
+          fi
+
+          export D1_DATABASE_NAME
+
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          def q(value):
+              return json.dumps(str(value), ensure_ascii=False)
+
+          lines = [
+              f'name = {q(os.environ["WORKER_NAME"])}',
+              'main = "src/index.js"',
+              'compatibility_date = "2025-06-04"',
+              'keep_vars = true',
+              # Routes/custom domains are intentionally dashboard-managed.
+              # Cloudflare documents that omitting route/routes prevents Wrangler
+              # from overwriting dashboard-managed routes on deploy.
+              'workers_dev = false',
+              '',
+              '[observability]',
+              'enabled = true',
+              '',
+              '[[d1_databases]]',
+              'binding = "db"',
+              f'database_name = {q(os.environ["D1_DATABASE_NAME"])}',
+              f'database_id = {q(os.environ["RESOLVED_D1_DATABASE_ID"])}',
+              'migrations_dir = "migrations"',
+              '',
+              '[[kv_namespaces]]',
+              'binding = "kv"',
+              f'id = {q(os.environ["RESOLVED_KV_NAMESPACE_ID"])}',
+              '',
+          ]
+
+          r2 = os.environ.get("RESOLVED_R2_BUCKET_NAME", "").strip()
+          if r2:
+              lines.extend([
+                  '[[r2_buckets]]',
+                  'binding = "r2"',
+                  f'bucket_name = {q(r2)}',
+                  '',
+              ])
+
+          lines.extend([
+              '[ai]',
+              'binding = "ai"',
+              '',
+              '[assets]',
+              'binding = "assets"',
+              'directory = "./dist"',
+              'not_found_handling = "single-page-application"',
+              'run_worker_first = true',
+              '',
+              '[triggers]',
+              'crons = ["0 16 * * *"]',
+              '',
+          ])
+
+          if os.environ.get("EXISTING_SEND_EMAIL") == "true":
+              lines.extend([
+                  '[[send_email]]',
+                  'name = "email"',
+                  '',
+              ])
+
+          Path("wrangler-ci.toml").write_text("\n".join(lines), encoding="utf-8")
+          print("✅ Generated CI config from existing Cloudflare bindings")
+          PY
+
+          pnpm wrangler deploy \
+            --dry-run \
+            --config wrangler-ci.toml \
+            --outdir .wrangler-dry-run
+
+      - name: Verify required Worker secrets already exist on Cloudflare
+        working-directory: ${{ github.workspace }}/cloudmail-source/mail-worker
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SECRET_LIST="$RUNNER_TEMP/cloudmail-secret-list.json"
+          pnpm wrangler secret list \
+            --name "$WORKER_NAME" \
+            --config wrangler-ci.toml \
+            > "$SECRET_LIST"
+
+          python3 - "$SECRET_LIST" <<'PY'
+          import json
+          import sys
+
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          names = {
+              str(item.get("name", "")).strip()
+              for item in data
+              if isinstance(item, dict)
+          }
+
+          required = {
+              "jwt_secret",
+              "init_secret",
+              "config_encryption_key",
+          }
+
+          missing = sorted(required - names)
+          if missing:
+              print("::error::Required application secrets are missing on the existing Cloudflare Worker:")
+              for name in missing:
+                  print(f"::error::  - {name}")
+              print("::error::Set them once in Cloudflare. They do NOT need to be copied into the public GitHub repository.")
+              raise SystemExit(1)
+
+          print("✅ Required application secrets already exist on Cloudflare")
+          print("✅ Secret values were never downloaded into GitHub Actions")
+          PY
+
+      - name: Run backend audit tests
+        working-directory: ${{ github.workspace }}/cloudmail-source/mail-worker
+        run: pnpm audit:test
+
+      - name: Run frontend tests
+        working-directory: ${{ github.workspace }}/cloudmail-source/mail-vue
+        run: pnpm test
+
+      - name: Build and smoke-test frontend
+        working-directory: ${{ github.workspace }}/cloudmail-source/mail-vue
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm run build
+          pnpm run e2e:smoke
+          test -f "$GITHUB_WORKSPACE/cloudmail-source/mail-worker/dist/index.html"
+
+      - name: Capture D1 recovery point before migration
+        if: ${{ inputs.mode == 'deploy-and-migrate' }}
+        working-directory: ${{ github.workspace }}/cloudmail-source/mail-worker
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RECOVERY_DIR="$RUNNER_TEMP/cloudmail-d1-recovery"
+          mkdir -p "$RECOVERY_DIR"
+
+          pnpm wrangler d1 time-travel info db \
+            --json \
+            --config wrangler-ci.toml \
+            > "$RECOVERY_DIR/time-travel.json"
+
+          pnpm wrangler d1 export db \
+            --remote \
+            --skip-confirmation \
+            --output "$RECOVERY_DIR/pre-migration.sql" \
+            --config wrangler-ci.toml
+
+          test -s "$RECOVERY_DIR/time-travel.json"
+          test -s "$RECOVERY_DIR/pre-migration.sql"
+
+          echo "✅ Private runner-local D1 recovery data captured"
+          echo "✅ Database export is intentionally not uploaded as an artifact"
+
+      - name: Safely repair legacy ownership mismatches
+        if: ${{ inputs.mode == 'deploy-and-migrate' }}
+        working-directory: ${{ github.workspace }}/cloudmail-source/mail-worker
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > "$RUNNER_TEMP/cloudmail-safe-repair.sql" <<'SQL'
+          -- Only deterministic ownership repairs are performed.
+          -- No account, email, or attachment row is deleted here.
+
+          UPDATE email
+          SET user_id = (
+            SELECT a.user_id
+            FROM account a
+            WHERE a.account_id = email.account_id
+          )
+          WHERE EXISTS (
+            SELECT 1
+            FROM account a
+            WHERE a.account_id = email.account_id
+              AND a.user_id <> email.user_id
+          );
+
+          UPDATE attachments
+          SET
+            account_id = (
+              SELECT e.account_id
+              FROM email e
+              WHERE e.email_id = attachments.email_id
+            ),
+            user_id = (
+              SELECT e.user_id
+              FROM email e
+              WHERE e.email_id = attachments.email_id
+            )
+          WHERE EXISTS (
+            SELECT 1
+            FROM email e
+            WHERE e.email_id = attachments.email_id
+              AND (
+                e.account_id <> attachments.account_id
+                OR e.user_id <> attachments.user_id
+              )
+          );
+
+          DELETE FROM star
+          WHERE NOT EXISTS (
+            SELECT 1 FROM email e WHERE e.email_id = star.email_id
+          );
+
+          UPDATE star
+          SET user_id = (
+            SELECT e.user_id
+            FROM email e
+            WHERE e.email_id = star.email_id
+          )
+          WHERE EXISTS (
+            SELECT 1
+            FROM email e
+            WHERE e.email_id = star.email_id
+              AND e.user_id <> star.user_id
+          );
+
+          DELETE FROM role_perm
+          WHERE NOT EXISTS (
+            SELECT 1 FROM role r WHERE r.role_id = role_perm.role_id
+          )
+          OR NOT EXISTS (
+            SELECT 1 FROM perm p WHERE p.perm_id = role_perm.perm_id
+          );
+
+          DELETE FROM push_subscription
+          WHERE NOT EXISTS (
+            SELECT 1 FROM user u WHERE u.user_id = push_subscription.user_id
+          );
+          SQL
+
+          pnpm wrangler d1 execute db \
+            --remote \
+            --config wrangler-ci.toml \
+            --file "$RUNNER_TEMP/cloudmail-safe-repair.sql"
+
+          echo "✅ Deterministic legacy ownership repairs completed"
+
+      - name: D1 hard-orphan integrity gate
+        if: ${{ inputs.mode == 'deploy-and-migrate' }}
+        working-directory: ${{ github.workspace }}/cloudmail-source/mail-worker
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RESULT="$RUNNER_TEMP/cloudmail-orphans.json"
+
+          pnpm wrangler d1 execute db \
+            --remote \
+            --json \
+            --config wrangler-ci.toml \
+            --command="
+              SELECT 'account_without_user' AS issue, COUNT(*) AS orphan_count
+              FROM account a
+              WHERE NOT EXISTS (
+                SELECT 1 FROM user u WHERE u.user_id = a.user_id
+              )
+
+              UNION ALL
+
+              SELECT 'email_owner_invalid', COUNT(*)
+              FROM email e
+              WHERE NOT EXISTS (
+                SELECT 1
+                FROM account a
+                WHERE a.account_id = e.account_id
+                  AND a.user_id = e.user_id
+              )
+
+              UNION ALL
+
+              SELECT 'attachment_owner_invalid', COUNT(*)
+              FROM attachments a
+              WHERE NOT EXISTS (
+                SELECT 1
+                FROM email e
+                WHERE e.email_id = a.email_id
+                  AND e.account_id = a.account_id
+                  AND e.user_id = a.user_id
+              )
+
+              UNION ALL
+
+              SELECT 'star_owner_invalid', COUNT(*)
+              FROM star s
+              WHERE NOT EXISTS (
+                SELECT 1
+                FROM email e
+                WHERE e.email_id = s.email_id
+                  AND e.user_id = s.user_id
+              )
+
+              UNION ALL
+
+              SELECT 'role_perm_invalid', COUNT(*)
+              FROM role_perm rp
+              WHERE NOT EXISTS (
+                SELECT 1 FROM role r WHERE r.role_id = rp.role_id
+              )
+              OR NOT EXISTS (
+                SELECT 1 FROM perm p WHERE p.perm_id = rp.perm_id
+              )
+
+              UNION ALL
+
+              SELECT 'push_subscription_without_user', COUNT(*)
+              FROM push_subscription ps
+              WHERE NOT EXISTS (
+                SELECT 1 FROM user u WHERE u.user_id = ps.user_id
+              );
+            " > "$RESULT"
+
+          python3 - "$RESULT" <<'PY'
+          import json
+          import sys
+
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          rows = []
+
+          def walk(value):
+              if isinstance(value, dict):
+                  if isinstance(value.get("results"), list):
+                      rows.extend(value["results"])
+                  for child in value.values():
+                      walk(child)
+              elif isinstance(value, list):
+                  for child in value:
+                      walk(child)
+
+          walk(payload)
+
+          bad = []
+          print("D1 integrity results:")
+          for row in rows:
+              if not isinstance(row, dict) or "issue" not in row:
+                  continue
+              issue = str(row["issue"])
+              count = int(row.get("orphan_count") or 0)
+              print(f"  {issue}: {count}")
+              if count:
+                  bad.append((issue, count))
+
+          if bad:
+              print("::error::Hard orphan rows remain. CI will not delete mail/account/attachment data automatically.")
+              for issue, count in bad:
+                  print(f"::error::{issue}={count}")
+              raise SystemExit(1)
+
+          print("✅ D1 integrity gate passed")
+          PY
+
+      - name: Apply versioned D1 migrations before Worker deploy
+        if: ${{ inputs.mode == 'deploy-and-migrate' }}
+        working-directory: ${{ github.workspace }}/cloudmail-source/mail-worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm wrangler d1 migrations apply db \
+            --remote \
+            --config wrangler-ci.toml
+
+      - name: Verify D1 runtime schema
+        working-directory: ${{ github.workspace }}/cloudmail-source/mail-worker
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RESULT="$RUNNER_TEMP/cloudmail-email-columns.json"
+          pnpm wrangler d1 execute db \
+            --remote \
+            --json \
+            --config wrangler-ci.toml \
+            --command="SELECT name FROM pragma_table_info('email') ORDER BY cid;" \
+            > "$RESULT"
+
+          python3 - "$RESULT" <<'PY'
+          import json
+          import sys
+
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          rows = []
+
+          def walk(value):
+              if isinstance(value, dict):
+                  if isinstance(value.get("results"), list):
+                      rows.extend(value["results"])
+                  for child in value.values():
+                      walk(child)
+              elif isinstance(value, list):
+                  for child in value:
+                      walk(child)
+
+          walk(payload)
+          columns = {
+              str(row.get("name", "")).strip()
+              for row in rows
+              if isinstance(row, dict)
+          }
+
+          required = {
+              "email_id",
+              "account_id",
+              "user_id",
+              "subject",
+              "content",
+              "cc",
+              "bcc",
+              "recipient",
+              "message_id",
+              "unread",
+              "is_del",
+              "deleted_at",
+          }
+
+          missing = sorted(required - columns)
+          if missing:
+              print("::error::D1 schema is not compatible with the current Worker.")
+              print("::error::Missing columns: " + ", ".join(missing))
+              raise SystemExit(1)
+
+          print("✅ D1 runtime schema is compatible with current Worker")
+          PY
+
+      - name: Deploy Worker and frontend without re-uploading application secrets
+        id: deploy
+        working-directory: ${{ github.workspace }}/cloudmail-source/mail-worker
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          pnpm wrangler deploy \
+            --config wrangler-ci.toml \
+            2>&1 | tee deploy.log
+
+          echo "✅ Worker deployed"
+          echo "✅ Existing encrypted Worker secrets were left in Cloudflare"
+
+      - name: Post-deploy health check
+        id: health
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${EXISTING_CUSTOM_DOMAIN:-}" ]; then
+            echo "::warning::No existing Cloudflare Worker custom domain was discovered; skipping HTTP health check."
+            exit 0
+          fi
+
+          HEALTH_URL="https://${EXISTING_CUSTOM_DOMAIN}/api/health"
+          echo "Checking $HEALTH_URL"
+
+          for attempt in $(seq 1 12); do
+            code="$(
+              curl --silent --show-error \
+                --connect-timeout 10 \
+                --max-time 30 \
+                --output "$RUNNER_TEMP/cloudmail-health.json" \
+                --write-out '%{http_code}' \
+                "$HEALTH_URL" || printf '000'
+            )"
+
+            if [ "$code" = "200" ]; then
+              echo "✅ CloudMail health check passed"
+              cat "$RUNNER_TEMP/cloudmail-health.json" || true
+              exit 0
+            fi
+
+            echo "Health attempt $attempt/12 returned HTTP $code"
+            sleep 5
+          done
+
+          echo "::error::CloudMail post-deploy health check failed"
+          cat "$RUNNER_TEMP/cloudmail-health.json" || true
+          exit 1
+
+      - name: Roll back Worker when post-deploy health fails
+        if: ${{ failure() && steps.deploy.outcome == 'success' && steps.health.outcome == 'failure' }}
+        working-directory: ${{ github.workspace }}/cloudmail-source/mail-worker
+        shell: bash
+        run: |
+          set +e
+          pnpm wrangler rollback \
+            --config wrangler-ci.toml \
+            --message "Automatic rollback: public CI post-deploy health check failed"
+
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Automatic Worker rollback failed; roll back from Cloudflare Deployments."
+            exit "$status"
+          fi
+
+          echo "✅ Previous Worker version restored"
+
+      - name: Deployment summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## CloudMail public CI deployment'
+            echo
+            echo "- Source repository: \`readori/CloudMail\`"
+            echo "- Source ref: \`${{ inputs.source_ref }}\`"
+            echo "- Mode: \`${{ inputs.mode }}\`"
+            echo "- Private repository Actions used: **No**"
+            echo "- Application secret values copied to public GitHub: **No**"
+            echo "- Required public credentials: \`TARGET_REPO_PAT\`, \`CLOUDFLARE_API_TOKEN\`, \`CLOUDFLARE_ACCOUNT_ID\`"
+          } >> "$GITHUB_STEP_SUMMARY"
