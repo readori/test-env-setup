@@ -1,0 +1,32 @@
+name: Cloudflare Deploy V2
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Deploy mode'
+        required: true
+        default: deploy
+        type: choice
+        options:
+          - deploy
+          - deploy-and-migrate
+      source_ref:
+        description: 'Private CloudMail branch, tag, or commit SHA'
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: CloudMail full-stack deployment
+    uses: ./.github/workflows/_deploy-cloudflare.yml
+    with:
+      source: full-stack
+      source_repository: readori/CloudMail
+      source_ref: ${{ inputs.source_ref }}
+      initialize_database: ${{ inputs.mode == 'deploy-and-migrate' }}
+    secrets: inherit
