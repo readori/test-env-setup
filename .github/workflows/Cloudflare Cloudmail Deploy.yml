@@ -267,6 +267,7 @@ jobs:
               "send_email",
               "secret_text",
               "plain_text",
+              "json",
               "ai",
               "assets",
           }
@@ -283,11 +284,23 @@ jobs:
                   "to overwrite automatically: " + ", ".join(unexpected)
               )
 
+          preserved_vars = sorted(
+              str(b.get("name"))
+              for b in bindings
+              if isinstance(b, dict)
+              and b.get("type") in {"plain_text", "json"}
+              and b.get("name")
+          )
+
           print("✅ Existing D1 binding discovered")
           print("✅ Existing KV binding discovered")
           print("✅ Existing R2 binding discovered" if r2_bucket else "ℹ️ No existing R2 binding")
           print("✅ Existing send_email binding discovered" if email_matches else "ℹ️ No send_email binding")
           print("✅ Existing custom domain discovered" if custom_domains else "ℹ️ No custom domain discovered")
+          if preserved_vars:
+              print("✅ Dashboard variables preserved by keep_vars=true: " + ", ".join(preserved_vars))
+          else:
+              print("ℹ️ No dashboard plain-text/JSON variables were discovered")
           print("✅ Existing binding set is safe for public-CI preservation")
           PY
 
