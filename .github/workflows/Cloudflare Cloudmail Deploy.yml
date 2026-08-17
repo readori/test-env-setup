@@ -30,3 +30,4 @@ jobs:
       source_ref: ${{ inputs.source_ref }}
       initialize_database: ${{ inputs.mode == 'deploy-and-migrate' }}
     secrets: inherit
+
