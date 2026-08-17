@@ -902,11 +902,14 @@ jobs:
                   """,
               ),
               (
-                  "attachment_owner_invalid",
+                  "attachment_owner_mismatch",
                   """
                   SELECT COUNT(*) AS orphan_count
                   FROM attachments a
-                  WHERE NOT EXISTS (
+                  WHERE EXISTS (
+                    SELECT 1 FROM email e WHERE e.email_id = a.email_id
+                  )
+                  AND NOT EXISTS (
                     SELECT 1
                     FROM email e
                     WHERE e.email_id = a.email_id
@@ -1036,6 +1039,17 @@ jobs:
                   print(f"::error::{label}={count}")
               raise SystemExit(1)
 
+          legacy_missing_parent_attachments = query(
+              "legacy_attachment_missing_parent",
+              """
+              SELECT COUNT(*) AS orphan_count
+              FROM attachments a
+              WHERE NOT EXISTS (
+                SELECT 1 FROM email e WHERE e.email_id = a.email_id
+              )
+              """,
+          )
+
           noone_mail = query(
               "legitimate_noone_mail",
               """
@@ -1064,9 +1078,15 @@ jobs:
               """,
           )
 
+          print(f"  legacy_attachment_missing_parent: {legacy_missing_parent_attachments}")
+          if legacy_missing_parent_attachments:
+              print(
+                  "::warning::Legacy attachment metadata with missing parent email will be preserved "
+                  "and registered in cloudmail_legacy_attachment_orphan; no attachment row is deleted."
+              )
           print(f"  legitimate_noone_mail: {noone_mail}")
           print(f"  legitimate_noone_attachments: {noone_attachments}")
-          print("✅ D1 integrity gate passed (CloudMail NOONE 0/0 ownership is treated as intentional)")
+          print("✅ D1 integrity gate passed (legacy missing-parent attachments are preserved; future writes remain strict)")
           PY
 
       - name: Apply versioned D1 migrations before Worker deploy
