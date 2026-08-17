@@ -159,6 +159,9 @@ jobs:
           PY
           )"
 
+          # GITHUB_ENV only affects later steps. Export it as well because
+          # the Python block below needs WORKER_NAME in this same step.
+          export WORKER_NAME
           echo "WORKER_NAME=$WORKER_NAME" >> "$GITHUB_ENV"
           echo "Resolved Worker name: $WORKER_NAME"
 
