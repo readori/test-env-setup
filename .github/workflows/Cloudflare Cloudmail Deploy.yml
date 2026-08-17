@@ -334,6 +334,8 @@ jobs:
           fi
 
           export D1_DATABASE_NAME
+          echo "D1_DATABASE_NAME=$D1_DATABASE_NAME" >> "$GITHUB_ENV"
+          echo "Resolved D1 database name: $D1_DATABASE_NAME"
 
           python3 <<'PY'
           import json
@@ -402,6 +404,242 @@ jobs:
           Path("wrangler-ci.toml").write_text("\n".join(lines), encoding="utf-8")
           print("✅ Generated CI config from existing Cloudflare bindings")
           PY
+
+      - name: Validate and bootstrap D1 migration prerequisites
+        working-directory: ${{ github.workspace }}/cloudmail-source/mail-worker
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TABLES_JSON="$RUNNER_TEMP/cloudmail-table-list.json"
+          TABLES_ERR="$RUNNER_TEMP/cloudmail-table-list.err"
+
+          if ! pnpm wrangler d1 execute "$D1_DATABASE_NAME" \
+            --remote \
+            --json \
+            --config wrangler-ci.toml \
+            --command="SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name;" \
+            > "$TABLES_JSON" 2> "$TABLES_ERR"; then
+            echo "::error::Unable to read the current D1 table list."
+            cat "$TABLES_ERR" || true
+            cat "$TABLES_JSON" || true
+            exit 1
+          fi
+
+          BOOTSTRAP_PUSH="$(
+            python3 - "$TABLES_JSON" <<'PY'
+          import json
+          import sys
+
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          rows = []
+
+          def walk(value):
+              if isinstance(value, dict):
+                  if isinstance(value.get("results"), list):
+                      rows.extend(value["results"])
+                  for child in value.values():
+                      walk(child)
+              elif isinstance(value, list):
+                  for child in value:
+                      walk(child)
+
+          walk(payload)
+
+          tables = {
+              str(row.get("name", "")).strip()
+              for row in rows
+              if isinstance(row, dict) and row.get("name")
+          }
+
+          core = {
+              "user",
+              "account",
+              "email",
+              "attachments",
+              "star",
+              "role",
+              "perm",
+              "role_perm",
+          }
+
+          missing_core = sorted(core - tables)
+
+          print("D1 tables discovered:", ", ".join(sorted(tables)), file=sys.stderr)
+
+          if missing_core:
+              print(
+                  "::error::Core CloudMail D1 tables are missing: "
+                  + ", ".join(missing_core),
+                  file=sys.stderr,
+              )
+              print(
+                  "::error::CI will not auto-create missing core mail/account tables.",
+                  file=sys.stderr,
+              )
+              raise SystemExit(2)
+
+          print("yes" if "push_subscription" not in tables else "no")
+          PY
+          )" || {
+            status=$?
+            [ "$status" -eq 2 ] && exit 1
+            echo "::error::Unable to parse D1 table list."
+            cat "$TABLES_JSON" || true
+            exit "$status"
+          }
+
+          if [ "$BOOTSTRAP_PUSH" = "yes" ]; then
+            echo "ℹ️ Legacy D1 has no push_subscription table; creating the current empty gateway-subscription table."
+
+            cat > "$RUNNER_TEMP/cloudmail-push-bootstrap.sql" <<'SQL'
+          CREATE TABLE IF NOT EXISTS push_subscription (
+            push_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            subscription_id TEXT NOT NULL,
+            push_secret TEXT NOT NULL,
+            account_ref TEXT NOT NULL DEFAULT '',
+            installation_id TEXT NOT NULL DEFAULT '',
+            preview_mode TEXT NOT NULL DEFAULT 'privateOnly',
+            sound_enabled INTEGER NOT NULL DEFAULT 1,
+            badge_enabled INTEGER NOT NULL DEFAULT 1,
+            quiet_hours_enabled INTEGER NOT NULL DEFAULT 0,
+            quiet_start_minutes INTEGER NOT NULL DEFAULT 1320,
+            quiet_end_minutes INTEGER NOT NULL DEFAULT 420,
+            time_zone TEXT NOT NULL DEFAULT 'UTC',
+            create_time TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+          );
+
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_push_subscription_user_id_unique
+            ON push_subscription(user_id, subscription_id);
+
+          CREATE INDEX IF NOT EXISTS idx_push_subscription_user_created
+            ON push_subscription(user_id, create_time DESC);
+
+          CREATE INDEX IF NOT EXISTS idx_push_subscription_user_installation
+            ON push_subscription(user_id, installation_id);
+
+          CREATE INDEX IF NOT EXISTS idx_push_subscription_user_account_ref
+            ON push_subscription(user_id, account_ref);
+          SQL
+
+            if ! pnpm wrangler d1 execute "$D1_DATABASE_NAME" \
+              --remote \
+              --config wrangler-ci.toml \
+              --file "$RUNNER_TEMP/cloudmail-push-bootstrap.sql"; then
+              echo "::error::Unable to bootstrap push_subscription."
+              exit 1
+            fi
+
+            echo "✅ Empty push_subscription compatibility table created"
+          else
+            PUSH_COLUMNS_JSON="$RUNNER_TEMP/cloudmail-push-columns.json"
+            PUSH_COLUMNS_ERR="$RUNNER_TEMP/cloudmail-push-columns.err"
+
+            if ! pnpm wrangler d1 execute "$D1_DATABASE_NAME" \
+              --remote \
+              --json \
+              --config wrangler-ci.toml \
+              --command="SELECT name FROM pragma_table_info('push_subscription') ORDER BY cid;" \
+              > "$PUSH_COLUMNS_JSON" 2> "$PUSH_COLUMNS_ERR"; then
+              echo "::error::Unable to inspect push_subscription columns."
+              cat "$PUSH_COLUMNS_ERR" || true
+              cat "$PUSH_COLUMNS_JSON" || true
+              exit 1
+            fi
+
+            python3 - "$PUSH_COLUMNS_JSON" "$RUNNER_TEMP/cloudmail-push-alters.sql" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          rows = []
+
+          def walk(value):
+              if isinstance(value, dict):
+                  if isinstance(value.get("results"), list):
+                      rows.extend(value["results"])
+                  for child in value.values():
+                      walk(child)
+              elif isinstance(value, list):
+                  for child in value:
+                      walk(child)
+
+          walk(payload)
+
+          columns = {
+              str(row.get("name", "")).strip()
+              for row in rows
+              if isinstance(row, dict)
+          }
+
+          required_base = {
+              "push_id",
+              "user_id",
+              "subscription_id",
+              "push_secret",
+              "account_ref",
+              "create_time",
+          }
+
+          missing_base = sorted(required_base - columns)
+          if missing_base:
+              print(
+                  "::error::Existing push_subscription table has an incompatible base schema. Missing: "
+                  + ", ".join(missing_base)
+              )
+              raise SystemExit(1)
+
+          additions = {
+              "installation_id":
+                  "ALTER TABLE push_subscription ADD COLUMN installation_id TEXT NOT NULL DEFAULT '';",
+              "preview_mode":
+                  "ALTER TABLE push_subscription ADD COLUMN preview_mode TEXT NOT NULL DEFAULT 'privateOnly';",
+              "sound_enabled":
+                  "ALTER TABLE push_subscription ADD COLUMN sound_enabled INTEGER NOT NULL DEFAULT 1;",
+              "badge_enabled":
+                  "ALTER TABLE push_subscription ADD COLUMN badge_enabled INTEGER NOT NULL DEFAULT 1;",
+              "quiet_hours_enabled":
+                  "ALTER TABLE push_subscription ADD COLUMN quiet_hours_enabled INTEGER NOT NULL DEFAULT 0;",
+              "quiet_start_minutes":
+                  "ALTER TABLE push_subscription ADD COLUMN quiet_start_minutes INTEGER NOT NULL DEFAULT 1320;",
+              "quiet_end_minutes":
+                  "ALTER TABLE push_subscription ADD COLUMN quiet_end_minutes INTEGER NOT NULL DEFAULT 420;",
+              "time_zone":
+                  "ALTER TABLE push_subscription ADD COLUMN time_zone TEXT NOT NULL DEFAULT 'UTC';",
+          }
+
+          sql = [
+              statement
+              for name, statement in additions.items()
+              if name not in columns
+          ]
+
+          Path(sys.argv[2]).write_text("\n".join(sql), encoding="utf-8")
+
+          if sql:
+              print("Push compatibility columns to add:")
+              for name in additions:
+                  if name not in columns:
+                      print("  - " + name)
+          else:
+              print("✅ push_subscription columns already match the current compatibility contract")
+          PY
+
+            if [ -s "$RUNNER_TEMP/cloudmail-push-alters.sql" ]; then
+              if ! pnpm wrangler d1 execute "$D1_DATABASE_NAME" \
+                --remote \
+                --config wrangler-ci.toml \
+                --file "$RUNNER_TEMP/cloudmail-push-alters.sql"; then
+                echo "::error::Unable to add missing push_subscription compatibility columns."
+                exit 1
+              fi
+              echo "✅ Missing push_subscription compatibility columns added"
+            fi
+          fi
+
+          echo "✅ D1 migration prerequisites are present"
 
       - name: Verify required Worker secrets already exist on Cloudflare
         working-directory: ${{ github.workspace }}/cloudmail-source/mail-worker
@@ -509,12 +747,12 @@ jobs:
           RECOVERY_DIR="$RUNNER_TEMP/cloudmail-d1-recovery"
           mkdir -p "$RECOVERY_DIR"
 
-          pnpm wrangler d1 time-travel info db \
+          pnpm wrangler d1 time-travel info "$D1_DATABASE_NAME" \
             --json \
             --config wrangler-ci.toml \
             > "$RECOVERY_DIR/time-travel.json"
 
-          pnpm wrangler d1 export db \
+          pnpm wrangler d1 export "$D1_DATABASE_NAME" \
             --remote \
             --skip-confirmation \
             --output "$RECOVERY_DIR/pre-migration.sql" \
@@ -604,7 +842,7 @@ jobs:
           );
           SQL
 
-          pnpm wrangler d1 execute db \
+          pnpm wrangler d1 execute "$D1_DATABASE_NAME" \
             --remote \
             --config wrangler-ci.toml \
             --file "$RUNNER_TEMP/cloudmail-safe-repair.sql"
@@ -619,8 +857,9 @@ jobs:
           set -euo pipefail
 
           RESULT="$RUNNER_TEMP/cloudmail-orphans.json"
+          RESULT_ERR="$RUNNER_TEMP/cloudmail-orphans.err"
 
-          pnpm wrangler d1 execute db \
+          if ! pnpm wrangler d1 execute "$D1_DATABASE_NAME" \
             --remote \
             --json \
             --config wrangler-ci.toml \
@@ -683,7 +922,16 @@ jobs:
               WHERE NOT EXISTS (
                 SELECT 1 FROM user u WHERE u.user_id = ps.user_id
               );
-            " > "$RESULT"
+            " > "$RESULT" 2> "$RESULT_ERR"; then
+            echo "::error::D1 integrity SQL itself failed before orphan counts could be evaluated."
+            echo "::group::Wrangler stderr"
+            cat "$RESULT_ERR" || true
+            echo "::endgroup::"
+            echo "::group::Wrangler JSON/stdout"
+            cat "$RESULT" || true
+            echo "::endgroup::"
+            exit 1
+          fi
 
           python3 - "$RESULT" <<'PY'
           import json
@@ -730,7 +978,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          pnpm wrangler d1 migrations apply db \
+          pnpm wrangler d1 migrations apply "$D1_DATABASE_NAME" \
             --remote \
             --config wrangler-ci.toml
 
@@ -741,12 +989,19 @@ jobs:
           set -euo pipefail
 
           RESULT="$RUNNER_TEMP/cloudmail-email-columns.json"
-          pnpm wrangler d1 execute db \
+          RESULT_ERR="$RUNNER_TEMP/cloudmail-email-columns.err"
+
+          if ! pnpm wrangler d1 execute "$D1_DATABASE_NAME" \
             --remote \
             --json \
             --config wrangler-ci.toml \
             --command="SELECT name FROM pragma_table_info('email') ORDER BY cid;" \
-            > "$RESULT"
+            > "$RESULT" 2> "$RESULT_ERR"; then
+            echo "::error::Unable to inspect the remote email schema."
+            cat "$RESULT_ERR" || true
+            cat "$RESULT" || true
+            exit 1
+          fi
 
           python3 - "$RESULT" <<'PY'
           import json
