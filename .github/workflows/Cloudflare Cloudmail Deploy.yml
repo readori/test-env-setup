@@ -851,122 +851,186 @@ jobs:
 
       - name: D1 hard-orphan integrity gate
         if: ${{ inputs.mode == 'deploy-and-migrate' }}
-        working-directory: ${{ github.workspace }}/cloudmail-source/mail-worker
         shell: bash
         run: |
           set -euo pipefail
 
-          RESULT="$RUNNER_TEMP/cloudmail-orphans.json"
-          RESULT_ERR="$RUNNER_TEMP/cloudmail-orphans.err"
-
-          if ! pnpm wrangler d1 execute "$D1_DATABASE_NAME" \
-            --remote \
-            --json \
-            --config wrangler-ci.toml \
-            --command="
-              SELECT 'account_without_user' AS issue, COUNT(*) AS orphan_count
-              FROM account a
-              WHERE NOT EXISTS (
-                SELECT 1 FROM user u WHERE u.user_id = a.user_id
-              )
-
-              UNION ALL
-
-              SELECT 'email_owner_invalid', COUNT(*)
-              FROM email e
-              WHERE NOT EXISTS (
-                SELECT 1
-                FROM account a
-                WHERE a.account_id = e.account_id
-                  AND a.user_id = e.user_id
-              )
-
-              UNION ALL
-
-              SELECT 'attachment_owner_invalid', COUNT(*)
-              FROM attachments a
-              WHERE NOT EXISTS (
-                SELECT 1
-                FROM email e
-                WHERE e.email_id = a.email_id
-                  AND e.account_id = a.account_id
-                  AND e.user_id = a.user_id
-              )
-
-              UNION ALL
-
-              SELECT 'star_owner_invalid', COUNT(*)
-              FROM star s
-              WHERE NOT EXISTS (
-                SELECT 1
-                FROM email e
-                WHERE e.email_id = s.email_id
-                  AND e.user_id = s.user_id
-              )
-
-              UNION ALL
-
-              SELECT 'role_perm_invalid', COUNT(*)
-              FROM role_perm rp
-              WHERE NOT EXISTS (
-                SELECT 1 FROM role r WHERE r.role_id = rp.role_id
-              )
-              OR NOT EXISTS (
-                SELECT 1 FROM perm p WHERE p.perm_id = rp.perm_id
-              )
-
-              UNION ALL
-
-              SELECT 'push_subscription_without_user', COUNT(*)
-              FROM push_subscription ps
-              WHERE NOT EXISTS (
-                SELECT 1 FROM user u WHERE u.user_id = ps.user_id
-              );
-            " > "$RESULT" 2> "$RESULT_ERR"; then
-            echo "::error::D1 integrity SQL itself failed before orphan counts could be evaluated."
-            echo "::group::Wrangler stderr"
-            cat "$RESULT_ERR" || true
-            echo "::endgroup::"
-            echo "::group::Wrangler JSON/stdout"
-            cat "$RESULT" || true
-            echo "::endgroup::"
-            exit 1
-          fi
-
-          python3 - "$RESULT" <<'PY'
+          python3 <<'PY'
           import json
+          import os
           import sys
+          import urllib.error
+          import urllib.request
 
-          payload = json.load(open(sys.argv[1], encoding="utf-8"))
-          rows = []
+          account_id = os.environ["CLOUDFLARE_ACCOUNT_ID"].strip()
+          database_id = os.environ["RESOLVED_D1_DATABASE_ID"].strip()
+          token = os.environ["CLOUDFLARE_API_TOKEN"].strip()
 
-          def walk(value):
-              if isinstance(value, dict):
-                  if isinstance(value.get("results"), list):
-                      rows.extend(value["results"])
-                  for child in value.values():
-                      walk(child)
-              elif isinstance(value, list):
-                  for child in value:
-                      walk(child)
+          if not account_id or not database_id or not token:
+              raise SystemExit("::error::Missing Cloudflare account/database/token for D1 integrity query")
 
-          walk(payload)
+          endpoint = (
+              f"https://api.cloudflare.com/client/v4/accounts/{account_id}"
+              f"/d1/database/{database_id}/query"
+          )
+
+          checks = [
+              (
+                  "account_without_user",
+                  """
+                  SELECT COUNT(*) AS orphan_count
+                  FROM account a
+                  WHERE NOT EXISTS (
+                    SELECT 1 FROM user u WHERE u.user_id = a.user_id
+                  )
+                  """,
+              ),
+              (
+                  "email_owner_invalid",
+                  """
+                  SELECT COUNT(*) AS orphan_count
+                  FROM email e
+                  WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM account a
+                    WHERE a.account_id = e.account_id
+                      AND a.user_id = e.user_id
+                  )
+                  """,
+              ),
+              (
+                  "attachment_owner_invalid",
+                  """
+                  SELECT COUNT(*) AS orphan_count
+                  FROM attachments a
+                  WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM email e
+                    WHERE e.email_id = a.email_id
+                      AND e.account_id = a.account_id
+                      AND e.user_id = a.user_id
+                  )
+                  """,
+              ),
+              (
+                  "star_owner_invalid",
+                  """
+                  SELECT COUNT(*) AS orphan_count
+                  FROM star s
+                  WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM email e
+                    WHERE e.email_id = s.email_id
+                      AND e.user_id = s.user_id
+                  )
+                  """,
+              ),
+              (
+                  "role_perm_invalid",
+                  """
+                  SELECT COUNT(*) AS orphan_count
+                  FROM role_perm rp
+                  WHERE NOT EXISTS (
+                    SELECT 1 FROM role r WHERE r.role_id = rp.role_id
+                  )
+                  OR NOT EXISTS (
+                    SELECT 1 FROM perm p WHERE p.perm_id = rp.perm_id
+                  )
+                  """,
+              ),
+              (
+                  "push_subscription_without_user",
+                  """
+                  SELECT COUNT(*) AS orphan_count
+                  FROM push_subscription ps
+                  WHERE NOT EXISTS (
+                    SELECT 1 FROM user u WHERE u.user_id = ps.user_id
+                  )
+                  """,
+              ),
+          ]
+
+          def query(label, sql):
+              payload = json.dumps({"sql": sql.strip()}).encode("utf-8")
+              request = urllib.request.Request(
+                  endpoint,
+                  data=payload,
+                  method="POST",
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Content-Type": "application/json",
+                      "Accept": "application/json",
+                  },
+              )
+
+              try:
+                  with urllib.request.urlopen(request, timeout=60) as response:
+                      raw = response.read().decode("utf-8", "replace")
+              except urllib.error.HTTPError as exc:
+                  raw = exc.read().decode("utf-8", "replace")
+                  print(f"::error::D1 REST query failed for {label} with HTTP {exc.code}")
+                  print(raw[:6000])
+                  raise SystemExit(1)
+              except Exception as exc:
+                  print(f"::error::D1 REST query transport failure for {label}: {exc}")
+                  raise SystemExit(1)
+
+              try:
+                  body = json.loads(raw)
+              except json.JSONDecodeError:
+                  print(f"::error::D1 REST query returned non-JSON data for {label}")
+                  print(raw[:6000])
+                  raise SystemExit(1)
+
+              if not body.get("success", False):
+                  print(f"::error::D1 REST query reported failure for {label}")
+                  for item in body.get("errors") or []:
+                      if isinstance(item, dict):
+                          print(
+                              "::error::"
+                              + str(item.get("message") or item)
+                          )
+                      else:
+                          print(f"::error::{item}")
+                  print(json.dumps(body, ensure_ascii=False)[:6000])
+                  raise SystemExit(1)
+
+              results = body.get("result") or []
+              if not results:
+                  print(f"::error::D1 REST query returned no result object for {label}")
+                  print(json.dumps(body, ensure_ascii=False)[:6000])
+                  raise SystemExit(1)
+
+              first = results[0] if isinstance(results[0], dict) else {}
+              if first.get("success") is False:
+                  print(f"::error::D1 SQL execution failed for {label}")
+                  print(json.dumps(first, ensure_ascii=False)[:6000])
+                  raise SystemExit(1)
+
+              rows = first.get("results") or []
+              if not rows or not isinstance(rows[0], dict):
+                  print(f"::error::D1 REST query returned no count row for {label}")
+                  print(json.dumps(first, ensure_ascii=False)[:6000])
+                  raise SystemExit(1)
+
+              try:
+                  return int(rows[0].get("orphan_count") or 0)
+              except Exception:
+                  print(f"::error::Invalid orphan_count returned for {label}: {rows[0]!r}")
+                  raise SystemExit(1)
 
           bad = []
           print("D1 integrity results:")
-          for row in rows:
-              if not isinstance(row, dict) or "issue" not in row:
-                  continue
-              issue = str(row["issue"])
-              count = int(row.get("orphan_count") or 0)
-              print(f"  {issue}: {count}")
+          for label, sql in checks:
+              count = query(label, sql)
+              print(f"  {label}: {count}")
               if count:
-                  bad.append((issue, count))
+                  bad.append((label, count))
 
           if bad:
-              print("::error::Hard orphan rows remain. CI will not delete mail/account/attachment data automatically.")
-              for issue, count in bad:
-                  print(f"::error::{issue}={count}")
+              print("::error::Hard orphan rows remain. CI will not delete mail/account/attachment rows automatically.")
+              for label, count in bad:
+                  print(f"::error::{label}={count}")
               raise SystemExit(1)
 
           print("✅ D1 integrity gate passed")
@@ -983,44 +1047,61 @@ jobs:
             --config wrangler-ci.toml
 
       - name: Verify D1 runtime schema
-        working-directory: ${{ github.workspace }}/cloudmail-source/mail-worker
         shell: bash
         run: |
           set -euo pipefail
 
-          RESULT="$RUNNER_TEMP/cloudmail-email-columns.json"
-          RESULT_ERR="$RUNNER_TEMP/cloudmail-email-columns.err"
-
-          if ! pnpm wrangler d1 execute "$D1_DATABASE_NAME" \
-            --remote \
-            --json \
-            --config wrangler-ci.toml \
-            --command="SELECT name FROM pragma_table_info('email') ORDER BY cid;" \
-            > "$RESULT" 2> "$RESULT_ERR"; then
-            echo "::error::Unable to inspect the remote email schema."
-            cat "$RESULT_ERR" || true
-            cat "$RESULT" || true
-            exit 1
-          fi
-
-          python3 - "$RESULT" <<'PY'
+          python3 <<'PY'
           import json
+          import os
           import sys
+          import urllib.error
+          import urllib.request
 
-          payload = json.load(open(sys.argv[1], encoding="utf-8"))
-          rows = []
+          account_id = os.environ["CLOUDFLARE_ACCOUNT_ID"].strip()
+          database_id = os.environ["RESOLVED_D1_DATABASE_ID"].strip()
+          token = os.environ["CLOUDFLARE_API_TOKEN"].strip()
 
-          def walk(value):
-              if isinstance(value, dict):
-                  if isinstance(value.get("results"), list):
-                      rows.extend(value["results"])
-                  for child in value.values():
-                      walk(child)
-              elif isinstance(value, list):
-                  for child in value:
-                      walk(child)
+          endpoint = (
+              f"https://api.cloudflare.com/client/v4/accounts/{account_id}"
+              f"/d1/database/{database_id}/query"
+          )
 
-          walk(payload)
+          sql = "PRAGMA table_info('email');"
+          request = urllib.request.Request(
+              endpoint,
+              data=json.dumps({"sql": sql}).encode("utf-8"),
+              method="POST",
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Content-Type": "application/json",
+                  "Accept": "application/json",
+              },
+          )
+
+          try:
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  raw = response.read().decode("utf-8", "replace")
+          except urllib.error.HTTPError as exc:
+              raw = exc.read().decode("utf-8", "replace")
+              print(f"::error::Unable to inspect remote email schema: HTTP {exc.code}")
+              print(raw[:6000])
+              raise SystemExit(1)
+
+          body = json.loads(raw)
+          if not body.get("success", False):
+              print("::error::Cloudflare D1 API rejected email schema query.")
+              for item in body.get("errors") or []:
+                  if isinstance(item, dict):
+                      print("::error::" + str(item.get("message") or item))
+              print(json.dumps(body, ensure_ascii=False)[:6000])
+              raise SystemExit(1)
+
+          results = body.get("result") or []
+          if not results or not isinstance(results[0], dict):
+              raise SystemExit("::error::No D1 schema result returned for email table")
+
+          rows = results[0].get("results") or []
           columns = {
               str(row.get("name", "")).strip()
               for row in rows
@@ -1043,6 +1124,8 @@ jobs:
           }
 
           missing = sorted(required - columns)
+          print("Remote email columns: " + ", ".join(sorted(columns)))
+
           if missing:
               print("::error::D1 schema is not compatible with the current Worker.")
               print("::error::Missing columns: " + ", ".join(missing))
