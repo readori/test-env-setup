@@ -890,11 +890,14 @@ jobs:
                   """
                   SELECT COUNT(*) AS orphan_count
                   FROM email e
-                  WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM account a
-                    WHERE a.account_id = e.account_id
-                      AND a.user_id = e.user_id
+                  WHERE NOT (
+                    (e.user_id = 0 AND e.account_id = 0 AND e.status IN (6, 7))
+                    OR EXISTS (
+                      SELECT 1
+                      FROM account a
+                      WHERE a.account_id = e.account_id
+                        AND a.user_id = e.user_id
+                    )
                   )
                   """,
               ),
@@ -1033,7 +1036,37 @@ jobs:
                   print(f"::error::{label}={count}")
               raise SystemExit(1)
 
-          print("✅ D1 integrity gate passed")
+          noone_mail = query(
+              "legitimate_noone_mail",
+              """
+              SELECT COUNT(*) AS orphan_count
+              FROM email
+              WHERE user_id = 0
+                AND account_id = 0
+                AND status IN (6, 7)
+              """,
+          )
+          noone_attachments = query(
+              "legitimate_noone_attachments",
+              """
+              SELECT COUNT(*) AS orphan_count
+              FROM attachments a
+              WHERE a.user_id = 0
+                AND a.account_id = 0
+                AND EXISTS (
+                  SELECT 1
+                  FROM email e
+                  WHERE e.email_id = a.email_id
+                    AND e.user_id = 0
+                    AND e.account_id = 0
+                    AND e.status IN (6, 7)
+                )
+              """,
+          )
+
+          print(f"  legitimate_noone_mail: {noone_mail}")
+          print(f"  legitimate_noone_attachments: {noone_attachments}")
+          print("✅ D1 integrity gate passed (CloudMail NOONE 0/0 ownership is treated as intentional)")
           PY
 
       - name: Apply versioned D1 migrations before Worker deploy
