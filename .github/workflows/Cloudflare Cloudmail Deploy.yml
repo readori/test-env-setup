@@ -37,22 +37,101 @@ jobs:
       TARGET_WORKFLOW: _deploy-cloudflare.yml
       TARGET_WORKFLOW_REF: main
       TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
-      GH_API_VERSION: '2022-11-28'
+      GH_API_VERSION: '2026-03-10'
 
     steps:
-      - name: Validate private-repository dispatch token
+      - name: Validate TARGET_REPO_PAT
         shell: bash
         run: |
           set -euo pipefail
 
           if [ -z "${TARGET_REPO_PAT:-}" ]; then
-            echo "::error::TARGET_REPO_PAT is missing in the public CI repository."
+            echo "::error::TARGET_REPO_PAT is missing in readori/test-env-setup."
             exit 1
           fi
 
           echo "::add-mask::$TARGET_REPO_PAT"
-          echo "✅ Public CI only dispatches the private deployment."
-          echo "✅ Cloudflare, D1, R2 and application secrets stay only in readori/CloudMail."
+          echo "Public CI repository: ${GITHUB_REPOSITORY}"
+          echo "Private target repository: ${TARGET_REPOSITORY}"
+          echo "Private target workflow: ${TARGET_WORKFLOW}"
+          echo
+          echo "TARGET_REPO_PAT requirements:"
+          echo "- Fine-grained PAT: repository readori/CloudMail + Actions: Read and write"
+          echo "- Classic PAT: repo scope"
+          echo
+          echo "Cloudflare/D1/R2/application secrets remain only in the private repository."
+
+      - name: Preflight private repository and workflow access
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          token = os.environ["TARGET_REPO_PAT"].strip()
+          repository = os.environ["TARGET_REPOSITORY"].strip()
+          workflow = os.environ["TARGET_WORKFLOW"].strip()
+          api_version = os.environ["GH_API_VERSION"].strip()
+
+          owner, repo = repository.split("/", 1)
+          api_base = f"https://api.github.com/repos/{owner}/{repo}"
+          workflow_q = urllib.parse.quote(workflow, safe="")
+
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "X-GitHub-Api-Version": api_version,
+              "User-Agent": "CloudMail-Public-CI-Dispatcher",
+          }
+
+          def get(url, label):
+              req = urllib.request.Request(url, headers=headers, method="GET")
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      raw = response.read()
+                      body = json.loads(raw.decode("utf-8")) if raw else {}
+                      print(f"✅ {label}: HTTP {response.status}")
+                      return body
+              except urllib.error.HTTPError as exc:
+                  body = exc.read().decode("utf-8", "replace")
+                  print(f"::error::{label} failed with HTTP {exc.code}")
+                  print(body[:2000])
+
+                  if label == "Private repository access":
+                      print("::error::TARGET_REPO_PAT cannot read readori/CloudMail.")
+                      print("::error::For a fine-grained PAT, include readori/CloudMail in Repository access.")
+                  else:
+                      print("::error::TARGET_REPO_PAT cannot read the target Actions workflow.")
+                      print("::error::For a fine-grained PAT, set Actions permission to Read and write.")
+                  raise SystemExit(1)
+
+          repo_info = get(api_base, "Private repository access")
+          if repo_info.get("full_name") != repository:
+              raise SystemExit("::error::Unexpected target repository returned by GitHub API.")
+
+          workflow_info = get(
+              f"{api_base}/actions/workflows/{workflow_q}",
+              "Private workflow access",
+          )
+
+          state = workflow_info.get("state")
+          path = workflow_info.get("path")
+          print(f"Target workflow path: {path}")
+          print(f"Target workflow state: {state}")
+
+          if state != "active":
+              raise SystemExit(
+                  "::error::Private target workflow exists but is not active."
+              )
+
+          print("✅ PAT read preflight passed.")
+          print("The dispatch step additionally requires Actions: write.")
+          PY
 
       - name: Dispatch private deployment and mirror its result
         shell: bash
@@ -105,23 +184,29 @@ jobs:
               if payload is not None:
                   data = json.dumps(payload).encode("utf-8")
                   local_headers["Content-Type"] = "application/json"
+
               req = urllib.request.Request(
                   url,
                   data=data,
                   headers=local_headers,
                   method=method,
               )
+
               try:
                   with urllib.request.urlopen(req, timeout=30) as response:
                       raw = response.read()
-                      if not raw:
-                          return response.status, None
-                      return response.status, json.loads(raw.decode("utf-8"))
+                      body = json.loads(raw.decode("utf-8")) if raw else None
+                      return response.status, body
               except urllib.error.HTTPError as exc:
                   body = exc.read().decode("utf-8", "replace")
                   print(f"::error::GitHub API request failed with HTTP {exc.code}")
                   print(body[:3000])
-                  raise
+
+                  if exc.code == 403:
+                      print("::error::TARGET_REPO_PAT reached readori/CloudMail but is not allowed to dispatch this workflow.")
+                      print("::error::Fine-grained PAT: set Repository access = readori/CloudMail and Actions = Read and write.")
+                      print("::error::Classic PAT: use repo scope.")
+                  raise SystemExit(1)
 
           dispatch_url = f"{api_base}/actions/workflows/{workflow_q}/dispatches"
           payload = {
@@ -133,8 +218,11 @@ jobs:
               },
           }
 
-          status, _ = request("POST", dispatch_url, payload)
-          if status != 204:
+          status, body = request("POST", dispatch_url, payload)
+
+          # Current GitHub API returns HTTP 200 with workflow_run_id/run URLs.
+          # Keep 204 support for compatibility with older behavior.
+          if status not in {200, 204}:
               raise SystemExit(
                   f"::error::Unexpected workflow dispatch response: HTTP {status}"
               )
@@ -144,33 +232,47 @@ jobs:
           print(f"Source ref: {source_ref}")
           print(f"Mode: {deploy_mode}")
 
-          expected_title = f"CloudMail Deploy - {dispatch_id}"
-          runs_url = (
-              f"{api_base}/actions/workflows/{workflow_q}/runs"
-              "?event=workflow_dispatch&per_page=50"
-          )
+          run_id = None
+          html_url = ""
 
-          run = None
-          for attempt in range(1, 31):
-              _, body = request("GET", runs_url)
-              for candidate in (body or {}).get("workflow_runs", []):
-                  if candidate.get("display_title") == expected_title:
-                      run = candidate
-                      break
-              if run:
-                  break
-              print(f"Waiting for private run to appear ({attempt}/30)...")
-              time.sleep(2)
+          if isinstance(body, dict):
+              run_id = body.get("workflow_run_id")
+              html_url = body.get("html_url") or ""
+              if run_id:
+                  print(f"GitHub returned private run id: {run_id}")
+              if html_url:
+                  print(f"Private run: {html_url}")
 
-          if not run:
-              raise SystemExit(
-                  "::error::Private workflow was dispatched but the run could not "
-                  f"be located. Dispatch id: {dispatch_id}"
+          # Fallback for old 204/no-body behavior.
+          if not run_id:
+              expected_title = f"CloudMail Deploy - {dispatch_id}"
+              runs_url = (
+                  f"{api_base}/actions/workflows/{workflow_q}/runs"
+                  "?event=workflow_dispatch&per_page=50"
               )
 
-          run_id = run["id"]
-          html_url = run.get("html_url", "")
-          print(f"Private run: {html_url}")
+              run = None
+              for attempt in range(1, 31):
+                  _, runs_body = request("GET", runs_url)
+                  for candidate in (runs_body or {}).get("workflow_runs", []):
+                      if candidate.get("display_title") == expected_title:
+                          run = candidate
+                          break
+                  if run:
+                      break
+
+                  print(f"Waiting for private run to appear ({attempt}/30)...")
+                  time.sleep(2)
+
+              if not run:
+                  raise SystemExit(
+                      "::error::Private workflow was dispatched but its run could "
+                      f"not be located. Dispatch id: {dispatch_id}"
+                  )
+
+              run_id = run["id"]
+              html_url = run.get("html_url", "")
+              print(f"Private run: {html_url}")
 
           run_url = f"{api_base}/actions/runs/{run_id}"
           deadline = time.time() + (40 * 60)
@@ -179,7 +281,9 @@ jobs:
               _, current = request("GET", run_url)
               run_status = current.get("status")
               conclusion = current.get("conclusion")
+              current_html_url = current.get("html_url") or html_url
               suffix = f" / {conclusion}" if conclusion else ""
+
               print(f"Private deployment status: {run_status}{suffix}")
 
               if run_status == "completed":
@@ -191,14 +295,16 @@ jobs:
                           fp.write(f"- Source ref: `{source_ref}`\n")
                           fp.write(f"- Mode: `{deploy_mode}`\n")
                           fp.write(f"- Dispatch id: `{dispatch_id}`\n")
-                          if html_url:
-                              fp.write(f"- Private run: {html_url}\n")
-                          fp.write(f"- Conclusion: **{conclusion or 'unknown'}**\n")
+                          if current_html_url:
+                              fp.write(f"- Private run: {current_html_url}\n")
+                          fp.write(
+                              f"- Conclusion: **{conclusion or 'unknown'}**\n"
+                          )
 
                   if conclusion != "success":
                       raise SystemExit(
                           "::error::Private CloudMail deployment failed with "
-                          f"conclusion={conclusion}. See: {html_url}"
+                          f"conclusion={conclusion}. See: {current_html_url}"
                       )
 
                   print("✅ Private CloudMail deployment completed successfully.")
