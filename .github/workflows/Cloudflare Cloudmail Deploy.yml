@@ -1,4 +1,6 @@
-name: Cloudflare Cloudmail Deploy V2
+name: Cloudflare Cloudmail Deploy
+
+run-name: Dispatch CloudMail ${{ inputs.mode }} @ ${{ inputs.source_ref }}
 
 on:
   workflow_dispatch:
@@ -20,13 +22,191 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: cloudmail-public-dispatch
+  cancel-in-progress: false
+
 jobs:
-  deploy:
-    name: CloudMail full-stack deployment
-    uses: ./.github/workflows/_deploy-cloudflare.yml
-    with:
-      source: full-stack
-      source_repository: readori/CloudMail
-      source_ref: ${{ inputs.source_ref }}
-      initialize_database: ${{ inputs.mode == 'deploy-and-migrate' }}
-    secrets: inherit
+  dispatch:
+    name: Trigger private CloudMail deployment
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      TARGET_REPOSITORY: readori/CloudMail
+      TARGET_WORKFLOW: _deploy-cloudflare.yml
+      TARGET_WORKFLOW_REF: main
+      TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+      GH_API_VERSION: '2022-11-28'
+
+    steps:
+      - name: Validate private-repository dispatch token
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TARGET_REPO_PAT:-}" ]; then
+            echo "::error::TARGET_REPO_PAT is missing in the public CI repository."
+            exit 1
+          fi
+
+          echo "::add-mask::$TARGET_REPO_PAT"
+          echo "✅ Public CI only dispatches the private deployment."
+          echo "✅ Cloudflare, D1, R2 and application secrets stay only in readori/CloudMail."
+
+      - name: Dispatch private deployment and mirror its result
+        shell: bash
+        env:
+          DEPLOY_MODE: ${{ inputs.mode }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+
+          DISPATCH_ID="public-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export DISPATCH_ID
+
+          python3 <<'PY'
+          import json
+          import os
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          token = os.environ["TARGET_REPO_PAT"].strip()
+          repository = os.environ["TARGET_REPOSITORY"].strip()
+          workflow = os.environ["TARGET_WORKFLOW"].strip()
+          workflow_ref = os.environ["TARGET_WORKFLOW_REF"].strip()
+          api_version = os.environ["GH_API_VERSION"].strip()
+          deploy_mode = os.environ["DEPLOY_MODE"].strip()
+          source_ref = os.environ["SOURCE_REF"].strip()
+          dispatch_id = os.environ["DISPATCH_ID"].strip()
+
+          if deploy_mode not in {"deploy", "deploy-and-migrate"}:
+              raise SystemExit(f"::error::Unsupported deploy mode: {deploy_mode}")
+          if not source_ref:
+              raise SystemExit("::error::source_ref must not be empty")
+
+          owner, repo = repository.split("/", 1)
+          workflow_q = urllib.parse.quote(workflow, safe="")
+          api_base = f"https://api.github.com/repos/{owner}/{repo}"
+
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "X-GitHub-Api-Version": api_version,
+              "User-Agent": "CloudMail-Public-CI-Dispatcher",
+          }
+
+          def request(method, url, payload=None):
+              data = None
+              local_headers = dict(headers)
+              if payload is not None:
+                  data = json.dumps(payload).encode("utf-8")
+                  local_headers["Content-Type"] = "application/json"
+              req = urllib.request.Request(
+                  url,
+                  data=data,
+                  headers=local_headers,
+                  method=method,
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      raw = response.read()
+                      if not raw:
+                          return response.status, None
+                      return response.status, json.loads(raw.decode("utf-8"))
+              except urllib.error.HTTPError as exc:
+                  body = exc.read().decode("utf-8", "replace")
+                  print(f"::error::GitHub API request failed with HTTP {exc.code}")
+                  print(body[:3000])
+                  raise
+
+          dispatch_url = f"{api_base}/actions/workflows/{workflow_q}/dispatches"
+          payload = {
+              "ref": workflow_ref,
+              "inputs": {
+                  "mode": deploy_mode,
+                  "source_ref": source_ref,
+                  "dispatch_id": dispatch_id,
+              },
+          }
+
+          status, _ = request("POST", dispatch_url, payload)
+          if status != 204:
+              raise SystemExit(
+                  f"::error::Unexpected workflow dispatch response: HTTP {status}"
+              )
+
+          print(f"✅ Dispatched {repository}/{workflow}")
+          print(f"Dispatch id: {dispatch_id}")
+          print(f"Source ref: {source_ref}")
+          print(f"Mode: {deploy_mode}")
+
+          expected_title = f"CloudMail Deploy - {dispatch_id}"
+          runs_url = (
+              f"{api_base}/actions/workflows/{workflow_q}/runs"
+              "?event=workflow_dispatch&per_page=50"
+          )
+
+          run = None
+          for attempt in range(1, 31):
+              _, body = request("GET", runs_url)
+              for candidate in (body or {}).get("workflow_runs", []):
+                  if candidate.get("display_title") == expected_title:
+                      run = candidate
+                      break
+              if run:
+                  break
+              print(f"Waiting for private run to appear ({attempt}/30)...")
+              time.sleep(2)
+
+          if not run:
+              raise SystemExit(
+                  "::error::Private workflow was dispatched but the run could not "
+                  f"be located. Dispatch id: {dispatch_id}"
+              )
+
+          run_id = run["id"]
+          html_url = run.get("html_url", "")
+          print(f"Private run: {html_url}")
+
+          run_url = f"{api_base}/actions/runs/{run_id}"
+          deadline = time.time() + (40 * 60)
+
+          while time.time() < deadline:
+              _, current = request("GET", run_url)
+              run_status = current.get("status")
+              conclusion = current.get("conclusion")
+              suffix = f" / {conclusion}" if conclusion else ""
+              print(f"Private deployment status: {run_status}{suffix}")
+
+              if run_status == "completed":
+                  summary = os.environ.get("GITHUB_STEP_SUMMARY")
+                  if summary:
+                      with open(summary, "a", encoding="utf-8") as fp:
+                          fp.write("## Private CloudMail deployment\n\n")
+                          fp.write(f"- Repository: `{repository}`\n")
+                          fp.write(f"- Source ref: `{source_ref}`\n")
+                          fp.write(f"- Mode: `{deploy_mode}`\n")
+                          fp.write(f"- Dispatch id: `{dispatch_id}`\n")
+                          if html_url:
+                              fp.write(f"- Private run: {html_url}\n")
+                          fp.write(f"- Conclusion: **{conclusion or 'unknown'}**\n")
+
+                  if conclusion != "success":
+                      raise SystemExit(
+                          "::error::Private CloudMail deployment failed with "
+                          f"conclusion={conclusion}. See: {html_url}"
+                      )
+
+                  print("✅ Private CloudMail deployment completed successfully.")
+                  sys.exit(0)
+
+              time.sleep(10)
+
+          raise SystemExit(
+              f"::error::Timed out waiting for private deployment. See: {html_url}"
+          )
+          PY
