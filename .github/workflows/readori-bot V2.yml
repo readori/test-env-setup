@@ -1,4 +1,4 @@
-name: Readori Bot V2
+name: Readori Bot · Public CI → Private Source → Cloudflare
 
 # Runs entirely in the PUBLIC repository readori/test-env-setup.
 # No new GitHub Secrets are required.
@@ -290,24 +290,12 @@ jobs:
       - name: Render wrangler.toml
         working-directory: bot
         shell: bash
-        env:
-          AI_TTS_OPENAI_ENABLED: ${{ vars.AI_TTS_OPENAI_ENABLED }}
-          AI_TTS_AZURE_ENABLED: ${{ vars.AI_TTS_AZURE_ENABLED }}
-          AI_TTS_AZURE_PREFERRED_FOR_NATURAL: ${{ vars.AI_TTS_AZURE_PREFERRED_FOR_NATURAL }}
-          AI_TTS_ORACLE_EDGE_ENABLED: ${{ vars.AI_TTS_ORACLE_EDGE_ENABLED }}
-          ORACLE_EDGE_TTS_URL: ${{ vars.ORACLE_EDGE_TTS_URL }}
-          AI_TTS_AZURE_VOICE_ZH_CN: ${{ vars.AI_TTS_AZURE_VOICE_ZH_CN }}
-          AI_TTS_AZURE_VOICE_ZH_TW: ${{ vars.AI_TTS_AZURE_VOICE_ZH_TW }}
-          AI_TTS_AZURE_VOICE_EN_US: ${{ vars.AI_TTS_AZURE_VOICE_EN_US }}
-          AI_TTS_AZURE_VOICE_JA_JP: ${{ vars.AI_TTS_AZURE_VOICE_JA_JP }}
-          AI_TTS_AZURE_VOICE_KO_KR: ${{ vars.AI_TTS_AZURE_VOICE_KO_KR }}
-          AI_TTS_AZURE_VOICE_FR_FR: ${{ vars.AI_TTS_AZURE_VOICE_FR_FR }}
-          AI_TTS_AZURE_VOICE_ES_ES: ${{ vars.AI_TTS_AZURE_VOICE_ES_ES }}
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
           import os
+          import re
           from pathlib import Path
 
           template_path = Path("wrangler.toml.template")
@@ -316,42 +304,40 @@ jobs:
 
           text = template_path.read_text(encoding="utf-8")
 
-          # The template is the source of truth for plain vars.
-          # Azure Entra regional credentials/region/resource-id intentionally remain
-          # remote Worker bindings and are NOT rendered from public-repo variables.
+          # PRODUCTION POLICY:
+          # Cloudflare Dashboard is the source of truth for ALL existing
+          # plain_text Worker variables.  The public CI must never render them
+          # into wrangler.toml, otherwise an empty/missing GitHub variable can
+          # overwrite a working production value.
+          #
+          # Strip the complete [vars] section from the private template.  The
+          # deploy command uses --keep-vars, so the current Cloudflare values
+          # remain attached to the Worker.
+          text, removed = re.subn(
+              r'(?ms)^\[vars\]\s*\n.*?(?=^\[)',
+              '',
+              text,
+              count=1,
+          )
+          if removed != 1:
+              raise SystemExit("Expected exactly one [vars] section in wrangler.toml.template")
+
           values = {
               "KV_NAMESPACE_ID": os.environ["KV_NAMESPACE_ID"],
               "KV_PREVIEW_NAMESPACE_ID": os.environ.get("KV_PREVIEW_NAMESPACE_ID") or os.environ["KV_NAMESPACE_ID"],
               "D1_DATABASE_ID": os.environ["D1_DATABASE_ID"],
-
-              "AI_TTS_OPENAI_ENABLED": os.environ.get("AI_TTS_OPENAI_ENABLED", "").strip() or "false",
-              "AI_TTS_AZURE_ENABLED": os.environ.get("AI_TTS_AZURE_ENABLED", "").strip() or "false",
-              "AI_TTS_AZURE_PREFERRED_FOR_NATURAL": os.environ.get("AI_TTS_AZURE_PREFERRED_FOR_NATURAL", "").strip() or "false",
-
-              "AI_TTS_ORACLE_EDGE_ENABLED": os.environ.get("AI_TTS_ORACLE_EDGE_ENABLED", "").strip() or "false",
-              "ORACLE_EDGE_TTS_URL": os.environ.get("ORACLE_EDGE_TTS_URL", "").strip(),
-
-              "AI_TTS_AZURE_VOICE_ZH_CN": os.environ.get("AI_TTS_AZURE_VOICE_ZH_CN", "").strip(),
-              "AI_TTS_AZURE_VOICE_ZH_TW": os.environ.get("AI_TTS_AZURE_VOICE_ZH_TW", "").strip(),
-              "AI_TTS_AZURE_VOICE_EN_US": os.environ.get("AI_TTS_AZURE_VOICE_EN_US", "").strip(),
-              "AI_TTS_AZURE_VOICE_JA_JP": os.environ.get("AI_TTS_AZURE_VOICE_JA_JP", "").strip(),
-              "AI_TTS_AZURE_VOICE_KO_KR": os.environ.get("AI_TTS_AZURE_VOICE_KO_KR", "").strip(),
-              "AI_TTS_AZURE_VOICE_FR_FR": os.environ.get("AI_TTS_AZURE_VOICE_FR_FR", "").strip(),
-              "AI_TTS_AZURE_VOICE_ES_ES": os.environ.get("AI_TTS_AZURE_VOICE_ES_ES", "").strip(),
           }
 
           for key, value in values.items():
               safe = str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\r", "").replace("\n", "")
               text = text.replace(f"__{key}__", safe)
 
-          unresolved = []
-          for token in set(part for part in text.replace('"', ' ').split() if "__" in part):
-              unresolved.append(token)
+          unresolved = sorted(set(re.findall(r'__[A-Z0-9_]+__', text)))
           if unresolved:
-              raise SystemExit(f"Unresolved wrangler placeholders: {sorted(unresolved)}")
+              raise SystemExit(f"Unresolved wrangler placeholders: {unresolved}")
 
           Path("wrangler.toml").write_text(text, encoding="utf-8")
-          print("wrangler.toml rendered")
+          print("wrangler.toml rendered with Cloudflare-managed vars preserved")
           PY
 
           echo "Rendered configuration bindings:"
@@ -362,17 +348,34 @@ jobs:
             exit 1
           }
 
-          # These values belong to the existing Cloudflare Worker, never to the
-          # generated public-CI wrangler configuration.  Comments are allowed;
-          # actual assignments are not.
-          for name in AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET AZURE_SPEECH_REGION AZURE_SPEECH_RESOURCE_ID AZURE_SPEECH_ENDPOINT; do
+          # No production plain_text variable may be emitted by this public CI.
+          # Existing Dashboard vars are preserved by `wrangler deploy --keep-vars`.
+          if grep -Eq '^\[vars\][[:space:]]*$' wrangler.toml; then
+            echo "::error::Production wrangler.toml must not contain a [vars] section"
+            exit 1
+          fi
+
+          for name in \
+            ENVIRONMENT APPLE_BUNDLE_ID \
+            AI_TTS_OPENAI_ENABLED AI_TTS_AZURE_ENABLED AI_TTS_AZURE_PREFERRED_FOR_NATURAL \
+            AI_TTS_AZURE_OUTPUT_FORMAT \
+            AI_TTS_AZURE_VOICE_ZH_CN AI_TTS_AZURE_VOICE_ZH_TW AI_TTS_AZURE_VOICE_EN_US \
+            AI_TTS_AZURE_VOICE_JA_JP AI_TTS_AZURE_VOICE_KO_KR AI_TTS_AZURE_VOICE_FR_FR AI_TTS_AZURE_VOICE_ES_ES \
+            AI_TTS_ORACLE_EDGE_ENABLED ORACLE_EDGE_TTS_URL \
+            AI_TTS_PROVIDER_FAILURE_THRESHOLD AI_TTS_PROVIDER_COOLDOWN_SECONDS AI_TTS_PROVIDER_TIMEOUT_MS \
+            AI_TTS_MAX_REQUESTS_PER_DAY AI_TTS_MAX_CHARS_PER_DAY AI_TTS_MAX_EXPRESSIVE_CHARS_PER_DAY \
+            AI_TTS_GLOBAL_CF_CHARS_PER_DAY AI_TTS_GLOBAL_OPENAI_CHARS_PER_DAY \
+            AI_TTS_GLOBAL_AZURE_CHARS_PER_DAY AI_TTS_GLOBAL_ORACLE_CHARS_PER_DAY \
+            AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET AZURE_SPEECH_REGION \
+            AZURE_SPEECH_RESOURCE_ID AZURE_SPEECH_ENDPOINT
+          do
             if grep -Eq "^[[:space:]]*${name}[[:space:]]*=" wrangler.toml; then
-              echo "::error::$name must not be emitted into wrangler.toml"
+              echo "::error::$name must remain Cloudflare-managed and must not be emitted into wrangler.toml"
               exit 1
             fi
           done
 
-          echo "Rendered Wrangler TTS guards: PASS"
+          echo "Rendered Wrangler production-var preservation guards: PASS"
 
       # ============================================================
       # 6. Confirm existing Worker bindings on Cloudflare.
@@ -385,11 +388,6 @@ jobs:
       - name: Verify existing Cloudflare Worker bindings
         working-directory: bot
         shell: bash
-        env:
-          AI_TTS_OPENAI_ENABLED: ${{ vars.AI_TTS_OPENAI_ENABLED }}
-          AI_TTS_AZURE_ENABLED: ${{ vars.AI_TTS_AZURE_ENABLED }}
-          AI_TTS_ORACLE_EDGE_ENABLED: ${{ vars.AI_TTS_ORACLE_EDGE_ENABLED }}
-          ORACLE_EDGE_TTS_URL: ${{ vars.ORACLE_EDGE_TTS_URL }}
         run: |
           set -euo pipefail
 
@@ -419,6 +417,21 @@ jobs:
           has_remote_name() {
             has_secret "$1" || has_binding_name "$1"
           }
+
+          get_plain() {
+            printf '%s' "$SETTINGS_JSON" |
+              jq -r --arg name "$1" '
+                .result.bindings[]?
+                | select(.type == "plain_text" and .name == $name)
+                | (.text // "")
+              ' |
+              head -n 1
+          }
+
+          AI_TTS_OPENAI_ENABLED="$(get_plain AI_TTS_OPENAI_ENABLED)"
+          AI_TTS_AZURE_ENABLED="$(get_plain AI_TTS_AZURE_ENABLED)"
+          AI_TTS_ORACLE_EDGE_ENABLED="$(get_plain AI_TTS_ORACLE_EDGE_ENABLED)"
+          ORACLE_EDGE_TTS_URL="$(get_plain ORACLE_EDGE_TTS_URL)"
 
           enabled() {
             case "${1,,}" in
@@ -482,6 +495,25 @@ jobs:
             echo "::error::Existing Worker/provider configuration is incomplete: ${missing[*]}"
             echo "::error::No secret value is copied by this public workflow; repair the existing Cloudflare Worker bindings instead."
             exit 1
+          fi
+
+          azure_voice_names=(
+            AI_TTS_AZURE_VOICE_ZH_CN
+            AI_TTS_AZURE_VOICE_ZH_TW
+            AI_TTS_AZURE_VOICE_EN_US
+            AI_TTS_AZURE_VOICE_JA_JP
+            AI_TTS_AZURE_VOICE_KO_KR
+            AI_TTS_AZURE_VOICE_FR_FR
+            AI_TTS_AZURE_VOICE_ES_ES
+          )
+          empty_voices=()
+          for name in "${azure_voice_names[@]}"; do
+            [[ -n "$(get_plain "$name")" ]] || empty_voices+=("$name")
+          done
+          if (( ${#empty_voices[@]} )); then
+            echo "::notice::Azure voice override(s) are empty on Cloudflare: ${empty_voices[*]}. Source-code locale defaults will be used until you restore custom values."
+          else
+            echo "Azure voice overrides: PASS (${#azure_voice_names[@]} non-empty Cloudflare values)"
           fi
 
           echo "Core Worker secrets: PASS (${#core_required[@]})"
@@ -654,4 +686,5 @@ jobs:
             echo "- Production entry guard: \`src/azure-regional-entry.js\`"
             echo "- TTS semantic guard: \`semantic-v5\`"
             echo "- Existing Cloudflare Worker secret values were not copied or modified."
+            echo "- Existing Cloudflare plain-text vars are the production source of truth and were preserved with --keep-vars."
           } >> "$GITHUB_STEP_SUMMARY"
