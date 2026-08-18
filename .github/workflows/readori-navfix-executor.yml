@@ -1,0 +1,94 @@
+name: Readori · Navigation Fix Executor
+
+on:
+  push:
+    paths:
+      - 'sync/readori-navfix-trigger.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    runs-on: macos-15
+    timeout-minutes: 35
+    env:
+      EXPECTED_BASE: 8c33402a25b8c2d387cf1fcf08f4dda1219a338c
+      TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install private repository SSH key
+        env:
+          PRIVATE_REPO_KEY: ${{ secrets.PRIVATE_REPO_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${PRIVATE_REPO_KEY:-}" || { echo "::error::PRIVATE_REPO_KEY is required"; exit 1; }
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          printf '%s\n' "$PRIVATE_REPO_KEY" > ~/.ssh/readori_key
+          chmod 600 ~/.ssh/readori_key
+          cat > ~/.ssh/config <<'EOF'
+          Host github-readori
+            HostName github.com
+            User git
+            IdentityFile ~/.ssh/readori_key
+            IdentitiesOnly yes
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Clone audited private source
+        run: |
+          set -euo pipefail
+          git clone --depth=20 git@github-readori:readori/readori.git app
+          CURRENT="$(git -C app rev-parse HEAD)"
+          echo "Private source HEAD: $CURRENT"
+          [[ "$CURRENT" == "$EXPECTED_BASE" ]] || { echo "::error::Expected $EXPECTED_BASE, got $CURRENT"; exit 1; }
+
+      - name: Apply audited patch script
+        run: |
+          set -euo pipefail
+          python3 sync/apply_readori_navfix_diag.py app
+
+      - name: Validate
+        working-directory: app
+        run: |
+          set -euo pipefail
+          git diff --check
+          grep -q 'wallpaperNavigationAppearance()' Readori/Core/Theme/AppThemeManager.swift
+          grep -q 'Adaptive page surface appeared' Readori/UI/Common/ViewExtensions.swift
+          grep -q 'AI narration worker audio received' Readori/Services/TTS/ReadoriAITTSClient.swift
+          grep -q 'AI narration audio resolved' Readori/Services/TTSService.swift
+          grep -q 'TTS fallback to system' Readori/Services/TTSService.swift
+          grep -q 'nav-transition-diag-v1-20260818' Readori/Supporting/Info.plist
+          for file in \
+            Readori/Core/Theme/AppThemeManager.swift \
+            Readori/UI/Common/ViewExtensions.swift \
+            Readori/UI/Settings/SettingsView.swift \
+            Readori/Services/TTS/ReadoriAITTSClient.swift \
+            Readori/Services/TTSService.swift; do
+            xcrun swiftc -parse "$file"
+            echo "Swift parse PASS: $file"
+          done
+          plutil -lint Readori/Supporting/Info.plist
+          if [[ -f Readori/Scripts/verify_ai_narration_v3.py ]]; then python3 Readori/Scripts/verify_ai_narration_v3.py; fi
+
+      - name: Commit and push private master
+        working-directory: app
+        run: |
+          set -euo pipefail
+          git fetch origin master --depth=20
+          [[ "$(git rev-parse origin/master)" == "$EXPECTED_BASE" ]] || { echo "::error::master changed during validation"; exit 1; }
+          git config user.name 'OpenAI Agent'
+          git config user.email 'agent@users.noreply.github.com'
+          git add Readori/Core/Theme/AppThemeManager.swift Readori/UI/Common/ViewExtensions.swift Readori/UI/Settings/SettingsView.swift Readori/Services/TTS/ReadoriAITTSClient.swift Readori/Services/TTSService.swift Readori/Supporting/Info.plist
+          git commit -m '修复二级页面顶部闪图并增强诊断日志'
+          if git push origin HEAD:master; then
+            echo 'Private master push via SSH: PASS'
+          else
+            test -n "${TARGET_REPO_PAT:-}" || { echo "::error::SSH push failed and TARGET_REPO_PAT missing"; exit 1; }
+            git remote set-url origin "https://x-access-token:${TARGET_REPO_PAT}@github.com/readori/readori.git"
+            git push origin HEAD:master
+            echo 'Private master push via PAT: PASS'
+          fi
+          echo "NEW_SHA=$(git rev-parse HEAD)"
