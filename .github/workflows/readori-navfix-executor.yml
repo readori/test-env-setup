@@ -11,6 +11,7 @@ permissions:
 jobs:
   apply:
     runs-on: macos-15
+    environment: production
     timeout-minutes: 35
     env:
       EXPECTED_BASE: 8c33402a25b8c2d387cf1fcf08f4dda1219a338c
