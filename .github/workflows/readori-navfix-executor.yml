@@ -16,6 +16,7 @@ jobs:
       EXPECTED_BASE: 8c33402a25b8c2d387cf1fcf08f4dda1219a338c
       TARGET_BRANCH: fix/navigation-top-flash-diagnostics
       TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+      STAGE: startup
     steps:
       - uses: actions/checkout@v6
 
@@ -23,6 +24,7 @@ jobs:
         env:
           PRIVATE_REPO_KEY: ${{ secrets.PRIVATE_REPO_KEY }}
         run: |
+          echo 'STAGE=ssh' >> "$GITHUB_ENV"
           set -euo pipefail
           test -n "${PRIVATE_REPO_KEY:-}" || { echo "::error::PRIVATE_REPO_KEY is required"; exit 1; }
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
@@ -40,6 +42,7 @@ jobs:
 
       - name: Clone audited private source
         run: |
+          echo 'STAGE=clone' >> "$GITHUB_ENV"
           set -euo pipefail
           git clone --depth=20 git@github-readori:readori/readori.git app
           CURRENT="$(git -C app rev-parse HEAD)"
@@ -51,12 +54,14 @@ jobs:
 
       - name: Apply audited patch script
         run: |
-          set -euo pipefail
-          python3 sync/apply_readori_navfix_diag_v2.py app
+          echo 'STAGE=patch' >> "$GITHUB_ENV"
+          set -o pipefail
+          python3 sync/apply_readori_navfix_diag_v2.py app 2>&1 | tee sync/readori-navfix-last-output.txt
 
-      - name: Validate
+      - name: Validate source contracts
         working-directory: app
         run: |
+          echo 'STAGE=contracts' >> "$GITHUB_ENV"
           set -euo pipefail
           git diff --check
           grep -q 'wallpaperNavigationAppearance()' Readori/Core/Theme/AppThemeManager.swift
@@ -67,6 +72,12 @@ jobs:
           grep -q 'TTS online audio player ready' Readori/Services/TTSService.swift
           grep -q 'nav-transition-diag-v1-20260818' Readori/Supporting/Info.plist
           ! grep -q 'NAVFIX_TEMP_STATUS_MATCH_GUARD' Readori/Services/TTS/ReadoriAITTSClient.swift
+
+      - name: Swift syntax and plist parse
+        working-directory: app
+        run: |
+          echo 'STAGE=parse' >> "$GITHUB_ENV"
+          set -euo pipefail
           for file in \
             Readori/Core/Theme/AppThemeManager.swift \
             Readori/UI/Common/ViewExtensions.swift \
@@ -77,11 +88,18 @@ jobs:
             echo "Swift parse PASS: $file"
           done
           plutil -lint Readori/Supporting/Info.plist
+
+      - name: AI narration regression gate
+        working-directory: app
+        run: |
+          echo 'STAGE=regression' >> "$GITHUB_ENV"
+          set -euo pipefail
           if [[ -f Readori/Scripts/verify_ai_narration_v3.py ]]; then python3 Readori/Scripts/verify_ai_narration_v3.py; fi
 
       - name: Commit and push review branch only
         working-directory: app
         run: |
+          echo 'STAGE=push' >> "$GITHUB_ENV"
           set -euo pipefail
           git fetch origin "$TARGET_BRANCH" --depth=20
           [[ "$(git rev-parse FETCH_HEAD)" == "$EXPECTED_BASE" ]] || { echo "::error::Review branch changed during validation"; exit 1; }
@@ -98,12 +116,13 @@ jobs:
             echo 'Review branch push via PAT: PASS'
           fi
           echo "NEW_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo 'STAGE=complete' >> "$GITHUB_ENV"
 
       - name: Publish success marker
         if: success()
         run: |
           set -euo pipefail
-          printf 'status=success\nbranch=%s\nprivate_sha=%s\npatch=nav-transition-diag-v1-20260818\n' "$TARGET_BRANCH" "$NEW_SHA" > sync/readori-navfix-result.txt
+          printf 'status=success\nbranch=%s\nprivate_sha=%s\nstage=%s\npatch=nav-transition-diag-v1-20260818\n' "$TARGET_BRANCH" "$NEW_SHA" "$STAGE" > sync/readori-navfix-result.txt
           git config user.name 'Readori CI'
           git config user.email 'actions@users.noreply.github.com'
           git add sync/readori-navfix-result.txt
@@ -114,7 +133,12 @@ jobs:
         if: failure()
         run: |
           set -euo pipefail
-          printf 'status=failed\nbranch=%s\nbase=%s\npatch=nav-transition-diag-v1-20260818\n' "$TARGET_BRANCH" "$EXPECTED_BASE" > sync/readori-navfix-result.txt
+          printf 'status=failed\nbranch=%s\nbase=%s\nstage=%s\npatch=nav-transition-diag-v1-20260818\n' "$TARGET_BRANCH" "$EXPECTED_BASE" "$STAGE" > sync/readori-navfix-result.txt
+          if [[ -f sync/readori-navfix-last-output.txt ]]; then
+            printf 'detail_begin\n' >> sync/readori-navfix-result.txt
+            tail -n 20 sync/readori-navfix-last-output.txt >> sync/readori-navfix-result.txt
+            printf 'detail_end\n' >> sync/readori-navfix-result.txt
+          fi
           git config user.name 'Readori CI'
           git config user.email 'actions@users.noreply.github.com'
           git add sync/readori-navfix-result.txt
