@@ -1,27 +1,28 @@
-name: Readori Bot · Private Source → Cloudflare
+name: Readori Bot · Public CI → Private Source → Cloudflare
 
-# IMPORTANT
-# - This workflow RUNS in the public repository: readori/test-env-setup.
-# - It checks out the private source repository readori/readoritgbot with a
-#   read-only Deploy Key stored as a secret in this public CI repository's
-#   `bot-production` environment (or as an organization secret selected for
-#   test-env-setup).
-# - GitHub does NOT allow a workflow to read secret VALUES from another
-#   repository. Put/share the deployment secrets where THIS workflow can read
-#   them. Organization secrets scoped to test-env-setup are recommended.
-# - Manual dispatch only: no pull_request/push trigger can receive production
-#   deployment credentials.
+# Runs entirely in the PUBLIC repository readori/test-env-setup.
+# No new GitHub Secrets are required.
+#
+# Existing public-repo secrets used:
+#   TARGET_REPO_PAT
+#   CLOUDFLARE_ACCOUNT_ID
+#   CLOUDFLARE_API_TOKEN
+#   READORI_SOCIAL_WORKER_ENDPOINT   # optional health check, already exists
+#
+# Existing Worker secrets (BOT_TOKEN / APPLE_IAP_* / PRO_LEASE_* / etc.)
+# remain stored on Cloudflare and are NOT copied into this workflow.
+# Cloudflare Wrangler deployments preserve existing Worker secrets.
 
 on:
   workflow_dispatch:
     inputs:
       bot_ref:
-        description: "Private readori/readoritgbot branch/tag/SHA"
+        description: "readori/readoritgbot branch / tag / SHA"
         required: true
         default: "main"
         type: string
       mode:
-        description: "validate = test only; deploy = migrate + secrets + deploy"
+        description: "validate = test + dry-run only; deploy = migrations + deploy"
         required: true
         default: "deploy"
         type: choice
@@ -38,72 +39,83 @@ permissions:
   contents: read
 
 concurrency:
-  group: readori-bot-production
+  group: readori-bot-cloudflare-production
   cancel-in-progress: false
 
 env:
   BOT_REPOSITORY: readori/readoritgbot
   BOT_DIR: bot
+  WORKER_NAME: bot-readori
   D1_DATABASE_NAME: tg-bot-db
+  KV_NAMESPACE_TITLE: SENT_RECORDS
 
 jobs:
-  build-and-deploy:
-    name: Validate private bot and deploy Cloudflare
+  bot:
+    name: Validate and deploy Readori Bot
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
 
-    # Store bot deployment secrets here if you do not use organization secrets.
-    # Environment protection / required reviewers are strongly recommended.
-    environment:
-      name: bot-production
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
 
     steps:
-      # ------------------------------------------------------------
-      # 1. PRIVATE SOURCE CHECKOUT
-      # ------------------------------------------------------------
-      - name: Validate private-repository checkout credential
+      # ============================================================
+      # 1. Validate only the secrets that already exist in PUBLIC CI
+      # ============================================================
+      - name: Validate public CI credentials
         shell: bash
         env:
-          READORITGBOT_DEPLOY_KEY: ${{ secrets.READORITGBOT_DEPLOY_KEY }}
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
         run: |
           set -euo pipefail
-          if [[ -z "${READORITGBOT_DEPLOY_KEY:-}" ]]; then
-            echo "::error::Missing READORITGBOT_DEPLOY_KEY."
-            echo "::error::Add the matching public key as a read-only Deploy Key on readori/readoritgbot."
-            echo "::error::Store the PRIVATE key in test-env-setup → Environment bot-production (or an organization secret selected for test-env-setup)."
+          missing=()
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || missing+=("TARGET_REPO_PAT")
+          [[ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]] || missing+=("CLOUDFLARE_ACCOUNT_ID")
+          [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]] || missing+=("CLOUDFLARE_API_TOKEN")
+
+          if (( ${#missing[@]} )); then
+            echo "::error::Missing existing public-repo secret(s): ${missing[*]}"
             exit 1
           fi
 
+          echo "Public CI credentials: PASS"
+
+      # ============================================================
+      # 2. Checkout PRIVATE bot source with existing TARGET_REPO_PAT
+      # ============================================================
       - name: Checkout private readori/readoritgbot
         uses: actions/checkout@v4
         with:
           repository: readori/readoritgbot
           ref: ${{ inputs.bot_ref }}
-          ssh-key: ${{ secrets.READORITGBOT_DEPLOY_KEY }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
           path: bot
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Verify checked-out source
-        shell: bash
+      - name: Verify private source
         working-directory: bot
+        shell: bash
         run: |
           set -euo pipefail
           test -f package.json || { echo "::error::package.json missing"; exit 1; }
-          test -f wrangler.toml.template || { echo "::error::wrangler.toml.template missing"; exit 1; }
           test -f src/index.js || { echo "::error::src/index.js missing"; exit 1; }
-          echo "Repository: $BOT_REPOSITORY"
-          echo "Requested ref: ${{ inputs.bot_ref }}"
+          test -f wrangler.toml.template || { echo "::error::wrangler.toml.template missing"; exit 1; }
+
+          echo "Private repo checkout: PASS"
           echo "Commit: $(git rev-parse HEAD)"
           echo "Short SHA: $(git rev-parse --short HEAD)"
 
-      # ------------------------------------------------------------
-      # 2. NODE / TESTS
-      # ------------------------------------------------------------
+      # ============================================================
+      # 3. Node + tests
+      # ============================================================
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: "npm"
+          cache-dependency-path: bot/package-lock.json
 
       - name: Install dependencies
         working-directory: bot
@@ -124,71 +136,105 @@ jobs:
         working-directory: bot
         run: npm test
 
-      - name: Static syntax checks
+      - name: JavaScript syntax check
         working-directory: bot
         shell: bash
         run: |
           set -euo pipefail
+          found=0
           while IFS= read -r -d '' file; do
+            found=1
             node --check "$file"
           done < <(find src scripts -type f \( -name '*.js' -o -name '*.mjs' \) -print0 2>/dev/null || true)
 
-      # ------------------------------------------------------------
-      # 3. FAIL EARLY BEFORE ANY REMOTE MUTATION
-      # ------------------------------------------------------------
-      - name: Validate required deployment secrets
-        if: ${{ inputs.mode == 'deploy' }}
+          [[ "$found" -eq 1 ]] || echo "::notice::No JS files found under src/scripts"
+          echo "JavaScript syntax: PASS"
+
+      # ============================================================
+      # 4. Discover EXISTING Cloudflare resources.
+      #    No D1_DATABASE_ID / KV_NAMESPACE_ID GitHub secrets needed.
+      # ============================================================
+      - name: Discover existing D1 and KV IDs
+        id: cloudflare_resources
+        working-directory: bot
         shell: bash
-        env:
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-          KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID }}
-          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
-          ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
-          APPLE_IAP_KEY_ID: ${{ secrets.APPLE_IAP_KEY_ID }}
-          APPLE_IAP_ISSUER_ID: ${{ secrets.APPLE_IAP_ISSUER_ID }}
-          APPLE_IAP_PRIVATE_KEY: ${{ secrets.APPLE_IAP_PRIVATE_KEY }}
-          PRO_LEASE_PRIVATE_KEY_JWK: ${{ secrets.PRO_LEASE_PRIVATE_KEY_JWK }}
-          DEVICE_CHALLENGE_SECRET: ${{ secrets.DEVICE_CHALLENGE_SECRET }}
         run: |
           set -euo pipefail
-          required=(
-            CF_API_TOKEN
-            CF_ACCOUNT_ID
-            KV_NAMESPACE_ID
-            D1_DATABASE_ID
-            BOT_TOKEN
-            WEBHOOK_SECRET
-            ADMIN_SECRET
-            APPLE_IAP_KEY_ID
-            APPLE_IAP_ISSUER_ID
-            APPLE_IAP_PRIVATE_KEY
-            PRO_LEASE_PRIVATE_KEY_JWK
-            DEVICE_CHALLENGE_SECRET
-          )
-          missing=()
-          for name in "${required[@]}"; do
-            [[ -n "${!name:-}" ]] || missing+=("$name")
-          done
-          if (( ${#missing[@]} )); then
-            echo "::error::Missing required bot-production secret(s): ${missing[*]}"
+
+          echo "Wrangler:"
+          npx wrangler --version
+
+          # ---------- D1 ----------
+          D1_JSON="$(npx wrangler d1 list --json)"
+          D1_ID="$(
+            printf '%s' "$D1_JSON" |
+              jq -r --arg name "$D1_DATABASE_NAME" '
+                .[]
+                | select(.name == $name)
+                | (.uuid // .id // empty)
+              ' |
+              head -n 1
+          )"
+
+          if [[ -z "$D1_ID" || "$D1_ID" == "null" ]]; then
+            echo "::error::Existing D1 database '$D1_DATABASE_NAME' was not found."
             exit 1
           fi
-          echo "Required deployment secrets: PASS (${#required[@]} present)"
 
-      # ------------------------------------------------------------
-      # 4. RENDER WRANGLER CONFIG
-      # ------------------------------------------------------------
-      - name: Generate wrangler.toml from private source template
+          # ---------- KV ----------
+          # Cloudflare KV namespace IDs are not secrets. We discover the
+          # existing production namespace by its title instead of duplicating
+          # the ID into another GitHub repository.
+          KV_JSON="$(
+            curl --fail --silent --show-error \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/storage/kv/namespaces?per_page=100"
+          )"
+
+          KV_SUCCESS="$(printf '%s' "$KV_JSON" | jq -r '.success // false')"
+          if [[ "$KV_SUCCESS" != "true" ]]; then
+            echo "::error::Cloudflare KV namespace listing failed."
+            printf '%s' "$KV_JSON" | jq -c '{success,errors,messages}' || true
+            exit 1
+          fi
+
+          KV_ID="$(
+            printf '%s' "$KV_JSON" |
+              jq -r --arg title "$KV_NAMESPACE_TITLE" '
+                .result[]
+                | select(.title == $title)
+                | .id
+              ' |
+              head -n 1
+          )"
+
+          if [[ -z "$KV_ID" || "$KV_ID" == "null" ]]; then
+            echo "::error::Existing KV namespace '$KV_NAMESPACE_TITLE' was not found."
+            echo "::error::No new namespace will be auto-created."
+            exit 1
+          fi
+
+          echo "D1 database: $D1_DATABASE_NAME"
+          echo "KV namespace: $KV_NAMESPACE_TITLE"
+
+          # IDs are resource identifiers, not secret values, but do not need to
+          # print them to the log.
+          {
+            echo "D1_DATABASE_ID=$D1_ID"
+            echo "KV_NAMESPACE_ID=$KV_ID"
+            echo "KV_PREVIEW_NAMESPACE_ID=$KV_ID"
+          } >> "$GITHUB_ENV"
+
+          echo "Existing Cloudflare resources: PASS"
+
+      # ============================================================
+      # 5. Render the PRIVATE repository's wrangler template
+      # ============================================================
+      - name: Render wrangler.toml
         working-directory: bot
         shell: bash
         env:
-          KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID }}
-          KV_PREVIEW_NAMESPACE_ID: ${{ secrets.KV_PREVIEW_NAMESPACE_ID }}
-          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
-
           AI_TTS_OPENAI_ENABLED: ${{ vars.AI_TTS_OPENAI_ENABLED }}
           AI_TTS_AZURE_ENABLED: ${{ vars.AI_TTS_AZURE_ENABLED }}
           AI_TTS_AZURE_PREFERRED_FOR_NATURAL: ${{ vars.AI_TTS_AZURE_PREFERRED_FOR_NATURAL }}
@@ -196,7 +242,6 @@ jobs:
           AZURE_SPEECH_ENDPOINT: ${{ vars.AZURE_SPEECH_ENDPOINT }}
           AI_TTS_ORACLE_EDGE_ENABLED: ${{ vars.AI_TTS_ORACLE_EDGE_ENABLED }}
           ORACLE_EDGE_TTS_URL: ${{ vars.ORACLE_EDGE_TTS_URL }}
-
           AI_TTS_AZURE_VOICE_ZH_CN: ${{ vars.AI_TTS_AZURE_VOICE_ZH_CN }}
           AI_TTS_AZURE_VOICE_ZH_TW: ${{ vars.AI_TTS_AZURE_VOICE_ZH_TW }}
           AI_TTS_AZURE_VOICE_EN_US: ${{ vars.AI_TTS_AZURE_VOICE_EN_US }}
@@ -207,36 +252,33 @@ jobs:
         run: |
           set -euo pipefail
 
-          # validate mode can still fully render when IDs are configured.
-          # deploy mode already fails above when these are absent.
-          if [[ "${{ inputs.mode }}" == "deploy" ]]; then
-            test -n "${KV_NAMESPACE_ID:-}"
-            test -n "${D1_DATABASE_ID:-}"
-          fi
-
           python3 - <<'PY'
           import os
           from pathlib import Path
 
-          source = Path("wrangler.toml.template")
-          if not source.is_file():
+          template_path = Path("wrangler.toml.template")
+          if not template_path.is_file():
               raise SystemExit("wrangler.toml.template is missing")
 
-          template = source.read_text()
-          kv_id = os.environ.get("KV_NAMESPACE_ID", "").strip()
-          preview_id = os.environ.get("KV_PREVIEW_NAMESPACE_ID", "").strip() or kv_id
+          text = template_path.read_text(encoding="utf-8")
 
+          # Current safe production default:
+          # Cloudflare Workers AI / MeloTTS ON by binding,
+          # OpenAI / Azure / Oracle OFF unless an existing GitHub Variable says otherwise.
           values = {
-              "KV_NAMESPACE_ID": kv_id or "00000000000000000000000000000000",
-              "KV_PREVIEW_NAMESPACE_ID": preview_id or "00000000000000000000000000000000",
-              "D1_DATABASE_ID": os.environ.get("D1_DATABASE_ID", "").strip() or "00000000-0000-0000-0000-000000000000",
+              "KV_NAMESPACE_ID": os.environ["KV_NAMESPACE_ID"],
+              "KV_PREVIEW_NAMESPACE_ID": os.environ.get("KV_PREVIEW_NAMESPACE_ID") or os.environ["KV_NAMESPACE_ID"],
+              "D1_DATABASE_ID": os.environ["D1_DATABASE_ID"],
+
               "AI_TTS_OPENAI_ENABLED": os.environ.get("AI_TTS_OPENAI_ENABLED", "").strip() or "false",
               "AI_TTS_AZURE_ENABLED": os.environ.get("AI_TTS_AZURE_ENABLED", "").strip() or "false",
               "AI_TTS_AZURE_PREFERRED_FOR_NATURAL": os.environ.get("AI_TTS_AZURE_PREFERRED_FOR_NATURAL", "").strip() or "false",
               "AZURE_SPEECH_REGION": os.environ.get("AZURE_SPEECH_REGION", "").strip(),
               "AZURE_SPEECH_ENDPOINT": os.environ.get("AZURE_SPEECH_ENDPOINT", "").strip(),
+
               "AI_TTS_ORACLE_EDGE_ENABLED": os.environ.get("AI_TTS_ORACLE_EDGE_ENABLED", "").strip() or "false",
               "ORACLE_EDGE_TTS_URL": os.environ.get("ORACLE_EDGE_TTS_URL", "").strip(),
+
               "AI_TTS_AZURE_VOICE_ZH_CN": os.environ.get("AI_TTS_AZURE_VOICE_ZH_CN", "").strip(),
               "AI_TTS_AZURE_VOICE_ZH_TW": os.environ.get("AI_TTS_AZURE_VOICE_ZH_TW", "").strip(),
               "AI_TTS_AZURE_VOICE_EN_US": os.environ.get("AI_TTS_AZURE_VOICE_EN_US", "").strip(),
@@ -247,71 +289,107 @@ jobs:
           }
 
           for key, value in values.items():
-              safe = str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "")
-              template = template.replace(f"__{key}__", safe)
+              safe = str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\r", "").replace("\n", "")
+              text = text.replace(f"__{key}__", safe)
 
-          if "__" in template:
-              unresolved = sorted({part for part in template.replace('"', ' ').split() if "__" in part})
-              raise SystemExit(f"wrangler.toml contains unresolved placeholders: {unresolved}")
+          unresolved = []
+          for token in set(part for part in text.replace('"', ' ').split() if "__" in part):
+              unresolved.append(token)
+          if unresolved:
+              raise SystemExit(f"Unresolved wrangler placeholders: {sorted(unresolved)}")
 
-          Path("wrangler.toml").write_text(template)
-          print("wrangler.toml generated")
+          Path("wrangler.toml").write_text(text, encoding="utf-8")
+          print("wrangler.toml rendered")
           PY
 
-      - name: Wrangler dry-run validation
+          echo "Rendered configuration bindings:"
+          grep -E '^(name|main|binding|database_name|AI_TTS_.*ENABLED)' wrangler.toml || true
+
+      # ============================================================
+      # 6. Confirm existing Worker secret NAMES on Cloudflare.
+      #    Values remain hidden and are never moved into public CI.
+      # ============================================================
+      - name: Verify existing Cloudflare Worker secrets
         working-directory: bot
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf /tmp/readori-bot-worker-dry-run
-          npx wrangler deploy --dry-run --outdir /tmp/readori-bot-worker-dry-run
+
+          SECRET_JSON="$(npx wrangler secret list --name "$WORKER_NAME" --format json)"
+
+          required=(
+            BOT_TOKEN
+            WEBHOOK_SECRET
+            ADMIN_SECRET
+            APPLE_IAP_KEY_ID
+            APPLE_IAP_ISSUER_ID
+            APPLE_IAP_PRIVATE_KEY
+            PRO_LEASE_PRIVATE_KEY_JWK
+            DEVICE_CHALLENGE_SECRET
+            APPLE_ALLOW_SANDBOX_IAP
+          )
+
+          missing=()
+          for name in "${required[@]}"; do
+            if ! printf '%s' "$SECRET_JSON" |
+                 jq -e --arg name "$name" '.[] | select(.name == $name)' >/dev/null; then
+              missing+=("$name")
+            fi
+          done
+
+          if (( ${#missing[@]} )); then
+            echo "::error::The existing Cloudflare Worker is missing required secret name(s): ${missing[*]}"
+            echo "::error::This CI intentionally does not copy secret values from another GitHub repository."
+            exit 1
+          fi
+
+          echo "Existing Worker secrets: PASS (${#required[@]} required names found)"
+
+      # ============================================================
+      # 7. Build-only Wrangler validation
+      # ============================================================
+      - name: Wrangler dry-run
+        working-directory: bot
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/readori-bot-dry-run
+          npx wrangler deploy \
+            --dry-run \
+            --outdir /tmp/readori-bot-dry-run \
+            --keep-vars
           echo "Wrangler dry-run: PASS"
 
-      - name: Stop after validation
+      - name: Stop after validate
         if: ${{ inputs.mode == 'validate' }}
         run: |
-          echo "Validation completed. No Cloudflare resource was changed."
+          echo "Validation completed."
+          echo "No Cloudflare Worker code, D1 migration, or secret was changed."
 
-      # ------------------------------------------------------------
-      # 5. REMOTE CLOUDFLARE VALIDATION / D1
-      # ------------------------------------------------------------
-      - name: Validate Cloudflare account resources
-        if: ${{ inputs.mode == 'deploy' }}
-        working-directory: bot
-        shell: bash
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-          KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID }}
-        run: |
-          set -euo pipefail
-          npx wrangler --version
-          npx wrangler d1 list >/tmp/readori-d1-list.txt
-          grep -q "$D1_DATABASE_NAME" /tmp/readori-d1-list.txt || {
-            echo "::error::D1 database '$D1_DATABASE_NAME' not visible to this Cloudflare token/account."
-            exit 1
-          }
-          npx wrangler kv key list --namespace-id "$KV_NAMESPACE_ID" >/tmp/readori-kv-check.json
-          echo "Cloudflare D1/KV access: PASS"
-
+      # ============================================================
+      # 8. D1 migrations
+      # ============================================================
       - name: Apply D1 migrations
         if: ${{ inputs.mode == 'deploy' && inputs.run_migrations }}
         working-directory: bot
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-        run: npx wrangler d1 migrations apply tg-bot-db --remote
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx wrangler d1 migrations apply "$D1_DATABASE_NAME" --remote
 
       - name: Verify required D1 tables
         if: ${{ inputs.mode == 'deploy' }}
         working-directory: bot
         shell: bash
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
         run: |
           set -euo pipefail
-          OUT="$(npx wrangler d1 execute tg-bot-db --remote --command "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")"
+
+          OUT="$(
+            npx wrangler d1 execute "$D1_DATABASE_NAME" \
+              --remote \
+              --command="SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"
+          )"
+
           required_tables=(
             coupon_codes
             ordinary_coupon_claims
@@ -335,138 +413,88 @@ jobs:
             ai_tts_global_daily_usage
             ai_tts_provider_health
           )
+
+          missing=()
           for table in "${required_tables[@]}"; do
-            grep -q "$table" <<<"$OUT" || {
-              echo "::error::Missing required D1 table: $table"
-              exit 1
-            }
+            grep -q "$table" <<<"$OUT" || missing+=("$table")
           done
+
+          if (( ${#missing[@]} )); then
+            echo "::error::Missing required D1 table(s): ${missing[*]}"
+            exit 1
+          fi
+
           echo "Required D1 tables: PASS (${#required_tables[@]})"
 
-      # ------------------------------------------------------------
-      # 6. WORKER SECRETS
-      # ------------------------------------------------------------
-      - name: Upload required and configured Worker secrets
+      # ============================================================
+      # 9. Deploy code/config only.
+      #
+      # IMPORTANT:
+      # - No `wrangler secret put` here.
+      # - Existing Worker secrets are preserved by Wrangler deployment.
+      # - --keep-vars also preserves remote plain-text vars not represented
+      #   in this config, while applying the TTS vars rendered above.
+      # ============================================================
+      - name: Deploy Cloudflare Worker
         if: ${{ inputs.mode == 'deploy' }}
         working-directory: bot
         shell: bash
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-
-          # Core bot + Pro entitlement (required)
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
-          ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
-          APPLE_IAP_KEY_ID: ${{ secrets.APPLE_IAP_KEY_ID }}
-          APPLE_IAP_ISSUER_ID: ${{ secrets.APPLE_IAP_ISSUER_ID }}
-          APPLE_IAP_PRIVATE_KEY: ${{ secrets.APPLE_IAP_PRIVATE_KEY }}
-          PRO_LEASE_PRIVATE_KEY_JWK: ${{ secrets.PRO_LEASE_PRIVATE_KEY_JWK }}
-          DEVICE_CHALLENGE_SECRET: ${{ secrets.DEVICE_CHALLENGE_SECRET }}
-
-          # Optional bot / compatibility
-          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
-          WELCOME_MESSAGE_TEMPLATE: ${{ secrets.WELCOME_MESSAGE_TEMPLATE }}
-          READORI_API_SECRET: ${{ secrets.READORI_API_SECRET }}
-          DISCORD_PUBLIC_KEY: ${{ secrets.DISCORD_PUBLIC_KEY }}
-          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
-          DISCORD_APPLICATION_ID: ${{ secrets.DISCORD_APPLICATION_ID }}
-          DISCORD_GUILD_ID: ${{ secrets.DISCORD_GUILD_ID }}
-          APPLE_NOTIFICATION_ROUTE_TOKEN: ${{ secrets.APPLE_NOTIFICATION_ROUTE_TOKEN }}
-          APPLE_ALLOW_SANDBOX_IAP: ${{ secrets.APPLE_ALLOW_SANDBOX_IAP }}
-
-          # Optional TTS providers. Cloudflare Workers AI/MeloTTS needs no key.
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          AZURE_SPEECH_KEY: ${{ secrets.AZURE_SPEECH_KEY }}
-          ORACLE_EDGE_TTS_TOKEN: ${{ secrets.ORACLE_EDGE_TTS_TOKEN }}
         run: |
           set -euo pipefail
+          npx wrangler deploy --keep-vars
 
-          put_secret() {
-            local name="$1"
-            local value="${!name:-}"
-            [[ -n "$value" ]] || {
-              echo "::error::Required secret disappeared before upload: $name"
-              exit 1
-            }
-            printf '%s' "$value" | npx wrangler secret put "$name" >/dev/null
-            echo "Uploaded required Worker secret: $name"
-          }
-
-          put_optional_secret() {
-            local name="$1"
-            local value="${!name:-}"
-            if [[ -n "$value" ]]; then
-              printf '%s' "$value" | npx wrangler secret put "$name" >/dev/null
-              echo "Uploaded optional Worker secret: $name"
-            else
-              echo "Optional Worker secret not configured: $name"
-            fi
-          }
-
-          for name in \
-            BOT_TOKEN WEBHOOK_SECRET ADMIN_SECRET \
-            APPLE_IAP_KEY_ID APPLE_IAP_ISSUER_ID APPLE_IAP_PRIVATE_KEY \
-            PRO_LEASE_PRIVATE_KEY_JWK DEVICE_CHALLENGE_SECRET; do
-            put_secret "$name"
-          done
-
-          for name in \
-            ADMIN_CHAT_ID WELCOME_MESSAGE_TEMPLATE READORI_API_SECRET \
-            DISCORD_PUBLIC_KEY DISCORD_BOT_TOKEN DISCORD_APPLICATION_ID DISCORD_GUILD_ID \
-            APPLE_NOTIFICATION_ROUTE_TOKEN APPLE_ALLOW_SANDBOX_IAP \
-            OPENAI_API_KEY AZURE_SPEECH_KEY ORACLE_EDGE_TTS_TOKEN; do
-            put_optional_secret "$name"
-          done
-
-      # ------------------------------------------------------------
-      # 7. DEPLOY + HEALTH CHECK
-      # ------------------------------------------------------------
-      - name: Deploy Worker
-        if: ${{ inputs.mode == 'deploy' }}
-        working-directory: bot
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-        run: npx wrangler deploy
-
+      # ============================================================
+      # 10. Health check using EXISTING public-repo endpoint secret
+      # ============================================================
       - name: Health check
         if: ${{ inputs.mode == 'deploy' }}
         shell: bash
         env:
-          BOT_WORKER_BASE_URL: ${{ vars.BOT_WORKER_BASE_URL }}
+          READORI_SOCIAL_WORKER_ENDPOINT: ${{ secrets.READORI_SOCIAL_WORKER_ENDPOINT }}
         run: |
           set -euo pipefail
-          BASE="${BOT_WORKER_BASE_URL:-}"
+
+          BASE="${READORI_SOCIAL_WORKER_ENDPOINT:-}"
           if [[ -z "$BASE" ]]; then
-            echo "::notice::BOT_WORKER_BASE_URL is not configured; skipping HTTP /health check."
+            echo "::notice::READORI_SOCIAL_WORKER_ENDPOINT is empty; deployment succeeded, HTTP health check skipped."
             exit 0
           fi
+
           BASE="${BASE%/}"
+
           for attempt in 1 2 3 4 5; do
-            if curl --fail --silent --show-error --max-time 10 "$BASE/health" >/tmp/readori-bot-health.json; then
-              cat /tmp/readori-bot-health.json
+            if curl --fail --silent --show-error --max-time 15 \
+                 "$BASE/health" > /tmp/readori-health.json; then
+              cat /tmp/readori-health.json
               echo
               echo "Worker health check: PASS"
               exit 0
             fi
+            echo "Health attempt $attempt failed; retrying..."
             sleep 3
           done
-          echo "::error::Worker /health check failed after deploy."
+
+          echo "::error::Worker deployed but /health did not become healthy."
           exit 1
 
-      - name: Deployment summary
+      # ============================================================
+      # 11. Summary
+      # ============================================================
+      - name: Summary
         if: ${{ always() }}
-        shell: bash
         working-directory: bot
+        shell: bash
         run: |
           {
-            echo "## Readori Bot CI"
-            echo ""
-            echo "- Source repository: \`$BOT_REPOSITORY\`"
-            echo "- Requested ref: \`${{ inputs.bot_ref }}\`"
-            echo "- Source SHA: \`$(git rev-parse --short HEAD 2>/dev/null || echo unknown)\`"
+            echo "## Readori Bot"
+            echo
+            echo "- CI repository: \`${{ github.repository }}\`"
+            echo "- Source: \`$BOT_REPOSITORY\`"
+            echo "- Ref: \`${{ inputs.bot_ref }}\`"
+            echo "- SHA: \`$(git rev-parse --short HEAD 2>/dev/null || echo unknown)\`"
             echo "- Mode: \`${{ inputs.mode }}\`"
-            echo "- D1 migrations requested: \`${{ inputs.run_migrations }}\`"
-            echo "- Runner repository: \`${{ github.repository }}\`"
+            echo "- Worker: \`$WORKER_NAME\`"
+            echo "- D1: \`$D1_DATABASE_NAME\`"
+            echo "- KV: \`$KV_NAMESPACE_TITLE\`"
+            echo "- Existing Cloudflare Worker secret values were not copied or modified."
           } >> "$GITHUB_STEP_SUMMARY"
