@@ -1,0 +1,472 @@
+name: Readori Bot · Private Source → Cloudflare
+
+# IMPORTANT
+# - This workflow RUNS in the public repository: readori/test-env-setup.
+# - It checks out the private source repository readori/readoritgbot with a
+#   read-only Deploy Key stored as a secret in this public CI repository's
+#   `bot-production` environment (or as an organization secret selected for
+#   test-env-setup).
+# - GitHub does NOT allow a workflow to read secret VALUES from another
+#   repository. Put/share the deployment secrets where THIS workflow can read
+#   them. Organization secrets scoped to test-env-setup are recommended.
+# - Manual dispatch only: no pull_request/push trigger can receive production
+#   deployment credentials.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bot_ref:
+        description: "Private readori/readoritgbot branch/tag/SHA"
+        required: true
+        default: "main"
+        type: string
+      mode:
+        description: "validate = test only; deploy = migrate + secrets + deploy"
+        required: true
+        default: "deploy"
+        type: choice
+        options:
+          - validate
+          - deploy
+      run_migrations:
+        description: "Apply remote D1 migrations before deploy"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: readori-bot-production
+  cancel-in-progress: false
+
+env:
+  BOT_REPOSITORY: readori/readoritgbot
+  BOT_DIR: bot
+  D1_DATABASE_NAME: tg-bot-db
+
+jobs:
+  build-and-deploy:
+    name: Validate private bot and deploy Cloudflare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # Store bot deployment secrets here if you do not use organization secrets.
+    # Environment protection / required reviewers are strongly recommended.
+    environment:
+      name: bot-production
+
+    steps:
+      # ------------------------------------------------------------
+      # 1. PRIVATE SOURCE CHECKOUT
+      # ------------------------------------------------------------
+      - name: Validate private-repository checkout credential
+        shell: bash
+        env:
+          READORITGBOT_DEPLOY_KEY: ${{ secrets.READORITGBOT_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${READORITGBOT_DEPLOY_KEY:-}" ]]; then
+            echo "::error::Missing READORITGBOT_DEPLOY_KEY."
+            echo "::error::Add the matching public key as a read-only Deploy Key on readori/readoritgbot."
+            echo "::error::Store the PRIVATE key in test-env-setup → Environment bot-production (or an organization secret selected for test-env-setup)."
+            exit 1
+          fi
+
+      - name: Checkout private readori/readoritgbot
+        uses: actions/checkout@v4
+        with:
+          repository: readori/readoritgbot
+          ref: ${{ inputs.bot_ref }}
+          ssh-key: ${{ secrets.READORITGBOT_DEPLOY_KEY }}
+          path: bot
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify checked-out source
+        shell: bash
+        working-directory: bot
+        run: |
+          set -euo pipefail
+          test -f package.json || { echo "::error::package.json missing"; exit 1; }
+          test -f wrangler.toml.template || { echo "::error::wrangler.toml.template missing"; exit 1; }
+          test -f src/index.js || { echo "::error::src/index.js missing"; exit 1; }
+          echo "Repository: $BOT_REPOSITORY"
+          echo "Requested ref: ${{ inputs.bot_ref }}"
+          echo "Commit: $(git rev-parse HEAD)"
+          echo "Short SHA: $(git rev-parse --short HEAD)"
+
+      # ------------------------------------------------------------
+      # 2. NODE / TESTS
+      # ------------------------------------------------------------
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        working-directory: bot
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f package-lock.json ]]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Lint
+        working-directory: bot
+        run: npm run lint --if-present
+
+      - name: Test
+        working-directory: bot
+        run: npm test
+
+      - name: Static syntax checks
+        working-directory: bot
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do
+            node --check "$file"
+          done < <(find src scripts -type f \( -name '*.js' -o -name '*.mjs' \) -print0 2>/dev/null || true)
+
+      # ------------------------------------------------------------
+      # 3. FAIL EARLY BEFORE ANY REMOTE MUTATION
+      # ------------------------------------------------------------
+      - name: Validate required deployment secrets
+        if: ${{ inputs.mode == 'deploy' }}
+        shell: bash
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID }}
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
+          APPLE_IAP_KEY_ID: ${{ secrets.APPLE_IAP_KEY_ID }}
+          APPLE_IAP_ISSUER_ID: ${{ secrets.APPLE_IAP_ISSUER_ID }}
+          APPLE_IAP_PRIVATE_KEY: ${{ secrets.APPLE_IAP_PRIVATE_KEY }}
+          PRO_LEASE_PRIVATE_KEY_JWK: ${{ secrets.PRO_LEASE_PRIVATE_KEY_JWK }}
+          DEVICE_CHALLENGE_SECRET: ${{ secrets.DEVICE_CHALLENGE_SECRET }}
+        run: |
+          set -euo pipefail
+          required=(
+            CF_API_TOKEN
+            CF_ACCOUNT_ID
+            KV_NAMESPACE_ID
+            D1_DATABASE_ID
+            BOT_TOKEN
+            WEBHOOK_SECRET
+            ADMIN_SECRET
+            APPLE_IAP_KEY_ID
+            APPLE_IAP_ISSUER_ID
+            APPLE_IAP_PRIVATE_KEY
+            PRO_LEASE_PRIVATE_KEY_JWK
+            DEVICE_CHALLENGE_SECRET
+          )
+          missing=()
+          for name in "${required[@]}"; do
+            [[ -n "${!name:-}" ]] || missing+=("$name")
+          done
+          if (( ${#missing[@]} )); then
+            echo "::error::Missing required bot-production secret(s): ${missing[*]}"
+            exit 1
+          fi
+          echo "Required deployment secrets: PASS (${#required[@]} present)"
+
+      # ------------------------------------------------------------
+      # 4. RENDER WRANGLER CONFIG
+      # ------------------------------------------------------------
+      - name: Generate wrangler.toml from private source template
+        working-directory: bot
+        shell: bash
+        env:
+          KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID }}
+          KV_PREVIEW_NAMESPACE_ID: ${{ secrets.KV_PREVIEW_NAMESPACE_ID }}
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+
+          AI_TTS_OPENAI_ENABLED: ${{ vars.AI_TTS_OPENAI_ENABLED }}
+          AI_TTS_AZURE_ENABLED: ${{ vars.AI_TTS_AZURE_ENABLED }}
+          AI_TTS_AZURE_PREFERRED_FOR_NATURAL: ${{ vars.AI_TTS_AZURE_PREFERRED_FOR_NATURAL }}
+          AZURE_SPEECH_REGION: ${{ vars.AZURE_SPEECH_REGION }}
+          AZURE_SPEECH_ENDPOINT: ${{ vars.AZURE_SPEECH_ENDPOINT }}
+          AI_TTS_ORACLE_EDGE_ENABLED: ${{ vars.AI_TTS_ORACLE_EDGE_ENABLED }}
+          ORACLE_EDGE_TTS_URL: ${{ vars.ORACLE_EDGE_TTS_URL }}
+
+          AI_TTS_AZURE_VOICE_ZH_CN: ${{ vars.AI_TTS_AZURE_VOICE_ZH_CN }}
+          AI_TTS_AZURE_VOICE_ZH_TW: ${{ vars.AI_TTS_AZURE_VOICE_ZH_TW }}
+          AI_TTS_AZURE_VOICE_EN_US: ${{ vars.AI_TTS_AZURE_VOICE_EN_US }}
+          AI_TTS_AZURE_VOICE_JA_JP: ${{ vars.AI_TTS_AZURE_VOICE_JA_JP }}
+          AI_TTS_AZURE_VOICE_KO_KR: ${{ vars.AI_TTS_AZURE_VOICE_KO_KR }}
+          AI_TTS_AZURE_VOICE_FR_FR: ${{ vars.AI_TTS_AZURE_VOICE_FR_FR }}
+          AI_TTS_AZURE_VOICE_ES_ES: ${{ vars.AI_TTS_AZURE_VOICE_ES_ES }}
+        run: |
+          set -euo pipefail
+
+          # validate mode can still fully render when IDs are configured.
+          # deploy mode already fails above when these are absent.
+          if [[ "${{ inputs.mode }}" == "deploy" ]]; then
+            test -n "${KV_NAMESPACE_ID:-}"
+            test -n "${D1_DATABASE_ID:-}"
+          fi
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          source = Path("wrangler.toml.template")
+          if not source.is_file():
+              raise SystemExit("wrangler.toml.template is missing")
+
+          template = source.read_text()
+          kv_id = os.environ.get("KV_NAMESPACE_ID", "").strip()
+          preview_id = os.environ.get("KV_PREVIEW_NAMESPACE_ID", "").strip() or kv_id
+
+          values = {
+              "KV_NAMESPACE_ID": kv_id or "00000000000000000000000000000000",
+              "KV_PREVIEW_NAMESPACE_ID": preview_id or "00000000000000000000000000000000",
+              "D1_DATABASE_ID": os.environ.get("D1_DATABASE_ID", "").strip() or "00000000-0000-0000-0000-000000000000",
+              "AI_TTS_OPENAI_ENABLED": os.environ.get("AI_TTS_OPENAI_ENABLED", "").strip() or "false",
+              "AI_TTS_AZURE_ENABLED": os.environ.get("AI_TTS_AZURE_ENABLED", "").strip() or "false",
+              "AI_TTS_AZURE_PREFERRED_FOR_NATURAL": os.environ.get("AI_TTS_AZURE_PREFERRED_FOR_NATURAL", "").strip() or "false",
+              "AZURE_SPEECH_REGION": os.environ.get("AZURE_SPEECH_REGION", "").strip(),
+              "AZURE_SPEECH_ENDPOINT": os.environ.get("AZURE_SPEECH_ENDPOINT", "").strip(),
+              "AI_TTS_ORACLE_EDGE_ENABLED": os.environ.get("AI_TTS_ORACLE_EDGE_ENABLED", "").strip() or "false",
+              "ORACLE_EDGE_TTS_URL": os.environ.get("ORACLE_EDGE_TTS_URL", "").strip(),
+              "AI_TTS_AZURE_VOICE_ZH_CN": os.environ.get("AI_TTS_AZURE_VOICE_ZH_CN", "").strip(),
+              "AI_TTS_AZURE_VOICE_ZH_TW": os.environ.get("AI_TTS_AZURE_VOICE_ZH_TW", "").strip(),
+              "AI_TTS_AZURE_VOICE_EN_US": os.environ.get("AI_TTS_AZURE_VOICE_EN_US", "").strip(),
+              "AI_TTS_AZURE_VOICE_JA_JP": os.environ.get("AI_TTS_AZURE_VOICE_JA_JP", "").strip(),
+              "AI_TTS_AZURE_VOICE_KO_KR": os.environ.get("AI_TTS_AZURE_VOICE_KO_KR", "").strip(),
+              "AI_TTS_AZURE_VOICE_FR_FR": os.environ.get("AI_TTS_AZURE_VOICE_FR_FR", "").strip(),
+              "AI_TTS_AZURE_VOICE_ES_ES": os.environ.get("AI_TTS_AZURE_VOICE_ES_ES", "").strip(),
+          }
+
+          for key, value in values.items():
+              safe = str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "")
+              template = template.replace(f"__{key}__", safe)
+
+          if "__" in template:
+              unresolved = sorted({part for part in template.replace('"', ' ').split() if "__" in part})
+              raise SystemExit(f"wrangler.toml contains unresolved placeholders: {unresolved}")
+
+          Path("wrangler.toml").write_text(template)
+          print("wrangler.toml generated")
+          PY
+
+      - name: Wrangler dry-run validation
+        working-directory: bot
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/readori-bot-worker-dry-run
+          npx wrangler deploy --dry-run --outdir /tmp/readori-bot-worker-dry-run
+          echo "Wrangler dry-run: PASS"
+
+      - name: Stop after validation
+        if: ${{ inputs.mode == 'validate' }}
+        run: |
+          echo "Validation completed. No Cloudflare resource was changed."
+
+      # ------------------------------------------------------------
+      # 5. REMOTE CLOUDFLARE VALIDATION / D1
+      # ------------------------------------------------------------
+      - name: Validate Cloudflare account resources
+        if: ${{ inputs.mode == 'deploy' }}
+        working-directory: bot
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID }}
+        run: |
+          set -euo pipefail
+          npx wrangler --version
+          npx wrangler d1 list >/tmp/readori-d1-list.txt
+          grep -q "$D1_DATABASE_NAME" /tmp/readori-d1-list.txt || {
+            echo "::error::D1 database '$D1_DATABASE_NAME' not visible to this Cloudflare token/account."
+            exit 1
+          }
+          npx wrangler kv key list --namespace-id "$KV_NAMESPACE_ID" >/tmp/readori-kv-check.json
+          echo "Cloudflare D1/KV access: PASS"
+
+      - name: Apply D1 migrations
+        if: ${{ inputs.mode == 'deploy' && inputs.run_migrations }}
+        working-directory: bot
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: npx wrangler d1 migrations apply tg-bot-db --remote
+
+      - name: Verify required D1 tables
+        if: ${{ inputs.mode == 'deploy' }}
+        working-directory: bot
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          OUT="$(npx wrangler d1 execute tg-bot-db --remote --command "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")"
+          required_tables=(
+            coupon_codes
+            ordinary_coupon_claims
+            send_records
+            bind_codes
+            social_bindings
+            reading_sessions
+            reading_session_dedup
+            user_cultivation
+            daily_reading_stats
+            cultivation_logs
+            user_finished_books
+            pro_applications
+            app_devices
+            pro_purchases
+            pro_devices
+            pro_device_activation_history
+            pro_reward_codes
+            level24_pro_rewards
+            ai_tts_daily_usage
+            ai_tts_global_daily_usage
+            ai_tts_provider_health
+          )
+          for table in "${required_tables[@]}"; do
+            grep -q "$table" <<<"$OUT" || {
+              echo "::error::Missing required D1 table: $table"
+              exit 1
+            }
+          done
+          echo "Required D1 tables: PASS (${#required_tables[@]})"
+
+      # ------------------------------------------------------------
+      # 6. WORKER SECRETS
+      # ------------------------------------------------------------
+      - name: Upload required and configured Worker secrets
+        if: ${{ inputs.mode == 'deploy' }}
+        working-directory: bot
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+
+          # Core bot + Pro entitlement (required)
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
+          APPLE_IAP_KEY_ID: ${{ secrets.APPLE_IAP_KEY_ID }}
+          APPLE_IAP_ISSUER_ID: ${{ secrets.APPLE_IAP_ISSUER_ID }}
+          APPLE_IAP_PRIVATE_KEY: ${{ secrets.APPLE_IAP_PRIVATE_KEY }}
+          PRO_LEASE_PRIVATE_KEY_JWK: ${{ secrets.PRO_LEASE_PRIVATE_KEY_JWK }}
+          DEVICE_CHALLENGE_SECRET: ${{ secrets.DEVICE_CHALLENGE_SECRET }}
+
+          # Optional bot / compatibility
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+          WELCOME_MESSAGE_TEMPLATE: ${{ secrets.WELCOME_MESSAGE_TEMPLATE }}
+          READORI_API_SECRET: ${{ secrets.READORI_API_SECRET }}
+          DISCORD_PUBLIC_KEY: ${{ secrets.DISCORD_PUBLIC_KEY }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_APPLICATION_ID: ${{ secrets.DISCORD_APPLICATION_ID }}
+          DISCORD_GUILD_ID: ${{ secrets.DISCORD_GUILD_ID }}
+          APPLE_NOTIFICATION_ROUTE_TOKEN: ${{ secrets.APPLE_NOTIFICATION_ROUTE_TOKEN }}
+          APPLE_ALLOW_SANDBOX_IAP: ${{ secrets.APPLE_ALLOW_SANDBOX_IAP }}
+
+          # Optional TTS providers. Cloudflare Workers AI/MeloTTS needs no key.
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AZURE_SPEECH_KEY: ${{ secrets.AZURE_SPEECH_KEY }}
+          ORACLE_EDGE_TTS_TOKEN: ${{ secrets.ORACLE_EDGE_TTS_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          put_secret() {
+            local name="$1"
+            local value="${!name:-}"
+            [[ -n "$value" ]] || {
+              echo "::error::Required secret disappeared before upload: $name"
+              exit 1
+            }
+            printf '%s' "$value" | npx wrangler secret put "$name" >/dev/null
+            echo "Uploaded required Worker secret: $name"
+          }
+
+          put_optional_secret() {
+            local name="$1"
+            local value="${!name:-}"
+            if [[ -n "$value" ]]; then
+              printf '%s' "$value" | npx wrangler secret put "$name" >/dev/null
+              echo "Uploaded optional Worker secret: $name"
+            else
+              echo "Optional Worker secret not configured: $name"
+            fi
+          }
+
+          for name in \
+            BOT_TOKEN WEBHOOK_SECRET ADMIN_SECRET \
+            APPLE_IAP_KEY_ID APPLE_IAP_ISSUER_ID APPLE_IAP_PRIVATE_KEY \
+            PRO_LEASE_PRIVATE_KEY_JWK DEVICE_CHALLENGE_SECRET; do
+            put_secret "$name"
+          done
+
+          for name in \
+            ADMIN_CHAT_ID WELCOME_MESSAGE_TEMPLATE READORI_API_SECRET \
+            DISCORD_PUBLIC_KEY DISCORD_BOT_TOKEN DISCORD_APPLICATION_ID DISCORD_GUILD_ID \
+            APPLE_NOTIFICATION_ROUTE_TOKEN APPLE_ALLOW_SANDBOX_IAP \
+            OPENAI_API_KEY AZURE_SPEECH_KEY ORACLE_EDGE_TTS_TOKEN; do
+            put_optional_secret "$name"
+          done
+
+      # ------------------------------------------------------------
+      # 7. DEPLOY + HEALTH CHECK
+      # ------------------------------------------------------------
+      - name: Deploy Worker
+        if: ${{ inputs.mode == 'deploy' }}
+        working-directory: bot
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: npx wrangler deploy
+
+      - name: Health check
+        if: ${{ inputs.mode == 'deploy' }}
+        shell: bash
+        env:
+          BOT_WORKER_BASE_URL: ${{ vars.BOT_WORKER_BASE_URL }}
+        run: |
+          set -euo pipefail
+          BASE="${BOT_WORKER_BASE_URL:-}"
+          if [[ -z "$BASE" ]]; then
+            echo "::notice::BOT_WORKER_BASE_URL is not configured; skipping HTTP /health check."
+            exit 0
+          fi
+          BASE="${BASE%/}"
+          for attempt in 1 2 3 4 5; do
+            if curl --fail --silent --show-error --max-time 10 "$BASE/health" >/tmp/readori-bot-health.json; then
+              cat /tmp/readori-bot-health.json
+              echo
+              echo "Worker health check: PASS"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::Worker /health check failed after deploy."
+          exit 1
+
+      - name: Deployment summary
+        if: ${{ always() }}
+        shell: bash
+        working-directory: bot
+        run: |
+          {
+            echo "## Readori Bot CI"
+            echo ""
+            echo "- Source repository: \`$BOT_REPOSITORY\`"
+            echo "- Requested ref: \`${{ inputs.bot_ref }}\`"
+            echo "- Source SHA: \`$(git rev-parse --short HEAD 2>/dev/null || echo unknown)\`"
+            echo "- Mode: \`${{ inputs.mode }}\`"
+            echo "- D1 migrations requested: \`${{ inputs.run_migrations }}\`"
+            echo "- Runner repository: \`${{ github.repository }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
