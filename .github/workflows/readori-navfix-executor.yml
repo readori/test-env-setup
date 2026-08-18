@@ -1,4 +1,4 @@
-name: Readori · Navigation Fix Executor
+name: Readori · Navigation Fix Branch Sync
 
 on:
   push:
@@ -14,6 +14,7 @@ jobs:
     timeout-minutes: 35
     env:
       EXPECTED_BASE: 8c33402a25b8c2d387cf1fcf08f4dda1219a338c
+      TARGET_BRANCH: fix/navigation-top-flash-diagnostics
       TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
     steps:
       - uses: actions/checkout@v6
@@ -42,13 +43,16 @@ jobs:
           set -euo pipefail
           git clone --depth=20 git@github-readori:readori/readori.git app
           CURRENT="$(git -C app rev-parse HEAD)"
-          echo "Private source HEAD: $CURRENT"
-          [[ "$CURRENT" == "$EXPECTED_BASE" ]] || { echo "::error::Expected $EXPECTED_BASE, got $CURRENT"; exit 1; }
+          echo "Private master HEAD: $CURRENT"
+          [[ "$CURRENT" == "$EXPECTED_BASE" ]] || { echo "::error::Expected master $EXPECTED_BASE, got $CURRENT"; exit 1; }
+          git -C app fetch origin "$TARGET_BRANCH" --depth=20
+          TARGET_CURRENT="$(git -C app rev-parse FETCH_HEAD)"
+          [[ "$TARGET_CURRENT" == "$EXPECTED_BASE" ]] || { echo "::error::Target branch already changed: $TARGET_CURRENT"; exit 1; }
 
       - name: Apply audited patch script
         run: |
           set -euo pipefail
-          python3 sync/apply_readori_navfix_diag.py app
+          python3 sync/apply_readori_navfix_diag_v2.py app
 
       - name: Validate
         working-directory: app
@@ -60,7 +64,9 @@ jobs:
           grep -q 'AI narration worker audio received' Readori/Services/TTS/ReadoriAITTSClient.swift
           grep -q 'AI narration audio resolved' Readori/Services/TTSService.swift
           grep -q 'TTS fallback to system' Readori/Services/TTSService.swift
+          grep -q 'TTS online audio player ready' Readori/Services/TTSService.swift
           grep -q 'nav-transition-diag-v1-20260818' Readori/Supporting/Info.plist
+          ! grep -q 'NAVFIX_TEMP_STATUS_MATCH_GUARD' Readori/Services/TTS/ReadoriAITTSClient.swift
           for file in \
             Readori/Core/Theme/AppThemeManager.swift \
             Readori/UI/Common/ViewExtensions.swift \
@@ -73,23 +79,23 @@ jobs:
           plutil -lint Readori/Supporting/Info.plist
           if [[ -f Readori/Scripts/verify_ai_narration_v3.py ]]; then python3 Readori/Scripts/verify_ai_narration_v3.py; fi
 
-      - name: Commit and push private master
+      - name: Commit and push review branch only
         working-directory: app
         run: |
           set -euo pipefail
-          git fetch origin master --depth=20
-          [[ "$(git rev-parse origin/master)" == "$EXPECTED_BASE" ]] || { echo "::error::master changed during validation"; exit 1; }
+          git fetch origin "$TARGET_BRANCH" --depth=20
+          [[ "$(git rev-parse FETCH_HEAD)" == "$EXPECTED_BASE" ]] || { echo "::error::Review branch changed during validation"; exit 1; }
           git config user.name 'OpenAI Agent'
           git config user.email 'agent@users.noreply.github.com'
           git add Readori/Core/Theme/AppThemeManager.swift Readori/UI/Common/ViewExtensions.swift Readori/UI/Settings/SettingsView.swift Readori/Services/TTS/ReadoriAITTSClient.swift Readori/Services/TTSService.swift Readori/Supporting/Info.plist
           git commit -m '修复二级页面顶部闪图并增强诊断日志'
-          if git push origin HEAD:master; then
-            echo 'Private master push via SSH: PASS'
+          if git push origin HEAD:"$TARGET_BRANCH"; then
+            echo 'Review branch push via SSH: PASS'
           else
             test -n "${TARGET_REPO_PAT:-}" || { echo "::error::SSH push failed and TARGET_REPO_PAT missing"; exit 1; }
             git remote set-url origin "https://x-access-token:${TARGET_REPO_PAT}@github.com/readori/readori.git"
-            git push origin HEAD:master
-            echo 'Private master push via PAT: PASS'
+            git push origin HEAD:"$TARGET_BRANCH"
+            echo 'Review branch push via PAT: PASS'
           fi
           echo "NEW_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
@@ -97,20 +103,20 @@ jobs:
         if: success()
         run: |
           set -euo pipefail
-          printf 'status=success\nprivate_sha=%s\npatch=nav-transition-diag-v1-20260818\n' "$NEW_SHA" > sync/readori-navfix-result.txt
+          printf 'status=success\nbranch=%s\nprivate_sha=%s\npatch=nav-transition-diag-v1-20260818\n' "$TARGET_BRANCH" "$NEW_SHA" > sync/readori-navfix-result.txt
           git config user.name 'Readori CI'
           git config user.email 'actions@users.noreply.github.com'
           git add sync/readori-navfix-result.txt
-          git commit -m 'Record Readori nav fix success' || true
+          git commit -m 'Record Readori review-branch sync success' || true
           git push origin HEAD:main
 
       - name: Publish failure marker
         if: failure()
         run: |
           set -euo pipefail
-          printf 'status=failed\nbase=%s\npatch=nav-transition-diag-v1-20260818\n' "$EXPECTED_BASE" > sync/readori-navfix-result.txt
+          printf 'status=failed\nbranch=%s\nbase=%s\npatch=nav-transition-diag-v1-20260818\n' "$TARGET_BRANCH" "$EXPECTED_BASE" > sync/readori-navfix-result.txt
           git config user.name 'Readori CI'
           git config user.email 'actions@users.noreply.github.com'
           git add sync/readori-navfix-result.txt
-          git commit -m 'Record Readori nav fix failure' || true
+          git commit -m 'Record Readori review-branch sync failure' || true
           git push origin HEAD:main || true
