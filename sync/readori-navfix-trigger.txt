@@ -1,4 +1,5 @@
-trigger=2026-08-18T13:31:00-07:00
+trigger=2026-08-18T13:40:00-07:00
 base=8c33402a25b8c2d387cf1fcf08f4dda1219a338c
+branch=fix/navigation-top-flash-diagnostics
 patch=nav-transition-diag-v1-20260818
-attempt=2
+attempt=3
