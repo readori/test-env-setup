@@ -1,0 +1,427 @@
+name: One-shot · Readori Navigation Chrome + Diagnostics Fix
+
+on:
+  push:
+    paths:
+      - '.github/workflows/oneshot-readori-navigation-diagnostics-fix.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  patch-private-readori:
+    runs-on: macos-15
+    timeout-minutes: 35
+    env:
+      EXPECTED_BASE: 8c33402a25b8c2d387cf1fcf08f4dda1219a338c
+      TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+    steps:
+      - name: Install private repository SSH key
+        env:
+          PRIVATE_REPO_KEY: ${{ secrets.PRIVATE_REPO_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${PRIVATE_REPO_KEY:-}" || { echo "::error::PRIVATE_REPO_KEY is required"; exit 1; }
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          printf '%s\n' "$PRIVATE_REPO_KEY" > ~/.ssh/readori_key
+          chmod 600 ~/.ssh/readori_key
+          cat > ~/.ssh/config <<'EOF'
+          Host github-readori
+            HostName github.com
+            User git
+            IdentityFile ~/.ssh/readori_key
+            IdentitiesOnly yes
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Clone current private source
+        run: |
+          set -euo pipefail
+          git clone --depth=20 git@github-readori:readori/readori.git app
+          cd app
+          CURRENT="$(git rev-parse HEAD)"
+          echo "Private source HEAD: $CURRENT"
+          [[ "$CURRENT" == "$EXPECTED_BASE" ]] || {
+            echo "::error::readori/master changed since audit. Expected $EXPECTED_BASE, got $CURRENT"
+            exit 1
+          }
+
+      - name: Apply audited navigation and diagnostics changes
+        working-directory: app
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one match, found {count}\n--- needle ---\n{old[:1000]}")
+              p.write_text(text.replace(old, new, 1), encoding='utf-8')
+              print(f"patched {path}")
+
+          # 1) UIKit first-frame navigation chrome: never expose a raw wallpaper
+          # strip while NavigationStack is creating a destination controller.
+          replace_once(
+              'Readori/Core/Theme/AppThemeManager.swift',
+              '''    private let transparentNavigationAppearance: UINavigationBarAppearance = {
+              let appearance = UINavigationBarAppearance()
+              appearance.configureWithTransparentBackground()
+              appearance.backgroundColor = .clear
+              appearance.backgroundEffect = nil
+              appearance.shadowColor = .clear
+              return appearance
+          }()
+          '''.replace('          ', ''),
+              '''    /// Wallpaper navigation chrome must exist before SwiftUI's destination
+              /// preferences settle. A fully transparent UINavigationBar exposed the root
+              /// wallpaper for the first frames of every push, while the destination's
+              /// own wallpaper backdrop was still being mounted/cropped. Use the same
+              /// readability veil as the fixed bottom navigation so UIKit and SwiftUI
+              /// render an identical top surface throughout the transition.
+              private func wallpaperNavigationAppearance() -> UINavigationBarAppearance {
+                  let appearance = UINavigationBarAppearance()
+                  appearance.configureWithTransparentBackground()
+                  let base: UIColor = prefersDarkTextOnWallpaper ? .white : .black
+                  let alpha: CGFloat = UIAccessibility.isReduceTransparencyEnabled ? 1.0 : 0.50
+                  appearance.backgroundColor = base.withAlphaComponent(alpha)
+                  appearance.backgroundEffect = nil
+                  appearance.shadowColor = UIColor.separator.withAlphaComponent(0.18)
+                  return appearance
+              }
+          '''.replace('          ', '')
+          )
+
+          replace_once(
+              'Readori/Core/Theme/AppThemeManager.swift',
+              '''                let appearance = wallpaperEnabled ? transparentNavigationAppearance : defaultNavigationAppearance
+                  nav.navigationBar.standardAppearance = appearance
+                  nav.navigationBar.scrollEdgeAppearance = appearance
+                  nav.navigationBar.compactAppearance = appearance
+                  nav.navigationBar.compactScrollEdgeAppearance = appearance
+                  nav.navigationBar.isTranslucent = wallpaperEnabled
+              '''.replace('              ', ''),
+              '''                let appearance = wallpaperEnabled ? wallpaperNavigationAppearance() : defaultNavigationAppearance
+                  nav.navigationBar.standardAppearance = appearance
+                  nav.navigationBar.scrollEdgeAppearance = appearance
+                  nav.navigationBar.compactAppearance = appearance
+                  nav.navigationBar.compactScrollEdgeAppearance = appearance
+                  nav.navigationBar.isTranslucent = wallpaperEnabled && !UIAccessibility.isReduceTransparencyEnabled
+              '''.replace('              ', '')
+          )
+
+          # 2) SwiftUI navigation chrome must agree with UIKit from the first
+          # destination frame instead of hiding the navigation background.
+          replace_once(
+              'Readori/UI/Common/ViewExtensions.swift',
+              '''        if appThemeManager.hasCustomBackgroundImage {
+                      // A wallpaper is the page chrome. Painting a system material here
+                      // recreates the white/black strip users explicitly opted out of.
+                      content
+                          .toolbarBackground(Color.clear, for: .navigationBar)
+                          .toolbarBackground(.hidden, for: .navigationBar)
+                  } else if reduceTransparency {
+              '''.replace('              ', ''),
+              '''        if appThemeManager.hasCustomBackgroundImage {
+                      // Keep the wallpaper visible without exposing it raw during a push.
+                      // UIKit installs the same veil before the destination is mounted;
+                      // SwiftUI then keeps that exact surface for standard/scroll-edge states.
+                      let navigationBackground = reduceTransparency
+                          ? (appThemeManager.prefersDarkTextOnWallpaper ? Color.white : Color.black)
+                          : appThemeManager.fixedBottomNavigationBackground
+                      content
+                          .toolbarBackground(navigationBackground, for: .navigationBar)
+                          .toolbarBackground(.visible, for: .navigationBar)
+                  } else if reduceTransparency {
+              '''.replace('              ', '')
+          )
+
+          replace_once(
+              'Readori/UI/Common/ViewExtensions.swift',
+              '''        if appWallpaperSurfaceEnabled, let image = appThemeManager.appBackgroundImage {
+                      // Reuse the one UIImage decoded by AppThemeManager, but paint it inside
+                      // every pushed page's own hierarchy. NavigationStack/Form can install
+                      // an opaque hosting surface between a destination and ContentView on
+                      // iOS 26; merely setting `.background(Color.clear)` therefore leaves a
+                      // white page even though the root wallpaper exists underneath.
+                      // Reassert public UIKit list-cell backgroundConfiguration on the next
+                      // run loop as well; this also covers destinations that contain an
+                      // indirectly nested List/Form but forgot the dedicated list modifier.
+                      content
+                          .background { ReadoriAppWallpaperBackdrop(image: image) }
+                          .onAppear {
+                              appThemeManager.refreshMountedWallpaperListBackgrounds()
+                              DispatchQueue.main.async {
+                                  appThemeManager.refreshMountedWallpaperListBackgrounds()
+                              }
+                          }
+                  } else if reduceTransparency {
+                      content.background(fallback)
+                  } else {
+                      content.background { Rectangle().fill(.ultraThinMaterial) }
+                  }
+              '''.replace('              ', ''),
+              '''        if appWallpaperSurfaceEnabled, let image = appThemeManager.appBackgroundImage {
+                      // Reuse the one decoded UIImage inside the pushed page hierarchy, but
+                      // make the navigation safe-area deterministic from frame zero. Without
+                      // this explicit toolbar surface, NavigationStack briefly showed the root
+                      // wallpaper crop before this destination background finished mounting.
+                      let navigationBackground = reduceTransparency
+                          ? (appThemeManager.prefersDarkTextOnWallpaper ? Color.white : Color.black)
+                          : appThemeManager.fixedBottomNavigationBackground
+                      content
+                          .background { ReadoriAppWallpaperBackdrop(image: image) }
+                          .toolbarBackground(navigationBackground, for: .navigationBar)
+                          .toolbarBackground(.visible, for: .navigationBar)
+                          .onAppear {
+                              DiagnosticLogger.shared.log(.info, .navigation, "Adaptive page surface appeared", context: [
+                                  "wallpaper": "1",
+                                  "pageSurface": "wallpaperBackdrop",
+                                  "navigationChrome": reduceTransparency ? "opaqueWallpaperVeil" : "wallpaperVeil"
+                              ])
+                              appThemeManager.refreshMountedWallpaperListBackgrounds()
+                              DispatchQueue.main.async {
+                                  appThemeManager.refreshMountedWallpaperListBackgrounds()
+                              }
+                          }
+                  } else if reduceTransparency {
+                      content
+                          .background(fallback)
+                          .toolbarBackground(fallback, for: .navigationBar)
+                          .toolbarBackground(.visible, for: .navigationBar)
+                          .onAppear {
+                              DiagnosticLogger.shared.log(.info, .navigation, "Adaptive page surface appeared", context: [
+                                  "wallpaper": "0",
+                                  "pageSurface": "opaqueSystem",
+                                  "navigationChrome": "opaqueSystem"
+                              ])
+                          }
+                  } else {
+                      content
+                          .background { Rectangle().fill(.ultraThinMaterial) }
+                          .toolbarBackground(.ultraThinMaterial, for: .navigationBar)
+                          .toolbarBackground(.visible, for: .navigationBar)
+                          .onAppear {
+                              DiagnosticLogger.shared.log(.info, .navigation, "Adaptive page surface appeared", context: [
+                                  "wallpaper": "0",
+                                  "pageSurface": "ultraThinMaterial",
+                                  "navigationChrome": "ultraThinMaterial"
+                              ])
+                          }
+                  }
+              '''.replace('              ', '')
+          )
+
+          # 3) Enrich Settings destination diagnostics with the exact navigation
+          # mode and first-frame chrome chosen by the common modifiers.
+          replace_once(
+              'Readori/UI/Settings/SettingsView.swift',
+              '''    private func logSettingsDestinationAppeared(_ category: PrimaryCategory) {
+                  DiagnosticLogger.shared.log(.info, .navigation, "Settings destination appeared", context: [
+                      "category": String(describing: category),
+                      "wallpaper": appThemeManager.hasCustomBackgroundImage ? "1" : "0"
+                  ])
+              }
+          '''.replace('          ', ''),
+              '''    private func logSettingsDestinationAppeared(_ category: PrimaryCategory) {
+                  DiagnosticLogger.shared.log(.info, .navigation, "Settings destination appeared", context: [
+                      "category": String(describing: category),
+                      "wallpaper": appThemeManager.hasCustomBackgroundImage ? "1" : "0",
+                      "backgroundReady": appThemeManager.appBackgroundImage == nil ? "0" : "1",
+                      "layout": isSplitLayoutActive ? "split" : "compact",
+                      "navigationDepth": isSplitLayoutActive ? "0" : "\\(compactPath.count)",
+                      "navigationChrome": appThemeManager.hasCustomBackgroundImage ? "wallpaperVeil" : "systemMaterial"
+                  ])
+              }
+          '''.replace('          ', '')
+          )
+
+          # 4) Worker request observability: provider, revision, response status,
+          # network latency and Cloudflare/request trace, never text or credentials.
+          replace_once(
+              'Readori/Services/TTS/ReadoriAITTSClient.swift',
+              '''        try await deviceAuth.authorize(&request, retrying: retryingAuth)
+
+                  do {
+                      let (data, response) = try await TTSNetworkSession.data(for: request)
+                      guard let http = response as? HTTPURLResponse else { throw TTSProviderError.invalidResponse }
+              '''.replace('              ', ''),
+              '''        try await deviceAuth.authorize(&request, retrying: retryingAuth)
+                  let requestStartedAt = ProcessInfo.processInfo.systemUptime
+
+                  do {
+                      let (data, response) = try await TTSNetworkSession.data(for: request)
+                      guard let http = response as? HTTPURLResponse else { throw TTSProviderError.invalidResponse }
+              '''.replace('              ', '')
+          )
+
+          replace_once(
+              'Readori/Services/TTS/ReadoriAITTSClient.swift',
+              '''            guard (200..<300).contains(http.statusCode) else {
+                      throw Self.providerError(for: http.statusCode, data: data)
+                  }
+
+                  let payload = try TTSHTTPAudioResponseDecoder.decode(
+                      data: data,
+                      response: response,
+                      expectedContentType: "audio/mpeg"
+                  )
+                  guard case let .data(audio) = payload, !audio.isEmpty else {
+                      throw TTSProviderError.emptyAudio
+                  }
+                  return ReadoriAITTSResult(
+                      audio: audio,
+                      provider: http.value(forHTTPHeaderField: "X-READORI-TTS-PROVIDER") ?? "server"
+                  )
+              '''.replace('              ', ''),
+              '''            let latencyMS = max(0, Int(((ProcessInfo.processInfo.systemUptime - requestStartedAt) * 1_000).rounded()))
+                  let provider = http.value(forHTTPHeaderField: "X-READORI-TTS-PROVIDER") ?? "server"
+                  let revision = http.value(forHTTPHeaderField: "X-READORI-TTS-REVISION") ?? "unknown"
+                  let trace = http.value(forHTTPHeaderField: "CF-Ray")
+                      ?? http.value(forHTTPHeaderField: "X-Request-ID")
+                      ?? ""
+                  let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? ""
+
+                  if !(200..<300).contains(http.statusCode) {
+                      let workerFailure = Self.workerError(from: data)
+                      DiagnosticLogger.shared.log(.warning, .network, "AI narration worker response failed", context: [
+                          "status": "\\(http.statusCode)",
+                          "code": workerFailure.code ?? "HTTP_\\(http.statusCode)",
+                          "provider": provider,
+                          "workerRevision": revision,
+                          "latencyMs": "\\(latencyMS)",
+                          "trace": trace,
+                          "authRetry": retryingAuth ? "1" : "0"
+                      ])
+                      throw Self.providerError(for: http.statusCode, data: data)
+                  }
+
+                  let payload = try TTSHTTPAudioResponseDecoder.decode(
+                      data: data,
+                      response: response,
+                      expectedContentType: "audio/mpeg"
+                  )
+                  guard case let .data(audio) = payload, !audio.isEmpty else {
+                      throw TTSProviderError.emptyAudio
+                  }
+                  DiagnosticLogger.shared.log(.info, .network, "AI narration worker audio received", context: [
+                      "status": "\\(http.statusCode)",
+                      "provider": provider,
+                      "workerRevision": revision,
+                      "bytes": "\\(audio.count)",
+                      "latencyMs": "\\(latencyMS)",
+                      "contentType": contentType,
+                      "trace": trace,
+                      "authRetry": retryingAuth ? "1" : "0"
+                  ])
+                  return ReadoriAITTSResult(
+                      audio: audio,
+                      provider: provider
+                  )
+              '''.replace('              ', '')
+          )
+
+          # 5) Explicitly record online playback start and every system fallback.
+          replace_once(
+              'Readori/Services/TTSService.swift',
+              '''        let remainingRanges = sentenceRanges.indices.contains(remainingStart)
+                      ? Array(sentenceRanges[remainingStart...])
+                      : []
+
+                  // 清空 HTTP 相关状态，切换到系统语音路径继续朗读剩余内容
+              '''.replace('              ', ''),
+              '''        let remainingRanges = sentenceRanges.indices.contains(remainingStart)
+                      ? Array(sentenceRanges[remainingStart...])
+                      : []
+
+                  diagLog(.warning, .general, "TTS fallback to system", ctx: [
+                      "configuredProvider": String(describing: config.providerType),
+                      "fromSentence": "\\(remainingStart)",
+                      "remainingSentences": "\\(remainingSentences.count)",
+                      "noticeSource": notice == nil ? "default" : "explicit"
+                  ])
+
+                  // 清空 HTTP 相关状态，切换到系统语音路径继续朗读剩余内容
+              '''.replace('              ', '')
+          )
+
+          replace_once(
+              'Readori/Services/TTSService.swift',
+              '''        httpAudioPlayer = player
+                  switch state {
+              '''.replace('              ', ''),
+              '''        httpAudioPlayer = player
+                  if httpSentenceIndex == 0 {
+                      diagLog(.info, .general, "TTS online audio player ready", ctx: [
+                          "configuredProvider": String(describing: config.providerType),
+                          "sentence": "\\(httpSentenceIndex)",
+                          "bytes": "\\(data.count)",
+                          "durationMs": "\\(max(0, Int((player.duration * 1_000).rounded())))",
+                          "rateOverride": playbackRateOverride.map { String(format: "%.2f", $0) } ?? "none"
+                      ])
+                  }
+                  switch state {
+              '''.replace('              ', '')
+          )
+          PY
+
+      - name: Validate source contracts
+        working-directory: app
+        run: |
+          set -euo pipefail
+          git diff --check
+          grep -q 'wallpaperNavigationAppearance()' Readori/Core/Theme/AppThemeManager.swift
+          grep -q 'toolbarBackground(.visible, for: .navigationBar)' Readori/UI/Common/ViewExtensions.swift
+          grep -q 'Adaptive page surface appeared' Readori/UI/Common/ViewExtensions.swift
+          grep -q 'AI narration worker audio received' Readori/Services/TTS/ReadoriAITTSClient.swift
+          grep -q 'TTS fallback to system' Readori/Services/TTSService.swift
+          grep -q 'TTS online audio player ready' Readori/Services/TTSService.swift
+          if [[ -f Readori/Scripts/verify_ai_narration_v3.py ]]; then
+            python3 Readori/Scripts/verify_ai_narration_v3.py
+          fi
+
+      - name: Swift syntax parse
+        working-directory: app
+        run: |
+          set -euo pipefail
+          for file in \
+            Readori/Core/Theme/AppThemeManager.swift \
+            Readori/UI/Common/ViewExtensions.swift \
+            Readori/UI/Settings/SettingsView.swift \
+            Readori/Services/TTS/ReadoriAITTSClient.swift \
+            Readori/Services/TTSService.swift; do
+            xcrun swiftc -parse "$file"
+            echo "Swift parse PASS: $file"
+          done
+
+      - name: Commit and push private master
+        working-directory: app
+        run: |
+          set -euo pipefail
+          git fetch origin master --depth=20
+          [[ "$(git rev-parse origin/master)" == "$EXPECTED_BASE" ]] || {
+            echo "::error::readori/master changed during validation; refusing to overwrite concurrent work"
+            exit 1
+          }
+          git config user.name 'OpenAI Agent'
+          git config user.email 'agent@users.noreply.github.com'
+          git add \
+            Readori/Core/Theme/AppThemeManager.swift \
+            Readori/UI/Common/ViewExtensions.swift \
+            Readori/UI/Settings/SettingsView.swift \
+            Readori/Services/TTS/ReadoriAITTSClient.swift \
+            Readori/Services/TTSService.swift
+          git commit -m '修复二级页面顶部闪图并增强诊断日志'
+          if git push origin HEAD:master; then
+            echo 'Private master push via SSH: PASS'
+          else
+            test -n "${TARGET_REPO_PAT:-}" || { echo '::error::SSH push failed and TARGET_REPO_PAT is unavailable'; exit 1; }
+            git remote set-url origin "https://x-access-token:${TARGET_REPO_PAT}@github.com/readori/readori.git"
+            git push origin HEAD:master
+            echo 'Private master push via PAT: PASS'
+          fi
+          echo "NEW_SHA=$(git rev-parse HEAD)"
