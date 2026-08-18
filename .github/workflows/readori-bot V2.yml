@@ -1,4 +1,4 @@
-name: Readori Bot · Public CI → Private Source → Cloudflare
+name: Readori Bot V2
 
 # Runs entirely in the PUBLIC repository readori/test-env-setup.
 # No new GitHub Secrets are required.
