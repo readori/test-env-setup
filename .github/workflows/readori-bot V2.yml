@@ -1,0 +1,657 @@
+name: Readori Bot V2
+
+# Runs entirely in the PUBLIC repository readori/test-env-setup.
+# No new GitHub Secrets are required.
+#
+# Existing public-repo secrets used:
+#   TARGET_REPO_PAT
+#   CLOUDFLARE_ACCOUNT_ID
+#   CLOUDFLARE_API_TOKEN
+#   READORI_SOCIAL_WORKER_ENDPOINT   # optional health check, already exists
+#
+# Existing Worker secrets (BOT_TOKEN / APPLE_IAP_* / PRO_LEASE_* / etc.)
+# remain stored on Cloudflare and are NOT copied into this workflow.
+# Azure Entra regional fallback bindings also remain on the existing Worker.
+# Cloudflare Wrangler deployments preserve secrets; --keep-vars preserves
+# remote dashboard vars that are intentionally not represented in wrangler.toml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bot_ref:
+        description: "readori/readoritgbot branch / tag / SHA"
+        required: true
+        default: "main"
+        type: string
+      mode:
+        description: "validate = test + dry-run only; deploy = migrations + deploy"
+        required: true
+        default: "deploy"
+        type: choice
+        options:
+          - validate
+          - deploy
+      run_migrations:
+        description: "Apply remote D1 migrations before deploy"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: readori-bot-cloudflare-production
+  cancel-in-progress: false
+
+env:
+  BOT_REPOSITORY: readori/readoritgbot
+  BOT_DIR: bot
+  WORKER_NAME: bot-readori
+  D1_DATABASE_NAME: tg-bot-db
+  KV_NAMESPACE_TITLE: SENT_RECORDS
+
+jobs:
+  bot:
+    name: Validate and deploy Readori Bot
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+    steps:
+      # ============================================================
+      # 1. Validate only the secrets that already exist in PUBLIC CI
+      # ============================================================
+      - name: Validate public CI credentials
+        shell: bash
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || missing+=("TARGET_REPO_PAT")
+          [[ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]] || missing+=("CLOUDFLARE_ACCOUNT_ID")
+          [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]] || missing+=("CLOUDFLARE_API_TOKEN")
+
+          if (( ${#missing[@]} )); then
+            echo "::error::Missing existing public-repo secret(s): ${missing[*]}"
+            exit 1
+          fi
+
+          echo "Public CI credentials: PASS"
+
+      # ============================================================
+      # 2. Checkout PRIVATE bot source with existing TARGET_REPO_PAT
+      # ============================================================
+      - name: Checkout private readori/readoritgbot
+        uses: actions/checkout@v6
+        with:
+          repository: readori/readoritgbot
+          ref: ${{ inputs.bot_ref }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: bot
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify private source
+        working-directory: bot
+        shell: bash
+        run: |
+          set -euo pipefail
+          required_files=(
+            package.json
+            wrangler.toml.template
+            src/index.js
+            src/tts/index.js
+            src/azure-entry.js
+            src/azure-regional-entry.js
+            test/tts-semantic-controls.test.js
+          )
+
+          missing=()
+          for file in "${required_files[@]}"; do
+            [[ -f "$file" ]] || missing+=("$file")
+          done
+
+          if (( ${#missing[@]} )); then
+            echo "::error::Private bot source is missing required file(s): ${missing[*]}"
+            exit 1
+          fi
+
+          # Production must stay on the regional Entra wrapper.  This is the
+          # path that produced provider=azure-entra-regional in Build 45.
+          grep -Eq '^main[[:space:]]*=[[:space:]]*"src/azure-regional-entry\.js"[[:space:]]*$' wrangler.toml.template || {
+            echo "::error::wrangler.toml.template is not deploying src/azure-regional-entry.js"
+            exit 1
+          }
+
+          # Guard the semantic-v5 fix in all three TTS execution paths.
+          for file in src/tts/index.js src/azure-entry.js src/azure-regional-entry.js; do
+            grep -q 'semantic-v5' "$file" || {
+              echo "::error::$file does not contain semantic-v5"
+              exit 1
+            }
+            grep -q 'x-readori-tts-style-applied' "$file" || {
+              echo "::error::$file is missing semantic response diagnostics"
+              exit 1
+            }
+          done
+
+          echo "Private repo checkout + TTS source guards: PASS"
+          echo "Commit: $(git rev-parse HEAD)"
+          echo "Short SHA: $(git rev-parse --short HEAD)"
+
+      # ============================================================
+      # 3. Node + tests
+      # ============================================================
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          # This production deployment handles Cloudflare credentials.
+          # Disable setup-node automatic package-manager caching so the job
+          # does not depend on package-lock.json being committed/present.
+          package-manager-cache: false
+
+      - name: Verify Node.js runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Node: $(node --version)"
+          echo "npm:  $(npm --version)"
+          [[ "$(node --version)" == v24.* ]] || {
+            echo "::error::Expected Node.js 24.x"
+            exit 1
+          }
+
+      - name: Install dependencies
+        working-directory: bot
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f package-lock.json ]]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Lint
+        working-directory: bot
+        run: npm run lint --if-present
+
+      - name: Test
+        working-directory: bot
+        run: npm test
+
+      - name: JavaScript syntax check
+        working-directory: bot
+        shell: bash
+        run: |
+          set -euo pipefail
+          found=0
+          while IFS= read -r -d '' file; do
+            found=1
+            node --check "$file"
+          done < <(find src scripts -type f \( -name '*.js' -o -name '*.mjs' \) -print0 2>/dev/null || true)
+
+          [[ "$found" -eq 1 ]] || echo "::notice::No JS files found under src/scripts"
+          echo "JavaScript syntax: PASS"
+
+      # ============================================================
+      # 4. Discover EXISTING Cloudflare resources.
+      #    No D1_DATABASE_ID / KV_NAMESPACE_ID GitHub secrets needed.
+      # ============================================================
+      - name: Discover existing D1 and KV IDs
+        id: cloudflare_resources
+        working-directory: bot
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Wrangler:"
+          npx wrangler --version
+
+          # ---------- D1 ----------
+          # Resolve the existing production D1 by its stable database name.
+          D1_JSON="$(npx wrangler d1 list --json)"
+          D1_ID="$(
+            printf '%s' "$D1_JSON" |
+              jq -r --arg name "$D1_DATABASE_NAME" '
+                .[]
+                | select(.name == $name)
+                | (.uuid // .id // empty)
+              ' |
+              head -n 1
+          )"
+
+          if [[ -z "$D1_ID" || "$D1_ID" == "null" ]]; then
+            echo "::error::Existing D1 database '$D1_DATABASE_NAME' was not found."
+            exit 1
+          fi
+
+          # ---------- KV ----------
+          # IMPORTANT: SENT_RECORDS is the WORKER BINDING NAME, not necessarily
+          # the Cloudflare KV namespace title. Read the already-deployed
+          # bot-readori Worker settings and recover the exact namespace_id
+          # attached to binding SENT_RECORDS. This avoids adding/copying any
+          # KV_NAMESPACE_ID GitHub secret and cannot accidentally create a new KV.
+          WORKER_SETTINGS="$(
+            curl --fail --silent --show-error \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${WORKER_NAME}/settings"
+          )"
+
+          SETTINGS_SUCCESS="$(printf '%s' "$WORKER_SETTINGS" | jq -r '.success // false')"
+          if [[ "$SETTINGS_SUCCESS" != "true" ]]; then
+            echo "::error::Unable to read settings for existing Worker '$WORKER_NAME'."
+            printf '%s' "$WORKER_SETTINGS" | jq -c '{success,errors,messages}' || true
+            exit 1
+          fi
+
+          KV_ID="$(
+            printf '%s' "$WORKER_SETTINGS" |
+              jq -r --arg binding "$KV_NAMESPACE_TITLE" '
+                .result.bindings[]?
+                | select(.type == "kv_namespace" and .name == $binding)
+                | .namespace_id
+              ' |
+              head -n 1
+          )"
+
+          if [[ -z "$KV_ID" || "$KV_ID" == "null" ]]; then
+            echo "::error::Worker '$WORKER_NAME' does not currently have KV binding '$KV_NAMESPACE_TITLE'."
+            echo "::error::Existing bindings returned by Cloudflare:"
+            printf '%s' "$WORKER_SETTINGS" |
+              jq -r '.result.bindings[]? | "  - \(.name // "?") [\(.type // "?")]"' || true
+            echo "::error::No KV namespace will be created or replaced automatically."
+            exit 1
+          fi
+
+          echo "D1 database: $D1_DATABASE_NAME"
+          echo "KV binding: $KV_NAMESPACE_TITLE (existing Worker binding recovered)"
+
+          # Resource IDs are intentionally not printed. They only live in the
+          # runner environment long enough to render wrangler.toml.
+          {
+            echo "D1_DATABASE_ID=$D1_ID"
+            echo "KV_NAMESPACE_ID=$KV_ID"
+            echo "KV_PREVIEW_NAMESPACE_ID=$KV_ID"
+          } >> "$GITHUB_ENV"
+
+          echo "Existing Cloudflare resources: PASS"
+
+      # ============================================================
+      # 5. Render the PRIVATE repository's wrangler template
+      # ============================================================
+      - name: Render wrangler.toml
+        working-directory: bot
+        shell: bash
+        env:
+          AI_TTS_OPENAI_ENABLED: ${{ vars.AI_TTS_OPENAI_ENABLED }}
+          AI_TTS_AZURE_ENABLED: ${{ vars.AI_TTS_AZURE_ENABLED }}
+          AI_TTS_AZURE_PREFERRED_FOR_NATURAL: ${{ vars.AI_TTS_AZURE_PREFERRED_FOR_NATURAL }}
+          AI_TTS_ORACLE_EDGE_ENABLED: ${{ vars.AI_TTS_ORACLE_EDGE_ENABLED }}
+          ORACLE_EDGE_TTS_URL: ${{ vars.ORACLE_EDGE_TTS_URL }}
+          AI_TTS_AZURE_VOICE_ZH_CN: ${{ vars.AI_TTS_AZURE_VOICE_ZH_CN }}
+          AI_TTS_AZURE_VOICE_ZH_TW: ${{ vars.AI_TTS_AZURE_VOICE_ZH_TW }}
+          AI_TTS_AZURE_VOICE_EN_US: ${{ vars.AI_TTS_AZURE_VOICE_EN_US }}
+          AI_TTS_AZURE_VOICE_JA_JP: ${{ vars.AI_TTS_AZURE_VOICE_JA_JP }}
+          AI_TTS_AZURE_VOICE_KO_KR: ${{ vars.AI_TTS_AZURE_VOICE_KO_KR }}
+          AI_TTS_AZURE_VOICE_FR_FR: ${{ vars.AI_TTS_AZURE_VOICE_FR_FR }}
+          AI_TTS_AZURE_VOICE_ES_ES: ${{ vars.AI_TTS_AZURE_VOICE_ES_ES }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          template_path = Path("wrangler.toml.template")
+          if not template_path.is_file():
+              raise SystemExit("wrangler.toml.template is missing")
+
+          text = template_path.read_text(encoding="utf-8")
+
+          # The template is the source of truth for plain vars.
+          # Azure Entra regional credentials/region/resource-id intentionally remain
+          # remote Worker bindings and are NOT rendered from public-repo variables.
+          values = {
+              "KV_NAMESPACE_ID": os.environ["KV_NAMESPACE_ID"],
+              "KV_PREVIEW_NAMESPACE_ID": os.environ.get("KV_PREVIEW_NAMESPACE_ID") or os.environ["KV_NAMESPACE_ID"],
+              "D1_DATABASE_ID": os.environ["D1_DATABASE_ID"],
+
+              "AI_TTS_OPENAI_ENABLED": os.environ.get("AI_TTS_OPENAI_ENABLED", "").strip() or "false",
+              "AI_TTS_AZURE_ENABLED": os.environ.get("AI_TTS_AZURE_ENABLED", "").strip() or "false",
+              "AI_TTS_AZURE_PREFERRED_FOR_NATURAL": os.environ.get("AI_TTS_AZURE_PREFERRED_FOR_NATURAL", "").strip() or "false",
+
+              "AI_TTS_ORACLE_EDGE_ENABLED": os.environ.get("AI_TTS_ORACLE_EDGE_ENABLED", "").strip() or "false",
+              "ORACLE_EDGE_TTS_URL": os.environ.get("ORACLE_EDGE_TTS_URL", "").strip(),
+
+              "AI_TTS_AZURE_VOICE_ZH_CN": os.environ.get("AI_TTS_AZURE_VOICE_ZH_CN", "").strip(),
+              "AI_TTS_AZURE_VOICE_ZH_TW": os.environ.get("AI_TTS_AZURE_VOICE_ZH_TW", "").strip(),
+              "AI_TTS_AZURE_VOICE_EN_US": os.environ.get("AI_TTS_AZURE_VOICE_EN_US", "").strip(),
+              "AI_TTS_AZURE_VOICE_JA_JP": os.environ.get("AI_TTS_AZURE_VOICE_JA_JP", "").strip(),
+              "AI_TTS_AZURE_VOICE_KO_KR": os.environ.get("AI_TTS_AZURE_VOICE_KO_KR", "").strip(),
+              "AI_TTS_AZURE_VOICE_FR_FR": os.environ.get("AI_TTS_AZURE_VOICE_FR_FR", "").strip(),
+              "AI_TTS_AZURE_VOICE_ES_ES": os.environ.get("AI_TTS_AZURE_VOICE_ES_ES", "").strip(),
+          }
+
+          for key, value in values.items():
+              safe = str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\r", "").replace("\n", "")
+              text = text.replace(f"__{key}__", safe)
+
+          unresolved = []
+          for token in set(part for part in text.replace('"', ' ').split() if "__" in part):
+              unresolved.append(token)
+          if unresolved:
+              raise SystemExit(f"Unresolved wrangler placeholders: {sorted(unresolved)}")
+
+          Path("wrangler.toml").write_text(text, encoding="utf-8")
+          print("wrangler.toml rendered")
+          PY
+
+          echo "Rendered configuration bindings:"
+          grep -E '^(name|main|binding|database_name|AI_TTS_.*ENABLED)' wrangler.toml || true
+
+          grep -Eq '^main[[:space:]]*=[[:space:]]*"src/azure-regional-entry\.js"[[:space:]]*$' wrangler.toml || {
+            echo "::error::Rendered wrangler.toml lost the production Azure regional entry"
+            exit 1
+          }
+
+          # These values belong to the existing Cloudflare Worker, never to the
+          # generated public-CI wrangler configuration.  Comments are allowed;
+          # actual assignments are not.
+          for name in AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET AZURE_SPEECH_REGION AZURE_SPEECH_RESOURCE_ID AZURE_SPEECH_ENDPOINT; do
+            if grep -Eq "^[[:space:]]*${name}[[:space:]]*=" wrangler.toml; then
+              echo "::error::$name must not be emitted into wrangler.toml"
+              exit 1
+            fi
+          done
+
+          echo "Rendered Wrangler TTS guards: PASS"
+
+      # ============================================================
+      # 6. Confirm existing Worker bindings on Cloudflare.
+      #    IMPORTANT for the integrated bot:
+      #    src/azure-regional-entry.js is the production entry and its Entra
+      #    fallback is independent from AI_TTS_AZURE_ENABLED. Therefore the
+      #    Entra bindings must exist even when the direct key-based Azure
+      #    provider is disabled. Values remain hidden and are never copied.
+      # ============================================================
+      - name: Verify existing Cloudflare Worker bindings
+        working-directory: bot
+        shell: bash
+        env:
+          AI_TTS_OPENAI_ENABLED: ${{ vars.AI_TTS_OPENAI_ENABLED }}
+          AI_TTS_AZURE_ENABLED: ${{ vars.AI_TTS_AZURE_ENABLED }}
+          AI_TTS_ORACLE_EDGE_ENABLED: ${{ vars.AI_TTS_ORACLE_EDGE_ENABLED }}
+          ORACLE_EDGE_TTS_URL: ${{ vars.ORACLE_EDGE_TTS_URL }}
+        run: |
+          set -euo pipefail
+
+          SECRET_JSON="$(npx wrangler secret list --name "$WORKER_NAME" --format json)"
+          SETTINGS_JSON="$(
+            curl --fail --silent --show-error \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${WORKER_NAME}/settings"
+          )"
+
+          SETTINGS_SUCCESS="$(printf '%s' "$SETTINGS_JSON" | jq -r '.success // false')"
+          [[ "$SETTINGS_SUCCESS" == "true" ]] || {
+            echo "::error::Unable to inspect existing Worker bindings."
+            printf '%s' "$SETTINGS_JSON" | jq -c '{success,errors,messages}' || true
+            exit 1
+          }
+
+          has_secret() {
+            printf '%s' "$SECRET_JSON" | jq -e --arg name "$1" '.[] | select(.name == $name)' >/dev/null
+          }
+
+          has_binding_name() {
+            printf '%s' "$SETTINGS_JSON" | jq -e --arg name "$1" '.result.bindings[]? | select(.name == $name)' >/dev/null
+          }
+
+          has_remote_name() {
+            has_secret "$1" || has_binding_name "$1"
+          }
+
+          enabled() {
+            case "${1,,}" in
+              1|true|yes|on) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          core_required=(
+            BOT_TOKEN
+            WEBHOOK_SECRET
+            ADMIN_SECRET
+            APPLE_IAP_KEY_ID
+            APPLE_IAP_ISSUER_ID
+            APPLE_IAP_PRIVATE_KEY
+            PRO_LEASE_PRIVATE_KEY_JWK
+            DEVICE_CHALLENGE_SECRET
+            APPLE_ALLOW_SANDBOX_IAP
+          )
+
+          # Required by src/azure-entry.js + src/azure-regional-entry.js.
+          # AZURE_SPEECH_ENDPOINT is optional because the regional fallback
+          # constructs the endpoint from AZURE_SPEECH_REGION.
+          entra_required=(
+            AZURE_TENANT_ID
+            AZURE_CLIENT_ID
+            AZURE_CLIENT_SECRET
+            AZURE_SPEECH_REGION
+            AZURE_SPEECH_RESOURCE_ID
+          )
+
+          missing=()
+          for name in "${core_required[@]}"; do
+            has_secret "$name" || missing+=("$name")
+          done
+
+          for name in "${entra_required[@]}"; do
+            has_remote_name "$name" || missing+=("$name")
+          done
+
+          # Optional direct providers become mandatory only when their public
+          # enable switch says they are intended to be active.
+          if enabled "${AI_TTS_OPENAI_ENABLED:-false}"; then
+            has_secret OPENAI_API_KEY || missing+=("OPENAI_API_KEY")
+          fi
+
+          # AI_TTS_AZURE_ENABLED controls only the legacy/direct subscription-key
+          # Azure provider in src/tts/index.js.  The production Entra fallback is
+          # separate and already validated above, so a missing AZURE_SPEECH_KEY
+          # is a notice rather than a deployment blocker.
+          if enabled "${AI_TTS_AZURE_ENABLED:-false}" && ! has_secret AZURE_SPEECH_KEY; then
+            echo "::notice::AI_TTS_AZURE_ENABLED is true but AZURE_SPEECH_KEY is absent; direct key-based Azure will be skipped, while Entra regional fallback remains available."
+          fi
+
+          if enabled "${AI_TTS_ORACLE_EDGE_ENABLED:-false}"; then
+            has_secret ORACLE_EDGE_TTS_TOKEN || missing+=("ORACLE_EDGE_TTS_TOKEN")
+            [[ -n "${ORACLE_EDGE_TTS_URL:-}" ]] || missing+=("ORACLE_EDGE_TTS_URL(var)")
+          fi
+
+          if (( ${#missing[@]} )); then
+            echo "::error::Existing Worker/provider configuration is incomplete: ${missing[*]}"
+            echo "::error::No secret value is copied by this public workflow; repair the existing Cloudflare Worker bindings instead."
+            exit 1
+          fi
+
+          echo "Core Worker secrets: PASS (${#core_required[@]})"
+          echo "Azure Entra regional fallback bindings: PASS (${#entra_required[@]})"
+          echo "Conditional provider bindings: PASS"
+
+      # ============================================================
+      # 7. Build-only Wrangler validation
+      # ============================================================
+      - name: Wrangler dry-run
+        working-directory: bot
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/readori-bot-dry-run
+          npx wrangler deploy \
+            --dry-run \
+            --outdir /tmp/readori-bot-dry-run \
+            --keep-vars
+
+          # Verify the bundle Wrangler is about to ship actually contains the
+          # semantic-v5 regional Azure implementation, not merely the source tree.
+          grep -Rqs 'azure-regional-fallback-v4.2-20260818+semantic-v5' /tmp/readori-bot-dry-run || {
+            echo "::error::Dry-run bundle does not contain the semantic-v5 Azure regional revision"
+            exit 1
+          }
+          grep -Rqs 'x-readori-tts-style-applied' /tmp/readori-bot-dry-run || {
+            echo "::error::Dry-run bundle does not contain semantic TTS response diagnostics"
+            exit 1
+          }
+
+          echo "Wrangler dry-run + bundled TTS semantic guards: PASS"
+
+      - name: Stop after validate
+        if: ${{ inputs.mode == 'validate' }}
+        run: |
+          echo "Validation completed."
+          echo "No Cloudflare Worker code, D1 migration, or secret was changed."
+
+      # ============================================================
+      # 8. D1 migrations
+      # ============================================================
+      - name: Apply D1 migrations
+        if: ${{ inputs.mode == 'deploy' && inputs.run_migrations }}
+        working-directory: bot
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx wrangler d1 migrations apply "$D1_DATABASE_NAME" --remote
+
+      - name: Verify required D1 tables
+        if: ${{ inputs.mode == 'deploy' }}
+        working-directory: bot
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="$(
+            npx wrangler d1 execute "$D1_DATABASE_NAME" \
+              --remote \
+              --command="SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"
+          )"
+
+          required_tables=(
+            coupon_codes
+            ordinary_coupon_claims
+            send_records
+            bind_codes
+            social_bindings
+            reading_sessions
+            reading_session_dedup
+            user_cultivation
+            daily_reading_stats
+            cultivation_logs
+            user_finished_books
+            pro_applications
+            app_devices
+            pro_purchases
+            pro_devices
+            pro_device_activation_history
+            pro_reward_codes
+            level24_pro_rewards
+            ai_tts_daily_usage
+            ai_tts_global_daily_usage
+            ai_tts_provider_health
+          )
+
+          missing=()
+          for table in "${required_tables[@]}"; do
+            grep -q "$table" <<<"$OUT" || missing+=("$table")
+          done
+
+          if (( ${#missing[@]} )); then
+            echo "::error::Missing required D1 table(s): ${missing[*]}"
+            exit 1
+          fi
+
+          echo "Required D1 tables: PASS (${#required_tables[@]})"
+
+      # ============================================================
+      # 9. Deploy code/config only.
+      #
+      # IMPORTANT:
+      # - No `wrangler secret put` here.
+      # - Existing Worker secrets are preserved by Wrangler deployment.
+      # - --keep-vars also preserves remote plain-text vars not represented
+      #   in this config, while applying the TTS vars rendered above.
+      # ============================================================
+      - name: Deploy Cloudflare Worker
+        if: ${{ inputs.mode == 'deploy' }}
+        working-directory: bot
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx wrangler deploy --keep-vars
+
+      # ============================================================
+      # 10. Health check using EXISTING public-repo endpoint secret
+      # ============================================================
+      - name: Health check
+        if: ${{ inputs.mode == 'deploy' }}
+        shell: bash
+        env:
+          READORI_SOCIAL_WORKER_ENDPOINT: ${{ secrets.READORI_SOCIAL_WORKER_ENDPOINT }}
+        run: |
+          set -euo pipefail
+
+          BASE="${READORI_SOCIAL_WORKER_ENDPOINT:-}"
+          if [[ -z "$BASE" ]]; then
+            echo "::notice::READORI_SOCIAL_WORKER_ENDPOINT is empty; deployment succeeded, HTTP health check skipped."
+            exit 0
+          fi
+
+          BASE="${BASE%/}"
+
+          for attempt in 1 2 3 4 5; do
+            if curl --fail --silent --show-error --max-time 15 \
+                 "$BASE/health" > /tmp/readori-health.json; then
+              cat /tmp/readori-health.json
+              echo
+              echo "Worker health check: PASS"
+              exit 0
+            fi
+            echo "Health attempt $attempt failed; retrying..."
+            sleep 3
+          done
+
+          echo "::error::Worker deployed but /health did not become healthy."
+          exit 1
+
+      # ============================================================
+      # 11. Summary
+      # ============================================================
+      - name: Summary
+        if: ${{ always() }}
+        working-directory: bot
+        shell: bash
+        run: |
+          {
+            echo "## Readori Bot"
+            echo
+            echo "- CI repository: \`${{ github.repository }}\`"
+            echo "- Source: \`$BOT_REPOSITORY\`"
+            echo "- Ref: \`${{ inputs.bot_ref }}\`"
+            echo "- SHA: \`$(git rev-parse --short HEAD 2>/dev/null || echo unknown)\`"
+            echo "- Mode: \`${{ inputs.mode }}\`"
+            echo "- Worker: \`$WORKER_NAME\`"
+            echo "- D1: \`$D1_DATABASE_NAME\`"
+            echo "- KV: \`$KV_NAMESPACE_TITLE\`"
+            echo "- Production entry guard: \`src/azure-regional-entry.js\`"
+            echo "- TTS semantic guard: \`semantic-v5\`"
+            echo "- Existing Cloudflare Worker secret values were not copied or modified."
+          } >> "$GITHUB_STEP_SUMMARY"
