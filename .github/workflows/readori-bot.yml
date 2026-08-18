@@ -178,6 +178,7 @@ jobs:
           npx wrangler --version
 
           # ---------- D1 ----------
+          # Resolve the existing production D1 by its stable database name.
           D1_JSON="$(npx wrangler d1 list --json)"
           D1_ID="$(
             printf '%s' "$D1_JSON" |
@@ -195,44 +196,49 @@ jobs:
           fi
 
           # ---------- KV ----------
-          # Cloudflare KV namespace IDs are not secrets. We discover the
-          # existing production namespace by its title instead of duplicating
-          # the ID into another GitHub repository.
-          KV_JSON="$(
+          # IMPORTANT: SENT_RECORDS is the WORKER BINDING NAME, not necessarily
+          # the Cloudflare KV namespace title. Read the already-deployed
+          # bot-readori Worker settings and recover the exact namespace_id
+          # attached to binding SENT_RECORDS. This avoids adding/copying any
+          # KV_NAMESPACE_ID GitHub secret and cannot accidentally create a new KV.
+          WORKER_SETTINGS="$(
             curl --fail --silent --show-error \
               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
               -H "Content-Type: application/json" \
-              "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/storage/kv/namespaces?per_page=100"
+              "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${WORKER_NAME}/settings"
           )"
 
-          KV_SUCCESS="$(printf '%s' "$KV_JSON" | jq -r '.success // false')"
-          if [[ "$KV_SUCCESS" != "true" ]]; then
-            echo "::error::Cloudflare KV namespace listing failed."
-            printf '%s' "$KV_JSON" | jq -c '{success,errors,messages}' || true
+          SETTINGS_SUCCESS="$(printf '%s' "$WORKER_SETTINGS" | jq -r '.success // false')"
+          if [[ "$SETTINGS_SUCCESS" != "true" ]]; then
+            echo "::error::Unable to read settings for existing Worker '$WORKER_NAME'."
+            printf '%s' "$WORKER_SETTINGS" | jq -c '{success,errors,messages}' || true
             exit 1
           fi
 
           KV_ID="$(
-            printf '%s' "$KV_JSON" |
-              jq -r --arg title "$KV_NAMESPACE_TITLE" '
-                .result[]
-                | select(.title == $title)
-                | .id
+            printf '%s' "$WORKER_SETTINGS" |
+              jq -r --arg binding "$KV_NAMESPACE_TITLE" '
+                .result.bindings[]?
+                | select(.type == "kv_namespace" and .name == $binding)
+                | .namespace_id
               ' |
               head -n 1
           )"
 
           if [[ -z "$KV_ID" || "$KV_ID" == "null" ]]; then
-            echo "::error::Existing KV namespace '$KV_NAMESPACE_TITLE' was not found."
-            echo "::error::No new namespace will be auto-created."
+            echo "::error::Worker '$WORKER_NAME' does not currently have KV binding '$KV_NAMESPACE_TITLE'."
+            echo "::error::Existing bindings returned by Cloudflare:"
+            printf '%s' "$WORKER_SETTINGS" |
+              jq -r '.result.bindings[]? | "  - \(.name // "?") [\(.type // "?")]"' || true
+            echo "::error::No KV namespace will be created or replaced automatically."
             exit 1
           fi
 
           echo "D1 database: $D1_DATABASE_NAME"
-          echo "KV namespace: $KV_NAMESPACE_TITLE"
+          echo "KV binding: $KV_NAMESPACE_TITLE (existing Worker binding recovered)"
 
-          # IDs are resource identifiers, not secret values, but do not need to
-          # print them to the log.
+          # Resource IDs are intentionally not printed. They only live in the
+          # runner environment long enough to render wrangler.toml.
           {
             echo "D1_DATABASE_ID=$D1_ID"
             echo "KV_NAMESPACE_ID=$KV_ID"
