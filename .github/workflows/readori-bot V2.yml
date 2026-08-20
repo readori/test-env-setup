@@ -1,4 +1,4 @@
-name: Readori Bot · V2
+name: Readori Bot V2
 
 # Runs entirely in the PUBLIC repository readori/test-env-setup.
 # No new GitHub Secrets are required.
@@ -107,6 +107,7 @@ jobs:
             src/tts/index.js
             src/entitlement/index.js
             src/growth/referral.js
+            src/growth/voice-pass-og.js
             src/azure-entry.js
             src/azure-regional-entry.js
             migrations/0014_bot_admin_operations.sql
@@ -335,6 +336,7 @@ jobs:
             APPLE_IAP_KEY_ID
             APPLE_IAP_ISSUER_ID
             APPLE_ALLOW_SANDBOX_IAP
+            READORI_APP_TEAM_ID
           )
 
           missing=()
@@ -373,8 +375,8 @@ jobs:
             --outdir /tmp/readori-bot-dry-run \
             --keep-vars
 
-          grep -Rqs 'readori-bot-clean-production-v1.1-growth-integrated-v1-20260820' /tmp/readori-bot-dry-run || {
-            echo "::error::Dry-run bundle is missing unified Growth-integrated production revision"
+          grep -Rqs 'readori-bot-clean-production-v1.1-production-complete-v1-20260820' /tmp/readori-bot-dry-run || {
+            echo "::error::Dry-run bundle is missing Production Complete revision"
             exit 1
           }
           grep -Rqs 'bot-admin-operations-v1.1-20260820' /tmp/readori-bot-dry-run || {
@@ -383,6 +385,14 @@ jobs:
           }
           grep -Rqs 'growth_referral_claims_enabled' /tmp/readori-bot-dry-run || {
             echo "::error::Dry-run bundle is missing Voice Pass runtime operations controls"
+            exit 1
+          }
+          grep -Rqs 'apple-app-site-association' /tmp/readori-bot-dry-run || {
+            echo "::error::Dry-run bundle is missing Universal Link AASA routes"
+            exit 1
+          }
+          grep -Rqs 'voice-pass/og.jpg' /tmp/readori-bot-dry-run || {
+            echo "::error::Dry-run bundle is missing Voice Pass social preview asset route"
             exit 1
           }
           grep -Rqs 'x-readori-tts-style-applied' /tmp/readori-bot-dry-run || {
