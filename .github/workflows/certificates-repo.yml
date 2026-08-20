@@ -168,7 +168,7 @@ jobs:
       - name: Install pinned Fastlane
         run: |
           set -euo pipefail
-          sudo gem install fastlane -v 2.237.0 --no-document
+          sudo gem install fastlane -v 2.238.0 --no-document
           fastlane --version
 
       # ============================================================
@@ -274,19 +274,33 @@ jobs:
             --api_key_path /tmp/asc_api_key.json
           )
 
+          # The app repository's historical fastlane/Matchfile may contain
+          # readonly(true). Never rely on Matchfile defaults here: write modes
+          # explicitly override readonly both through MATCH_READONLY and CLI.
+          # The final Fastlane summary MUST show readonly=false for write modes.
           case "$SIGNING_MODE" in
             readonly)
-              fastlane match "${COMMON_ARGS[@]}" --readonly
+              MATCH_READONLY=true \
+                fastlane match "${COMMON_ARGS[@]}" --readonly true
               ;;
             bootstrap_empty)
               # Repository emptiness and explicit WRITE confirmation were checked above.
-              fastlane match "${COMMON_ARGS[@]}"
+              # This mode is allowed to create the initial Apple Distribution identity
+              # and provisioning profile and persist them into the Match repository.
+              MATCH_READONLY=false MATCH_GENERATE_APPLE_CERTS=true \
+                fastlane match "${COMMON_ARGS[@]}" \
+                  --readonly false \
+                  --generate_apple_certs true
               ;;
             refresh_profile)
-              # Regenerates the App Store provisioning profile while reusing the
-              # existing Match certificate. Use after enabling capabilities such
-              # as Associated Domains on the App ID.
-              fastlane match "${COMMON_ARGS[@]}" --force
+              # Capability refresh is a WRITE operation. If the Match repository has
+              # no currently valid Apple Distribution identity, non-readonly Match is
+              # also allowed to create one before regenerating the App Store profile.
+              MATCH_READONLY=false MATCH_GENERATE_APPLE_CERTS=true \
+                fastlane match "${COMMON_ARGS[@]}" \
+                  --readonly false \
+                  --generate_apple_certs true \
+                  --force
               ;;
           esac
 
