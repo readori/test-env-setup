@@ -136,15 +136,61 @@ jobs:
           echo "::add-mask::$MATCH_AUTH"
           echo "MATCH_GIT_BASIC_AUTHORIZATION=$MATCH_AUTH" >> "$GITHUB_ENV"
 
+          # Inspect refs without assuming `main` already exists. The clean-reset
+          # contract standardizes Match on `main`, but a recreated empty repo or an
+          # old repository whose only branch is `master` must still be recoverable.
           git -c http.extraheader="AUTHORIZATION: basic $MATCH_AUTH" \
-            ls-remote "$MATCH_GIT_URL" >/tmp/match-refs.txt || {
+            ls-remote --symref "$MATCH_GIT_URL" HEAD >/tmp/match-head.txt || {
               echo '::error::TARGET_REPO_PAT cannot read readori/readori-certificates.'
               exit 78
             }
+          git -c http.extraheader="AUTHORIZATION: basic $MATCH_AUTH" \
+            ls-remote --heads "$MATCH_GIT_URL" >/tmp/match-heads.txt || {
+              echo '::error::Unable to enumerate branches in readori/readori-certificates.'
+              exit 78
+            }
+
+          DEFAULT_BRANCH="$(sed -n 's#^ref: refs/heads/\([^[:space:]]*\)[[:space:]]HEAD$#\1#p' /tmp/match-head.txt | head -n1)"
+          FIRST_BRANCH="$(awk '{sub("refs/heads/", "", $2); print $2; exit}' /tmp/match-heads.txt)"
+
+          if grep -q $'refs/heads/main$' /tmp/match-heads.txt; then
+            MATCH_MAIN_EXISTS='true'
+            MATCH_REPO_EMPTY='false'
+            MATCH_SOURCE_BRANCH='main'
+          elif [[ -n "$DEFAULT_BRANCH" ]]; then
+            MATCH_MAIN_EXISTS='false'
+            MATCH_REPO_EMPTY='false'
+            MATCH_SOURCE_BRANCH="$DEFAULT_BRANCH"
+          elif [[ -n "$FIRST_BRANCH" ]]; then
+            MATCH_MAIN_EXISTS='false'
+            MATCH_REPO_EMPTY='false'
+            MATCH_SOURCE_BRANCH="$FIRST_BRANCH"
+          else
+            MATCH_MAIN_EXISTS='false'
+            MATCH_REPO_EMPTY='true'
+            MATCH_SOURCE_BRANCH=''
+          fi
+
+          # Production convention: all Readori/CF Mail Match consumers use main.
+          echo 'MATCH_GIT_BRANCH=main' >> "$GITHUB_ENV"
+          echo "MATCH_MAIN_EXISTS=$MATCH_MAIN_EXISTS" >> "$GITHUB_ENV"
+          echo "MATCH_REPO_EMPTY=$MATCH_REPO_EMPTY" >> "$GITHUB_ENV"
+          echo "MATCH_SOURCE_BRANCH=$MATCH_SOURCE_BRANCH" >> "$GITHUB_ENV"
+
           echo 'Match repository HTTPS/TARGET_REPO_PAT access: PASS'
+          echo "Match refs: main_exists=$MATCH_MAIN_EXISTS empty=$MATCH_REPO_EMPTY source=${MATCH_SOURCE_BRANCH:-none}"
+
+          if [[ "$SIGNING_MODE" == 'readonly_verify' && "$MATCH_MAIN_EXISTS" != 'true' ]]; then
+            echo '::error::Match branch main does not exist yet.'
+            echo '::error::Run signing_mode=fresh_bootstrap_both with destructive_confirmation=RESET_ALL_SIGNING to initialize/normalize main.'
+            exit 78
+          fi
 
           if [[ "$SIGNING_MODE" == 'fresh_bootstrap_both' ]]; then
             echo '::notice::TARGET_REPO_PAT must have Contents: Read and write for readori/readori-certificates.'
+            if [[ "$MATCH_MAIN_EXISTS" != 'true' ]]; then
+              echo '::notice::The workflow will create Match branch main automatically.'
+            fi
           fi
 
       # ============================================================
@@ -237,24 +283,49 @@ jobs:
           WORK="$RUNNER_TEMP/readori-match-reset"
           rm -rf "$WORK"
 
-          git -c http.extraheader="AUTHORIZATION: basic $MATCH_GIT_BASIC_AUTHORIZATION" \
-            clone --branch "$MATCH_GIT_BRANCH" "$MATCH_GIT_URL" "$WORK"
+          if [[ "${MATCH_MAIN_EXISTS:-false}" == 'true' ]]; then
+            git -c http.extraheader="AUTHORIZATION: basic $MATCH_GIT_BASIC_AUTHORIZATION" \
+              clone --branch main --single-branch "$MATCH_GIT_URL" "$WORK"
+            cd "$WORK"
+          elif [[ "${MATCH_REPO_EMPTY:-false}" == 'true' ]]; then
+            echo 'Match repository has no branches; initializing main...'
+            mkdir -p "$WORK"
+            cd "$WORK"
+            git init -b main
+            git remote add origin "$MATCH_GIT_URL"
+            git config user.name 'readori-signing-reset'
+            git config user.email 'actions@users.noreply.github.com'
+            printf '%s\n' 'Fastlane Match signing repository initialized by Readori production CI.' > .match-bootstrap
+            git add .match-bootstrap
+            git commit -m 'Initialize Match signing repository'
+          else
+            echo "Match main is missing; normalizing existing branch ${MATCH_SOURCE_BRANCH:-unknown} -> main..."
+            [[ -n "${MATCH_SOURCE_BRANCH:-}" ]] || {
+              echo '::error::No source branch was resolved for Match repository normalization.'
+              exit 78
+            }
+            git -c http.extraheader="AUTHORIZATION: basic $MATCH_GIT_BASIC_AUTHORIZATION" \
+              clone --branch "$MATCH_SOURCE_BRANCH" --single-branch "$MATCH_GIT_URL" "$WORK"
+            cd "$WORK"
+            git switch -C main
+          fi
 
-          cd "$WORK"
-          BEFORE="$(git status --short)"
+          git config user.name 'readori-signing-reset'
+          git config user.email 'actions@users.noreply.github.com'
           rm -rf certs profiles
           git add -A
 
           if git diff --cached --quiet; then
             echo 'Match repository already contains no certs/profiles.'
           else
-            git config user.name 'readori-signing-reset'
-            git config user.email 'actions@users.noreply.github.com'
             git commit -m 'Reset Match signing assets for clean Readori + CF Mail bootstrap'
-            git -c http.extraheader="AUTHORIZATION: basic $MATCH_GIT_BASIC_AUTHORIZATION" \
-              push origin "$MATCH_GIT_BRANCH"
-            echo 'Old Match certs/profiles removed from repository: PASS'
           fi
+
+          # Always push main. Besides creating/normalizing the branch when needed,
+          # this also proves TARGET_REPO_PAT has write permission before Fastlane.
+          git -c http.extraheader="AUTHORIZATION: basic $MATCH_GIT_BASIC_AUTHORIZATION" \
+            push -u origin main
+          echo 'Match main branch prepared and old certs/profiles removed: PASS'
 
       # ============================================================
       # 7A. FRESH BOOTSTRAP
@@ -442,7 +513,7 @@ jobs:
         if: ${{ always() }}
         run: |
           {
-            echo '## Readori signing reset / verification v7'
+            echo '## Readori signing reset / verification v8'
             echo
             echo "- Mode: \`${{ inputs.signing_mode }}\`"
             echo "- Match repo: \`$MATCH_GIT_URL@$MATCH_GIT_BRANCH\`"
