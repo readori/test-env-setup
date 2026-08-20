@@ -1,4 +1,4 @@
-name: Readori Bot V2
+name: Readori Bot · V2
 
 # Runs entirely in the PUBLIC repository readori/test-env-setup.
 # No new GitHub Secrets are required.
@@ -106,12 +106,16 @@ jobs:
             src/admin/operations.js
             src/tts/index.js
             src/entitlement/index.js
+            src/growth/referral.js
             src/azure-entry.js
             src/azure-regional-entry.js
             migrations/0014_bot_admin_operations.sql
             migrations/0015_remove_example_coupon_seeds.sql
+            migrations/0016_growth_referral_voice_pass.sql
+            migrations/0017_growth_admin_operations.sql
             scripts/verify-release.mjs
             test/admin-operations.test.js
+            test/growth-referral.test.js
           )
           missing=()
           for file in "${required_files[@]}"; do
@@ -369,12 +373,16 @@ jobs:
             --outdir /tmp/readori-bot-dry-run \
             --keep-vars
 
-          grep -Rqs 'readori-bot-clean-v1.1-20260820' /tmp/readori-bot-dry-run || {
-            echo "::error::Dry-run bundle is missing Clean Production v1.1 revision"
+          grep -Rqs 'readori-bot-clean-production-v1.1-growth-integrated-v1-20260820' /tmp/readori-bot-dry-run || {
+            echo "::error::Dry-run bundle is missing unified Growth-integrated production revision"
             exit 1
           }
           grep -Rqs 'bot-admin-operations-v1.1-20260820' /tmp/readori-bot-dry-run || {
             echo "::error::Dry-run bundle is missing Bot Admin Operations v1.1"
+            exit 1
+          }
+          grep -Rqs 'growth_referral_claims_enabled' /tmp/readori-bot-dry-run || {
+            echo "::error::Dry-run bundle is missing Voice Pass runtime operations controls"
             exit 1
           }
           grep -Rqs 'x-readori-tts-style-applied' /tmp/readori-bot-dry-run || {
@@ -437,6 +445,10 @@ jobs:
             ai_tts_provider_health
             bot_settings
             bot_admin_audit_log
+            growth_referral_profiles
+            growth_referrals
+            growth_offer_inventory
+            growth_reward_grants
           )
 
           missing=()
@@ -463,6 +475,19 @@ jobs:
             exit 1
           fi
           echo "Demo coupon cleanup: PASS"
+
+          GROWTH_SETTINGS_OUT="$(
+            npx wrangler d1 execute "$D1_DATABASE_NAME" \
+              --remote \
+              --json \
+              --command="SELECT key, value FROM bot_settings WHERE key IN ('growth_referral_claims_enabled','growth_referral_pause_message') ORDER BY key;"
+          )"
+          GROWTH_SETTINGS_COUNT="$(printf '%s' "$GROWTH_SETTINGS_OUT" | jq -r '.[0].results | length // 0')"
+          if [[ "$GROWTH_SETTINGS_COUNT" != "2" ]]; then
+            echo "::error::Voice Pass Bot Operations settings are missing after migrations."
+            exit 1
+          fi
+          echo "Voice Pass Bot Operations settings: PASS"
 
       # ============================================================
       # 9. Deploy code/config only.
@@ -535,5 +560,5 @@ jobs:
             echo "- D1: \`$D1_DATABASE_NAME\`"
             echo "- KV: \`$KV_NAMESPACE_TITLE\`"
             echo "- Existing Cloudflare Worker secret values were not copied or modified."
-            echo "- After the first Operations v1.1 deploy, call POST /setup once with Authorization: Bearer ADMIN_SECRET so Telegram registers callback_query + secret_token."
+            echo "- After this unified Growth deploy, call POST /setup once with Authorization: Bearer ADMIN_SECRET so Telegram refreshes the administrator command menu (including /growth)."
           } >> "$GITHUB_STEP_SUMMARY"
