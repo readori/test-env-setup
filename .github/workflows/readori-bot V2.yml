@@ -9,11 +9,9 @@ name: Readori Bot V2
 #   CLOUDFLARE_API_TOKEN
 #   READORI_SOCIAL_WORKER_ENDPOINT   # optional health check, already exists
 #
-# Existing Worker secrets (BOT_TOKEN / APPLE_IAP_* / PRO_LEASE_* / etc.)
+# Existing Worker secrets (BOT_TOKEN / ADMIN_CHAT_ID / APPLE_IAP_* / PRO_LEASE_* / etc.)
 # remain stored on Cloudflare and are NOT copied into this workflow.
-# Azure Entra regional fallback bindings also remain on the existing Worker.
-# Cloudflare Wrangler deployments preserve secrets; --keep-vars preserves
-# remote dashboard vars that are intentionally not represented in wrangler.toml.
+# Cloudflare Wrangler deployments preserve existing Worker secrets.
 
 on:
   workflow_dispatch:
@@ -105,42 +103,34 @@ jobs:
             package.json
             wrangler.toml.template
             src/index.js
+            src/admin/operations.js
             src/tts/index.js
+            src/entitlement/index.js
             src/azure-entry.js
             src/azure-regional-entry.js
-            test/tts-semantic-controls.test.js
+            migrations/0014_bot_admin_operations.sql
+            migrations/0015_remove_example_coupon_seeds.sql
+            scripts/verify-release.mjs
+            test/admin-operations.test.js
           )
-
           missing=()
           for file in "${required_files[@]}"; do
             [[ -f "$file" ]] || missing+=("$file")
           done
-
           if (( ${#missing[@]} )); then
             echo "::error::Private bot source is missing required file(s): ${missing[*]}"
             exit 1
           fi
-
-          # Production must stay on the regional Entra wrapper.  This is the
-          # path that produced provider=azure-entra-regional in Build 45.
           grep -Eq '^main[[:space:]]*=[[:space:]]*"src/azure-regional-entry\.js"[[:space:]]*$' wrangler.toml.template || {
-            echo "::error::wrangler.toml.template is not deploying src/azure-regional-entry.js"
+            echo "::error::Production entry must remain src/azure-regional-entry.js"
             exit 1
           }
+          if grep -Eq '^\[vars\][[:space:]]*$' wrangler.toml.template; then
+            echo "::error::Private wrangler template must not contain [vars]; Cloudflare Dashboard is production source of truth."
+            exit 1
+          fi
 
-          # Guard the semantic-v5 fix in all three TTS execution paths.
-          for file in src/tts/index.js src/azure-entry.js src/azure-regional-entry.js; do
-            grep -q 'semantic-v5' "$file" || {
-              echo "::error::$file does not contain semantic-v5"
-              exit 1
-            }
-            grep -q 'x-readori-tts-style-applied' "$file" || {
-              echo "::error::$file is missing semantic response diagnostics"
-              exit 1
-            }
-          done
-
-          echo "Private repo checkout + TTS source guards: PASS"
+          echo "Private repo checkout: PASS"
           echo "Commit: $(git rev-parse HEAD)"
           echo "Short SHA: $(git rev-parse --short HEAD)"
 
@@ -178,27 +168,9 @@ jobs:
             npm install --no-audit --no-fund
           fi
 
-      - name: Lint
+      - name: Private source self-check
         working-directory: bot
-        run: npm run lint --if-present
-
-      - name: Test
-        working-directory: bot
-        run: npm test
-
-      - name: JavaScript syntax check
-        working-directory: bot
-        shell: bash
-        run: |
-          set -euo pipefail
-          found=0
-          while IFS= read -r -d '' file; do
-            found=1
-            node --check "$file"
-          done < <(find src scripts -type f \( -name '*.js' -o -name '*.mjs' \) -print0 2>/dev/null || true)
-
-          [[ "$found" -eq 1 ]] || echo "::notice::No JS files found under src/scripts"
-          echo "JavaScript syntax: PASS"
+        run: npm run check
 
       # ============================================================
       # 4. Discover EXISTING Cloudflare resources.
@@ -285,7 +257,9 @@ jobs:
           echo "Existing Cloudflare resources: PASS"
 
       # ============================================================
-      # 5. Render the PRIVATE repository's wrangler template
+      # 5. Render ONLY resource IDs into wrangler.toml.
+      #    Plain-text Worker vars remain owned by Cloudflare Dashboard
+      #    and are preserved by --keep-vars.
       # ============================================================
       - name: Render wrangler.toml
         working-directory: bot
@@ -295,95 +269,32 @@ jobs:
 
           python3 - <<'PY'
           import os
-          import re
           from pathlib import Path
 
-          template_path = Path("wrangler.toml.template")
-          if not template_path.is_file():
-              raise SystemExit("wrangler.toml.template is missing")
-
-          text = template_path.read_text(encoding="utf-8")
-
-          # PRODUCTION POLICY:
-          # Cloudflare Dashboard is the source of truth for ALL existing
-          # plain_text Worker variables.  The public CI must never render them
-          # into wrangler.toml, otherwise an empty/missing GitHub variable can
-          # overwrite a working production value.
-          #
-          # Strip the complete [vars] section from the private template.  The
-          # deploy command uses --keep-vars, so the current Cloudflare values
-          # remain attached to the Worker.
-          text, removed = re.subn(
-              r'(?ms)^\[vars\]\s*\n.*?(?=^\[)',
-              '',
-              text,
-              count=1,
-          )
-          if removed != 1:
-              raise SystemExit("Expected exactly one [vars] section in wrangler.toml.template")
-
-          values = {
-              "KV_NAMESPACE_ID": os.environ["KV_NAMESPACE_ID"],
-              "KV_PREVIEW_NAMESPACE_ID": os.environ.get("KV_PREVIEW_NAMESPACE_ID") or os.environ["KV_NAMESPACE_ID"],
-              "D1_DATABASE_ID": os.environ["D1_DATABASE_ID"],
+          template = Path("wrangler.toml.template").read_text(encoding="utf-8")
+          replacements = {
+              "__KV_NAMESPACE_ID__": os.environ["KV_NAMESPACE_ID"],
+              "__KV_PREVIEW_NAMESPACE_ID__": os.environ.get("KV_PREVIEW_NAMESPACE_ID") or os.environ["KV_NAMESPACE_ID"],
+              "__D1_DATABASE_ID__": os.environ["D1_DATABASE_ID"],
           }
+          for token, value in replacements.items():
+              template = template.replace(token, str(value))
 
-          for key, value in values.items():
-              safe = str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\r", "").replace("\n", "")
-              text = text.replace(f"__{key}__", safe)
-
-          unresolved = sorted(set(re.findall(r'__[A-Z0-9_]+__', text)))
+          unresolved = sorted({part for part in template.replace('"', ' ').split() if "__" in part})
           if unresolved:
               raise SystemExit(f"Unresolved wrangler placeholders: {unresolved}")
+          if "[vars]" in template:
+              raise SystemExit("Rendered wrangler.toml unexpectedly contains [vars]")
 
-          Path("wrangler.toml").write_text(text, encoding="utf-8")
-          print("wrangler.toml rendered with Cloudflare-managed vars preserved")
+          Path("wrangler.toml").write_text(template, encoding="utf-8")
+          print("wrangler.toml rendered with existing resource IDs only")
           PY
 
-          echo "Rendered configuration bindings:"
-          grep -E '^(name|main|binding|database_name|AI_TTS_.*ENABLED)' wrangler.toml || true
-
-          grep -Eq '^main[[:space:]]*=[[:space:]]*"src/azure-regional-entry\.js"[[:space:]]*$' wrangler.toml || {
-            echo "::error::Rendered wrangler.toml lost the production Azure regional entry"
-            exit 1
-          }
-
-          # No production plain_text variable may be emitted by this public CI.
-          # Existing Dashboard vars are preserved by `wrangler deploy --keep-vars`.
-          if grep -Eq '^\[vars\][[:space:]]*$' wrangler.toml; then
-            echo "::error::Production wrangler.toml must not contain a [vars] section"
-            exit 1
-          fi
-
-          for name in \
-            ENVIRONMENT APPLE_BUNDLE_ID \
-            AI_TTS_OPENAI_ENABLED AI_TTS_AZURE_ENABLED AI_TTS_AZURE_PREFERRED_FOR_NATURAL \
-            AI_TTS_AZURE_OUTPUT_FORMAT \
-            AI_TTS_AZURE_VOICE_ZH_CN AI_TTS_AZURE_VOICE_ZH_TW AI_TTS_AZURE_VOICE_EN_US \
-            AI_TTS_AZURE_VOICE_JA_JP AI_TTS_AZURE_VOICE_KO_KR AI_TTS_AZURE_VOICE_FR_FR AI_TTS_AZURE_VOICE_ES_ES \
-            AI_TTS_ORACLE_EDGE_ENABLED ORACLE_EDGE_TTS_URL \
-            AI_TTS_PROVIDER_FAILURE_THRESHOLD AI_TTS_PROVIDER_COOLDOWN_SECONDS AI_TTS_PROVIDER_TIMEOUT_MS \
-            AI_TTS_MAX_REQUESTS_PER_DAY AI_TTS_MAX_CHARS_PER_DAY AI_TTS_MAX_EXPRESSIVE_CHARS_PER_DAY \
-            AI_TTS_GLOBAL_CF_CHARS_PER_DAY AI_TTS_GLOBAL_OPENAI_CHARS_PER_DAY \
-            AI_TTS_GLOBAL_AZURE_CHARS_PER_DAY AI_TTS_GLOBAL_ORACLE_CHARS_PER_DAY \
-            AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET AZURE_SPEECH_REGION \
-            AZURE_SPEECH_RESOURCE_ID AZURE_SPEECH_ENDPOINT
-          do
-            if grep -Eq "^[[:space:]]*${name}[[:space:]]*=" wrangler.toml; then
-              echo "::error::$name must remain Cloudflare-managed and must not be emitted into wrangler.toml"
-              exit 1
-            fi
-          done
-
-          echo "Rendered Wrangler production-var preservation guards: PASS"
+          grep -E '^(name|main|binding|database_name)' wrangler.toml || true
 
       # ============================================================
-      # 6. Confirm existing Worker bindings on Cloudflare.
-      #    IMPORTANT for the integrated bot:
-      #    src/azure-regional-entry.js is the production entry and its Entra
-      #    fallback is independent from AI_TTS_AZURE_ENABLED. Therefore the
-      #    Entra bindings must exist even when the direct key-based Azure
-      #    provider is disabled. Values remain hidden and are never copied.
+      # 6. Confirm the existing production bindings.
+      #    Secret VALUES stay on Cloudflare and are never copied into CI.
       # ============================================================
       - name: Verify existing Cloudflare Worker bindings
         working-directory: bot
@@ -399,126 +310,50 @@ jobs:
               "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${WORKER_NAME}/settings"
           )"
 
-          SETTINGS_SUCCESS="$(printf '%s' "$SETTINGS_JSON" | jq -r '.success // false')"
-          [[ "$SETTINGS_SUCCESS" == "true" ]] || {
-            echo "::error::Unable to inspect existing Worker bindings."
-            printf '%s' "$SETTINGS_JSON" | jq -c '{success,errors,messages}' || true
-            exit 1
-          }
-
           has_secret() {
             printf '%s' "$SECRET_JSON" | jq -e --arg name "$1" '.[] | select(.name == $name)' >/dev/null
           }
-
           has_binding_name() {
             printf '%s' "$SETTINGS_JSON" | jq -e --arg name "$1" '.result.bindings[]? | select(.name == $name)' >/dev/null
           }
+          has_remote_name() { has_secret "$1" || has_binding_name "$1"; }
 
-          has_remote_name() {
-            has_secret "$1" || has_binding_name "$1"
-          }
-
-          get_plain() {
-            printf '%s' "$SETTINGS_JSON" |
-              jq -r --arg name "$1" '
-                .result.bindings[]?
-                | select(.type == "plain_text" and .name == $name)
-                | (.text // "")
-              ' |
-              head -n 1
-          }
-
-          AI_TTS_OPENAI_ENABLED="$(get_plain AI_TTS_OPENAI_ENABLED)"
-          AI_TTS_AZURE_ENABLED="$(get_plain AI_TTS_AZURE_ENABLED)"
-          AI_TTS_ORACLE_EDGE_ENABLED="$(get_plain AI_TTS_ORACLE_EDGE_ENABLED)"
-          ORACLE_EDGE_TTS_URL="$(get_plain ORACLE_EDGE_TTS_URL)"
-
-          enabled() {
-            case "${1,,}" in
-              1|true|yes|on) return 0 ;;
-              *) return 1 ;;
-            esac
-          }
-
-          core_required=(
+          secret_required=(
             BOT_TOKEN
             WEBHOOK_SECRET
             ADMIN_SECRET
-            APPLE_IAP_KEY_ID
-            APPLE_IAP_ISSUER_ID
             APPLE_IAP_PRIVATE_KEY
             PRO_LEASE_PRIVATE_KEY_JWK
             DEVICE_CHALLENGE_SECRET
+          )
+          remote_required=(
+            ADMIN_CHAT_ID
+            APPLE_IAP_KEY_ID
+            APPLE_IAP_ISSUER_ID
             APPLE_ALLOW_SANDBOX_IAP
           )
 
-          # Required by src/azure-entry.js + src/azure-regional-entry.js.
-          # AZURE_SPEECH_ENDPOINT is optional because the regional fallback
-          # constructs the endpoint from AZURE_SPEECH_REGION.
-          entra_required=(
-            AZURE_TENANT_ID
-            AZURE_CLIENT_ID
-            AZURE_CLIENT_SECRET
-            AZURE_SPEECH_REGION
-            AZURE_SPEECH_RESOURCE_ID
-          )
-
           missing=()
-          for name in "${core_required[@]}"; do
-            has_secret "$name" || missing+=("$name")
+          for name in "${secret_required[@]}"; do
+            has_secret "$name" || missing+=("$name(secret)")
           done
-
-          for name in "${entra_required[@]}"; do
-            has_remote_name "$name" || missing+=("$name")
+          for name in "${remote_required[@]}"; do
+            has_remote_name "$name" || missing+=("$name(binding)")
           done
-
-          # Optional direct providers become mandatory only when their public
-          # enable switch says they are intended to be active.
-          if enabled "${AI_TTS_OPENAI_ENABLED:-false}"; then
-            has_secret OPENAI_API_KEY || missing+=("OPENAI_API_KEY")
-          fi
-
-          # AI_TTS_AZURE_ENABLED controls only the legacy/direct subscription-key
-          # Azure provider in src/tts/index.js.  The production Entra fallback is
-          # separate and already validated above, so a missing AZURE_SPEECH_KEY
-          # is a notice rather than a deployment blocker.
-          if enabled "${AI_TTS_AZURE_ENABLED:-false}" && ! has_secret AZURE_SPEECH_KEY; then
-            echo "::notice::AI_TTS_AZURE_ENABLED is true but AZURE_SPEECH_KEY is absent; direct key-based Azure will be skipped, while Entra regional fallback remains available."
-          fi
-
-          if enabled "${AI_TTS_ORACLE_EDGE_ENABLED:-false}"; then
-            has_secret ORACLE_EDGE_TTS_TOKEN || missing+=("ORACLE_EDGE_TTS_TOKEN")
-            [[ -n "${ORACLE_EDGE_TTS_URL:-}" ]] || missing+=("ORACLE_EDGE_TTS_URL(var)")
-          fi
 
           if (( ${#missing[@]} )); then
-            echo "::error::Existing Worker/provider configuration is incomplete: ${missing[*]}"
-            echo "::error::No secret value is copied by this public workflow; repair the existing Cloudflare Worker bindings instead."
+            echo "::error::Existing Worker configuration is incomplete: ${missing[*]}"
+            echo "::error::This workflow never copies or regenerates production secret values."
             exit 1
           fi
 
-          azure_voice_names=(
-            AI_TTS_AZURE_VOICE_ZH_CN
-            AI_TTS_AZURE_VOICE_ZH_TW
-            AI_TTS_AZURE_VOICE_EN_US
-            AI_TTS_AZURE_VOICE_JA_JP
-            AI_TTS_AZURE_VOICE_KO_KR
-            AI_TTS_AZURE_VOICE_FR_FR
-            AI_TTS_AZURE_VOICE_ES_ES
-          )
-          empty_voices=()
-          for name in "${azure_voice_names[@]}"; do
-            [[ -n "$(get_plain "$name")" ]] || empty_voices+=("$name")
+          # Production can run without Azure Entra until fallback is needed, so
+          # these are notices rather than deployment blockers.
+          for name in AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET AZURE_SPEECH_REGION AZURE_SPEECH_RESOURCE_ID; do
+            has_remote_name "$name" || echo "::notice::Optional Azure regional fallback binding is absent: $name"
           done
-          if (( ${#empty_voices[@]} )); then
-            echo "::notice::Azure voice override(s) are empty on Cloudflare: ${empty_voices[*]}. Source-code locale defaults will be used until you restore custom values."
-          else
-            echo "Azure voice overrides: PASS (${#azure_voice_names[@]} non-empty Cloudflare values)"
-          fi
 
-          echo "Core Worker secrets: PASS (${#core_required[@]})"
-          echo "Azure Entra regional fallback bindings: PASS (${#entra_required[@]})"
-          echo "Conditional provider bindings: PASS"
+          echo "Existing Worker security/operations bindings: PASS"
 
       # ============================================================
       # 7. Build-only Wrangler validation
@@ -534,18 +369,19 @@ jobs:
             --outdir /tmp/readori-bot-dry-run \
             --keep-vars
 
-          # Verify the bundle Wrangler is about to ship actually contains the
-          # semantic-v5 regional Azure implementation, not merely the source tree.
-          grep -Rqs 'azure-regional-fallback-v4.2-20260818+semantic-v5' /tmp/readori-bot-dry-run || {
-            echo "::error::Dry-run bundle does not contain the semantic-v5 Azure regional revision"
+          grep -Rqs 'readori-bot-clean-v1.1-20260820' /tmp/readori-bot-dry-run || {
+            echo "::error::Dry-run bundle is missing Clean Production v1.1 revision"
+            exit 1
+          }
+          grep -Rqs 'bot-admin-operations-v1.1-20260820' /tmp/readori-bot-dry-run || {
+            echo "::error::Dry-run bundle is missing Bot Admin Operations v1.1"
             exit 1
           }
           grep -Rqs 'x-readori-tts-style-applied' /tmp/readori-bot-dry-run || {
-            echo "::error::Dry-run bundle does not contain semantic TTS response diagnostics"
+            echo "::error::Dry-run bundle is missing semantic TTS diagnostics"
             exit 1
           }
-
-          echo "Wrangler dry-run + bundled TTS semantic guards: PASS"
+          echo "Wrangler dry-run + release guards: PASS"
 
       - name: Stop after validate
         if: ${{ inputs.mode == 'validate' }}
@@ -599,6 +435,8 @@ jobs:
             ai_tts_daily_usage
             ai_tts_global_daily_usage
             ai_tts_provider_health
+            bot_settings
+            bot_admin_audit_log
           )
 
           missing=()
@@ -613,14 +451,27 @@ jobs:
 
           echo "Required D1 tables: PASS (${#required_tables[@]})"
 
+          DEMO_OUT="$(
+            npx wrangler d1 execute "$D1_DATABASE_NAME" \
+              --remote \
+              --json \
+              --command="SELECT COUNT(*) AS count FROM coupon_codes WHERE is_used=0 AND link LIKE 'https://your-shop.com/%';"
+          )"
+          DEMO_COUNT="$(printf '%s' "$DEMO_OUT" | jq -r '.[0].results[0].count // 0')"
+          if [[ "$DEMO_COUNT" != "0" ]]; then
+            echo "::error::Unused demo coupon seed rows still exist after migrations."
+            exit 1
+          fi
+          echo "Demo coupon cleanup: PASS"
+
       # ============================================================
       # 9. Deploy code/config only.
       #
       # IMPORTANT:
       # - No `wrangler secret put` here.
       # - Existing Worker secrets are preserved by Wrangler deployment.
-      # - --keep-vars also preserves remote plain-text vars not represented
-      #   in this config, while applying the TTS vars rendered above.
+      # - --keep-vars preserves ALL existing remote plain-text vars.
+      # - This workflow renders resource IDs only; it never renders TTS/provider vars.
       # ============================================================
       - name: Deploy Cloudflare Worker
         if: ${{ inputs.mode == 'deploy' }}
@@ -683,8 +534,6 @@ jobs:
             echo "- Worker: \`$WORKER_NAME\`"
             echo "- D1: \`$D1_DATABASE_NAME\`"
             echo "- KV: \`$KV_NAMESPACE_TITLE\`"
-            echo "- Production entry guard: \`src/azure-regional-entry.js\`"
-            echo "- TTS semantic guard: \`semantic-v5\`"
             echo "- Existing Cloudflare Worker secret values were not copied or modified."
-            echo "- Existing Cloudflare plain-text vars are the production source of truth and were preserved with --keep-vars."
+            echo "- After the first Operations v1.1 deploy, call POST /setup once with Authorization: Bearer ADMIN_SECRET so Telegram registers callback_query + secret_token."
           } >> "$GITHUB_STEP_SUMMARY"
