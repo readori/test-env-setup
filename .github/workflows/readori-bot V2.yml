@@ -1,4 +1,4 @@
-name: Readori Bot · V2
+name: Readori Bot V2
 
 # Runs entirely in the PUBLIC repository readori/test-env-setup.
 # No new GitHub Secrets are required.
@@ -375,8 +375,8 @@ jobs:
             --outdir /tmp/readori-bot-dry-run \
             --keep-vars
 
-          grep -Rqs 'readori-bot-clean-production-v1.1-production-complete-v1-20260820' /tmp/readori-bot-dry-run || {
-            echo "::error::Dry-run bundle is missing Production Complete revision"
+          grep -Rqs 'readori-bot-clean-production-v1.1-referral-share-v2-20260820' /tmp/readori-bot-dry-run || {
+            echo "::error::Dry-run bundle is missing Referral Share v2 revision"
             exit 1
           }
           grep -Rqs 'bot-admin-operations-v1.1-20260820' /tmp/readori-bot-dry-run || {
@@ -540,7 +540,12 @@ jobs:
                  "$BASE/health" > /tmp/readori-health.json; then
               cat /tmp/readori-health.json
               echo
-              echo "Worker health check: PASS"
+              REVISION="$(jq -r '.revision // empty' /tmp/readori-health.json)"
+              if [[ "$REVISION" != 'readori-bot-clean-production-v1.1-referral-share-v2-20260820' ]]; then
+                echo "::error::Worker is healthy but stale. Expected referral-share-v2 revision; got: ${REVISION:-missing}"
+                exit 1
+              fi
+              echo "Worker health + deployed revision: PASS ($REVISION)"
               exit 0
             fi
             echo "Health attempt $attempt failed; retrying..."
