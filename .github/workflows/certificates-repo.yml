@@ -16,18 +16,16 @@ on:
         type: string
 
       signing_mode:
-        description: "readonly | refresh_profile | recover_existing_identity | bootstrap_empty"
+        description: "readonly_verify | fresh_bootstrap_both"
         required: true
-        default: "readonly"
+        default: "readonly_verify"
         type: choice
         options:
-          - readonly
-          - refresh_profile
-          - recover_existing_identity
-          - bootstrap_empty
+          - readonly_verify
+          - fresh_bootstrap_both
 
-      write_confirmation:
-        description: "For write modes only: type WRITE"
+      destructive_confirmation:
+        description: "For fresh_bootstrap_both only: type RESET_ALL_SIGNING"
         required: false
         default: ""
         type: string
@@ -40,19 +38,46 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  signing:
     runs-on: macos-15
     timeout-minutes: 90
     environment: production
 
     env:
-      APP_BUNDLE_ID: com.readori.app
+      READORI_BUNDLE_ID: com.readori.app
+      MAIL_BUNDLE_ID: com.readori.mail
       MATCH_GIT_URL: https://github.com/readori/readori-certificates.git
       MATCH_GIT_BRANCH: main
 
     steps:
       # ============================================================
-      # 1. PRIVATE APP SOURCE — SSH only
+      # 1. SAFETY / INPUTS
+      # ============================================================
+      - name: Validate requested operation
+        env:
+          SIGNING_MODE: ${{ inputs.signing_mode }}
+          DESTRUCTIVE_CONFIRMATION: ${{ inputs.destructive_confirmation }}
+        run: |
+          set -euo pipefail
+          case "$SIGNING_MODE" in
+            readonly_verify)
+              ;;
+            fresh_bootstrap_both)
+              [[ "$DESTRUCTIVE_CONFIRMATION" == 'RESET_ALL_SIGNING' ]] || {
+                echo '::error::fresh_bootstrap_both requires destructive_confirmation=RESET_ALL_SIGNING.'
+                exit 64
+              }
+              echo '::warning::Fresh bootstrap assumes Apple Developer Distribution certificates/profiles were intentionally revoked/deleted first.'
+              echo '::warning::This workflow clears signing assets from the Match repository branch, then creates ONE fresh Distribution identity and fresh App Store profiles for com.readori.app and com.readori.mail.'
+              ;;
+            *)
+              echo "::error::Unsupported signing_mode: $SIGNING_MODE"
+              exit 64
+              ;;
+          esac
+
+      # ============================================================
+      # 2. PRIVATE SOURCE — SSH only (build source)
       # ============================================================
       - name: Configure source repository SSH
         env:
@@ -96,52 +121,15 @@ jobs:
           echo "[clone] $(git -C core_project rev-parse --short HEAD)"
 
       # ============================================================
-      # 2. SANITIZE HISTORICAL MATCHFILE IN RUNNER ONLY
-      #    The private repository may still contain the old github-certs
-      #    SSH URL and readonly(true). Do not let those defaults leak into CI.
-      #    This does NOT commit or modify the user's repository.
+      # 3. MATCH REPOSITORY — TARGET_REPO_PAT / HTTPS ONLY
       # ============================================================
-      - name: Install CI-safe Matchfile override
-        run: |
-          set -euo pipefail
-          mkdir -p core_project/fastlane
-          if [[ -f core_project/fastlane/Matchfile ]]; then
-            cp core_project/fastlane/Matchfile /tmp/Readori.Matchfile.original
-          fi
-          cat > core_project/fastlane/Matchfile <<'RUBY'
-          git_url(ENV.fetch("MATCH_GIT_URL"))
-          storage_mode("git")
-          git_branch(ENV.fetch("MATCH_GIT_BRANCH", "main"))
-          type("appstore")
-          app_identifier([ENV.fetch("APP_BUNDLE_ID", "com.readori.app")])
-          team_id(ENV["ASC_TEAM_ID"]) if ENV["ASC_TEAM_ID"] && !ENV["ASC_TEAM_ID"].empty?
-          readonly(%w[true 1 yes].include?(ENV.fetch("MATCH_READONLY", "true").downcase))
-          RUBY
-          echo 'CI Matchfile override installed (HTTPS URL + environment-controlled readonly).'
-
-      # ============================================================
-      # 3. CERT REPOSITORY — HTTPS + TARGET_REPO_PAT only
-      # ============================================================
-      - name: Configure certificates repository authentication
+      - name: Configure Match repository authentication
         env:
-          SIGNING_MODE: ${{ inputs.signing_mode }}
-          WRITE_CONFIRMATION: ${{ inputs.write_confirmation }}
           TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          SIGNING_MODE: ${{ inputs.signing_mode }}
         run: |
           set -euo pipefail
-          [[ -n "${TARGET_REPO_PAT:-}" ]] || { echo '::error::Missing TARGET_REPO_PAT'; exit 78; }
-
-          case "$SIGNING_MODE" in
-            readonly) ;;
-            refresh_profile|recover_existing_identity|bootstrap_empty)
-              [[ "$WRITE_CONFIRMATION" == 'WRITE' ]] || {
-                echo '::error::Write signing mode requires write_confirmation=WRITE.'
-                exit 64
-              }
-              echo '::notice::TARGET_REPO_PAT must have Contents: Read and write on readori/readori-certificates.'
-              ;;
-            *) echo "::error::Unsupported signing_mode: $SIGNING_MODE"; exit 64 ;;
-          esac
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || { echo '::error::Missing TARGET_REPO_PAT.'; exit 78; }
 
           MATCH_AUTH="$(printf '%s:%s' 'readori' "$TARGET_REPO_PAT" | base64 | tr -d '\n')"
           echo "::add-mask::$TARGET_REPO_PAT"
@@ -149,20 +137,18 @@ jobs:
           echo "MATCH_GIT_BASIC_AUTHORIZATION=$MATCH_AUTH" >> "$GITHUB_ENV"
 
           git -c http.extraheader="AUTHORIZATION: basic $MATCH_AUTH" \
-            ls-remote "$MATCH_GIT_URL" >/tmp/readori-match-refs.txt || {
+            ls-remote "$MATCH_GIT_URL" >/tmp/match-refs.txt || {
               echo '::error::TARGET_REPO_PAT cannot read readori/readori-certificates.'
               exit 78
             }
-          echo 'Certificates repository HTTPS/TARGET_REPO_PAT access: PASS'
+          echo 'Match repository HTTPS/TARGET_REPO_PAT access: PASS'
 
-          if [[ "$SIGNING_MODE" == 'bootstrap_empty' && -s /tmp/readori-match-refs.txt ]]; then
-            echo '::error::bootstrap_empty refused: certificates repository is not empty.'
-            echo '::error::Use recover_existing_identity if the repository lacks a usable private key.'
-            exit 64
+          if [[ "$SIGNING_MODE" == 'fresh_bootstrap_both' ]]; then
+            echo '::notice::TARGET_REPO_PAT must have Contents: Read and write for readori/readori-certificates.'
           fi
 
       # ============================================================
-      # 4. FASTLANE 2.238.0
+      # 4. FASTLANE + ASC API KEY
       # ============================================================
       - name: Install pinned Fastlane
         run: |
@@ -176,17 +162,16 @@ jobs:
         with:
           xcode-version: ${{ inputs.xcode_version }}
 
-      # ============================================================
-      # 5. ASC API KEY
-      # ============================================================
       - name: Setup App Store Connect API key
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
           ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
         run: |
           set -euo pipefail
-          for name in ASC_KEY_ID ASC_ISSUER_ID ASC_PRIVATE_KEY; do
+          for name in ASC_KEY_ID ASC_ISSUER_ID ASC_PRIVATE_KEY ASC_TEAM_ID MATCH_PASSWORD; do
             [[ -n "${!name:-}" ]] || { echo "::error::Missing $name"; exit 78; }
           done
 
@@ -194,7 +179,6 @@ jobs:
           python3 - <<'PYEOF'
           import base64, json, os
           from pathlib import Path
-
           raw = os.environ['ASC_PRIVATE_KEY'].strip().replace('\\n', '\n')
           if 'BEGIN PRIVATE KEY' in raw or 'BEGIN EC PRIVATE KEY' in raw:
               key = raw
@@ -205,7 +189,6 @@ jobs:
                   raise SystemExit(f'ASC_PRIVATE_KEY is neither PEM nor valid base64: {exc}')
           if 'PRIVATE KEY' not in key:
               raise SystemExit('ASC_PRIVATE_KEY did not decode to a .p8 PEM private key')
-
           key_id = os.environ['ASC_KEY_ID']
           issuer_id = os.environ['ASC_ISSUER_ID']
           key_path = Path.home() / '.appstoreconnect' / 'private_keys' / f'AuthKey_{key_id}.p8'
@@ -221,127 +204,209 @@ jobs:
           PYEOF
 
       # ============================================================
-      # 6. OPTIONAL RECOVERY OF EXISTING DISTRIBUTION IDENTITY
-      #    Uses the already-configured IOS_CERTIFICATE + password.
-      #    No new Apple Distribution certificate is created and nothing is revoked.
+      # 5. EPHEMERAL KEYCHAIN
       # ============================================================
-      - name: Recover existing Apple Distribution identity into Match
-        if: ${{ inputs.signing_mode == 'recover_existing_identity' }}
+      - name: Create signing keychain
+        run: |
+          set -euo pipefail
+          KEYCHAIN_NAME="readori-reset.keychain-db"
+          KEYCHAIN_PATH="$HOME/Library/Keychains/$KEYCHAIN_NAME"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          rm -f "$KEYCHAIN_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN_NAME"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" "$HOME/Library/Keychains/login.keychain-db"
+          security default-keychain -d user -s "$KEYCHAIN_PATH"
+          echo "SIGNING_KEYCHAIN_NAME=$KEYCHAIN_NAME" >> "$GITHUB_ENV"
+          echo "SIGNING_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "SIGNING_KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD" >> "$GITHUB_ENV"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+
+      # ============================================================
+      # 6. DESTRUCTIVE MATCH STORAGE RESET
+      #    IMPORTANT: Apple Portal revocation/deletion is intentionally manual.
+      #    This step only removes old encrypted signing files from Match storage.
+      # ============================================================
+      - name: Clear old Match signing assets
+        if: ${{ inputs.signing_mode == 'fresh_bootstrap_both' }}
         env:
-          IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
-          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/readori-match-reset"
+          rm -rf "$WORK"
+
+          git -c http.extraheader="AUTHORIZATION: basic $MATCH_GIT_BASIC_AUTHORIZATION" \
+            clone --branch "$MATCH_GIT_BRANCH" "$MATCH_GIT_URL" "$WORK"
+
+          cd "$WORK"
+          BEFORE="$(git status --short)"
+          rm -rf certs profiles
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo 'Match repository already contains no certs/profiles.'
+          else
+            git config user.name 'readori-signing-reset'
+            git config user.email 'actions@users.noreply.github.com'
+            git commit -m 'Reset Match signing assets for clean Readori + CF Mail bootstrap'
+            git -c http.extraheader="AUTHORIZATION: basic $MATCH_GIT_BASIC_AUTHORIZATION" \
+              push origin "$MATCH_GIT_BRANCH"
+            echo 'Old Match certs/profiles removed from repository: PASS'
+          fi
+
+      # ============================================================
+      # 7A. FRESH BOOTSTRAP
+      #     One Distribution certificate is created by the first Match call.
+      #     The second App Store profile reuses that same identity.
+      # ============================================================
+      - name: Fresh bootstrap Readori and CF Mail signing
+        if: ${{ inputs.signing_mode == 'fresh_bootstrap_both' }}
+        env:
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
           ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
         run: |
           set -euo pipefail
-          for name in IOS_CERTIFICATE MATCH_PASSWORD ASC_TEAM_ID MATCH_GIT_BASIC_AUTHORIZATION; do
-            [[ -n "${!name:-}" ]] || { echo "::error::Missing $name"; exit 78; }
-          done
 
-          WORK="$RUNNER_TEMP/readori-existing-identity"
-          KC="$WORK/recovery.keychain-db"
-          P12="$WORK/legacy.p12"
-          BLANK_P12="$WORK/recovered.p12"
-          CERT_PEM="$WORK/recovered.pem"
-          CERT_DER="$WORK/recovered.cer"
-          rm -rf "$WORK"
-          mkdir -p "$WORK"
-          chmod 700 "$WORK"
+          COMMON=(
+            --git_url "$MATCH_GIT_URL"
+            --git_branch "$MATCH_GIT_BRANCH"
+            --git_basic_authorization "$MATCH_GIT_BASIC_AUTHORIZATION"
+            --team_id "$ASC_TEAM_ID"
+            --api_key_path /tmp/asc_api_key.json
+            --readonly false
+            --generate_apple_certs true
+            --keychain_name "$SIGNING_KEYCHAIN_NAME"
+            --keychain_password "$SIGNING_KEYCHAIN_PASSWORD"
+            --skip_confirmation true
+          )
 
-          export P12
-          python3 - <<'PYEOF'
-          import base64, os
-          from pathlib import Path
-          raw = ''.join(os.environ['IOS_CERTIFICATE'].split())
-          try:
-              blob = base64.b64decode(raw, validate=True)
-          except Exception as exc:
-              raise SystemExit(f'IOS_CERTIFICATE must be the base64-encoded PKCS#12 (.p12): {exc}')
-          if len(blob) < 256:
-              raise SystemExit('IOS_CERTIFICATE decoded to an unexpectedly small file')
-          Path(os.environ['P12']).write_bytes(blob)
-          os.chmod(os.environ['P12'], 0o600)
-          print(f'Legacy IOS_CERTIFICATE decoded ({len(blob)} bytes)')
-          PYEOF
+          echo '=== 1/2 Readori: create fresh Distribution identity + App Store profile ==='
+          MATCH_READONLY=false fastlane match appstore \
+            --app_identifier "$READORI_BUNDLE_ID" \
+            --force \
+            "${COMMON[@]}"
 
-          # Import into an isolated keychain first. This proves that the P12 password
-          # and private key are usable before anything is written to Match.
-          security create-keychain -p recovery-temp "$KC"
-          security unlock-keychain -p recovery-temp "$KC"
-          security import "$P12" -k "$KC" -P "${IOS_CERTIFICATE_PASSWORD:-}" -A >/dev/null
+          security unlock-keychain -p "$SIGNING_KEYCHAIN_PASSWORD" "$SIGNING_KEYCHAIN_PATH"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$SIGNING_KEYCHAIN_PASSWORD" "$SIGNING_KEYCHAIN_PATH" >/dev/null
 
-          ID_COUNT="$(security find-identity -v -p codesigning "$KC" | grep -c 'Apple Distribution\|iPhone Distribution' || true)"
+          ID_COUNT="$(security find-identity -v -p codesigning "$SIGNING_KEYCHAIN_PATH" | grep -c 'Apple Distribution\|iPhone Distribution' || true)"
           [[ "$ID_COUNT" -ge 1 ]] || {
-            echo '::error::IOS_CERTIFICATE does not contain a usable Apple Distribution identity + private key.'
-            security delete-keychain "$KC" || true
+            echo '::error::Fresh Readori bootstrap completed without an Apple Distribution identity.'
             exit 78
           }
+          echo "Distribution identity after Readori bootstrap: PASS ($ID_COUNT)"
 
-          # Extract the imported leaf certificate and verify it has not expired.
-          security find-certificate -a -p "$KC" > "$CERT_PEM"
-          openssl x509 -in "$CERT_PEM" -noout -checkend 0 || {
-            echo '::error::IOS_CERTIFICATE is expired.'
-            security delete-keychain "$KC" || true
-            exit 78
-          }
-          openssl x509 -in "$CERT_PEM" -outform der -out "$CERT_DER"
+          echo '=== 2/2 CF Mail: create fresh App Store profile using shared identity ==='
+          MATCH_READONLY=false fastlane match appstore \
+            --app_identifier "$MAIL_BUNDLE_ID" \
+            --force \
+            "${COMMON[@]}"
 
-          # match later imports private-key PKCS#12 files with an empty password.
-          # Let Apple's Security framework export the identity with that representation.
-          security export -k "$KC" -t identities -f pkcs12 -P '' -o "$BLANK_P12" >/dev/null
-          chmod 600 "$BLANK_P12" "$CERT_DER"
+          echo 'Fresh Match bootstrap for both active apps: PASS'
 
-          # Resolve the exact Apple Developer certificate ID before import. If the
-          # certificate was revoked or is not part of this Team, fail safely here.
-          export CERT_DER
-          RECOVERED_CERTIFICATE_ID="$(ruby <<'RUBY'
-          require 'base64'
-          require 'spaceship'
-          token = Spaceship::ConnectAPI::Token.from(filepath: '/tmp/asc_api_key.json')
-          Spaceship::ConnectAPI.token = token
-          wanted = Base64.strict_encode64(File.binread(ENV.fetch('CERT_DER')))
-          types = [
-            Spaceship::ConnectAPI::Certificate::CertificateType::IOS_DISTRIBUTION,
-            Spaceship::ConnectAPI::Certificate::CertificateType::MAC_APP_DISTRIBUTION,
-            Spaceship::ConnectAPI::Certificate::CertificateType::DISTRIBUTION
-          ].join(',')
-          cert = Spaceship::ConnectAPI::Certificate.all(filter: { certificateType: types }).find do |item|
-            item.certificate_content == wanted
-          end
-          abort('RECOVERY_CERT_NOT_ON_PORTAL') unless cert
-          puts cert.id
-          RUBY
-          )" || {
-            echo '::error::IOS_CERTIFICATE is not an active Distribution certificate on this Apple Developer team.'
-            echo '::error::Do not revoke certificates blindly. Supply another existing valid identity or free one certificate slot intentionally.'
-            security delete-keychain "$KC" || true
-            exit 78
-          }
-          [[ -n "$RECOVERED_CERTIFICATE_ID" ]] || { echo '::error::Unable to resolve Distribution certificate ID.'; exit 78; }
-          echo "RECOVERED_CERTIFICATE_ID=$RECOVERED_CERTIFICATE_ID" >> "$GITHUB_ENV"
-          echo 'Existing Distribution identity verified against Apple Developer Portal: PASS'
-
-          cd core_project
-
-          # Import the already-existing identity into the encrypted Match repository.
-          # Paths are piped into the official match import prompts. No new Apple cert is created.
-          printf '%s\n%s\n\n' "$CERT_DER" "$BLANK_P12" | \
-            MATCH_READONLY=false fastlane match import \
+      # ============================================================
+      # 7B. READONLY VERIFY
+      # ============================================================
+      - name: Verify current Match assets readonly
+        if: ${{ inputs.signing_mode == 'readonly_verify' }}
+        env:
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for bundle in "$READORI_BUNDLE_ID" "$MAIL_BUNDLE_ID"; do
+            echo "=== Verify $bundle ==="
+            MATCH_READONLY=true fastlane match appstore \
+              --app_identifier "$bundle" \
               --git_url "$MATCH_GIT_URL" \
               --git_branch "$MATCH_GIT_BRANCH" \
               --git_basic_authorization "$MATCH_GIT_BASIC_AUTHORIZATION" \
-              --type appstore \
-              --app_identifier "$APP_BUNDLE_ID" \
               --team_id "$ASC_TEAM_ID" \
               --api_key_path /tmp/asc_api_key.json \
-              --readonly false
-
-          security delete-keychain "$KC" || true
-          rm -rf "$WORK"
-          echo 'Existing Distribution identity imported into Match: PASS'
+              --readonly true \
+              --keychain_name "$SIGNING_KEYCHAIN_NAME" \
+              --keychain_password "$SIGNING_KEYCHAIN_PASSWORD"
+          done
 
       # ============================================================
-      # 7. SWIFT RESOLVE / ICONS
+      # 8. VALIDATE INSTALLED PROFILES
+      # ============================================================
+      - name: Validate Readori and CF Mail App Store profiles
+        env:
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          PROFILE_ROOTS=(
+            "$HOME/Library/MobileDevice/Provisioning Profiles"
+            "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+          )
+
+          find_profile() {
+            local bundle="$1"
+            local out="$2"
+            rm -f "$out"
+            for root in "${PROFILE_ROOTS[@]}"; do
+              [[ -d "$root" ]] || continue
+              while IFS= read -r p; do
+                tmp="$(mktemp)"
+                if security cms -D -i "$p" > "$tmp" 2>/dev/null; then
+                  appid="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$tmp" 2>/dev/null || true)"
+                  gettask="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$tmp" 2>/dev/null || true)"
+                  if [[ "$appid" == "$ASC_TEAM_ID.$bundle" && "$gettask" != 'true' ]]; then
+                    cp "$tmp" "$out"
+                    rm -f "$tmp"
+                    echo "$p"
+                    return 0
+                  fi
+                fi
+                rm -f "$tmp"
+              done < <(find "$root" -maxdepth 1 -type f \( -name '*.mobileprovision' -o -name '*.provisionprofile' \) -print 2>/dev/null)
+            done
+            return 1
+          }
+
+          READORI_PROFILE="$(find_profile "$READORI_BUNDLE_ID" /tmp/readori-appstore.plist)" || {
+            echo '::error::No installed App Store profile found for com.readori.app.'
+            exit 78
+          }
+          MAIL_PROFILE="$(find_profile "$MAIL_BUNDLE_ID" /tmp/readori-mail-appstore.plist)" || {
+            echo '::error::No installed App Store profile found for com.readori.mail.'
+            exit 78
+          }
+
+          echo "Readori profile: $(basename "$READORI_PROFILE")"
+          echo "CF Mail profile: $(basename "$MAIL_PROFILE")"
+
+          python3 - <<'PYEOF'
+          import plistlib
+          with open('/tmp/readori-appstore.plist','rb') as f:
+              app = plistlib.load(f)
+          ent = app.get('Entitlements', {})
+          domains = ent.get('com.apple.developer.associated-domains', [])
+          if isinstance(domains, str):
+              domains = [domains]
+          required = 'applinks:api.readori.com'
+          if required not in domains:
+              raise SystemExit(
+                  'Readori App Store profile is missing Associated Domains: ' + required
+                  + '. Enable Associated Domains on com.readori.app in Apple Developer before fresh bootstrap.'
+              )
+          print('Readori Associated Domains profile capability: PASS')
+
+          with open('/tmp/readori-mail-appstore.plist','rb') as f:
+              mail = plistlib.load(f)
+          mail_ent = mail.get('Entitlements', {})
+          if not str(mail_ent.get('application-identifier','')).endswith('.com.readori.mail'):
+              raise SystemExit('CF Mail profile application-identifier mismatch')
+          print('CF Mail App Store profile bundle identity: PASS')
+          PYEOF
+
+      # ============================================================
+      # 9. BUILD READORI IPA (same workflow behavior as before)
       # ============================================================
       - name: Resolve Swift Packages
         run: |
@@ -356,136 +421,6 @@ jobs:
             swift core_project/scripts/generate_icons.swift "${GITHUB_WORKSPACE}/core_project"
           fi
 
-      # ============================================================
-      # 8. MATCH / PROFILE REFRESH
-      # ============================================================
-      - name: Setup certificates with Fastlane Match
-        env:
-          SIGNING_MODE: ${{ inputs.signing_mode }}
-          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
-          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
-          FL_NO_UPDATE_ACTION: "true"
-          CI: "true"
-        run: |
-          set -euo pipefail
-          for name in MATCH_PASSWORD ASC_TEAM_ID MATCH_GIT_BASIC_AUTHORIZATION; do
-            [[ -n "${!name:-}" ]] || { echo "::error::Missing $name"; exit 78; }
-          done
-          cd core_project
-
-          COMMON_ARGS=(
-            appstore
-            --git_url "$MATCH_GIT_URL"
-            --git_branch "$MATCH_GIT_BRANCH"
-            --git_basic_authorization "$MATCH_GIT_BASIC_AUTHORIZATION"
-            --type appstore
-            --app_identifier "$APP_BUNDLE_ID"
-            --team_id "$ASC_TEAM_ID"
-            --api_key_path /tmp/asc_api_key.json
-          )
-
-          case "$SIGNING_MODE" in
-            readonly)
-              MATCH_READONLY=true fastlane match "${COMMON_ARGS[@]}" --readonly true
-              ;;
-
-            refresh_profile)
-              # Safe refresh: first prove a valid Distribution identity already exists
-              # in Match. Do NOT fall through to certificate creation when Apple slots
-              # are full. If this preflight fails, use recover_existing_identity.
-              echo 'Preflight: validating existing Match Distribution identity without profiles...'
-              if ! MATCH_READONLY=true fastlane match "${COMMON_ARGS[@]}" \
-                    --readonly true \
-                    --skip_provisioning_profiles true; then
-                echo '::error::No usable Distribution identity exists in Match.'
-                echo '::error::Run signing_mode=recover_existing_identity with write_confirmation=WRITE to recover IOS_CERTIFICATE safely.'
-                exit 78
-              fi
-
-              MATCH_READONLY=false fastlane match "${COMMON_ARGS[@]}" \
-                --readonly false \
-                --force
-              ;;
-
-            recover_existing_identity)
-              [[ -n "${RECOVERED_CERTIFICATE_ID:-}" ]] || {
-                echo '::error::Recovery step did not produce RECOVERED_CERTIFICATE_ID.'
-                exit 78
-              }
-              # Pin Match to the exact identity we just verified/imported so stale
-              # historical certificate files cannot cause it to choose another pair.
-              MATCH_READONLY=false fastlane match "${COMMON_ARGS[@]}" \
-                --readonly false \
-                --certificate_id "$RECOVERED_CERTIFICATE_ID" \
-                --force
-              ;;
-
-            bootstrap_empty)
-              # First-time repository initialization only. This mode may ask Apple to
-              # create a Distribution certificate and will still fail if the Team's
-              # certificate quota is already full. It is NOT the recovery path.
-              MATCH_READONLY=false fastlane match "${COMMON_ARGS[@]}" \
-                --readonly false \
-                --generate_apple_certs true
-              ;;
-          esac
-
-      # ============================================================
-      # 9. VERIFY ASSOCIATED DOMAINS IN THE ACTUAL PROFILE
-      # ============================================================
-      - name: Verify Readori provisioning profile capabilities
-        env:
-          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
-        run: |
-          set -euo pipefail
-          MATCHED=''
-          for PROFILE_DIR in \
-            "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles" \
-            "$HOME/Library/MobileDevice/Provisioning Profiles"; do
-            [[ -d "$PROFILE_DIR" ]] || continue
-            while IFS= read -r p; do
-              [[ -f "$p" ]] || continue
-              out="$(mktemp)"
-              if security cms -D -i "$p" > "$out" 2>/dev/null; then
-                appid="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$out" 2>/dev/null || true)"
-                if [[ "$appid" == "$ASC_TEAM_ID.$APP_BUNDLE_ID" ]]; then
-                  cp "$out" /tmp/readori-profile.plist
-                  MATCHED="$p"
-                  rm -f "$out"
-                  break 2
-                fi
-              fi
-              rm -f "$out"
-            done < <(find "$PROFILE_DIR" -maxdepth 1 -type f \( -name '*.mobileprovision' -o -name '*.provisionprofile' \) -print 2>/dev/null)
-          done
-
-          [[ -n "$MATCHED" ]] || {
-            echo "::error::No installed App Store profile covers $ASC_TEAM_ID.$APP_BUNDLE_ID"
-            exit 78
-          }
-          echo "Matched profile: $(basename "$MATCHED")"
-
-          python3 - <<'PYEOF'
-          import plistlib
-          with open('/tmp/readori-profile.plist','rb') as fh:
-              p = plistlib.load(fh)
-          ent = p.get('Entitlements', {})
-          domains = ent.get('com.apple.developer.associated-domains', [])
-          if isinstance(domains, str):
-              domains = [domains]
-          required = 'applinks:api.readori.com'
-          if required not in domains:
-              raise SystemExit(
-                  'Provisioning profile is missing Associated Domains: ' + required
-                  + '. Enable Associated Domains for com.readori.app in Apple Developer, '
-                    'then run refresh_profile or recover_existing_identity with WRITE.'
-              )
-          print('Associated Domains profile capability: PASS')
-          PYEOF
-
-      # ============================================================
-      # 10. BUILD
-      # ============================================================
       - name: Build IPA
         run: |
           set -euo pipefail
@@ -495,9 +430,6 @@ jobs:
           ./scripts/build_unsigned_ipa.sh \
             "${{ inputs.app_scheme }}" \
             "${GITHUB_WORKSPACE}/build"
-
-      - name: Show output
-        run: ls -R build || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -510,12 +442,13 @@ jobs:
         if: ${{ always() }}
         run: |
           {
-            echo '## Readori certificates / build workflow v5'
+            echo '## Readori signing reset / verification v7'
             echo
-            echo "- Signing mode: \`${{ inputs.signing_mode }}\`"
-            echo "- Certificates repo: \`$MATCH_GIT_URL\`"
-            echo '- Certificates auth: HTTPS + TARGET_REPO_PAT'
-            echo '- Existing identity recovery: IOS_CERTIFICATE + IOS_CERTIFICATE_PASSWORD (when explicitly selected)'
-            echo '- Safety: no automatic certificate revocation / no match nuke'
-            echo "- App ID: \`$APP_BUNDLE_ID\`"
+            echo "- Mode: \`${{ inputs.signing_mode }}\`"
+            echo "- Match repo: \`$MATCH_GIT_URL@$MATCH_GIT_BRANCH\`"
+            echo '- Match auth: HTTPS + TARGET_REPO_PAT'
+            echo '- Active App IDs: com.readori.app + com.readori.mail'
+            echo '- Fresh bootstrap target: one shared Apple Distribution identity + two App Store profiles'
+            echo '- APNs keys / ASC API keys / Identifiers are never deleted by this workflow'
+            echo '- Apple Developer certificate/profile revocation is intentionally manual'
           } >> "$GITHUB_STEP_SUMMARY"
