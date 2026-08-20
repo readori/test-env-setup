@@ -103,32 +103,35 @@ jobs:
           echo "[clone] $(git -C core_project rev-parse --short HEAD)"
 
       # ============================================================
-      # 3. CERTIFICATES REPO AUTH — HTTPS/PAT ONLY
-      #    Normal runs should use MATCH_REPO_PAT_RO (Contents: Read).
-      #    Write modes should use MATCH_REPO_PAT_RW (Contents: Read/Write).
-      #    MATCH_REPO_PAT / TARGET_REPO_PAT are compatibility fallbacks.
+      # 3. CERTIFICATES REPO AUTH — HTTPS + TARGET_REPO_PAT ONLY
+      #    This project intentionally uses the existing TARGET_REPO_PAT
+      #    as the single GitHub token for Match repository access.
+      #    - readonly: token needs Contents: Read
+      #    - bootstrap_empty / refresh_profile: token needs Contents: Read and write
+      #    Legacy Match SSH credentials and host aliases are obsolete and must not be used.
       # ============================================================
       - name: Configure certificates repository authentication
         env:
           SIGNING_MODE: ${{ inputs.signing_mode }}
           WRITE_CONFIRMATION: ${{ inputs.write_confirmation }}
-          MATCH_REPO_PAT_RO: ${{ secrets.MATCH_REPO_PAT_RO }}
-          MATCH_REPO_PAT_RW: ${{ secrets.MATCH_REPO_PAT_RW }}
-          MATCH_REPO_PAT: ${{ secrets.MATCH_REPO_PAT }}
           TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
         run: |
           set -euo pipefail
 
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || {
+            echo '::error::Missing Repository secret: TARGET_REPO_PAT'
+            exit 78
+          }
+
           case "$SIGNING_MODE" in
             readonly)
-              CERT_REPO_PAT="${MATCH_REPO_PAT_RO:-${MATCH_REPO_PAT:-${TARGET_REPO_PAT:-}}}"
               ;;
             bootstrap_empty|refresh_profile)
               [[ "$WRITE_CONFIRMATION" == 'WRITE' ]] || {
                 echo '::error::Write signing mode requires write_confirmation=WRITE.'
                 exit 64
               }
-              CERT_REPO_PAT="${MATCH_REPO_PAT_RW:-${MATCH_REPO_PAT:-}}"
+              echo '::notice::This signing mode writes to readori/readori-certificates. TARGET_REPO_PAT must have Contents: Read and write.'
               ;;
             *)
               echo "::error::Unsupported signing_mode: $SIGNING_MODE"
@@ -136,24 +139,19 @@ jobs:
               ;;
           esac
 
-          [[ -n "$CERT_REPO_PAT" ]] || {
-            if [[ "$SIGNING_MODE" == 'readonly' ]]; then
-              echo '::error::Set MATCH_REPO_PAT_RO (preferred), MATCH_REPO_PAT, or TARGET_REPO_PAT.'
-            else
-              echo '::error::Set MATCH_REPO_PAT_RW (preferred) or MATCH_REPO_PAT with Contents: Read and write.'
-            fi
-            exit 78
-          }
-
-          MATCH_AUTH="$(printf '%s:%s' 'readori' "$CERT_REPO_PAT" | base64 | tr -d '\n')"
-          echo "::add-mask::$CERT_REPO_PAT"
+          MATCH_AUTH="$(printf '%s:%s' 'readori' "$TARGET_REPO_PAT" | base64 | tr -d '\n')"
+          echo "::add-mask::$TARGET_REPO_PAT"
           echo "::add-mask::$MATCH_AUTH"
           echo "MATCH_GIT_BASIC_AUTHORIZATION=$MATCH_AUTH" >> "$GITHUB_ENV"
 
           git -c http.extraheader="AUTHORIZATION: basic $MATCH_AUTH" \
-            ls-remote "$MATCH_GIT_URL" >/tmp/readori-match-refs.txt
+            ls-remote "$MATCH_GIT_URL" >/tmp/readori-match-refs.txt || {
+              echo '::error::TARGET_REPO_PAT cannot read readori/readori-certificates.'
+              echo '::error::Grant this token access to readori/readori-certificates with at least Contents: Read.'
+              exit 78
+            }
 
-          echo 'Certificates repository HTTPS/PAT access: PASS'
+          echo 'Certificates repository HTTPS/TARGET_REPO_PAT access: PASS'
 
           if [[ "$SIGNING_MODE" == 'bootstrap_empty' ]]; then
             if [[ -s /tmp/readori-match-refs.txt ]]; then
@@ -378,6 +376,6 @@ jobs:
             echo
             echo "- Signing mode: \`${{ inputs.signing_mode }}\`"
             echo "- Certificates repo: \`$MATCH_GIT_URL\`"
-            echo '- Certificates auth: HTTPS/PAT (SSH deliberately disabled)'
+            echo '- Certificates auth: HTTPS + TARGET_REPO_PAT (Match SSH disabled)'
             echo "- App ID: \`$APP_BUNDLE_ID\`"
           } >> "$GITHUB_STEP_SUMMARY"
