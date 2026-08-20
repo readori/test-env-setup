@@ -1,4 +1,4 @@
-name: Deploy Tcpwaybill Private Source
+name: Tcpwaybill ci
 
 on:
   workflow_dispatch:
