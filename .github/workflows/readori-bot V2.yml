@@ -375,8 +375,8 @@ jobs:
             --outdir /tmp/readori-bot-dry-run \
             --keep-vars
 
-          grep -Rqs 'readori-bot-clean-production-v1.1-referral-share-v2-20260820' /tmp/readori-bot-dry-run || {
-            echo "::error::Dry-run bundle is missing Referral Share v2 revision"
+          grep -Rqs 'readori-bot-clean-production-v1.1-readerhub-sync-v1-20260820' /tmp/readori-bot-dry-run || {
+            echo "::error::Dry-run bundle is missing Reader Hub + Reading Sync resilience revision"
             exit 1
           }
           grep -Rqs 'bot-admin-operations-v1.1-20260820' /tmp/readori-bot-dry-run || {
@@ -541,8 +541,8 @@ jobs:
               cat /tmp/readori-health.json
               echo
               REVISION="$(jq -r '.revision // empty' /tmp/readori-health.json)"
-              if [[ "$REVISION" != 'readori-bot-clean-production-v1.1-referral-share-v2-20260820' ]]; then
-                echo "::error::Worker is healthy but stale. Expected referral-share-v2 revision; got: ${REVISION:-missing}"
+              if [[ "$REVISION" != 'readori-bot-clean-production-v1.1-readerhub-sync-v1-20260820' ]]; then
+                echo "::error::Worker is healthy but stale. Expected Reader Hub + Reading Sync R13 revision; got: ${REVISION:-missing}"
                 exit 1
               fi
               echo "Worker health + deployed revision: PASS ($REVISION)"
