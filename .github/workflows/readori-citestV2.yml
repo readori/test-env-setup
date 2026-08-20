@@ -1,4 +1,4 @@
-name: Readori citest V2
+name: Readori ci V2
 # Unified pipeline — three modes via single dispatch:
 
 on:
@@ -246,45 +246,6 @@ jobs:
         echo "Developer dir: $(xcode-select -p)"
 
     # ==============================================
-    # 3.5 OFFLINE NEURAL TTS NATIVE SAFETY BRIDGE
-    # ==============================================
-    - name: Integrate Sherpa native exception safety bridge
-      shell: bash
-      run: |
-        set -euo pipefail
-        ROOT="$GITHUB_WORKSPACE/core_project"
-        BRIDGE="$ROOT/Readori/Native/SherpaSafeBridge/ReadoriSherpaSafeBridge.cpp"
-        PATCHER="$ROOT/Readori/Scripts/apply_sherpa_safe_bridge_package_patch.py"
-
-        if [[ ! -f "$BRIDGE" ]]; then
-          echo "Sherpa native safety bridge is not present in this private-source revision; no Package.swift mutation required."
-          exit 0
-        fi
-
-        [[ -f "$PATCHER" ]] || {
-          echo "::error::Sherpa native safety bridge exists but Package.swift integration script is missing: $PATCHER"
-          exit 65
-        }
-        [[ -f "$ROOT/Package.swift" ]] || {
-          echo "::error::Private Readori Package.swift is missing."
-          exit 66
-        }
-
-        cd "$ROOT"
-        python3 "$PATCHER" Package.swift
-
-        grep -q 'name: "ReadoriSherpaSafeBridge"' Package.swift || {
-          echo "::error::ReadoriSherpaSafeBridge target was not integrated into Package.swift."
-          exit 67
-        }
-        grep -q '"ReadoriSherpaSafeBridge"' Package.swift || {
-          echo "::error::Main Readori target does not depend on ReadoriSherpaSafeBridge."
-          exit 68
-        }
-
-        echo "Sherpa native exception safety bridge Package.swift integration: PASS"
-
-    # ==============================================
     # 4. SPM CACHE + RESOLVE
     # ==============================================
     - name: Cache Swift packages
@@ -301,28 +262,6 @@ jobs:
 
     - name: Resolve Swift packages
       run: cd core_project && swift package resolve
-
-    - name: Verify Sherpa / ONNX Runtime dependency resolution
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$GITHUB_WORKSPACE/core_project"
-        swift package describe >/tmp/readori-package-describe.txt
-
-        if [[ -f "Readori/Native/SherpaSafeBridge/ReadoriSherpaSafeBridge.cpp" ]]; then
-          grep -q 'ReadoriSherpaSafeBridge' /tmp/readori-package-describe.txt || {
-            echo "::error::SwiftPM did not resolve ReadoriSherpaSafeBridge into the package graph."
-            exit 69
-          }
-          echo "ReadoriSherpaSafeBridge resolved: PASS"
-        fi
-
-        echo "Resolved sherpa/onnxruntime entries:"
-        if [[ -f Package.resolved ]]; then
-          grep -iE -C2 'sherpa|onnxruntime' Package.resolved || true
-        else
-          echo "Package.resolved not present after resolve."
-        fi
 
     - name: Resolve clean 1.MINOR.PATCH version
       shell: bash
@@ -962,11 +901,18 @@ jobs:
         # Verify the normalized profile one final time.
         security cms -D -i "$TARGET_PROFILE" > "$PROFILE_PLIST"
         FINAL_APP_ID="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$PROFILE_PLIST" 2>/dev/null || true)"
+        PROFILE_ASSOCIATED_DOMAINS="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.associated-domains' "$PROFILE_PLIST" 2>/dev/null || true)"
         rm -f "$PROFILE_PLIST"
         [[ "$FINAL_APP_ID" == "${ASC_TEAM_ID}.${APP_BUNDLE_ID}" ]] || {
           echo "::error::Resolved provisioning profile belongs to unexpected App ID: ${FINAL_APP_ID:-missing}"
           exit 1
         }
+        if ! grep -q 'applinks:api.readori.com' <<<"$PROFILE_ASSOCIATED_DOMAINS"; then
+          echo "::error::The App Store provisioning profile for ${APP_BUNDLE_ID} does not contain Associated Domains."
+          echo "::error::Enable Associated Domains for the Apple Developer App ID, regenerate the Match App Store profile, and include applinks:api.readori.com."
+          exit 1
+        fi
+        echo "Associated Domains profile capability: PASS (applinks:api.readori.com)"
 
         echo "PROFILE_UUID=$PROFILE_UUID" >> "$GITHUB_ENV"
         echo "Signing identity installed by Match: yes"
@@ -1011,6 +957,19 @@ jobs:
 
         mkdir -p "$EXPORT_DIR"
         rm -rf "$DERIVED_DATA"
+
+        # Universal Link source contract: the app entitlement, provisioning profile,
+        # and final manually-signed entitlement must all agree.
+        [[ -f "$ENTITLEMENTS" ]] || { echo "::error::Missing Readori.entitlements"; exit 1; }
+        grep -q 'com.apple.developer.associated-domains' "$ENTITLEMENTS" || {
+          echo "::error::Source entitlements do not declare Associated Domains."
+          exit 1
+        }
+        grep -q 'applinks:api.readori.com' "$ENTITLEMENTS" || {
+          echo "::error::Source entitlements are missing applinks:api.readori.com."
+          exit 1
+        }
+        echo "Source Universal Link entitlement: PASS"
 
         # ── Pre-build: Strip alpha from AppIcon PNGs (Apple requires no transparency) ──
         if [[ -d "$ICONSET_DIR" ]]; then
@@ -1302,6 +1261,8 @@ jobs:
         /usr/libexec/PlistBuddy -c "Add :get-task-allow bool false" "$SIGN_ENTITLEMENTS"
         /usr/libexec/PlistBuddy -c "Add :keychain-access-groups array" "$SIGN_ENTITLEMENTS"
         /usr/libexec/PlistBuddy -c "Add :keychain-access-groups:0 string ${ASC_TEAM_ID}.com.readori.app" "$SIGN_ENTITLEMENTS"
+        /usr/libexec/PlistBuddy -c "Add :com.apple.developer.associated-domains array" "$SIGN_ENTITLEMENTS"
+        /usr/libexec/PlistBuddy -c "Add :com.apple.developer.associated-domains:0 string applinks:api.readori.com" "$SIGN_ENTITLEMENTS"
 
         # Check if profile supports iCloud — if so, add iCloud entitlements
         if [[ -n "$PROFILE_PATH" ]]; then
@@ -1329,9 +1290,16 @@ jobs:
         codesign -f -s "$SIGN_ID" --entitlements "$SIGN_ENTITLEMENTS" --timestamp=none "$APP_PATH"
         echo "Code signing succeeded"
 
-        # Verify
+        # Verify, including the Universal Link entitlement that must survive the
+        # manual-sign packaging path used by this workflow.
         codesign -dvv "$APP_PATH" 2>&1
         codesign --verify --strict "$APP_PATH" 2>&1 || echo "WARNING: strict verification failed"
+        SIGNED_ENTITLEMENTS="$(codesign -d --entitlements :- "$APP_PATH" 2>/dev/null || true)"
+        if ! grep -q 'applinks:api.readori.com' <<<"$SIGNED_ENTITLEMENTS"; then
+          echo "::error::Final signed app is missing applinks:api.readori.com."
+          exit 1
+        fi
+        echo "Final signed Associated Domains entitlement: PASS"
 
         # ── Step 5: Package IPA ──
         echo "=== Step 5: Package IPA ==="
