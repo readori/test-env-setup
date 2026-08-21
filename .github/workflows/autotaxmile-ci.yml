@@ -1,0 +1,176 @@
+name: AutoTaxMile iOS ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unsigned-ios-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PROJECT: AutoTaxMile.xcodeproj
+  SCHEME: AutoTaxMile
+
+jobs:
+  test-and-package:
+    name: Test and package unsigned IPA
+    runs-on: macos-26
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Verify Xcode and project
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          XCODE_VERSION="$(xcodebuild -version | awk '/Xcode/{print $2}')"
+          if [[ "$XCODE_VERSION" != 26.* ]]; then
+            echo "::error::Xcode 26 is required, but the runner selected Xcode $XCODE_VERSION"
+            exit 1
+          fi
+          xcodebuild -list -project "$PROJECT"
+
+      - name: Select an available iPhone Simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          SIMULATOR_UDID="$(xcrun simctl list devices available -j | /usr/bin/python3 -c '
+          import json, sys
+          payload = json.load(sys.stdin)
+          devices = [
+              device
+              for runtime_devices in payload.get("devices", {}).values()
+              for device in runtime_devices
+              if device.get("isAvailable") and device.get("name", "").startswith("iPhone")
+          ]
+          print(devices[0]["udid"] if devices else "")
+          ')"
+          if [[ -z "$SIMULATOR_UDID" ]]; then
+            xcrun simctl list devices available
+            echo "::error::No available iPhone Simulator was found"
+            exit 1
+          fi
+          echo "SIMULATOR_UDID=$SIMULATOR_UDID" >> "$GITHUB_ENV"
+          echo "Selected simulator: $SIMULATOR_UDID"
+
+      - name: Run unit tests without signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_OUTPUT="$RUNNER_TEMP/test-results"
+          rm -rf "$TEST_OUTPUT"
+          mkdir -p "$TEST_OUTPUT"
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData-Simulator" \
+            -resultBundlePath "$TEST_OUTPUT/AutoTaxMileTests.xcresult" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            test | tee "$TEST_OUTPUT/xcodebuild-test.log"
+
+      - name: Build unsigned iPhone app
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEVICE_DERIVED_DATA="$RUNNER_TEMP/DerivedData-Device"
+          rm -rf "$DEVICE_DERIVED_DATA"
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$DEVICE_DERIVED_DATA" \
+            CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            build
+
+          APP_PATH="$DEVICE_DERIVED_DATA/Build/Products/Release-iphoneos/AutoTaxMile.app"
+          if [[ ! -d "$APP_PATH" ]]; then
+            echo "::error::Expected app bundle was not produced at $APP_PATH"
+            exit 1
+          fi
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+
+      - name: Package unsigned app and IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE_ROOT="$RUNNER_TEMP/unsigned-package"
+          OUTPUT_DIR="$PACKAGE_ROOT/output"
+          SHORT_SHA="${GITHUB_SHA:0:8}"
+          IPA_NAME="AutoTaxMile-${SHORT_SHA}-unsigned.ipa"
+          APP_ZIP_NAME="AutoTaxMile-${SHORT_SHA}-unsigned-app.zip"
+
+          rm -rf "$PACKAGE_ROOT"
+          mkdir -p "$PACKAGE_ROOT/Payload" "$OUTPUT_DIR"
+          ditto "$APP_PATH" "$PACKAGE_ROOT/Payload/AutoTaxMile.app"
+
+          # Keep CI certificate-free even if a runner/toolchain added ad-hoc metadata.
+          rm -rf "$PACKAGE_ROOT/Payload/AutoTaxMile.app/_CodeSignature"
+          rm -f "$PACKAGE_ROOT/Payload/AutoTaxMile.app/embedded.mobileprovision"
+          codesign --remove-signature "$PACKAGE_ROOT/Payload/AutoTaxMile.app/AutoTaxMile" 2>/dev/null || true
+
+          if [[ -d "$PACKAGE_ROOT/Payload/AutoTaxMile.app/_CodeSignature" ]] || \
+             [[ -f "$PACKAGE_ROOT/Payload/AutoTaxMile.app/embedded.mobileprovision" ]]; then
+            echo "::error::Signing material remains in the packaged app"
+            exit 1
+          fi
+          if codesign -d "$PACKAGE_ROOT/Payload/AutoTaxMile.app" >/dev/null 2>&1; then
+            echo "::error::The packaged app still contains a code signature"
+            exit 1
+          fi
+
+          (
+            cd "$PACKAGE_ROOT"
+            /usr/bin/zip -qry "$OUTPUT_DIR/$IPA_NAME" Payload
+          )
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$PACKAGE_ROOT/Payload/AutoTaxMile.app" \
+            "$OUTPUT_DIR/$APP_ZIP_NAME"
+
+          {
+            echo "Commit: $GITHUB_SHA"
+            echo "Run: $GITHUB_RUN_ID / attempt $GITHUB_RUN_ATTEMPT"
+            echo "Unsigned: true"
+            echo "Bundle identifier: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PACKAGE_ROOT/Payload/AutoTaxMile.app/Info.plist")"
+            echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+            xcodebuild -version
+            echo
+            echo "SHA-256:"
+            shasum -a 256 "$OUTPUT_DIR/$IPA_NAME" "$OUTPUT_DIR/$APP_ZIP_NAME"
+          } > "$OUTPUT_DIR/build-info.txt"
+
+          echo "PACKAGE_OUTPUT=$OUTPUT_DIR" >> "$GITHUB_ENV"
+          ls -lah "$OUTPUT_DIR"
+
+      - name: Upload unsigned package
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoTaxMile-unsigned-${{ github.run_number }}
+          path: ${{ runner.temp }}/unsigned-package/output/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoTaxMile-test-results-${{ github.run_number }}
+          path: ${{ runner.temp }}/test-results
+          if-no-files-found: ignore
+          retention-days: 14
