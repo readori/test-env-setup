@@ -75,7 +75,7 @@ jobs:
       APP_VERSION_INPUT: ${{ github.event.inputs.app_version }}
       BUILD_NUMBER_INPUT: ${{ github.event.inputs.build_number }}
       READORI_SOCIAL_WORKER_ENDPOINT: ${{ secrets.READORI_SOCIAL_WORKER_ENDPOINT }}
-      CI_REVISION: "R14_PRODUCTION_CLOSEOUT_20260821"
+      CI_REVISION: "R14_BUILD57_USER_FEEDBACK_FIX_20260821"
 
     steps:
 
