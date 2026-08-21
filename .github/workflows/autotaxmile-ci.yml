@@ -1,174 +1,967 @@
-name: AutoTaxMile iOS ci
+name: AutoTaxMile iOS CI
+
+run-name: AutoTaxMile iOS · ${{ github.event.client_payload.distribution || inputs.distribution || 'verify' }} · ${{ github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
 
 on:
   workflow_dispatch:
+    inputs:
+      distribution:
+        description: 'Build task'
+        required: true
+        default: 'verify'
+        type: choice
+        options:
+          - verify
+          - sideload
+          - archive
+          - testflight
+          - both
+      source_ref:
+        description: 'Private readori/AutoTaxMile branch, tag, or SHA'
+        required: true
+        default: 'main'
+        type: string
+      app_version:
+        description: 'CFBundleShortVersionString. Blank = project MARKETING_VERSION'
+        required: false
+        default: ''
+        type: string
+      build_number:
+        description: 'CFBundleVersion. Blank = public CI GitHub run number'
+        required: false
+        default: ''
+        type: string
+      release_notes:
+        description: 'Optional notes for public sideload prerelease / CI summary'
+        required: false
+        default: ''
+        type: string
+      signing_bootstrap:
+        description: 'First App Store signing run only: allow Match to create/refresh AutoTaxMile App Store profile'
+        required: false
+        default: false
+        type: boolean
 
+  # Optional automation entry point. A tiny dispatcher in the PRIVATE source
+  # repository can call this event when main changes or a v* release tag is pushed.
+  repository_dispatch:
+    types:
+      - autotaxmile-ci
+      - autotaxmile-release
+
+# Default to the smallest token. This workflow grants contents:write only to the
+# build job because sideload mode may publish a prerelease in THIS PUBLIC repo.
 permissions:
   contents: read
 
 concurrency:
-  group: unsigned-ios-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: autotaxmile-ios-${{ github.event.client_payload.source_ref || inputs.source_ref || 'main' }}-${{ github.event.client_payload.distribution || inputs.distribution || 'verify' }}
+  cancel-in-progress: false
 
 env:
-  PROJECT: AutoTaxMile.xcodeproj
+  PRIVATE_SOURCE_REPOSITORY: readori/AutoTaxMile
+  PRIVATE_SOURCE_PATH: source
   SCHEME: AutoTaxMile
+  EXPECTED_BUNDLE_ID: com.readori.autotaxmile
+  MATCH_GIT_URL: https://github.com/readori/readori-certificates.git
+  # Pin fastlane for reproducible Match behavior. TestFlight upload itself uses Apple's altool.
+  FASTLANE_VERSION: '2.238.0'
 
 jobs:
-  test-and-package:
-    name: Test and package unsigned IPA
+  ios:
+    name: Build AutoTaxMile iOS
     runs-on: macos-26
-    timeout-minutes: 45
+    timeout-minutes: 75
+    permissions:
+      contents: write
+
+    env:
+      DISTRIBUTION: ${{ github.event.client_payload.distribution || inputs.distribution || 'verify' }}
+      SOURCE_REF: ${{ github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
+      APP_VERSION_INPUT: ${{ github.event.client_payload.app_version || inputs.app_version || '' }}
+      BUILD_NUMBER_INPUT: ${{ github.event.client_payload.build_number || inputs.build_number || '' }}
+      RELEASE_NOTES: ${{ github.event.client_payload.release_notes || inputs.release_notes || '' }}
+      SIGNING_BOOTSTRAP: ${{ github.event.client_payload.signing_bootstrap || inputs.signing_bootstrap || false }}
 
     steps:
-      - name: Check out source
-        uses: actions/checkout@v6
+      # ---------------------------------------------------------------------
+      # 0. Security / request validation BEFORE private source checkout
+      # ---------------------------------------------------------------------
+      - name: Validate CI request and private-repository credential
+        shell: bash
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          set -euo pipefail
 
-      - name: Verify Xcode and project
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || {
+            echo '::error::Missing public-repo secret TARGET_REPO_PAT.'
+            echo '::error::Use a fine-grained PAT with read-only Contents access to readori/AutoTaxMile.'
+            exit 78
+          }
+
+          case "$DISTRIBUTION" in
+            verify|sideload|archive|testflight|both) ;;
+            *)
+              echo "::error::Unsupported distribution mode: $DISTRIBUTION"
+              exit 64
+              ;;
+          esac
+
+          [[ -n "$SOURCE_REF" ]] || {
+            echo '::error::source_ref must not be empty.'
+            exit 64
+          }
+
+          echo "Requested mode: $DISTRIBUTION"
+          echo "Requested private source ref: $SOURCE_REF"
+
+      # ---------------------------------------------------------------------
+      # 1. PUBLIC CI repository -> PRIVATE AutoTaxMile source repository
+      # ---------------------------------------------------------------------
+      - name: Checkout private AutoTaxMile source
+        uses: actions/checkout@v7
+        with:
+          repository: readori/AutoTaxMile
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Discover and verify Xcode project
+        id: source
         shell: bash
         run: |
           set -euo pipefail
-          xcodebuild -version
-          XCODE_VERSION="$(xcodebuild -version | awk '/Xcode/{print $2}')"
-          if [[ "$XCODE_VERSION" != 26.* ]]; then
-            echo "::error::Xcode 26 is required, but the runner selected Xcode $XCODE_VERSION"
-            exit 1
+
+          SOURCE_ABS="$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH"
+          test -d "$SOURCE_ABS/.git" || {
+            echo '::error::Private source checkout is missing its .git directory.'
+            exit 66
+          }
+
+          PROJECT_PATH="$(find "$SOURCE_ABS" -maxdepth 3 -type d -name 'AutoTaxMile.xcodeproj' -print -quit)"
+          if [[ -z "$PROJECT_PATH" || ! -f "$PROJECT_PATH/project.pbxproj" ]]; then
+            echo '::error::AutoTaxMile.xcodeproj was not found within three levels of the private repository root.'
+            find "$SOURCE_ABS" -maxdepth 3 -type d -name '*.xcodeproj' -print || true
+            exit 66
           fi
-          xcodebuild -list -project "$PROJECT"
 
-      - name: Select an available iPhone Simulator
+          PROJECT_ROOT="$(dirname "$PROJECT_PATH")"
+          SOURCE_COMMIT="$(git -C "$SOURCE_ABS" rev-parse HEAD)"
+          SOURCE_SHORT_SHA="${SOURCE_COMMIT:0:8}"
+
+          echo "PROJECT_PATH=$PROJECT_PATH" >> "$GITHUB_ENV"
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+          echo "SOURCE_COMMIT=$SOURCE_COMMIT" >> "$GITHUB_ENV"
+          echo "SOURCE_SHORT_SHA=$SOURCE_SHORT_SHA" >> "$GITHUB_ENV"
+
+          echo "project_path=$PROJECT_PATH" >> "$GITHUB_OUTPUT"
+          echo "project_root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
+          echo "source_commit=$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "source_short_sha=$SOURCE_SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+          echo "Private source: $PRIVATE_SOURCE_REPOSITORY@$SOURCE_REF"
+          echo "Private source commit: $SOURCE_SHORT_SHA"
+          echo "Xcode project: $PROJECT_PATH"
+
+      # ---------------------------------------------------------------------
+      # 2. Toolchain — use Xcode 26 on GitHub's macOS 26 public runner
+      # ---------------------------------------------------------------------
+      - name: Select Xcode 26
         shell: bash
         run: |
           set -euo pipefail
+
+          select_xcode() {
+            local app="$1"
+            if [[ -d "$app/Contents/Developer" ]]; then
+              sudo xcode-select -s "$app/Contents/Developer"
+              echo "Selected Xcode: $app"
+              return 0
+            fi
+            return 1
+          }
+
+          select_xcode /Applications/Xcode_26.6.app || \
+          select_xcode /Applications/Xcode_26.5.app || \
+          select_xcode /Applications/Xcode_26.4.app || \
+          select_xcode /Applications/Xcode_26.3.app || \
+          select_xcode /Applications/Xcode_26.2.app || \
+          select_xcode /Applications/Xcode_26.1.app || \
+          select_xcode /Applications/Xcode_26.app || \
+          select_xcode /Applications/Xcode.app || {
+            echo '::error::No Xcode installation was found.'
+            ls -1 /Applications | grep '^Xcode' || true
+            exit 69
+          }
+
+          XCODE_VERSION="$(xcodebuild -version | awk 'NR==1 {print $2}')"
+          XCODE_MAJOR="${XCODE_VERSION%%.*}"
+          if ! [[ "$XCODE_MAJOR" =~ ^[0-9]+$ ]] || (( XCODE_MAJOR != 26 )); then
+            echo "::error::AutoTaxMile CI currently requires Xcode 26.x; selected $XCODE_VERSION"
+            exit 69
+          fi
+
+          xcodebuild -version
+          echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "Runner architecture: $(uname -m)"
+
+      # ---------------------------------------------------------------------
+      # 3. Resolve version/build without modifying the private repository
+      # ---------------------------------------------------------------------
+      - name: Resolve app version and build number
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          xcodebuild -list -project "$PROJECT_PATH" >/tmp/autotaxmile-xcode-list.txt
+          grep -q "$SCHEME" /tmp/autotaxmile-xcode-list.txt || {
+            echo "::error::Shared scheme '$SCHEME' was not found."
+            cat /tmp/autotaxmile-xcode-list.txt
+            exit 66
+          }
+
+          if [[ -n "$APP_VERSION_INPUT" ]]; then
+            APP_VERSION="$APP_VERSION_INPUT"
+          else
+            APP_VERSION="$(
+              xcodebuild \
+                -project "$PROJECT_PATH" \
+                -scheme "$SCHEME" \
+                -configuration Release \
+                -showBuildSettings 2>/dev/null \
+              | awk -F ' = ' '/MARKETING_VERSION = / {print $2; exit}'
+            )"
+          fi
+
+          [[ "$APP_VERSION" =~ ^[0-9]+([.][0-9]+){1,2}$ ]] || {
+            echo "::error::Resolved app version must look like 1.1 or 1.1.0; got: ${APP_VERSION:-<empty>}"
+            exit 64
+          }
+
+          RAW_BUILD_NUMBER="${BUILD_NUMBER_INPUT:-$GITHUB_RUN_NUMBER}"
+          [[ "$RAW_BUILD_NUMBER" =~ ^[0-9]+$ ]] || {
+            echo "::error::build_number must be a positive integer; got: $RAW_BUILD_NUMBER"
+            exit 64
+          }
+
+          BUILD_NUMBER="$((10#$RAW_BUILD_NUMBER))"
+          (( BUILD_NUMBER > 0 )) || {
+            echo "::error::build_number must be greater than zero; got: $RAW_BUILD_NUMBER"
+            exit 64
+          }
+
+          if [[ "$BUILD_NUMBER" != "$RAW_BUILD_NUMBER" ]]; then
+            echo "::notice::Normalized build number $RAW_BUILD_NUMBER -> $BUILD_NUMBER"
+          fi
+
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+
+          echo "Version: $APP_VERSION ($BUILD_NUMBER)"
+
+      # ---------------------------------------------------------------------
+      # 4. Simulator unit tests — no signing and no secret-dependent build phase
+      # ---------------------------------------------------------------------
+      - name: Select an available iPhone Simulator
+        id: simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+
           SIMULATOR_UDID="$(xcrun simctl list devices available -j | /usr/bin/python3 -c '
           import json, sys
           payload = json.load(sys.stdin)
           devices = [
               device
-              for runtime_devices in payload.get("devices", {}).values()
+              for runtime, runtime_devices in payload.get("devices", {}).items()
+              if "SimRuntime.iOS" in runtime
               for device in runtime_devices
               if device.get("isAvailable") and device.get("name", "").startswith("iPhone")
           ]
           print(devices[0]["udid"] if devices else "")
           ')"
+
           if [[ -z "$SIMULATOR_UDID" ]]; then
             xcrun simctl list devices available
-            echo "::error::No available iPhone Simulator was found"
-            exit 1
+            echo '::error::No available iPhone Simulator was found.'
+            exit 69
           fi
+
           echo "SIMULATOR_UDID=$SIMULATOR_UDID" >> "$GITHUB_ENV"
+          echo "udid=$SIMULATOR_UDID" >> "$GITHUB_OUTPUT"
+
+          xcrun simctl boot "$SIMULATOR_UDID" >/dev/null 2>&1 || true
+          xcrun simctl bootstatus "$SIMULATOR_UDID" -b
           echo "Selected simulator: $SIMULATOR_UDID"
 
-      - name: Run unit tests without signing
+      - name: Run AutoTaxMile unit tests
         shell: bash
         run: |
           set -euo pipefail
-          TEST_OUTPUT="$RUNNER_TEMP/test-results"
-          rm -rf "$TEST_OUTPUT"
-          mkdir -p "$TEST_OUTPUT"
-          xcodebuild \
-            -project "$PROJECT" \
+
+          TEST_RESULT="$RUNNER_TEMP/AutoTaxMileTests.xcresult"
+          TEST_DERIVED="$RUNNER_TEMP/DerivedData-Tests"
+          rm -rf "$TEST_RESULT" "$TEST_DERIVED"
+
+          # -quiet materially reduces the amount of private-source metadata exposed
+          # in this PUBLIC workflow's logs while still surfacing warnings/errors.
+          xcodebuild test \
+            -quiet \
+            -project "$PROJECT_PATH" \
             -scheme "$SCHEME" \
             -configuration Debug \
             -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
-            -derivedDataPath "$RUNNER_TEMP/DerivedData-Simulator" \
-            -resultBundlePath "$TEST_OUTPUT/AutoTaxMileTests.xcresult" \
+            -derivedDataPath "$TEST_DERIVED" \
+            -resultBundlePath "$TEST_RESULT" \
+            -parallel-testing-enabled NO \
             CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            test | tee "$TEST_OUTPUT/xcodebuild-test.log"
+            CODE_SIGNING_REQUIRED=NO
 
-      - name: Build unsigned iPhone app
+      # ---------------------------------------------------------------------
+      # 5A. Sideload package — intentionally UNSIGNED, then published only to
+      #     the PUBLIC CI repository. AltStore/Sideloadly/etc. can re-sign it.
+      # ---------------------------------------------------------------------
+      - name: Build unsigned device app for sideload
+        id: unsigned
+        if: ${{ env.DISTRIBUTION == 'sideload' || env.DISTRIBUTION == 'both' }}
         shell: bash
         run: |
           set -euo pipefail
-          DEVICE_DERIVED_DATA="$RUNNER_TEMP/DerivedData-Device"
-          rm -rf "$DEVICE_DERIVED_DATA"
-          xcodebuild \
-            -project "$PROJECT" \
+
+          DEVICE_DERIVED="$RUNNER_TEMP/DerivedData-Unsigned"
+          rm -rf "$DEVICE_DERIVED"
+
+          xcodebuild build \
+            -quiet \
+            -project "$PROJECT_PATH" \
             -scheme "$SCHEME" \
             -configuration Release \
             -sdk iphoneos \
-            -destination "generic/platform=iOS" \
-            -derivedDataPath "$DEVICE_DERIVED_DATA" \
-            CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$DEVICE_DERIVED" \
+            MARKETING_VERSION="$APP_VERSION" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            DEVELOPMENT_TEAM="" \
-            build
+            CODE_SIGN_IDENTITY='' \
+            DEVELOPMENT_TEAM=''
 
-          APP_PATH="$DEVICE_DERIVED_DATA/Build/Products/Release-iphoneos/AutoTaxMile.app"
-          if [[ ! -d "$APP_PATH" ]]; then
-            echo "::error::Expected app bundle was not produced at $APP_PATH"
-            exit 1
-          fi
-          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+          APP_PATH="$(find "$DEVICE_DERIVED/Build/Products/Release-iphoneos" -maxdepth 1 -type d -name 'AutoTaxMile.app' -print -quit)"
+          [[ -n "$APP_PATH" && -d "$APP_PATH" ]] || {
+            echo '::error::Unsigned AutoTaxMile.app was not produced.'
+            find "$DEVICE_DERIVED/Build/Products" -maxdepth 3 -type d -name '*.app' -print || true
+            exit 65
+          }
 
-      - name: Package unsigned app and IPA
+          BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist")"
+          [[ "$BUNDLE_ID" == "$EXPECTED_BUNDLE_ID" ]] || {
+            echo "::error::Unexpected bundle identifier: $BUNDLE_ID (expected $EXPECTED_BUNDLE_ID)"
+            exit 65
+          }
+
+          echo "UNSIGNED_APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+          echo "app_path=$APP_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Package and verify unsigned sideload IPA
+        id: sideload
+        if: ${{ env.DISTRIBUTION == 'sideload' || env.DISTRIBUTION == 'both' }}
         shell: bash
         run: |
           set -euo pipefail
-          PACKAGE_ROOT="$RUNNER_TEMP/unsigned-package"
+
+          PACKAGE_ROOT="$RUNNER_TEMP/AutoTaxMile-Sideload"
           OUTPUT_DIR="$PACKAGE_ROOT/output"
-          SHORT_SHA="${GITHUB_SHA:0:8}"
-          IPA_NAME="AutoTaxMile-${SHORT_SHA}-unsigned.ipa"
-          APP_ZIP_NAME="AutoTaxMile-${SHORT_SHA}-unsigned-app.zip"
+          IPA_NAME="AutoTaxMile-v${APP_VERSION}-b${BUILD_NUMBER}-${SOURCE_SHORT_SHA}-unsigned.ipa"
+          APP_ZIP_NAME="AutoTaxMile-v${APP_VERSION}-b${BUILD_NUMBER}-${SOURCE_SHORT_SHA}-unsigned-app.zip"
 
           rm -rf "$PACKAGE_ROOT"
           mkdir -p "$PACKAGE_ROOT/Payload" "$OUTPUT_DIR"
-          ditto "$APP_PATH" "$PACKAGE_ROOT/Payload/AutoTaxMile.app"
+          ditto "$UNSIGNED_APP_PATH" "$PACKAGE_ROOT/Payload/AutoTaxMile.app"
 
-          # Keep CI certificate-free even if a runner/toolchain added ad-hoc metadata.
+          # Defense-in-depth: remove any ad-hoc metadata a toolchain happened to add.
           rm -rf "$PACKAGE_ROOT/Payload/AutoTaxMile.app/_CodeSignature"
           rm -f "$PACKAGE_ROOT/Payload/AutoTaxMile.app/embedded.mobileprovision"
           codesign --remove-signature "$PACKAGE_ROOT/Payload/AutoTaxMile.app/AutoTaxMile" 2>/dev/null || true
 
           if [[ -d "$PACKAGE_ROOT/Payload/AutoTaxMile.app/_CodeSignature" ]] || \
              [[ -f "$PACKAGE_ROOT/Payload/AutoTaxMile.app/embedded.mobileprovision" ]]; then
-            echo "::error::Signing material remains in the packaged app"
-            exit 1
+            echo '::error::Signing material remains in the sideload app.'
+            exit 65
           fi
+
           if codesign -d "$PACKAGE_ROOT/Payload/AutoTaxMile.app" >/dev/null 2>&1; then
-            echo "::error::The packaged app still contains a code signature"
-            exit 1
+            echo '::error::Sideload package unexpectedly still contains a code signature.'
+            exit 65
           fi
 
           (
             cd "$PACKAGE_ROOT"
             /usr/bin/zip -qry "$OUTPUT_DIR/$IPA_NAME" Payload
           )
+
           ditto -c -k --sequesterRsrc --keepParent \
             "$PACKAGE_ROOT/Payload/AutoTaxMile.app" \
             "$OUTPUT_DIR/$APP_ZIP_NAME"
 
           {
-            echo "Commit: $GITHUB_SHA"
-            echo "Run: $GITHUB_RUN_ID / attempt $GITHUB_RUN_ATTEMPT"
-            echo "Unsigned: true"
-            echo "Bundle identifier: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PACKAGE_ROOT/Payload/AutoTaxMile.app/Info.plist")"
-            echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
-            xcodebuild -version
+            echo "AutoTaxMile unsigned sideload build"
+            echo "Version: $APP_VERSION"
+            echo "Build: $BUILD_NUMBER"
+            echo "Private source: $PRIVATE_SOURCE_REPOSITORY@$SOURCE_REF"
+            echo "Private source commit: $SOURCE_COMMIT"
+            echo "Bundle identifier: $EXPECTED_BUNDLE_ID"
+            echo "GitHub public CI run: $GITHUB_RUN_ID / attempt $GITHUB_RUN_ATTEMPT"
+            echo "Xcode: $(xcodebuild -version | head -1)"
+            echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
             echo
-            echo "SHA-256:"
+            echo 'SHA-256:'
             shasum -a 256 "$OUTPUT_DIR/$IPA_NAME" "$OUTPUT_DIR/$APP_ZIP_NAME"
           } > "$OUTPUT_DIR/build-info.txt"
 
-          echo "PACKAGE_OUTPUT=$OUTPUT_DIR" >> "$GITHUB_ENV"
-          ls -lah "$OUTPUT_DIR"
+          SIDELOAD_IPA_PATH="$OUTPUT_DIR/$IPA_NAME"
+          echo "SIDELOAD_OUTPUT=$OUTPUT_DIR" >> "$GITHUB_ENV"
+          echo "SIDELOAD_IPA=$SIDELOAD_IPA_PATH" >> "$GITHUB_ENV"
+          echo "ipa_path=$SIDELOAD_IPA_PATH" >> "$GITHUB_OUTPUT"
 
-      - name: Upload unsigned package
+          ls -lh "$OUTPUT_DIR"
+
+      - name: Publish sideload IPA to public GitHub prerelease
+        if: ${{ env.DISTRIBUTION == 'sideload' || env.DISTRIBUTION == 'both' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLIC_RELEASE_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          RELEASE_TAG="autotaxmile-sideload-v${APP_VERSION}-b${BUILD_NUMBER}-run${GITHUB_RUN_NUMBER}"
+          RELEASE_TITLE="AutoTaxMile Sideload v${APP_VERSION} (${BUILD_NUMBER})"
+          NOTES_FILE="$RUNNER_TEMP/autotaxmile-sideload-release-notes.md"
+
+          {
+            echo '# AutoTaxMile unsigned sideload build'
+            echo
+            echo "- Version: \`${APP_VERSION}\`"
+            echo "- Build: \`${BUILD_NUMBER}\`"
+            echo "- Bundle ID: \`${EXPECTED_BUNDLE_ID}\`"
+            echo "- Private source: \`${PRIVATE_SOURCE_REPOSITORY}@${SOURCE_REF}\`"
+            echo "- Source commit: \`${SOURCE_SHORT_SHA}\`"
+            echo
+            echo '> This IPA is intentionally unsigned. Install it with a sideloading tool that re-signs the app with your own Apple ID/developer certificate. It is not the TestFlight/App Store package.'
+            if [[ -n "${RELEASE_NOTES:-}" ]]; then
+              echo
+              echo '## Notes'
+              echo
+              printf '%s\n' "$RELEASE_NOTES"
+            fi
+          } > "$NOTES_FILE"
+
+          gh release create "$RELEASE_TAG" \
+            "$SIDELOAD_OUTPUT"/* \
+            --repo "$PUBLIC_RELEASE_REPO" \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TITLE" \
+            --notes-file "$NOTES_FILE" \
+            --prerelease
+
+          echo "SIDELOAD_RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------------
+      # 5B. App Store signing / Archive / TestFlight
+      #     - certificates/profiles: readori/readori-certificates via Match
+      #     - source PAT and Match PAT are deliberately separate
+      #     - upload: Apple's Xcode 26 altool with App Store Connect API key
+      # ---------------------------------------------------------------------
+      - name: Validate App Store signing secrets
+        if: ${{ env.DISTRIBUTION == 'archive' || env.DISTRIBUTION == 'testflight' || env.DISTRIBUTION == 'both' }}
+        shell: bash
+        env:
+          MATCH_REPO_PAT: ${{ secrets.MATCH_REPO_PAT }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+          AUTOTAXMILE_ASC_APP_ID: ${{ secrets.AUTOTAXMILE_ASC_APP_ID }}
+        run: |
+          set -euo pipefail
+
+          required=(
+            MATCH_REPO_PAT
+            MATCH_PASSWORD
+            ASC_ISSUER_ID
+            ASC_KEY_ID
+            ASC_PRIVATE_KEY
+            ASC_TEAM_ID
+          )
+
+          missing=0
+          for name in "${required[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing public-repo secret required for App Store signing: $name"
+              missing=1
+            fi
+          done
+          (( missing == 0 )) || exit 78
+
+          if [[ -n "${AUTOTAXMILE_ASC_APP_ID:-}" && ! "$AUTOTAXMILE_ASC_APP_ID" =~ ^[0-9]+$ ]]; then
+            echo '::error::AUTOTAXMILE_ASC_APP_ID, when set, must be the numeric App Store Connect Apple ID.'
+            exit 64
+          fi
+
+          if [[ "$SIGNING_BOOTSTRAP" == 'true' ]]; then
+            echo '::notice::signing_bootstrap=true: Match will be allowed to update the certificate repository.'
+          fi
+
+      - name: Install pinned fastlane for Match only
+        if: ${{ env.DISTRIBUTION == 'archive' || env.DISTRIBUTION == 'testflight' || env.DISTRIBUTION == 'both' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FASTLANE_GEM_HOME="$RUNNER_TEMP/fastlane-gems"
+          rm -rf "$FASTLANE_GEM_HOME"
+          mkdir -p "$FASTLANE_GEM_HOME"
+
+          export GEM_HOME="$FASTLANE_GEM_HOME"
+          export GEM_PATH="$FASTLANE_GEM_HOME"
+          export PATH="$FASTLANE_GEM_HOME/bin:$PATH"
+
+          gem install --no-document fastlane -v "$FASTLANE_VERSION"
+          fastlane --version
+
+          echo "GEM_HOME=$FASTLANE_GEM_HOME" >> "$GITHUB_ENV"
+          echo "GEM_PATH=$FASTLANE_GEM_HOME" >> "$GITHUB_ENV"
+          echo "$FASTLANE_GEM_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Create ephemeral signing keychain and App Store Connect key
+        id: signing_env
+        if: ${{ env.DISTRIBUTION == 'archive' || env.DISTRIBUTION == 'testflight' || env.DISTRIBUTION == 'both' }}
+        shell: bash
+        env:
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          KEYCHAIN_NAME="autotaxmile-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.keychain-db"
+          KEYCHAIN_PATH="$HOME/Library/Keychains/$KEYCHAIN_NAME"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_NAME"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+
+          # Keep login plus the ephemeral CI keychain in the search list.
+          LOGIN_KEYCHAIN="$(security default-keychain -d user | tr -d '"')"
+          echo "ORIGINAL_DEFAULT_KEYCHAIN=$LOGIN_KEYCHAIN" >> "$GITHUB_ENV"
+          security default-keychain -d user -s "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" "$LOGIN_KEYCHAIN"
+
+          ASC_DIR="$RUNNER_TEMP/autotaxmile-asc"
+          mkdir -p "$ASC_DIR" "$HOME/.appstoreconnect/private_keys"
+          P8_PATH="$ASC_DIR/AuthKey_${ASC_KEY_ID}.p8"
+          API_KEY_JSON="$ASC_DIR/api-key.json"
+
+          printf '%s\n' "$ASC_PRIVATE_KEY" > "$P8_PATH"
+          chmod 600 "$P8_PATH"
+
+          grep -q 'BEGIN PRIVATE KEY' "$P8_PATH" || {
+            echo '::error::ASC_PRIVATE_KEY does not look like an App Store Connect .p8 private key.'
+            exit 78
+          }
+
+          cp "$P8_PATH" "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          chmod 600 "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+
+          export P8_PATH_FOR_PY="$P8_PATH"
+          python3 - "$API_KEY_JSON" <<'PY'
+          import json, os, sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          p8 = Path(os.environ["P8_PATH_FOR_PY"]).read_text(encoding="utf-8")
+          payload = {
+              "key_id": os.environ["ASC_KEY_ID"],
+              "issuer_id": os.environ["ASC_ISSUER_ID"],
+              "key": p8,
+              "in_house": False,
+          }
+          path.write_text(json.dumps(payload), encoding="utf-8")
+          PY
+
+          echo "KEYCHAIN_NAME=$KEYCHAIN_NAME" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD" >> "$GITHUB_ENV"
+          echo "ASC_P8_PATH=$P8_PATH" >> "$GITHUB_ENV"
+          echo "ASC_API_KEY_JSON=$API_KEY_JSON" >> "$GITHUB_ENV"
+          echo "ASC_KEY_ID=$ASC_KEY_ID" >> "$GITHUB_ENV"
+
+          echo "keychain_name=$KEYCHAIN_NAME" >> "$GITHUB_OUTPUT"
+          echo "api_key_json=$API_KEY_JSON" >> "$GITHUB_OUTPUT"
+
+      - name: Configure Match repository authentication
+        if: ${{ env.DISTRIBUTION == 'archive' || env.DISTRIBUTION == 'testflight' || env.DISTRIBUTION == 'both' }}
+        shell: bash
+        env:
+          MATCH_REPO_PAT: ${{ secrets.MATCH_REPO_PAT }}
+        run: |
+          set -euo pipefail
+
+          MATCH_AUTH="$(printf '%s:%s' 'readori' "$MATCH_REPO_PAT" | base64 | tr -d '\n')"
+          echo "::add-mask::$MATCH_AUTH"
+          echo "MATCH_GIT_BASIC_AUTHORIZATION=$MATCH_AUTH" >> "$GITHUB_ENV"
+
+          git -c http.extraheader="AUTHORIZATION: basic $MATCH_AUTH" \
+            ls-remote "$MATCH_GIT_URL" HEAD >/dev/null
+          echo 'Match credential can read readori/readori-certificates.'
+
+          if [[ "$SIGNING_BOOTSTRAP" == 'true' ]]; then
+            PROBE_DIR="$(mktemp -d)"
+            trap 'rm -rf "$PROBE_DIR"' EXIT
+            git -c http.extraheader="AUTHORIZATION: basic $MATCH_AUTH" \
+              clone --depth=1 "$MATCH_GIT_URL" "$PROBE_DIR" >/dev/null 2>&1
+            PROBE_REF="refs/heads/__autotaxmile_match_probe_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+            if ! git -C "$PROBE_DIR" \
+              -c http.extraheader="AUTHORIZATION: basic $MATCH_AUTH" \
+              push --dry-run origin "HEAD:$PROBE_REF" >/dev/null 2>&1; then
+              echo '::error::signing_bootstrap=true requires MATCH_REPO_PAT write access to readori/readori-certificates.'
+              exit 78
+            fi
+            echo 'Match write permission dry-run: PASS'
+          fi
+
+      - name: Install AutoTaxMile App Store signing assets with Match
+        if: ${{ env.DISTRIBUTION == 'archive' || env.DISTRIBUTION == 'testflight' || env.DISTRIBUTION == 'both' }}
+        shell: bash
+        env:
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          MATCH_READONLY='true'
+          MATCH_FORCE='false'
+          if [[ "$SIGNING_BOOTSTRAP" == 'true' ]]; then
+            MATCH_READONLY='false'
+            MATCH_FORCE='true'
+          fi
+
+          args=(
+            fastlane match appstore
+            --app_identifier "$EXPECTED_BUNDLE_ID"
+            --git_url "$MATCH_GIT_URL"
+            --git_basic_authorization "$MATCH_GIT_BASIC_AUTHORIZATION"
+            --team_id "$ASC_TEAM_ID"
+            --api_key_path "$ASC_API_KEY_JSON"
+            --keychain_name "$KEYCHAIN_NAME"
+            --keychain_password "$KEYCHAIN_PASSWORD"
+            --shallow_clone true
+            --clone_branch_directly false
+            --readonly "$MATCH_READONLY"
+          )
+
+          if [[ "$MATCH_FORCE" == 'true' ]]; then
+            args+=(--force true)
+          fi
+
+          "${args[@]}"
+
+          # Prevent non-interactive codesign from prompting for private-key access.
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH" >/dev/null
+
+      - name: Locate and validate installed App Store profile
+        id: profile
+        if: ${{ env.DISTRIBUTION == 'archive' || env.DISTRIBUTION == 'testflight' || env.DISTRIBUTION == 'both' }}
+        shell: bash
+        env:
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          PROFILE_SCAN_DIR="$RUNNER_TEMP/autotaxmile-profile-scan"
+          rm -rf "$PROFILE_SCAN_DIR"
+          mkdir -p "$PROFILE_SCAN_DIR"
+
+          PROFILE_PATH=''
+          PROFILE_NAME=''
+          PROFILE_UUID=''
+          PROFILE_TEAM=''
+          GET_TASK_ALLOW=''
+
+          shopt -s nullglob
+          candidates=(
+            "$HOME/Library/MobileDevice/Provisioning Profiles/"*.mobileprovision
+            "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/"*.mobileprovision
+          )
+          shopt -u nullglob
+
+          for profile in "${candidates[@]}"; do
+            [[ -f "$profile" ]] || continue
+            plist="$PROFILE_SCAN_DIR/$(basename "$profile").plist"
+            /usr/bin/security cms -D -i "$profile" > "$plist" 2>/dev/null || continue
+
+            app_id="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$plist" 2>/dev/null || true)"
+            [[ "$app_id" == *".$EXPECTED_BUNDLE_ID" ]] || continue
+
+            PROFILE_PATH="$profile"
+            PROFILE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :Name' "$plist")"
+            PROFILE_UUID="$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$plist")"
+            PROFILE_TEAM="$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$plist")"
+            GET_TASK_ALLOW="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$plist" 2>/dev/null || echo false)"
+            break
+          done
+
+          [[ -n "$PROFILE_PATH" ]] || {
+            echo "::error::No App Store provisioning profile for $EXPECTED_BUNDLE_ID was installed by Match."
+            echo '::error::If this is the first AutoTaxMile signing run, create the App ID/App Store Connect app and rerun with signing_bootstrap=true.'
+            exit 65
+          }
+
+          [[ "$PROFILE_TEAM" == "$ASC_TEAM_ID" ]] || {
+            echo "::error::Provisioning profile team $PROFILE_TEAM does not match ASC_TEAM_ID $ASC_TEAM_ID."
+            exit 65
+          }
+
+          [[ "$GET_TASK_ALLOW" != 'true' ]] || {
+            echo '::error::Installed profile has get-task-allow=true and is not an App Store distribution profile.'
+            exit 65
+          }
+
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -q 'Apple Distribution' || {
+            echo '::error::No Apple Distribution signing identity was installed into the ephemeral keychain.'
+            security find-identity -v -p codesigning "$KEYCHAIN_PATH" || true
+            exit 65
+          }
+
+          echo "APPSTORE_PROFILE_PATH=$PROFILE_PATH" >> "$GITHUB_ENV"
+          echo "APPSTORE_PROFILE_NAME=$PROFILE_NAME" >> "$GITHUB_ENV"
+          echo "APPSTORE_PROFILE_UUID=$PROFILE_UUID" >> "$GITHUB_ENV"
+
+          echo "profile_path=$PROFILE_PATH" >> "$GITHUB_OUTPUT"
+          echo "profile_name=$PROFILE_NAME" >> "$GITHUB_OUTPUT"
+          echo "profile_uuid=$PROFILE_UUID" >> "$GITHUB_OUTPUT"
+
+          echo "Provisioning profile: $PROFILE_NAME ($PROFILE_UUID)"
+          echo "Team: $PROFILE_TEAM"
+
+      - name: Build signed App Store archive and IPA
+        id: appstore
+        if: ${{ env.DISTRIBUTION == 'archive' || env.DISTRIBUTION == 'testflight' || env.DISTRIBUTION == 'both' }}
+        shell: bash
+        env:
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          ARCHIVE_PATH="$RUNNER_TEMP/AutoTaxMile.xcarchive"
+          EXPORT_DIR="$RUNNER_TEMP/AutoTaxMile-AppStore-Export"
+          EXPORT_OPTIONS="$RUNNER_TEMP/AutoTaxMile-ExportOptions.plist"
+
+          rm -rf "$ARCHIVE_PATH" "$EXPORT_DIR" "$EXPORT_OPTIONS"
+          mkdir -p "$EXPORT_DIR"
+
+          xcodebuild archive \
+            -quiet \
+            -project "$PROJECT_PATH" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$ARCHIVE_PATH" \
+            MARKETING_VERSION="$APP_VERSION" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="$ASC_TEAM_ID" \
+            CODE_SIGN_IDENTITY='Apple Distribution' \
+            PROVISIONING_PROFILE_SPECIFIER="$APPSTORE_PROFILE_NAME"
+
+          test -d "$ARCHIVE_PATH/Products/Applications/AutoTaxMile.app" || {
+            echo '::error::Signed xcarchive was not produced.'
+            exit 65
+          }
+
+          export BUNDLE_ID_FOR_PLIST="$EXPECTED_BUNDLE_ID"
+          export PROFILE_NAME_FOR_PLIST="$APPSTORE_PROFILE_NAME"
+          export TEAM_ID_FOR_PLIST="$ASC_TEAM_ID"
+          python3 - "$EXPORT_OPTIONS" <<'PY'
+          import os, plistlib, sys
+
+          payload = {
+              "method": "app-store-connect",
+              "destination": "export",
+              "signingStyle": "manual",
+              "signingCertificate": "Apple Distribution",
+              "teamID": os.environ["TEAM_ID_FOR_PLIST"],
+              "provisioningProfiles": {
+                  os.environ["BUNDLE_ID_FOR_PLIST"]: os.environ["PROFILE_NAME_FOR_PLIST"]
+              },
+              "manageAppVersionAndBuildNumber": False,
+              "stripSwiftSymbols": True,
+              "uploadSymbols": True,
+          }
+          with open(sys.argv[1], "wb") as fh:
+              plistlib.dump(payload, fh)
+          PY
+
+          xcodebuild -exportArchive \
+            -quiet \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportPath "$EXPORT_DIR" \
+            -exportOptionsPlist "$EXPORT_OPTIONS"
+
+          SIGNED_IPA="$(find "$EXPORT_DIR" -maxdepth 1 -type f -name '*.ipa' -print -quit)"
+          [[ -n "$SIGNED_IPA" && -f "$SIGNED_IPA" ]] || {
+            echo '::error::Signed App Store IPA was not exported.'
+            find "$EXPORT_DIR" -maxdepth 2 -type f -print || true
+            exit 65
+          }
+
+          VERIFY_DIR="$RUNNER_TEMP/AutoTaxMile-Signed-Verify"
+          rm -rf "$VERIFY_DIR"
+          mkdir -p "$VERIFY_DIR"
+          unzip -q "$SIGNED_IPA" -d "$VERIFY_DIR"
+          SIGNED_APP="$VERIFY_DIR/Payload/AutoTaxMile.app"
+
+          test -f "$SIGNED_APP/embedded.mobileprovision" || {
+            echo '::error::Signed IPA is missing embedded.mobileprovision.'
+            exit 65
+          }
+          codesign --verify --deep --strict "$SIGNED_APP"
+
+          SIGNED_BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$SIGNED_APP/Info.plist")"
+          [[ "$SIGNED_BUNDLE_ID" == "$EXPECTED_BUNDLE_ID" ]] || {
+            echo "::error::Signed IPA bundle ID mismatch: $SIGNED_BUNDLE_ID"
+            exit 65
+          }
+
+          shasum -a 256 "$SIGNED_IPA" > "$EXPORT_DIR/AutoTaxMile-AppStore.sha256"
+
+          echo "ARCHIVE_PATH=$ARCHIVE_PATH" >> "$GITHUB_ENV"
+          echo "SIGNED_EXPORT_DIR=$EXPORT_DIR" >> "$GITHUB_ENV"
+          echo "SIGNED_IPA=$SIGNED_IPA" >> "$GITHUB_ENV"
+
+          echo "archive_path=$ARCHIVE_PATH" >> "$GITHUB_OUTPUT"
+          echo "ipa_path=$SIGNED_IPA" >> "$GITHUB_OUTPUT"
+
+          echo "Signed IPA: $SIGNED_IPA"
+          ls -lh "$SIGNED_IPA" "$EXPORT_DIR/AutoTaxMile-AppStore.sha256"
+
+      - name: Upload signed archive artifact (archive mode only)
+        if: ${{ env.DISTRIBUTION == 'archive' }}
         uses: actions/upload-artifact@v4
         with:
-          name: AutoTaxMile-unsigned-${{ github.run_number }}
-          path: ${{ runner.temp }}/unsigned-package/output/*
+          name: AutoTaxMile-AppStore-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/AutoTaxMile-AppStore-Export/*.ipa
+            ${{ runner.temp }}/AutoTaxMile-AppStore-Export/AutoTaxMile-AppStore.sha256
+            ${{ runner.temp }}/AutoTaxMile.xcarchive
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload test diagnostics
+      - name: Validate App Store package with Apple
+        if: ${{ env.DISTRIBUTION == 'testflight' || env.DISTRIBUTION == 'both' }}
+        shell: bash
+        env:
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          set -euo pipefail
+
+          xcrun altool \
+            --validate-app \
+            --file "$SIGNED_IPA" \
+            --type ios \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID"
+
+      - name: Upload AutoTaxMile to TestFlight
+        if: ${{ env.DISTRIBUTION == 'testflight' || env.DISTRIBUTION == 'both' }}
+        shell: bash
+        env:
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          set -euo pipefail
+
+          xcrun altool \
+            --upload-app \
+            --file "$SIGNED_IPA" \
+            --type ios \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID"
+
+          echo 'TestFlight binary upload accepted by App Store Connect.'
+
+      # ---------------------------------------------------------------------
+      # 6. Final summary
+      # ---------------------------------------------------------------------
+      - name: Build summary
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          {
+            echo '## AutoTaxMile iOS CI completed'
+            echo
+            echo "- Mode: \`${DISTRIBUTION}\`"
+            echo "- Version: \`${APP_VERSION}\`"
+            echo "- Build: \`${BUILD_NUMBER}\`"
+            echo "- Bundle ID: \`${EXPECTED_BUNDLE_ID}\`"
+            echo "- Private source: \`${PRIVATE_SOURCE_REPOSITORY}@${SOURCE_REF}\`"
+            echo "- Source commit: \`${SOURCE_SHORT_SHA}\`"
+            echo "- Xcode: \`$(xcodebuild -version | head -1)\`"
+            echo "- Tests: \`passed\`"
+
+            if [[ "$DISTRIBUTION" == 'sideload' || "$DISTRIBUTION" == 'both' ]]; then
+              echo "- Sideload prerelease: \`${SIDELOAD_RELEASE_TAG}\`"
+            fi
+            if [[ "$DISTRIBUTION" == 'archive' ]]; then
+              echo '- Signed App Store archive: uploaded as a 14-day Actions artifact.'
+            fi
+            if [[ "$DISTRIBUTION" == 'testflight' || "$DISTRIBUTION" == 'both' ]]; then
+              echo '- TestFlight: Apple validation passed and binary upload was accepted.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------------
+      # 7. Cleanup secrets/signing material even after failures
+      # ---------------------------------------------------------------------
+      - name: Cleanup signing material and simulator
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: AutoTaxMile-test-results-${{ github.run_number }}
-          path: ${{ runner.temp }}/test-results
-          if-no-files-found: ignore
-          retention-days: 14
+        shell: bash
+        run: |
+          set +e
+
+          if [[ -n "${SIMULATOR_UDID:-}" ]]; then
+            xcrun simctl shutdown "$SIMULATOR_UDID" >/dev/null 2>&1 || true
+          fi
+
+          if [[ -n "${ORIGINAL_DEFAULT_KEYCHAIN:-}" ]]; then
+            security default-keychain -d user -s "$ORIGINAL_DEFAULT_KEYCHAIN" >/dev/null 2>&1 || true
+            security list-keychains -d user -s "$ORIGINAL_DEFAULT_KEYCHAIN" >/dev/null 2>&1 || true
+          fi
+
+          if [[ -n "${KEYCHAIN_NAME:-}" ]]; then
+            security delete-keychain "$KEYCHAIN_NAME" >/dev/null 2>&1 || true
+          fi
+
+          if [[ -n "${ASC_P8_PATH:-}" ]]; then
+            rm -f "$ASC_P8_PATH" >/dev/null 2>&1 || true
+          fi
+          if [[ -n "${ASC_API_KEY_JSON:-}" ]]; then
+            rm -f "$ASC_API_KEY_JSON" >/dev/null 2>&1 || true
+          fi
+          if [[ -n "${ASC_KEY_ID:-}" ]]; then
+            rm -f "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8" >/dev/null 2>&1 || true
+          fi
+
+          rm -rf "$RUNNER_TEMP/autotaxmile-asc" "$RUNNER_TEMP/autotaxmile-profile-scan" >/dev/null 2>&1 || true
