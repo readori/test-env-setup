@@ -1,4 +1,4 @@
-name: AutoTaxMile iOS CI
+name: AutoTaxMile iOS CI 
 
 run-name: AutoTaxMile iOS · ${{ github.event.client_payload.distribution || inputs.distribution || 'verify' }} · ${{ github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
 
