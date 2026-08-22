@@ -37,9 +37,14 @@ on:
         default: ''
         type: string
       signing_bootstrap:
-        description: 'First App Store signing run only: allow Match to create/refresh ShiftMile App Store profile'
+        description: 'Force a writable Match refresh for this run (normally not needed)'
         required: false
         default: false
+        type: boolean
+      auto_repair_signing:
+        description: 'Automatically repair missing/stale Match signing assets on readori-certificates/main'
+        required: false
+        default: true
         type: boolean
 
 
@@ -59,6 +64,7 @@ env:
   EXPECTED_BUNDLE_ID: com.readori.shiftmile
   EXPECTED_IAP_PRODUCT_ID: com.readori.shiftmile.lifetime
   MATCH_GIT_URL: https://github.com/readori/readori-certificates.git
+  MATCH_GIT_BRANCH: main
   # Pin fastlane for reproducible Match behavior. TestFlight upload itself uses Apple's altool.
   FASTLANE_VERSION: '2.238.0'
 
@@ -77,6 +83,7 @@ jobs:
       BUILD_NUMBER_INPUT: ${{ inputs.build_number || '' }}
       RELEASE_NOTES: ${{ inputs.release_notes || '' }}
       SIGNING_BOOTSTRAP: ${{ inputs.signing_bootstrap || false }}
+      AUTO_REPAIR_SIGNING: ${{ inputs.auto_repair_signing || true }}
 
     steps:
       # ---------------------------------------------------------------------
@@ -547,6 +554,7 @@ jobs:
             echo "- Version: \`${APP_VERSION}\`"
             echo "- Build: \`${BUILD_NUMBER}\`"
             echo "- Bundle ID: \`${EXPECTED_BUNDLE_ID}\`"
+            echo "- Match branch: \`${MATCH_GIT_BRANCH}\`"
             echo "- Private source: \`${PRIVATE_SOURCE_REPOSITORY}@${SOURCE_REF}\`"
             echo "- Source commit: \`${SOURCE_SHORT_SHA}\`"
             echo
@@ -609,8 +617,8 @@ jobs:
           done
           (( missing == 0 )) || exit 78
 
-          if [[ "$SIGNING_BOOTSTRAP" == 'true' ]]; then
-            echo '::notice::signing_bootstrap=true: Match will be allowed to update the certificate repository.'
+          if [[ "$SIGNING_BOOTSTRAP" == 'true' || "$AUTO_REPAIR_SIGNING" == 'true' ]]; then
+            echo '::notice::Signed run may update Match when bootstrap or automatic repair is enabled.'
           fi
 
       - name: Install pinned fastlane for Match only
@@ -716,9 +724,20 @@ jobs:
 
           git -c http.extraheader="AUTHORIZATION: basic $MATCH_AUTH" \
             ls-remote "$MATCH_GIT_URL" HEAD >/dev/null
-          echo 'Match credential can read readori/readori-certificates.'
 
-          if [[ "$SIGNING_BOOTSTRAP" == 'true' ]]; then
+          MATCH_BRANCH_SHA="$(
+            git -c http.extraheader="AUTHORIZATION: basic $MATCH_AUTH" \
+              ls-remote --heads "$MATCH_GIT_URL" "refs/heads/$MATCH_GIT_BRANCH" \
+            | awk 'NR==1 {print $1}'
+          )"
+          [[ -n "$MATCH_BRANCH_SHA" ]] || {
+            echo "::error::Required Match branch '$MATCH_GIT_BRANCH' does not exist in readori/readori-certificates."
+            exit 66
+          }
+          echo 'Match credential can read readori/readori-certificates.'
+          echo "Match branch: $MATCH_GIT_BRANCH (${MATCH_BRANCH_SHA:0:8})"
+
+          if [[ "$SIGNING_BOOTSTRAP" == 'true' || "$AUTO_REPAIR_SIGNING" == 'true' ]]; then
             PROBE_DIR="$(mktemp -d)"
             trap 'rm -rf "$PROBE_DIR"' EXIT
             git -c http.extraheader="AUTHORIZATION: basic $MATCH_AUTH" \
@@ -727,54 +746,157 @@ jobs:
             if ! git -C "$PROBE_DIR" \
               -c http.extraheader="AUTHORIZATION: basic $MATCH_AUTH" \
               push --dry-run origin "HEAD:$PROBE_REF" >/dev/null 2>&1; then
-              echo '::error::signing_bootstrap=true requires TARGET_REPO_PAT write access to readori/readori-certificates.'
+              echo '::error::Signed ShiftMile runs with bootstrap/auto-repair require TARGET_REPO_PAT write access to readori/readori-certificates.'
               exit 78
             fi
             echo 'Match write permission dry-run: PASS'
           fi
 
-      - name: Install ShiftMile App Store signing assets with Match
+      - name: Install or auto-repair ShiftMile App Store signing assets with Match
         if: ${{ env.DISTRIBUTION == 'archive' || env.DISTRIBUTION == 'testflight' || env.DISTRIBUTION == 'both' }}
         shell: bash
         env:
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
           ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
         run: |
           set -euo pipefail
 
-          MATCH_READONLY='true'
-          MATCH_FORCE='false'
+          MATCH_LOG="$RUNNER_TEMP/shiftmile-match.log"
+          rm -f "$MATCH_LOG"
+
+          run_match() {
+            local readonly="$1"
+            local force="$2"
+            local app_id="${3:-$EXPECTED_BUNDLE_ID}"
+            local args=(
+              fastlane match appstore
+              --app_identifier "$app_id"
+              --git_url "$MATCH_GIT_URL"
+              --git_branch "$MATCH_GIT_BRANCH"
+              --git_basic_authorization "$MATCH_GIT_BASIC_AUTHORIZATION"
+              --team_id "$ASC_TEAM_ID"
+              --api_key_path "$ASC_API_KEY_JSON"
+              --keychain_name "$KEYCHAIN_NAME"
+              --keychain_password "$KEYCHAIN_PASSWORD"
+              --shallow_clone true
+              --clone_branch_directly true
+              --readonly "$readonly"
+            )
+            if [[ "$force" == 'true' ]]; then
+              args+=(--force true)
+            fi
+            echo "Match: branch=$MATCH_GIT_BRANCH app=$app_id readonly=$readonly force=$force"
+            "${args[@]}"
+          }
+
+          reset_signing_keychain() {
+            security delete-keychain "$KEYCHAIN_NAME" >/dev/null 2>&1 || true
+            security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+            security set-keychain-settings -lut 21600 "$KEYCHAIN_NAME"
+            security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+            security default-keychain -d user -s "$KEYCHAIN_PATH"
+            security list-keychains -d user -s "$KEYCHAIN_PATH" "$ORIGINAL_DEFAULT_KEYCHAIN"
+          }
+
+          remove_dead_match_certificate() {
+            local cert_id="$1"
+            local repair_dir="$RUNNER_TEMP/shiftmile-match-repair"
+            local match_auth="$MATCH_GIT_BASIC_AUTHORIZATION"
+            local found=0
+
+            [[ "$cert_id" =~ ^[A-Za-z0-9]+$ ]] || {
+              echo "::error::Refusing to repair unexpected certificate id: $cert_id"
+              return 1
+            }
+
+            rm -rf "$repair_dir"
+            git -c http.extraheader="AUTHORIZATION: basic $match_auth" \
+              clone --branch "$MATCH_GIT_BRANCH" --single-branch "$MATCH_GIT_URL" "$repair_dir"
+
+            git -C "$repair_dir" config user.name 'ShiftMile CI Signing Repair'
+            git -C "$repair_dir" config user.email 'actions@users.noreply.github.com'
+
+            for ext in cer p12; do
+              candidate="$repair_dir/certs/distribution/${cert_id}.${ext}"
+              if [[ -f "$candidate" ]]; then
+                git -C "$repair_dir" rm "certs/distribution/${cert_id}.${ext}"
+                found=1
+              fi
+            done
+
+            (( found == 1 )) || {
+              echo "::error::Apple reported certificate $cert_id missing from the Developer Portal, but its exact .cer/.p12 pair was not found on Match branch $MATCH_GIT_BRANCH. Refusing broad deletion."
+              return 1
+            }
+
+            # Remove only ShiftMile's stale App Store profile here. Other apps are not mutated by this app CI.
+            while IFS= read -r profile; do
+              [[ -n "$profile" ]] || continue
+              rel="${profile#$repair_dir/}"
+              git -C "$repair_dir" rm "$rel"
+            done < <(find "$repair_dir/profiles/appstore" -maxdepth 1 -type f -iname "*${EXPECTED_BUNDLE_ID}*" -print 2>/dev/null || true)
+
+            git -C "$repair_dir" commit -m "Remove revoked Apple Distribution certificate ${cert_id} for ShiftMile repair"
+            git -C "$repair_dir" \
+              -c http.extraheader="AUTHORIZATION: basic $match_auth" \
+              push origin "HEAD:$MATCH_GIT_BRANCH"
+
+            echo "::notice::Removed revoked Match certificate $cert_id from $MATCH_GIT_BRANCH using exact-ID deletion only."
+          }
+
+          install_key_partition_list() {
+            security set-key-partition-list \
+              -S apple-tool:,apple:,codesign: \
+              -s \
+              -k "$KEYCHAIN_PASSWORD" \
+              "$KEYCHAIN_PATH" >/dev/null
+          }
+
           if [[ "$SIGNING_BOOTSTRAP" == 'true' ]]; then
-            MATCH_READONLY='false'
-            MATCH_FORCE='true'
+            echo '::notice::signing_bootstrap=true: running writable Match on the shared main branch.'
+            run_match false true
+            install_key_partition_list
+            exit 0
           fi
 
-          args=(
-            fastlane match appstore
-            --app_identifier "$EXPECTED_BUNDLE_ID"
-            --git_url "$MATCH_GIT_URL"
-            --git_basic_authorization "$MATCH_GIT_BASIC_AUTHORIZATION"
-            --team_id "$ASC_TEAM_ID"
-            --api_key_path "$ASC_API_KEY_JSON"
-            --keychain_name "$KEYCHAIN_NAME"
-            --keychain_password "$KEYCHAIN_PASSWORD"
-            --shallow_clone true
-            --clone_branch_directly false
-            --readonly "$MATCH_READONLY"
-          )
+          set +e
+          run_match true false 2>&1 | tee "$MATCH_LOG"
+          match_status=${PIPESTATUS[0]}
+          set -e
 
-          if [[ "$MATCH_FORCE" == 'true' ]]; then
-            args+=(--force true)
+          if (( match_status == 0 )); then
+            install_key_partition_list
+            exit 0
           fi
 
-          "${args[@]}"
+          [[ "$AUTO_REPAIR_SIGNING" == 'true' ]] || {
+            echo '::error::Readonly Match failed and auto_repair_signing=false.'
+            exit "$match_status"
+          }
 
-          # Prevent non-interactive codesign from prompting for private-key access.
-          security set-key-partition-list \
-            -S apple-tool:,apple:,codesign: \
-            -s \
-            -k "$KEYCHAIN_PASSWORD" \
-            "$KEYCHAIN_PATH" >/dev/null
+          DEAD_CERT_ID="$(sed -nE "s/.*Certificate '([A-Za-z0-9]+)'.*not available on the Developer Portal.*/\1/p" "$MATCH_LOG" | head -1)"
+          if [[ -n "$DEAD_CERT_ID" ]]; then
+            echo "::warning::Match certificate $DEAD_CERT_ID is stored in the repository but no longer exists on the Apple Developer Portal."
+            remove_dead_match_certificate "$DEAD_CERT_ID"
+            reset_signing_keychain
+            run_match false true
+            install_key_partition_list
+            exit 0
+          fi
+
+          if grep -Eqi \
+            'No code signing identity found.*readonly|No matching provisioning profiles|provisioning profile.*not found|Could not find.*provisioning profile|No profiles for.*were found' \
+            "$MATCH_LOG"; then
+            echo '::notice::Readonly Match is missing a usable Distribution identity or ShiftMile profile. Retrying writable Match on main.'
+            reset_signing_keychain
+            run_match false true
+            install_key_partition_list
+            exit 0
+          fi
+
+          echo '::error::Readonly Match failed for an unrecognized reason. No certificate repository mutation was attempted.'
+          exit "$match_status"
 
       - name: Locate and validate installed App Store profile
         id: profile
