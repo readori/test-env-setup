@@ -690,6 +690,7 @@ jobs:
         shell: bash
         env:
           APPSTORE_IPA: ${{ steps.appstore.outputs.ipa_path }}
+          ARCHIVE_SHA256: ${{ steps.verify_archive.outputs.sha256 }}
         run: |
           {
             echo '## CloudMail iOS task completed'
@@ -708,6 +709,7 @@ jobs:
             if [[ "$DISTRIBUTION" == 'archive' ]]; then
               echo '- Archive: signed App Store IPA built and uploaded as a GitHub Actions artifact; TestFlight upload skipped.'
               echo "- Archive IPA: \`${APPSTORE_IPA:-unknown}\`"
+              echo "- Archive SHA-256: \`${ARCHIVE_SHA256:-unknown}\`"
             fi
             if [[ "$DISTRIBUTION" == 'sideload' || "$DISTRIBUTION" == 'both' ]]; then
               echo '- Sideload: IPA published as a prerelease in this public GitHub repository.'
