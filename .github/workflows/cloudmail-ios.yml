@@ -362,6 +362,10 @@ jobs:
           echo "MATCH_GIT_URL=https://github.com/readori/readori-certificates.git" >> "$GITHUB_ENV"
           echo "MATCH_GIT_BRANCH=main" >> "$GITHUB_ENV"
 
+          # readori-certificates' default branch (HEAD) is "master", but the
+          # signing certificates themselves only live on "main" — do NOT
+          # derive this from the repo's default branch. It must stay a fixed
+          # "main" regardless of what HEAD points to.
           CERT_REPO_URL='https://github.com/readori/readori-certificates.git'
           git -c http.extraheader="AUTHORIZATION: basic $MATCH_AUTH" \
             ls-remote --exit-code --heads "$CERT_REPO_URL" main >/dev/null || {
@@ -440,8 +444,8 @@ jobs:
         env:
           CLOUDMAIL_BUNDLE_ID: com.readori.mail
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
-          MATCH_GIT_URL: https://github.com/readori/readori-certificates.git
-          MATCH_GIT_BRANCH: main
+          MATCH_GIT_URL: ${{ env.MATCH_GIT_URL }}
+          MATCH_GIT_BRANCH: ${{ env.MATCH_GIT_BRANCH }}
           MATCH_GIT_BASIC_AUTHORIZATION: ${{ env.MATCH_GIT_BASIC_AUTHORIZATION }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
@@ -625,8 +629,8 @@ jobs:
           CI: 'true'
           CLOUDMAIL_BUNDLE_ID: com.readori.mail
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
-          MATCH_GIT_URL: https://github.com/readori/readori-certificates.git
-          MATCH_GIT_BRANCH: main
+          MATCH_GIT_URL: ${{ env.MATCH_GIT_URL }}
+          MATCH_GIT_BRANCH: ${{ env.MATCH_GIT_BRANCH }}
           MATCH_GIT_BASIC_AUTHORIZATION: ${{ env.MATCH_GIT_BASIC_AUTHORIZATION }}
           MATCH_READONLY: ${{ inputs.signing_bootstrap && 'false' || 'true' }}
           MATCH_AUTO_REPAIR_STALE_PROFILE: ${{ inputs.auto_repair_signing && 'true' || 'false' }}
