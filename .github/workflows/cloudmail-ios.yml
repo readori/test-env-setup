@@ -68,6 +68,13 @@ jobs:
       CLOUDMAIL_BUILD_NUMBER: ${{ inputs.build_number != '' && inputs.build_number || github.run_number }}
       DISTRIBUTION: ${{ inputs.distribution }}
 
+    # Surfaced at the job level (not just inside the verify step) so the
+    # Release Archive Gate — or any downstream consumer — can read the
+    # signed archive's integrity hash without re-deriving it.
+    outputs:
+      archive_sha256: ${{ steps.verify_archive.outputs.archive_sha256 }}
+      archive_checksum_path: ${{ steps.verify_archive.outputs.checksum_path }}
+
     steps:
       # ----------------------------------------------------------------------
       # 1. Public workflow repository -> target private source repository
@@ -663,7 +670,7 @@ jobs:
           printf '%s  %s\n' "$ARCHIVE_SHA256" "$(basename "$IPA_PATH")" > "$CHECKSUM_FILE"
 
           echo "Archive SHA-256: $ARCHIVE_SHA256"
-          echo "sha256=$ARCHIVE_SHA256" >> "$GITHUB_OUTPUT"
+          echo "archive_sha256=$ARCHIVE_SHA256" >> "$GITHUB_OUTPUT"
           echo "checksum_path=$CHECKSUM_FILE" >> "$GITHUB_OUTPUT"
 
           {
@@ -690,7 +697,7 @@ jobs:
         shell: bash
         env:
           APPSTORE_IPA: ${{ steps.appstore.outputs.ipa_path }}
-          ARCHIVE_SHA256: ${{ steps.verify_archive.outputs.sha256 }}
+          ARCHIVE_SHA256: ${{ steps.verify_archive.outputs.archive_sha256 }}
         run: |
           {
             echo '## CloudMail iOS task completed'
