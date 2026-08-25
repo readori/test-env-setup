@@ -640,6 +640,7 @@ jobs:
           fi
 
       - name: Verify signed Archive IPA
+        id: verify_archive
         if: ${{ inputs.distribution == 'archive' }}
         shell: bash
         env:
@@ -653,12 +654,31 @@ jobs:
           echo "Signed Archive IPA: $IPA_PATH"
           ls -lh "$IPA_PATH"
 
+          # The Release Archive Gate verifies build integrity against this
+          # checksum before allowing a TestFlight/App Store handoff, so the
+          # archive job must surface it as a step output, a step summary
+          # line, and a companion .sha256 file next to the artifact.
+          ARCHIVE_SHA256="$(shasum -a 256 "$IPA_PATH" | awk '{print $1}')"
+          CHECKSUM_FILE="${IPA_PATH}.sha256"
+          printf '%s  %s\n' "$ARCHIVE_SHA256" "$(basename "$IPA_PATH")" > "$CHECKSUM_FILE"
+
+          echo "Archive SHA-256: $ARCHIVE_SHA256"
+          echo "sha256=$ARCHIVE_SHA256" >> "$GITHUB_OUTPUT"
+          echo "checksum_path=$CHECKSUM_FILE" >> "$GITHUB_OUTPUT"
+
+          {
+            echo '### Archive integrity'
+            echo "- SHA-256: \`$ARCHIVE_SHA256\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload signed Archive IPA artifact
         if: ${{ inputs.distribution == 'archive' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: CloudMail-App-Store-Archive-v${{ inputs.app_version }}-b${{ env.CLOUDMAIL_BUILD_NUMBER }}
-          path: ${{ steps.appstore.outputs.ipa_path }}
+          path: |
+            ${{ steps.appstore.outputs.ipa_path }}
+            ${{ steps.verify_archive.outputs.checksum_path }}
           if-no-files-found: error
           retention-days: 30
 
