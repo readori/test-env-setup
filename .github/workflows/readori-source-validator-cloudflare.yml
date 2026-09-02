@@ -1,4 +1,4 @@
-name: Readori Source Validator Cloudflare
+name: AA Readori Source Validator Cloudflare
 
 run-name: Source Validator Cloudflare ${{ inputs.mode }} @ ${{ inputs.source_ref }}
 
