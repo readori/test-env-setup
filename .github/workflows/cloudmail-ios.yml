@@ -40,6 +40,14 @@ on:
         required: false
         default: true
         type: boolean
+      xcode_track:
+        description: 'Build toolchain: xcode-27 = Xcode 27.1+ / iOS 27.1 SDK (required for native iPhone Duo + iPadOS 27 layouts); xcode-26 = fallback'
+        required: false
+        default: 'xcode-27'
+        type: choice
+        options:
+          - xcode-27
+          - xcode-26
 
 # Default to read-only. The iOS job receives contents:write only because
 # sideload/both can publish an IPA prerelease to THIS public workflow repository.
@@ -60,7 +68,9 @@ jobs:
     if: ${{ inputs.distribution == 'testflight' || inputs.distribution == 'sideload' || inputs.distribution == 'both' || inputs.distribution == 'archive' }}
     permissions:
       contents: write
-    runs-on: macos-15
+    # iPhone Duo / iPadOS 27 native layouts need the iOS 27.1 SDK. GitHub ships
+    # Xcode 27 only on the arm64 `xcode-27` image; xcode-26 stays as a fallback.
+    runs-on: ${{ inputs.xcode_track == 'xcode-26' && 'macos-15' || 'xcode-27' }}
     timeout-minutes: 90
 
     env:
@@ -109,45 +119,55 @@ jobs:
       # ----------------------------------------------------------------------
       # 2. Xcode / SDK
       # ----------------------------------------------------------------------
-      - name: Select Xcode 26+
+      - name: Select Xcode (27.1+ for iPhone Duo)
         shell: bash
+        env:
+          XCODE_TRACK: ${{ inputs.xcode_track || 'xcode-27' }}
         run: |
           set -euo pipefail
 
-          select_xcode() {
-            local app="$1"
-            if [[ -d "$app/Contents/Developer" ]]; then
-              sudo xcode-select -s "$app/Contents/Developer"
-              echo "Selected Xcode: $app"
-              return 0
-            fi
-            return 1
-          }
+          case "$XCODE_TRACK" in
+            xcode-27) WANT_MAJOR=27; MIN_VERSION=27.1 ;;
+            xcode-26) WANT_MAJOR=26; MIN_VERSION=26.0 ;;
+            *) echo "::error::Unknown xcode_track: $XCODE_TRACK"; exit 1 ;;
+          esac
 
-          select_xcode /Applications/Xcode_26.6.app || \
-          select_xcode /Applications/Xcode_26.5.app || \
-          select_xcode /Applications/Xcode_26.4.app || \
-          select_xcode /Applications/Xcode_26.3.app || \
-          select_xcode /Applications/Xcode_26.2.app || \
-          select_xcode /Applications/Xcode_26.1.app || \
-          select_xcode /Applications/Xcode_26.app || \
-          select_xcode /Applications/Xcode.app || {
-            echo '::error::No Xcode installation was found on this runner.'
+          # Pick the newest non-beta Xcode of the requested major version by its
+          # real CFBundleShortVersionString (file names such as Xcode_27.app vs
+          # Xcode_27.1.app do not sort reliably).
+          XCODE_APP=""
+          BEST_VERSION=""
+          for app in /Applications/Xcode*.app; do
+            [[ -d "$app/Contents/Developer" ]] || continue
+            case "$app" in *[Bb]eta*) continue ;; esac
+            version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || true)"
+            [[ "${version%%.*}" == "$WANT_MAJOR" ]] || continue
+            if [[ -z "$BEST_VERSION" ]] || [[ "$(printf '%s\n%s\n' "$BEST_VERSION" "$version" | sort -V | tail -1)" == "$version" ]]; then
+              BEST_VERSION="$version"
+              XCODE_APP="$app"
+            fi
+          done
+
+          if [[ -z "$XCODE_APP" ]]; then
+            echo "::error::No Xcode $WANT_MAJOR.x installation was found on this runner ($XCODE_TRACK)."
             ls -1 /Applications | grep '^Xcode' || true
             exit 1
-          }
-
-          XCODE_VERSION="$(xcodebuild -version | awk 'NR==1 {print $2}')"
-          XCODE_MAJOR="${XCODE_VERSION%%.*}"
-
-          if ! [[ "$XCODE_MAJOR" =~ ^[0-9]+$ ]] || (( XCODE_MAJOR < 26 )); then
-            echo "::error::CloudMail distribution/archive requires Xcode 26+. Selected: $XCODE_VERSION"
+          fi
+          if [[ "$(printf '%s\n%s\n' "$MIN_VERSION" "$BEST_VERSION" | sort -V | head -1)" != "$MIN_VERSION" ]]; then
+            echo "::error::$XCODE_TRACK requires Xcode $MIN_VERSION or later. Newest found: $BEST_VERSION"
             exit 1
           fi
 
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          echo "Selected Xcode: $XCODE_APP ($BEST_VERSION)"
           xcodebuild -version
-          echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+
+          IOS_SDK="$(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "iPhoneOS SDK: $IOS_SDK"
           echo "Runner architecture: $(uname -m)"
+          if [[ "$XCODE_TRACK" == "xcode-26" ]]; then
+            echo "::warning::Built with the iOS $IOS_SDK SDK: iPhone Duo shows this build letterboxed. Use xcode_track=xcode-27 for App Store releases."
+          fi
 
       # ----------------------------------------------------------------------
       # 3. Validate inputs / secrets
