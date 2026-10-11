@@ -1,0 +1,888 @@
+# Paobuwan (The Long Boring Run) iOS CI.
+#
+# Public CI repository -> private source readori/paobuwan (Expo SDK 57 / React Native).
+# Modeled on shiftmile-ci.yml (native Xcode pipeline) with the Expo-specific steps added:
+#   npm ci -> expo prebuild -> pod install -> Xcode build/archive of the .xcworkspace.
+#
+# Safety rules (public repo, public logs):
+#   - workflow_dispatch only; never pull_request.
+#   - third-party actions pinned to commit SHAs; xcodebuild always -quiet.
+#   - derived secret values are add-mask'ed; private source/config files are never printed.
+#   - no sideload, no GitHub Release: the IPA is never published. archive mode keeps a
+#     short-lived Actions artifact only.
+#   - signing material is created only in signed modes, after all private-source
+#     lifecycle scripts (npm ci / prebuild / pod install) have run.
+name: Paobuwan iOS CI
+
+run-name: Paobuwan iOS · ${{ inputs.mode || 'verify' }} · ${{ inputs.ref || 'main' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'verify = simulator build + Maestro smoke (no signing); archive = signed IPA + altool validate; testflight = archive + upload to TestFlight'
+        required: true
+        default: 'verify'
+        type: choice
+        options:
+          - verify
+          - archive
+          - testflight
+      ref:
+        description: 'Private readori/paobuwan branch, tag, or SHA'
+        required: true
+        default: 'main'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: paobuwan-ios-${{ inputs.ref || 'main' }}-${{ inputs.mode || 'verify' }}
+  cancel-in-progress: false
+
+env:
+  PRIVATE_SOURCE_REPOSITORY: readori/paobuwan
+  PRIVATE_SOURCE_PATH: source
+  EXPECTED_BUNDLE_ID: com.readori.paobuwan
+  # Opus decision (T-008, 2026-10-11): Xcode 26.4+ on the 26.x track; min iOS 16.4.
+  XCODE_MAJOR_WANTED: '26'
+  XCODE_MIN_VERSION: '26.4'
+  EXPECTED_MIN_IOS: '16.4'
+  MATCH_GIT_URL: https://github.com/readori/readori-certificates.git
+  MATCH_GIT_BRANCH: main
+  # Pinned like shiftmile-ci.yml / certificates-repo.yml. Upload itself uses Apple's altool.
+  FASTLANE_VERSION: '2.238.0'
+  # Maestro CLI (smoke tests). Verify mode only, and only when e2e/ contains *.yaml.
+  # MAESTRO_SHA256 must be pinned by the product owner (see T-007 draft notes); the job
+  # refuses to run an unverified download.
+  MAESTRO_VERSION: '2.11.0'
+  MAESTRO_SHA256: ''
+  # Privacy: the app collects nothing, so the build tooling should not phone home either.
+  EXPO_NO_TELEMETRY: '1'
+  CI: '1'
+  LANG: en_US.UTF-8
+
+jobs:
+  ios:
+    name: Build Paobuwan iOS
+    runs-on: macos-26
+    timeout-minutes: 75
+
+    env:
+      MODE: ${{ inputs.mode || 'verify' }}
+      SOURCE_REF: ${{ inputs.ref || 'main' }}
+
+    steps:
+      # ---------------------------------------------------------------------
+      # 0. Request validation BEFORE any private-source checkout
+      # ---------------------------------------------------------------------
+      - name: Validate request and required secrets
+        shell: bash
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+          PAOBUWAN_ASC_APP_ID: ${{ secrets.PAOBUWAN_ASC_APP_ID }}
+        run: |
+          set -euo pipefail
+
+          case "$MODE" in
+            verify|archive|testflight) ;;
+            *)
+              echo "::error::Unsupported mode: $MODE"
+              exit 64
+              ;;
+          esac
+
+          # The ref is used as a git ref only; keep it to a conservative character set.
+          [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || {
+            echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only).'
+            exit 64
+          }
+
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || {
+            echo '::error::Missing public-repo secret TARGET_REPO_PAT.'
+            echo '::error::It needs Contents read access to readori/paobuwan (and to readori-certificates for signed modes).'
+            exit 78
+          }
+
+          if [[ "$MODE" == 'archive' || "$MODE" == 'testflight' ]]; then
+            required=(MATCH_PASSWORD ASC_ISSUER_ID ASC_KEY_ID ASC_PRIVATE_KEY ASC_TEAM_ID)
+            if [[ "$MODE" == 'testflight' ]]; then
+              required+=(PAOBUWAN_ASC_APP_ID)
+            fi
+            missing=0
+            for name in "${required[@]}"; do
+              if [[ -z "${!name:-}" ]]; then
+                echo "::error::Missing public-repo secret required for $MODE mode: $name"
+                missing=1
+              fi
+            done
+            (( missing == 0 )) || exit 78
+
+            if [[ "$MODE" == 'testflight' ]]; then
+              [[ "$PAOBUWAN_ASC_APP_ID" =~ ^[0-9]+$ ]] || {
+                echo '::error::PAOBUWAN_ASC_APP_ID must be the numeric App Store Connect Apple ID.'
+                exit 78
+              }
+            fi
+          fi
+
+          echo "Mode: $MODE"
+          echo "Private source ref: $SOURCE_REF"
+
+      # ---------------------------------------------------------------------
+      # 1. PUBLIC CI repository -> PRIVATE source repository
+      # ---------------------------------------------------------------------
+      - name: Checkout private Paobuwan source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/paobuwan
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Verify private source layout
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE_ABS="$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH"
+          for f in package.json package-lock.json app.json; do
+            [[ -f "$SOURCE_ABS/$f" ]] || {
+              echo "::error::Private source is missing $f at its root."
+              exit 66
+            }
+          done
+
+          SOURCE_COMMIT="$(git -C "$SOURCE_ABS" rev-parse HEAD)"
+          echo "SOURCE_COMMIT=$SOURCE_COMMIT" >> "$GITHUB_ENV"
+          echo "SOURCE_SHORT_SHA=${SOURCE_COMMIT:0:8}" >> "$GITHUB_ENV"
+
+          # Print only the comparison result, never the file contents.
+          CONFIGURED_BUNDLE_ID="$(node -e 'const c=require(process.argv[1]).expo||{}; process.stdout.write(String((c.ios||{}).bundleIdentifier||""))' "$SOURCE_ABS/app.json")"
+          [[ "$CONFIGURED_BUNDLE_ID" == "$EXPECTED_BUNDLE_ID" ]] || {
+            echo "::error::app.json ios.bundleIdentifier must be $EXPECTED_BUNDLE_ID (got: ${CONFIGURED_BUNDLE_ID:-<empty>})."
+            exit 65
+          }
+
+          echo "Private source: $PRIVATE_SOURCE_REPOSITORY@$SOURCE_REF (${SOURCE_COMMIT:0:8})"
+          echo "Bundle ID check: PASS"
+
+      # ---------------------------------------------------------------------
+      # 2. Toolchain: Node 24 (same major as the private repo's ci.yml) + Xcode 26.4+
+      # ---------------------------------------------------------------------
+      - name: Set up Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ${{ env.PRIVATE_SOURCE_PATH }}/package-lock.json
+
+      - name: Select Xcode 26.4+
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Pick the newest non-beta Xcode of the wanted major by its real
+          # CFBundleShortVersionString (file names do not sort reliably).
+          XCODE_APP=''
+          BEST_VERSION=''
+          for app in /Applications/Xcode*.app; do
+            [[ -d "$app/Contents/Developer" ]] || continue
+            case "$app" in *[Bb]eta*) continue ;; esac
+            version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || true)"
+            [[ "${version%%.*}" == "$XCODE_MAJOR_WANTED" ]] || continue
+            if [[ -z "$BEST_VERSION" ]] || [[ "$(printf '%s\n%s\n' "$BEST_VERSION" "$version" | sort -V | tail -1)" == "$version" ]]; then
+              BEST_VERSION="$version"
+              XCODE_APP="$app"
+            fi
+          done
+
+          if [[ -z "$XCODE_APP" ]]; then
+            echo "::error::No Xcode ${XCODE_MAJOR_WANTED}.x installation was found on this runner."
+            ls -1 /Applications | grep '^Xcode' || true
+            exit 69
+          fi
+          if [[ "$(printf '%s\n%s\n' "$XCODE_MIN_VERSION" "$BEST_VERSION" | sort -V | head -1)" != "$XCODE_MIN_VERSION" ]]; then
+            echo "::error::Paobuwan CI requires Xcode $XCODE_MIN_VERSION or later on the 26.x track; newest found: $BEST_VERSION"
+            exit 69
+          fi
+
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          echo "Selected Xcode: $XCODE_APP ($BEST_VERSION)"
+          xcodebuild -version
+          echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "Runner architecture: $(uname -m)"
+
+      # ---------------------------------------------------------------------
+      # 3. JS dependencies, native project generation, CocoaPods
+      #    (all private-source lifecycle scripts run here, BEFORE any signing
+      #    material or App Store Connect key exists on the runner)
+      # ---------------------------------------------------------------------
+      - name: Install npm dependencies
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          npm --version
+          npm ci --no-audit --no-fund --loglevel=error
+
+      - name: Generate native iOS project (expo prebuild)
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ios/ is generated, never committed. --no-install: JS deps are already
+          # installed and CocoaPods runs as its own step below.
+          npx expo prebuild --platform ios --clean --no-install
+
+          test -d ios || {
+            echo '::error::expo prebuild did not create ios/.'
+            exit 66
+          }
+
+      - name: Install CocoaPods dependencies
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}/ios
+        shell: bash
+        run: |
+          set -euo pipefail
+          pod --version
+          pod install --silent
+
+      - name: Resolve workspace, scheme, version and build number
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IOS_DIR="$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH/ios"
+
+          WORKSPACE_PATH=''
+          COUNT=0
+          for ws in "$IOS_DIR"/*.xcworkspace; do
+            [[ -d "$ws" ]] || continue
+            WORKSPACE_PATH="$ws"
+            COUNT=$((COUNT + 1))
+          done
+          (( COUNT == 1 )) || {
+            echo "::error::Expected exactly one .xcworkspace in ios/ after pod install; found $COUNT."
+            exit 66
+          }
+
+          # Expo names the scheme after the generated project (= workspace basename).
+          SCHEME="$(basename "$WORKSPACE_PATH" .xcworkspace)"
+          xcodebuild -list -workspace "$WORKSPACE_PATH" -json > "$RUNNER_TEMP/paobuwan-xcode-list.json"
+          python3 - "$RUNNER_TEMP/paobuwan-xcode-list.json" "$SCHEME" <<'PY'
+          import json, sys
+          schemes = json.load(open(sys.argv[1])).get("workspace", {}).get("schemes", [])
+          if sys.argv[2] not in schemes:
+              print("::error::Scheme '%s' was not found in the generated workspace." % sys.argv[2])
+              print("Available schemes (%d): %s" % (len(schemes), ", ".join(schemes[:40])))
+              raise SystemExit(66)
+          PY
+
+          # Product bundle ID and marketing version as Xcode sees them (not printed in full).
+          SETTINGS_FILE="$RUNNER_TEMP/paobuwan-build-settings.txt"
+          xcodebuild -showBuildSettings -workspace "$WORKSPACE_PATH" -scheme "$SCHEME" -configuration Release 2>/dev/null > "$SETTINGS_FILE"
+
+          BUNDLE_ID="$(awk -F ' = ' '/^ *PRODUCT_BUNDLE_IDENTIFIER = / {print $2; exit}' "$SETTINGS_FILE")"
+          [[ "$BUNDLE_ID" == "$EXPECTED_BUNDLE_ID" ]] || {
+            echo "::error::PRODUCT_BUNDLE_IDENTIFIER is '${BUNDLE_ID:-<empty>}', expected $EXPECTED_BUNDLE_ID."
+            exit 65
+          }
+
+          APP_VERSION="$(awk -F ' = ' '/^ *MARKETING_VERSION = / {print $2; exit}' "$SETTINGS_FILE")"
+          [[ "$APP_VERSION" =~ ^[0-9]+([.][0-9]+){1,2}$ ]] || {
+            echo "::error::MARKETING_VERSION must look like 0.1 or 0.1.0; got: ${APP_VERSION:-<empty>}"
+            exit 64
+          }
+
+          # Build number = public CI run number (same convention as ShiftMile).
+          BUILD_NUMBER="${GITHUB_RUN_NUMBER}"
+          [[ "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::Run number is not a positive integer: $BUILD_NUMBER"
+            exit 64
+          }
+
+          DEPLOYMENT_TARGET="$(awk -F ' = ' '/^ *IPHONEOS_DEPLOYMENT_TARGET = / {print $2; exit}' "$SETTINGS_FILE")"
+          if [[ "$DEPLOYMENT_TARGET" != "$EXPECTED_MIN_IOS" ]]; then
+            echo "::warning::IPHONEOS_DEPLOYMENT_TARGET is '${DEPLOYMENT_TARGET:-<empty>}'; the Opus decision (T-008) is $EXPECTED_MIN_IOS."
+          fi
+
+          rm -f "$SETTINGS_FILE"
+
+          echo "WORKSPACE_PATH=$WORKSPACE_PATH" >> "$GITHUB_ENV"
+          echo "SCHEME=$SCHEME" >> "$GITHUB_ENV"
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+
+          echo "Scheme: $SCHEME"
+          echo "Version: $APP_VERSION ($BUILD_NUMBER)"
+          echo "Deployment target: ${DEPLOYMENT_TARGET:-unknown}"
+
+      # ---------------------------------------------------------------------
+      # 4. VERIFY mode: Simulator build + Maestro smoke (no signing, no secrets)
+      # ---------------------------------------------------------------------
+      - name: Select an available iPhone Simulator
+        if: ${{ env.MODE == 'verify' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SIMULATOR_UDID="$(xcrun simctl list devices available -j | /usr/bin/python3 -c '
+          import json, sys
+          payload = json.load(sys.stdin)
+          devices = [
+              device
+              for runtime, runtime_devices in payload.get("devices", {}).items()
+              if "SimRuntime.iOS" in runtime
+              for device in runtime_devices
+              if device.get("isAvailable") and device.get("name", "").startswith("iPhone")
+          ]
+          print(devices[0]["udid"] if devices else "")
+          ')"
+
+          if [[ -z "$SIMULATOR_UDID" ]]; then
+            xcrun simctl list devices available
+            echo '::error::No available iPhone Simulator was found.'
+            exit 69
+          fi
+
+          echo "SIMULATOR_UDID=$SIMULATOR_UDID" >> "$GITHUB_ENV"
+
+          xcrun simctl boot "$SIMULATOR_UDID" >/dev/null 2>&1 || true
+          xcrun simctl bootstatus "$SIMULATOR_UDID" -b
+          echo "Selected simulator: $SIMULATOR_UDID"
+
+      - name: Build app for iOS Simulator (Release, embedded JS bundle)
+        if: ${{ env.MODE == 'verify' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERIFY_DERIVED="$RUNNER_TEMP/DerivedData-Paobuwan-Verify"
+          rm -rf "$VERIFY_DERIVED"
+
+          # Release (not Debug) so the JS bundle is embedded and the app runs without Metro.
+          # -quiet keeps private project metadata out of this PUBLIC log.
+          xcodebuild build \
+            -quiet \
+            -workspace "$WORKSPACE_PATH" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphonesimulator \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
+            -derivedDataPath "$VERIFY_DERIVED" \
+            ARCHS="$(uname -m)" \
+            ONLY_ACTIVE_ARCH=YES \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+          APP_PATH="$(find "$VERIFY_DERIVED/Build/Products/Release-iphonesimulator" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          [[ -n "$APP_PATH" && -d "$APP_PATH" ]] || {
+            echo '::error::Simulator .app was not produced.'
+            exit 65
+          }
+
+          BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist")"
+          [[ "$BUNDLE_ID" == "$EXPECTED_BUNDLE_ID" ]] || {
+            echo "::error::Unexpected bundle identifier in built app: $BUNDLE_ID"
+            exit 65
+          }
+
+          echo "SIMULATOR_APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+          echo 'Simulator build: PASS'
+
+      - name: Detect Maestro flows
+        if: ${{ env.MODE == 'verify' }}
+        id: maestro_flows
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE_ABS="$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH"
+          FLOW_COUNT=0
+          if [[ -d "$SOURCE_ABS/e2e" ]]; then
+            FLOW_COUNT="$(find "$SOURCE_ABS/e2e" -type f -name '*.yaml' | wc -l | tr -d ' ')"
+          fi
+
+          if (( FLOW_COUNT == 0 )); then
+            echo 'found=false' >> "$GITHUB_OUTPUT"
+            echo '::notice::No *.yaml flows in e2e/; skipping Maestro smoke tests.'
+          else
+            echo 'found=true' >> "$GITHUB_OUTPUT"
+            echo "Maestro flow files: $FLOW_COUNT"
+          fi
+
+      - name: Install Maestro CLI
+        if: ${{ env.MODE == 'verify' && steps.maestro_flows.outputs.found == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ -n "$MAESTRO_SHA256" ]] || {
+            echo '::error::MAESTRO_SHA256 is not pinned in this workflow; refusing to run an unverified download.'
+            echo "::error::Download https://github.com/mobile-dev-inc/maestro/releases/download/cli-${MAESTRO_VERSION}/maestro.zip on a trusted machine, compute its SHA-256, and set MAESTRO_SHA256."
+            exit 78
+          }
+
+          java -version 2>&1 | head -1 || {
+            echo '::error::Java is required by Maestro and was not found on this runner.'
+            exit 69
+          }
+
+          MAESTRO_ZIP="$RUNNER_TEMP/maestro.zip"
+          curl --fail --silent --show-error --location \
+            "https://github.com/mobile-dev-inc/maestro/releases/download/cli-${MAESTRO_VERSION}/maestro.zip" \
+            --output "$MAESTRO_ZIP"
+
+          ACTUAL="$(shasum -a 256 "$MAESTRO_ZIP" | awk '{print $1}')"
+          [[ "$ACTUAL" == "$MAESTRO_SHA256" ]] || {
+            echo '::error::Maestro download checksum mismatch.'
+            echo "::error::expected $MAESTRO_SHA256"
+            echo "::error::actual   $ACTUAL"
+            exit 65
+          }
+
+          MAESTRO_DIR="$RUNNER_TEMP/maestro-cli"
+          rm -rf "$MAESTRO_DIR"
+          mkdir -p "$MAESTRO_DIR"
+          unzip -q "$MAESTRO_ZIP" -d "$MAESTRO_DIR"
+          echo "$MAESTRO_DIR/maestro/bin" >> "$GITHUB_PATH"
+          "$MAESTRO_DIR/maestro/bin/maestro" --version
+
+      - name: Run Maestro smoke tests
+        if: ${{ env.MODE == 'verify' && steps.maestro_flows.outputs.found == 'true' }}
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          xcrun simctl install "$SIMULATOR_UDID" "$SIMULATOR_APP_PATH"
+          maestro test e2e/
+
+      # ---------------------------------------------------------------------
+      # 5. ARCHIVE / TESTFLIGHT: Match signing (readonly), archive, export, altool
+      # ---------------------------------------------------------------------
+      - name: Install pinned fastlane for Match only
+        if: ${{ env.MODE == 'archive' || env.MODE == 'testflight' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FASTLANE_GEM_HOME="$RUNNER_TEMP/fastlane-gems"
+          rm -rf "$FASTLANE_GEM_HOME"
+          mkdir -p "$FASTLANE_GEM_HOME"
+
+          export GEM_HOME="$FASTLANE_GEM_HOME"
+          export GEM_PATH="$FASTLANE_GEM_HOME"
+          export PATH="$FASTLANE_GEM_HOME/bin:$PATH"
+
+          gem install --no-document fastlane -v "$FASTLANE_VERSION"
+          fastlane --version
+
+          echo "GEM_HOME=$FASTLANE_GEM_HOME" >> "$GITHUB_ENV"
+          echo "GEM_PATH=$FASTLANE_GEM_HOME" >> "$GITHUB_ENV"
+          echo "$FASTLANE_GEM_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Create ephemeral keychain, write ASC key, install signing assets with Match
+        if: ${{ env.MODE == 'archive' || env.MODE == 'testflight' }}
+        shell: bash
+        env:
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          # --- ephemeral keychain (password never leaves this step) ---------
+          KEYCHAIN_NAME="paobuwan-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.keychain-db"
+          KEYCHAIN_PATH="$HOME/Library/Keychains/$KEYCHAIN_NAME"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_NAME"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+
+          LOGIN_KEYCHAIN="$(security default-keychain -d user | tr -d '"')"
+          echo "ORIGINAL_DEFAULT_KEYCHAIN=$LOGIN_KEYCHAIN" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_NAME=$KEYCHAIN_NAME" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          security default-keychain -d user -s "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" "$LOGIN_KEYCHAIN"
+
+          # --- App Store Connect API key (Match + altool) -------------------
+          ASC_DIR="$RUNNER_TEMP/paobuwan-asc"
+          mkdir -p "$ASC_DIR" "$HOME/.appstoreconnect/private_keys"
+          P8_PATH="$ASC_DIR/AuthKey_${ASC_KEY_ID}.p8"
+          API_KEY_JSON="$ASC_DIR/api-key.json"
+
+          printf '%s\n' "$ASC_PRIVATE_KEY" > "$P8_PATH"
+          chmod 600 "$P8_PATH"
+          grep -q 'BEGIN PRIVATE KEY' "$P8_PATH" || {
+            echo '::error::ASC_PRIVATE_KEY does not look like an App Store Connect .p8 private key.'
+            exit 78
+          }
+          cp "$P8_PATH" "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          chmod 600 "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+
+          export P8_PATH_FOR_PY="$P8_PATH"
+          python3 - "$API_KEY_JSON" <<'PY'
+          import json, os, sys
+          from pathlib import Path
+
+          p8 = Path(os.environ["P8_PATH_FOR_PY"]).read_text(encoding="utf-8")
+          payload = {
+              "key_id": os.environ["ASC_KEY_ID"],
+              "issuer_id": os.environ["ASC_ISSUER_ID"],
+              "key": p8,
+              "in_house": False,
+          }
+          Path(sys.argv[1]).write_text(json.dumps(payload), encoding="utf-8")
+          PY
+          chmod 600 "$API_KEY_JSON"
+
+          echo "ASC_P8_PATH=$P8_PATH" >> "$GITHUB_ENV"
+          echo "ASC_API_KEY_JSON=$API_KEY_JSON" >> "$GITHUB_ENV"
+          echo "ASC_KEY_ID=$ASC_KEY_ID" >> "$GITHUB_ENV"
+
+          # --- Match repository authentication (readonly) -------------------
+          MATCH_AUTH="$(printf '%s:%s' 'readori' "$TARGET_REPO_PAT" | base64 | tr -d '\n')"
+          echo "::add-mask::$MATCH_AUTH"
+
+          MATCH_BRANCH_SHA="$(
+            git -c http.extraheader="AUTHORIZATION: basic $MATCH_AUTH" \
+              ls-remote --heads "$MATCH_GIT_URL" "refs/heads/$MATCH_GIT_BRANCH" \
+            | awk 'NR==1 {print $1}'
+          )"
+          [[ -n "$MATCH_BRANCH_SHA" ]] || {
+            echo "::error::Match branch '$MATCH_GIT_BRANCH' is not readable in readori/readori-certificates (TARGET_REPO_PAT scope?)."
+            exit 66
+          }
+          echo "Match branch: $MATCH_GIT_BRANCH (${MATCH_BRANCH_SHA:0:8})"
+
+          # --- Match: shared Apple Distribution identity + Paobuwan App Store profile
+          # Readonly by design: this workflow never writes to the shared certificates
+          # repository. The profile is created once by certificates-repo.yml
+          # (signing_mode=refresh_paobuwan_profile).
+          if ! MATCH_READONLY=true fastlane match appstore \
+              --app_identifier "$EXPECTED_BUNDLE_ID" \
+              --git_url "$MATCH_GIT_URL" \
+              --git_branch "$MATCH_GIT_BRANCH" \
+              --git_basic_authorization "$MATCH_AUTH" \
+              --team_id "$ASC_TEAM_ID" \
+              --api_key_path "$API_KEY_JSON" \
+              --keychain_name "$KEYCHAIN_NAME" \
+              --keychain_password "$KEYCHAIN_PASSWORD" \
+              --shallow_clone true \
+              --clone_branch_directly true \
+              --readonly true; then
+            echo "::error::Readonly Match could not install signing assets for $EXPECTED_BUNDLE_ID."
+            echo '::error::First run? Run certificates-repo.yml with signing_mode=refresh_paobuwan_profile and destructive_confirmation=WRITE, then retry.'
+            exit 65
+          fi
+
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH" >/dev/null
+
+      - name: Locate and validate installed App Store profile
+        if: ${{ env.MODE == 'archive' || env.MODE == 'testflight' }}
+        shell: bash
+        env:
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          PROFILE_SCAN_DIR="$RUNNER_TEMP/paobuwan-profile-scan"
+          rm -rf "$PROFILE_SCAN_DIR"
+          mkdir -p "$PROFILE_SCAN_DIR"
+
+          PROFILE_PATH=''
+          PROFILE_NAME=''
+          PROFILE_TEAM=''
+          GET_TASK_ALLOW=''
+
+          shopt -s nullglob
+          candidates=(
+            "$HOME/Library/MobileDevice/Provisioning Profiles/"*.mobileprovision
+            "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/"*.mobileprovision
+          )
+          shopt -u nullglob
+
+          for profile in "${candidates[@]}"; do
+            [[ -f "$profile" ]] || continue
+            plist="$PROFILE_SCAN_DIR/$(basename "$profile").plist"
+            /usr/bin/security cms -D -i "$profile" > "$plist" 2>/dev/null || continue
+
+            app_id="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$plist" 2>/dev/null || true)"
+            [[ "$app_id" == *".$EXPECTED_BUNDLE_ID" ]] || continue
+
+            PROFILE_PATH="$profile"
+            PROFILE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :Name' "$plist")"
+            PROFILE_TEAM="$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$plist")"
+            GET_TASK_ALLOW="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$plist" 2>/dev/null || echo false)"
+            break
+          done
+
+          [[ -n "$PROFILE_PATH" ]] || {
+            echo "::error::No App Store provisioning profile for $EXPECTED_BUNDLE_ID was installed by Match."
+            exit 65
+          }
+          [[ "$PROFILE_TEAM" == "$ASC_TEAM_ID" ]] || {
+            echo '::error::Provisioning profile team does not match ASC_TEAM_ID.'
+            exit 65
+          }
+          [[ "$GET_TASK_ALLOW" != 'true' ]] || {
+            echo '::error::Installed profile has get-task-allow=true and is not an App Store distribution profile.'
+            exit 65
+          }
+
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -q 'Apple Distribution' || {
+            echo '::error::No Apple Distribution signing identity was installed into the ephemeral keychain.'
+            exit 65
+          }
+
+          rm -rf "$PROFILE_SCAN_DIR"
+          echo "APPSTORE_PROFILE_NAME=$PROFILE_NAME" >> "$GITHUB_ENV"
+          echo "Provisioning profile: $PROFILE_NAME"
+
+      - name: Build signed App Store archive and IPA
+        if: ${{ env.MODE == 'archive' || env.MODE == 'testflight' }}
+        shell: bash
+        env:
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          ARCHIVE_PATH="$RUNNER_TEMP/Paobuwan.xcarchive"
+          EXPORT_DIR="$RUNNER_TEMP/Paobuwan-AppStore-Export"
+          EXPORT_OPTIONS="$RUNNER_TEMP/Paobuwan-ExportOptions.plist"
+
+          rm -rf "$ARCHIVE_PATH" "$EXPORT_DIR" "$EXPORT_OPTIONS"
+          mkdir -p "$EXPORT_DIR"
+
+          xcodebuild archive \
+            -quiet \
+            -workspace "$WORKSPACE_PATH" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$ARCHIVE_PATH" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="$ASC_TEAM_ID" \
+            CODE_SIGN_IDENTITY='Apple Distribution' \
+            PROVISIONING_PROFILE_SPECIFIER="$APPSTORE_PROFILE_NAME"
+
+          ARCHIVED_APP="$(find "$ARCHIVE_PATH/Products/Applications" -maxdepth 1 -type d -name '*.app' -print -quit 2>/dev/null || true)"
+          [[ -n "$ARCHIVED_APP" && -d "$ARCHIVED_APP" ]] || {
+            echo '::error::Signed xcarchive was not produced.'
+            exit 65
+          }
+
+          export BUNDLE_ID_FOR_PLIST="$EXPECTED_BUNDLE_ID"
+          export PROFILE_NAME_FOR_PLIST="$APPSTORE_PROFILE_NAME"
+          export TEAM_ID_FOR_PLIST="$ASC_TEAM_ID"
+          python3 - "$EXPORT_OPTIONS" <<'PY'
+          import os, plistlib, sys
+
+          payload = {
+              "method": "app-store-connect",
+              "destination": "export",
+              "signingStyle": "manual",
+              "signingCertificate": "Apple Distribution",
+              "teamID": os.environ["TEAM_ID_FOR_PLIST"],
+              "provisioningProfiles": {
+                  os.environ["BUNDLE_ID_FOR_PLIST"]: os.environ["PROFILE_NAME_FOR_PLIST"]
+              },
+              "manageAppVersionAndBuildNumber": False,
+              "stripSwiftSymbols": True,
+              "uploadSymbols": True,
+          }
+          with open(sys.argv[1], "wb") as fh:
+              plistlib.dump(payload, fh)
+          PY
+
+          xcodebuild -exportArchive \
+            -quiet \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportPath "$EXPORT_DIR" \
+            -exportOptionsPlist "$EXPORT_OPTIONS"
+
+          SIGNED_IPA="$(find "$EXPORT_DIR" -maxdepth 1 -type f -name '*.ipa' -print -quit)"
+          [[ -n "$SIGNED_IPA" && -f "$SIGNED_IPA" ]] || {
+            echo '::error::Signed App Store IPA was not exported.'
+            find "$EXPORT_DIR" -maxdepth 2 -type f -print || true
+            exit 65
+          }
+
+          # Verify the exported IPA without printing its contents.
+          VERIFY_DIR="$RUNNER_TEMP/Paobuwan-Signed-Verify"
+          rm -rf "$VERIFY_DIR"
+          mkdir -p "$VERIFY_DIR"
+          unzip -q "$SIGNED_IPA" -d "$VERIFY_DIR"
+          SIGNED_APP="$(find "$VERIFY_DIR/Payload" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          [[ -n "$SIGNED_APP" ]] || {
+            echo '::error::Exported IPA has no .app payload.'
+            exit 65
+          }
+
+          test -f "$SIGNED_APP/embedded.mobileprovision" || {
+            echo '::error::Signed IPA is missing embedded.mobileprovision.'
+            exit 65
+          }
+          codesign --verify --deep --strict "$SIGNED_APP"
+
+          SIGNED_BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$SIGNED_APP/Info.plist")"
+          [[ "$SIGNED_BUNDLE_ID" == "$EXPECTED_BUNDLE_ID" ]] || {
+            echo "::error::Signed IPA bundle ID mismatch: $SIGNED_BUNDLE_ID"
+            exit 65
+          }
+
+          MIN_OS="$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$SIGNED_APP/Info.plist" 2>/dev/null || true)"
+          if [[ "$MIN_OS" != "$EXPECTED_MIN_IOS" ]]; then
+            echo "::warning::MinimumOSVersion is '${MIN_OS:-<empty>}'; the Opus decision (T-008) is $EXPECTED_MIN_IOS."
+          fi
+
+          NON_EXEMPT="$(/usr/libexec/PlistBuddy -c 'Print :ITSAppUsesNonExemptEncryption' "$SIGNED_APP/Info.plist" 2>/dev/null || true)"
+          if [[ -z "$NON_EXEMPT" ]]; then
+            echo '::warning::ITSAppUsesNonExemptEncryption is not set; App Store Connect will ask the export-compliance question for every build.'
+          fi
+
+          rm -rf "$VERIFY_DIR"
+          shasum -a 256 "$SIGNED_IPA" > "$EXPORT_DIR/Paobuwan-AppStore.sha256"
+
+          echo "SIGNED_IPA=$SIGNED_IPA" >> "$GITHUB_ENV"
+          echo "SIGNED_EXPORT_DIR=$EXPORT_DIR" >> "$GITHUB_ENV"
+
+          echo "Signed IPA: $(basename "$SIGNED_IPA")"
+          ls -lh "$SIGNED_IPA" "$EXPORT_DIR/Paobuwan-AppStore.sha256"
+
+      - name: Upload signed IPA artifact (archive mode only, short retention)
+        if: ${{ env.MODE == 'archive' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: Paobuwan-AppStore-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/Paobuwan-AppStore-Export/*.ipa
+            ${{ runner.temp }}/Paobuwan-AppStore-Export/Paobuwan-AppStore.sha256
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Validate App Store package with Apple (altool)
+        if: ${{ env.MODE == 'archive' || env.MODE == 'testflight' }}
+        shell: bash
+        env:
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          set -euo pipefail
+
+          xcrun altool \
+            --validate-app \
+            --file "$SIGNED_IPA" \
+            --type ios \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID"
+
+      - name: Upload Paobuwan to TestFlight (altool)
+        if: ${{ env.MODE == 'testflight' }}
+        shell: bash
+        env:
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          # Numeric App Store Connect app id. altool --upload-app resolves the app from the
+          # IPA's bundle ID; the id is checked here only to prove the App record exists
+          # and is the one the owner configured (see T-007 draft notes).
+          PAOBUWAN_ASC_APP_ID: ${{ secrets.PAOBUWAN_ASC_APP_ID }}
+        run: |
+          set -euo pipefail
+
+          [[ "$PAOBUWAN_ASC_APP_ID" =~ ^[0-9]+$ ]] || {
+            echo '::error::PAOBUWAN_ASC_APP_ID must be the numeric App Store Connect Apple ID.'
+            exit 78
+          }
+
+          xcrun altool \
+            --upload-app \
+            --file "$SIGNED_IPA" \
+            --type ios \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID"
+
+          echo 'TestFlight binary upload accepted by App Store Connect.'
+
+      # ---------------------------------------------------------------------
+      # 6. Summary
+      # ---------------------------------------------------------------------
+      - name: Build summary
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          {
+            echo '## Paobuwan iOS CI completed'
+            echo
+            echo "- Mode: \`${MODE}\`"
+            echo "- Version: \`${APP_VERSION}\` (${BUILD_NUMBER})"
+            echo "- Bundle ID: \`${EXPECTED_BUNDLE_ID}\`"
+            echo "- Private source: \`${PRIVATE_SOURCE_REPOSITORY}@${SOURCE_REF}\` (\`${SOURCE_SHORT_SHA}\`)"
+            echo "- Xcode: \`$(xcodebuild -version | head -1)\`"
+            if [[ "$MODE" == 'verify' ]]; then
+              echo '- Simulator build: passed (Maestro smoke runs only when e2e/ has flows)'
+            fi
+            if [[ "$MODE" == 'archive' ]]; then
+              echo '- Signed IPA: Apple validation passed; uploaded as a 2-day Actions artifact (not published anywhere).'
+            fi
+            if [[ "$MODE" == 'testflight' ]]; then
+              echo '- TestFlight: Apple validation passed and binary upload was accepted.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------------
+      # 7. Cleanup signing material and simulator, even after failures
+      # ---------------------------------------------------------------------
+      - name: Cleanup signing material and simulator
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          if [[ -n "${SIMULATOR_UDID:-}" ]]; then
+            xcrun simctl shutdown "$SIMULATOR_UDID" >/dev/null 2>&1 || true
+          fi
+
+          if [[ -n "${ORIGINAL_DEFAULT_KEYCHAIN:-}" ]]; then
+            security default-keychain -d user -s "$ORIGINAL_DEFAULT_KEYCHAIN" >/dev/null 2>&1 || true
+            security list-keychains -d user -s "$ORIGINAL_DEFAULT_KEYCHAIN" >/dev/null 2>&1 || true
+          fi
+          if [[ -n "${KEYCHAIN_NAME:-}" ]]; then
+            security delete-keychain "$KEYCHAIN_NAME" >/dev/null 2>&1 || true
+          fi
+
+          if [[ -n "${ASC_P8_PATH:-}" ]]; then
+            rm -f "$ASC_P8_PATH" >/dev/null 2>&1 || true
+          fi
+          if [[ -n "${ASC_API_KEY_JSON:-}" ]]; then
+            rm -f "$ASC_API_KEY_JSON" >/dev/null 2>&1 || true
+          fi
+          if [[ -n "${ASC_KEY_ID:-}" ]]; then
+            rm -f "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8" >/dev/null 2>&1 || true
+          fi
+
+          rm -rf "$RUNNER_TEMP/paobuwan-asc" "$RUNNER_TEMP/paobuwan-profile-scan" "$RUNNER_TEMP/Paobuwan-Signed-Verify" >/dev/null 2>&1 || true

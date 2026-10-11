@@ -1,0 +1,483 @@
+# Paobuwan (The Long Boring Run) Cloudflare Worker CI.
+#
+# Public CI repository -> private source readori/paobuwan, worker/ directory only.
+# Modeled on cloudmail-deploy-ci.yml (D1 recovery point -> migrations -> deploy -> health check),
+# with one difference: Worker config is the private repo's own worker/wrangler.toml
+# (CloudMail renders a CI config from existing Cloudflare bindings; Paobuwan does not).
+#
+#   dry-run : `wrangler deploy --dry-run` + remote migrations list. No writes anywhere.
+#   deploy  : the same checks first (job `validate`), then, after the `production`
+#             environment approval, job `deploy`: D1 bookmark -> migrations -> deploy ->
+#             GET /health (automatic Worker rollback if the health check fails).
+#
+# Safety rules (public repo, public logs): workflow_dispatch only; third-party actions pinned to
+# commit SHAs; Cloudflare credentials are passed only to the steps that run wrangler (never to
+# `npm ci`); only worker/ of the private repo is checked out; no private file is printed.
+name: Paobuwan Worker CI
+
+run-name: Paobuwan Worker · ${{ inputs.mode || 'dry-run' }} · ${{ inputs.ref || 'main' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'dry-run = validate only; deploy = validate, wait for production approval, migrate, deploy, health check'
+        required: true
+        default: 'dry-run'
+        type: choice
+        options:
+          - dry-run
+          - deploy
+      ref:
+        description: 'Private readori/paobuwan branch, tag, or SHA'
+        required: true
+        default: 'main'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: paobuwan-worker-production
+  cancel-in-progress: false
+
+env:
+  PRIVATE_SOURCE_REPOSITORY: readori/paobuwan
+  PRIVATE_SOURCE_PATH: source
+  WORKER_DIR: source/worker
+
+jobs:
+  # ========================================================================
+  # 1. Validate (always). In deploy mode this runs BEFORE the approval gate so a
+  #    reviewer only ever approves a build that already passed the dry-run.
+  # ========================================================================
+  validate:
+    name: Validate Worker (dry-run)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    outputs:
+      source_commit: ${{ steps.checkout_info.outputs.source_commit }}
+
+    env:
+      MODE: ${{ inputs.mode || 'dry-run' }}
+      SOURCE_REF: ${{ inputs.ref || 'main' }}
+
+    steps:
+      - name: Validate request and credentials
+        shell: bash
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+          WORKER_URL: ${{ vars.PAOBUWAN_WORKER_URL }}
+        run: |
+          set -euo pipefail
+
+          case "$MODE" in
+            dry-run|deploy) ;;
+            *)
+              echo "::error::Unsupported mode: $MODE"
+              exit 64
+              ;;
+          esac
+
+          [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || {
+            echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only).'
+            exit 64
+          }
+
+          missing=()
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || missing+=('TARGET_REPO_PAT')
+          [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]] || missing+=('CLOUDFLARE_API_TOKEN')
+          [[ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]] || missing+=('CLOUDFLARE_ACCOUNT_ID')
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::Missing public CI credentials: ${missing[*]}"
+            exit 78
+          fi
+          echo "::add-mask::$CLOUDFLARE_ACCOUNT_ID"
+
+          if [[ "$MODE" == 'deploy' ]]; then
+            [[ -n "${WORKER_URL:-}" ]] || {
+              echo '::error::Repository variable PAOBUWAN_WORKER_URL is required in deploy mode (health check target, e.g. https://api.example.com).'
+              exit 78
+            }
+            [[ "$WORKER_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || {
+              echo '::error::PAOBUWAN_WORKER_URL must be an https origin with no path or trailing slash.'
+              exit 78
+            }
+          fi
+
+          echo "Mode: $MODE"
+          echo "Private source ref: $SOURCE_REF"
+
+      - name: Checkout private source (worker/ only)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/paobuwan
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+          sparse-checkout: /worker/
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+          clean: true
+
+      - name: Verify worker/ layout (fail fast)
+        id: checkout_info
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE_COMMIT="$(git -C "$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH" rev-parse HEAD)"
+          echo "source_commit=$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "Private source commit: ${SOURCE_COMMIT:0:8}"
+
+          [[ -d "$GITHUB_WORKSPACE/$WORKER_DIR" ]] || {
+            echo "::error::worker/ does not exist in $PRIVATE_SOURCE_REPOSITORY@$SOURCE_REF. The Worker is planned for week 5 of the sprint; nothing to build or deploy yet."
+            exit 66
+          }
+          [[ -f "$GITHUB_WORKSPACE/$WORKER_DIR/wrangler.toml" ]] || {
+            echo "::error::worker/wrangler.toml is missing in $PRIVATE_SOURCE_REPOSITORY@$SOURCE_REF. Add it (or wait for the week-5 Worker task) before running this workflow."
+            exit 66
+          }
+          for f in package.json package-lock.json; do
+            [[ -f "$GITHUB_WORKSPACE/$WORKER_DIR/$f" ]] || {
+              echo "::error::worker/$f is missing; the Worker needs its own package.json and lockfile (wrangler pinned as a devDependency)."
+              exit 66
+            }
+          done
+          echo 'worker/ layout: PASS'
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ${{ env.WORKER_DIR }}/package-lock.json
+
+      - name: Install Worker dependencies (no Cloudflare credentials in this step)
+        working-directory: ${{ env.WORKER_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund --loglevel=error
+
+          # Use only the lockfile-pinned wrangler; never let npx download "latest".
+          test -x node_modules/.bin/wrangler || {
+            echo '::error::wrangler is not installed by worker/package.json. Add it as a pinned devDependency.'
+            exit 66
+          }
+          npx --no-install wrangler --version
+
+      - name: Resolve Worker name and D1 database from wrangler.toml
+        working-directory: ${{ env.WORKER_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import os, sys, tomllib
+          from pathlib import Path
+
+          data = tomllib.loads(Path("wrangler.toml").read_text(encoding="utf-8"))
+          name = str(data.get("name", "")).strip()
+          if not name:
+              raise SystemExit("::error::worker/wrangler.toml does not define a Worker name")
+
+          dbs = data.get("d1_databases") or []
+          if len(dbs) != 1:
+              raise SystemExit(f"::error::worker/wrangler.toml must define exactly one D1 database; found {len(dbs)}")
+          db_name = str(dbs[0].get("database_name", "")).strip()
+          if not db_name:
+              raise SystemExit("::error::worker/wrangler.toml D1 binding has no database_name")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fp:
+              fp.write(f"WORKER_NAME={name}\n")
+              fp.write(f"D1_DATABASE_NAME={db_name}\n")
+          print("Worker config: name and one D1 database resolved")
+          PY
+
+      - name: Wrangler deploy dry-run
+        working-directory: ${{ env.WORKER_DIR }}
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          rm -rf .wrangler-dry-run
+          npx --no-install wrangler deploy \
+            --dry-run \
+            --config wrangler.toml \
+            --outdir .wrangler-dry-run
+          echo 'Wrangler dry-run: PASS'
+
+      - name: List D1 migrations (read-only)
+        working-directory: ${{ env.WORKER_DIR }}
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          # Shows which migrations are still pending on the remote database. Applies nothing.
+          npx --no-install wrangler d1 migrations list "$D1_DATABASE_NAME" \
+            --remote \
+            --config wrangler.toml
+
+      - name: Dry-run summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          {
+            echo '## Paobuwan Worker CI: validate'
+            echo
+            echo "- Mode: \`${MODE}\`"
+            echo "- Source: \`${PRIVATE_SOURCE_REPOSITORY}@${SOURCE_REF}\` (worker/ only)"
+            echo "- Result of this job: \`${{ job.status }}\`"
+            if [[ "$MODE" == 'deploy' ]]; then
+              echo '- Next: waiting for `production` environment approval before the deploy job.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ========================================================================
+  # 2. Deploy (deploy mode only). The `production` environment must have required
+  #    reviewers; the job does not start until the product owner approves.
+  # ========================================================================
+  deploy:
+    name: Migrate and deploy Worker
+    needs: validate
+    if: ${{ (inputs.mode || 'dry-run') == 'deploy' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+
+    env:
+      SOURCE_COMMIT: ${{ needs.validate.outputs.source_commit }}
+
+    steps:
+      - name: Validate credentials and health-check target
+        shell: bash
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+          WORKER_URL: ${{ vars.PAOBUWAN_WORKER_URL }}
+        run: |
+          set -euo pipefail
+
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
+            echo '::error::Validated source commit was not passed from the validate job.'
+            exit 64
+          }
+          missing=()
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || missing+=('TARGET_REPO_PAT')
+          [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]] || missing+=('CLOUDFLARE_API_TOKEN')
+          [[ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]] || missing+=('CLOUDFLARE_ACCOUNT_ID')
+          [[ -n "${WORKER_URL:-}" ]] || missing+=('vars.PAOBUWAN_WORKER_URL')
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::Missing credentials/variables: ${missing[*]}"
+            exit 78
+          fi
+          echo "::add-mask::$CLOUDFLARE_ACCOUNT_ID"
+          echo "Deploying private source commit: ${SOURCE_COMMIT:0:8}"
+
+      # Check out the exact commit that passed validation, not the moving ref.
+      - name: Checkout private source (worker/ only, validated commit)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/paobuwan
+          ref: ${{ env.SOURCE_COMMIT }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+          sparse-checkout: /worker/
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+          clean: true
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ${{ env.WORKER_DIR }}/package-lock.json
+
+      - name: Install Worker dependencies (no Cloudflare credentials in this step)
+        working-directory: ${{ env.WORKER_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f wrangler.toml
+          npm ci --no-audit --no-fund --loglevel=error
+          test -x node_modules/.bin/wrangler
+          npx --no-install wrangler --version
+
+      - name: Resolve Worker name and D1 database from wrangler.toml
+        working-directory: ${{ env.WORKER_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import os, tomllib
+          from pathlib import Path
+
+          data = tomllib.loads(Path("wrangler.toml").read_text(encoding="utf-8"))
+          name = str(data.get("name", "")).strip()
+          dbs = data.get("d1_databases") or []
+          if not name or len(dbs) != 1 or not str(dbs[0].get("database_name", "")).strip():
+              raise SystemExit("::error::worker/wrangler.toml must define a name and exactly one named D1 database")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fp:
+              fp.write(f"WORKER_NAME={name}\n")
+              fp.write(f"D1_DATABASE_NAME={dbs[0]['database_name'].strip()}\n")
+          PY
+
+      - name: Record D1 restore point (Time Travel bookmark) before migration
+        working-directory: ${{ env.WORKER_DIR }}
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+
+          INFO_JSON="$RUNNER_TEMP/paobuwan-d1-time-travel.json"
+          npx --no-install wrangler d1 time-travel info "$D1_DATABASE_NAME" \
+            --json \
+            --config wrangler.toml \
+            > "$INFO_JSON"
+
+          BOOKMARK="$(python3 - "$INFO_JSON" <<'PY'
+          import json, sys
+
+          def find(value):
+              if isinstance(value, dict):
+                  if isinstance(value.get("bookmark"), str) and value["bookmark"]:
+                      return value["bookmark"]
+                  for child in value.values():
+                      found = find(child)
+                      if found:
+                          return found
+              elif isinstance(value, list):
+                  for child in value:
+                      found = find(child)
+                      if found:
+                          return found
+              return ""
+
+          print(find(json.load(open(sys.argv[1], encoding="utf-8"))))
+          PY
+          )"
+
+          [[ -n "$BOOKMARK" ]] || {
+            echo '::error::Could not read a D1 Time Travel bookmark; refusing to migrate without a restore point.'
+            exit 1
+          }
+
+          # A bookmark is only usable with this account's Cloudflare credentials, so it is
+          # safe to keep in the run summary for manual restore if something goes wrong.
+          echo "D1 restore point bookmark: $BOOKMARK"
+          {
+            echo '## Paobuwan Worker CI: D1 restore point'
+            echo
+            echo "- Bookmark before migrations: \`$BOOKMARK\`"
+            echo '- Restore (manual): `wrangler d1 time-travel restore <database> --bookmark=<bookmark>`'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply D1 migrations
+        working-directory: ${{ env.WORKER_DIR }}
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          npx --no-install wrangler d1 migrations apply "$D1_DATABASE_NAME" \
+            --remote \
+            --config wrangler.toml
+
+      - name: Deploy Worker
+        id: deploy
+        working-directory: ${{ env.WORKER_DIR }}
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+
+          # Application secrets (anonymous-token signing key etc.) live in Cloudflare
+          # (`wrangler secret put`), are never read here, and are preserved by deploy.
+          npx --no-install wrangler deploy --config wrangler.toml
+          echo 'Worker deployed.'
+
+      - name: Post-deploy health check (GET /health)
+        id: health
+        shell: bash
+        env:
+          WORKER_URL: ${{ vars.PAOBUWAN_WORKER_URL }}
+        run: |
+          set -euo pipefail
+
+          HEALTH_URL="${WORKER_URL}/health"
+          echo "Checking GET ${HEALTH_URL}"
+
+          for attempt in $(seq 1 12); do
+            code="$(
+              curl --silent --show-error \
+                --connect-timeout 10 \
+                --max-time 30 \
+                --output "$RUNNER_TEMP/paobuwan-health.json" \
+                --write-out '%{http_code}' \
+                "$HEALTH_URL" || printf '000'
+            )"
+
+            if [[ "$code" == '200' ]]; then
+              echo 'Paobuwan health check passed.'
+              exit 0
+            fi
+
+            echo "Health attempt $attempt/12 returned HTTP $code"
+            sleep 5
+          done
+
+          echo '::error::Post-deploy health check failed.'
+          exit 1
+
+      - name: Roll back Worker when post-deploy health fails
+        if: ${{ failure() && steps.deploy.outcome == 'success' && steps.health.outcome == 'failure' }}
+        working-directory: ${{ env.WORKER_DIR }}
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set +e
+          npx --no-install wrangler rollback \
+            --config wrangler.toml \
+            --message "Automatic rollback: public CI post-deploy health check failed"
+
+          status=$?
+          if [[ "$status" -ne 0 ]]; then
+            echo '::error::Automatic Worker rollback failed; roll back from the Cloudflare Deployments page.'
+            exit "$status"
+          fi
+
+          echo 'Previous Worker version restored.'
+          echo '::warning::Worker code was rolled back, but D1 migrations were NOT. If needed, restore D1 with the bookmark recorded in the run summary.'
+
+      - name: Deployment summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          {
+            echo '## Paobuwan Worker CI: deploy'
+            echo
+            echo "- Source: \`${PRIVATE_SOURCE_REPOSITORY}\` @ \`${SOURCE_COMMIT:0:8}\` (worker/ only)"
+            echo "- Result of this job: \`${{ job.status }}\`"
+            echo '- Application secret values copied to public GitHub: **No**'
+            echo '- Public credentials used: `TARGET_REPO_PAT`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`'
+          } >> "$GITHUB_STEP_SUMMARY"
