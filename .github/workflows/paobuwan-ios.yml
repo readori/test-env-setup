@@ -14,7 +14,7 @@
 #     lifecycle scripts (npm ci / prebuild / pod install) have run.
 name: Paobuwan iOS CI
 
-run-name: Paobuwan iOS · ${{ inputs.mode || 'verify' }} · ${{ inputs.ref || 'main' }}
+run-name: Paobuwan iOS · ${{ inputs.mode || 'verify' }} · ${{ inputs.ref || 'main' }}${{ inputs.build_number && format(' · build {0}', inputs.build_number) || '' }}
 
 on:
   workflow_dispatch:
@@ -32,6 +32,11 @@ on:
         description: 'Private readori/paobuwan branch, tag, or SHA'
         required: true
         default: 'main'
+        type: string
+      build_number:
+        description: 'Build number (CFBundleVersion), entered by the product owner. Required for archive / testflight: a whole number higher than the last build uploaded to App Store Connect. verify: leave empty (uses the run number).'
+        required: false
+        default: ''
         type: string
 
 permissions:
@@ -73,6 +78,7 @@ jobs:
     env:
       MODE: ${{ inputs.mode || 'verify' }}
       SOURCE_REF: ${{ inputs.ref || 'main' }}
+      BUILD_NUMBER_INPUT: ${{ inputs.build_number || '' }}
 
     steps:
       # ---------------------------------------------------------------------
@@ -133,8 +139,20 @@ jobs:
             fi
           fi
 
+          # Build number: entered by hand on each run (product owner decision 2026-10-12).
+          if [[ -n "$BUILD_NUMBER_INPUT" ]]; then
+            [[ "$BUILD_NUMBER_INPUT" =~ ^[1-9][0-9]{0,8}$ ]] || {
+              echo '::error::build_number must be a whole number (1-999999999) with no leading zeros, spaces, or dots.'
+              exit 64
+            }
+          elif [[ "$MODE" == 'archive' || "$MODE" == 'testflight' ]]; then
+            echo "::error::build_number is required for $MODE mode: enter a number higher than the last build uploaded to App Store Connect."
+            exit 64
+          fi
+
           echo "Mode: $MODE"
           echo "Private source ref: $SOURCE_REF"
+          echo "Build number input: ${BUILD_NUMBER_INPUT:-<empty, verify uses run number>}"
 
       # ---------------------------------------------------------------------
       # 1. PUBLIC CI repository -> PRIVATE source repository
@@ -306,12 +324,23 @@ jobs:
             exit 64
           }
 
-          # Build number = public CI run number (same convention as ShiftMile).
-          BUILD_NUMBER="${GITHUB_RUN_NUMBER}"
+          # Build number: the build_number input (validated in step 0; required for archive / testflight).
+          # verify without an input falls back to the run number (simulator only, never uploaded).
+          BUILD_NUMBER="${BUILD_NUMBER_INPUT:-${GITHUB_RUN_NUMBER}}"
           [[ "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]] || {
-            echo "::error::Run number is not a positive integer: $BUILD_NUMBER"
+            echo "::error::Build number is not a positive integer: $BUILD_NUMBER"
             exit 64
           }
+
+          # expo prebuild writes a literal CFBundleVersion (app.json ios.buildNumber, default "1") into the app
+          # Info.plist, so CURRENT_PROJECT_VERSION alone does not change the uploaded build number. Write it there.
+          INFOPLIST_REL="$(awk -F ' = ' '/^ *INFOPLIST_FILE = / {print $2; exit}' "$SETTINGS_FILE")"
+          INFOPLIST_PATH="$IOS_DIR/$INFOPLIST_REL"
+          [[ -n "$INFOPLIST_REL" && -f "$INFOPLIST_PATH" ]] || {
+            echo "::error::App Info.plist not found (INFOPLIST_FILE=${INFOPLIST_REL:-<empty>})."
+            exit 66
+          }
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$INFOPLIST_PATH"
 
           DEPLOYMENT_TARGET="$(awk -F ' = ' '/^ *IPHONEOS_DEPLOYMENT_TARGET = / {print $2; exit}' "$SETTINGS_FILE")"
           if [[ "$DEPLOYMENT_TARGET" != "$EXPECTED_MIN_IOS" ]]; then
@@ -749,6 +778,12 @@ jobs:
             exit 65
           }
           codesign --verify --deep --strict "$SIGNED_APP"
+
+          SIGNED_BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$SIGNED_APP/Info.plist")"
+          [[ "$SIGNED_BUILD_NUMBER" == "$BUILD_NUMBER" ]] || {
+            echo "::error::Signed IPA CFBundleVersion is '$SIGNED_BUILD_NUMBER', expected $BUILD_NUMBER."
+            exit 65
+          }
 
           SIGNED_BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$SIGNED_APP/Info.plist")"
           [[ "$SIGNED_BUNDLE_ID" == "$EXPECTED_BUNDLE_ID" ]] || {
