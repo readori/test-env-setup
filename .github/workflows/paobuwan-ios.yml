@@ -57,7 +57,8 @@ env:
   # MAESTRO_SHA256 must be pinned by the product owner (see T-007 draft notes); the job
   # refuses to run an unverified download.
   MAESTRO_VERSION: '2.11.0'
-  MAESTRO_SHA256: ''
+  # Pinned 2026-10-12: sha256 of cli-2.11.0 maestro.zip (314886578 bytes), matches the GitHub release asset digest.
+  MAESTRO_SHA256: '5384593cb4e7a106489e75a821d157dd43f4e438df6bc308b72e82c685e1283a'
   # Privacy: the app collects nothing, so the build tooling should not phone home either.
   EXPO_NO_TELEMETRY: '1'
   CI: '1'
