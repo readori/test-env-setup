@@ -193,6 +193,16 @@ jobs:
           if not db_name:
               raise SystemExit("::error::worker/wrangler.toml D1 binding has no database_name")
 
+          # Placeholder ids (all zeros) mean the product owner has not created the resources yet.
+          def is_placeholder(value):
+              v = str(value or "").replace("-", "").strip()
+              return v == "" or set(v) == {"0"}
+          if is_placeholder(dbs[0].get("database_id")):
+              raise SystemExit("::error::worker/wrangler.toml D1 database_id is still the placeholder. Create the D1 database and commit its id first.")
+          for kv in data.get("kv_namespaces") or []:
+              if is_placeholder(kv.get("id")):
+                  raise SystemExit(f"::error::worker/wrangler.toml KV namespace {kv.get('binding', '?')} id is still the placeholder. Create it and commit its id first.")
+
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fp:
               fp.write(f"WORKER_NAME={name}\n")
               fp.write(f"D1_DATABASE_NAME={db_name}\n")

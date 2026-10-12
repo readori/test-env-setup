@@ -8,8 +8,8 @@
 #   - workflow_dispatch only; never pull_request.
 #   - third-party actions pinned to commit SHAs; xcodebuild always -quiet.
 #   - derived secret values are add-mask'ed; private source/config files are never printed.
-#   - no sideload, no GitHub Release: the IPA is never published. archive mode keeps a
-#     short-lived Actions artifact only.
+#   - no sideload, no GitHub Release, no Actions artifact: the signed IPA never leaves the
+#     runner (this repo is public; artifacts would be downloadable by anyone signed in).
 #   - signing material is created only in signed modes, after all private-source
 #     lifecycle scripts (npm ci / prebuild / pod install) have run.
 name: Paobuwan iOS CI
@@ -20,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'verify = simulator build + Maestro smoke (no signing); archive = signed IPA + altool validate; testflight = archive + upload to TestFlight'
+        description: 'verify = simulator build + Maestro smoke (no signing); archive = signed IPA + altool validate (IPA is not kept); testflight = archive + upload to TestFlight'
         required: true
         default: 'verify'
         type: choice
@@ -774,16 +774,6 @@ jobs:
           echo "Signed IPA: $(basename "$SIGNED_IPA")"
           ls -lh "$SIGNED_IPA" "$EXPORT_DIR/Paobuwan-AppStore.sha256"
 
-      - name: Upload signed IPA artifact (archive mode only, short retention)
-        if: ${{ env.MODE == 'archive' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: Paobuwan-AppStore-${{ github.run_number }}
-          path: |
-            ${{ runner.temp }}/Paobuwan-AppStore-Export/*.ipa
-            ${{ runner.temp }}/Paobuwan-AppStore-Export/Paobuwan-AppStore.sha256
-          if-no-files-found: error
-          retention-days: 2
 
       - name: Validate App Store package with Apple (altool)
         if: ${{ env.MODE == 'archive' || env.MODE == 'testflight' }}
@@ -847,7 +837,7 @@ jobs:
               echo '- Simulator build: passed (Maestro smoke runs only when e2e/ has flows)'
             fi
             if [[ "$MODE" == 'archive' ]]; then
-              echo '- Signed IPA: Apple validation passed; uploaded as a 2-day Actions artifact (not published anywhere).'
+              echo '- Signed IPA: Apple validation passed (not uploaded anywhere; the runner is discarded).'
             fi
             if [[ "$MODE" == 'testflight' ]]; then
               echo '- TestFlight: Apple validation passed and binary upload was accepted.'
