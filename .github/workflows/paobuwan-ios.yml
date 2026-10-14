@@ -529,11 +529,21 @@ jobs:
         if: ${{ env.MODE == 'verify' && steps.maestro_flows.outputs.found == 'true' }}
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
         shell: bash
+        env:
+          # Hosted macOS runners are slow to start Maestro's XCTest driver on a cold simulator;
+          # the default startup wait is too short there ("iOS driver not ready in time"). Milliseconds.
+          MAESTRO_DRIVER_STARTUP_TIMEOUT: '300000'
+          MAESTRO_CLI_NO_ANALYTICS: '1'
+          MAESTRO_CLI_ANALYSIS_NOTIFICATION_DISABLED: 'true'
         run: |
           set -euo pipefail
 
+          # Make sure the selected simulator is still fully booted after the long build.
+          xcrun simctl boot "$SIMULATOR_UDID" >/dev/null 2>&1 || true
+          xcrun simctl bootstatus "$SIMULATOR_UDID" -b
+
           xcrun simctl install "$SIMULATOR_UDID" "$SIMULATOR_APP_PATH"
-          maestro test e2e/
+          maestro --device "$SIMULATOR_UDID" test e2e/
 
       # ---------------------------------------------------------------------
       # 5. ARCHIVE / TESTFLIGHT: Match signing (readonly), archive, export, altool
