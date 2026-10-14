@@ -545,6 +545,78 @@ jobs:
           xcrun simctl install "$SIMULATOR_UDID" "$SIMULATOR_APP_PATH"
           maestro --device "$SIMULATOR_UDID" test e2e/
 
+      - name: Diagnose Maestro failure (UI tree after choosing a mode, log only)
+        if: ${{ failure() && env.MODE == 'verify' && steps.maestro_flows.outputs.found == 'true' }}
+        shell: bash
+        env:
+          MAESTRO_DRIVER_STARTUP_TIMEOUT: '300000'
+          MAESTRO_CLI_NO_ANALYTICS: '1'
+          MAESTRO_CLI_ANALYSIS_NOTIFICATION_DISABLED: 'true'
+        run: |
+          set -uo pipefail
+
+          # Replays the common first steps (fresh install -> health notice -> mode select -> Finger)
+          # and prints only element ids, texts and labels on screen. No screenshots or artifacts are
+          # published from this public repository.
+          DIAG_DIR="$RUNNER_TEMP/maestro-diagnose"
+          rm -rf "$DIAG_DIR"
+          mkdir -p "$DIAG_DIR"
+          cat > "$DIAG_DIR/diagnose.yaml" <<'YAML'
+          appId: com.readori.paobuwan
+          ---
+          - launchApp:
+              clearState: true
+              stopApp: true
+          - extendedWaitUntil:
+              visible:
+                id: "health-notice"
+              timeout: 30000
+          - tapOn:
+              id: "health-notice-continue"
+          - extendedWaitUntil:
+              visible:
+                id: "mode-select"
+              timeout: 10000
+          - waitForAnimationToEnd:
+              timeout: 5000
+          - tapOn:
+              id: "mode-select-B"
+          - waitForAnimationToEnd:
+              timeout: 15000
+          YAML
+
+          maestro --device "$SIMULATOR_UDID" test "$DIAG_DIR/diagnose.yaml" || echo '::warning::Diagnostic replay itself failed; dumping the current screen anyway.'
+          sleep 10
+
+          maestro --device "$SIMULATOR_UDID" hierarchy > "$DIAG_DIR/hierarchy.json" 2>/dev/null || true
+          python3 - "$DIAG_DIR/hierarchy.json" <<'PY'
+          import json, sys
+          raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+          start = raw.find("{")
+          if start < 0:
+              print("No hierarchy JSON was produced.")
+              raise SystemExit(0)
+          tree = json.loads(raw[start:])
+          def walk(node, depth=0):
+              attrs = node.get("attributes", {}) or {}
+              rid = attrs.get("resource-id") or ""
+              text = attrs.get("text") or ""
+              label = attrs.get("accessibilityText") or ""
+              enabled = attrs.get("enabled")
+              if rid or text or label:
+                  parts = [p for p in (
+                      ("id=" + rid) if rid else "",
+                      ("text=" + text[:80]) if text else "",
+                      ("label=" + label[:80]) if label and label != text else "",
+                      "disabled" if enabled == "false" else "",
+                  ) if p]
+                  print("  " * min(depth, 12) + " | ".join(parts))
+              for child in node.get("children", []) or []:
+                  walk(child, depth + 1)
+          walk(tree)
+          PY
+          rm -rf "$DIAG_DIR"
+
       # ---------------------------------------------------------------------
       # 5. ARCHIVE / TESTFLIGHT: Match signing (readonly), archive, export, altool
       # ---------------------------------------------------------------------
