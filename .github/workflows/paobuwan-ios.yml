@@ -878,6 +878,37 @@ jobs:
             echo "Live Activity extension profile: $LA_PROFILE_NAME"
           fi
 
+      - name: Check build number is higher than the latest TestFlight build
+        if: ${{ env.MODE == 'testflight' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Fails in minutes instead of after the archive when build_number was already uploaded.
+          # Read-only App Store Connect query with the same API key used by Match and altool.
+          set +e
+          LATEST_OUTPUT="$(
+            fastlane run latest_testflight_build_number \
+              api_key_path:"$ASC_API_KEY_JSON" \
+              app_identifier:"$EXPECTED_BUNDLE_ID" \
+              version:"$APP_VERSION" \
+              initial_build_number:0 2>&1
+          )"
+          query_status=$?
+          set -e
+          LATEST="$(printf '%s\n' "$LATEST_OUTPUT" | sed -n 's/.*Result: \([0-9][0-9]*\).*/\1/p' | tail -1)"
+
+          if [[ "$query_status" -ne 0 || -z "$LATEST" ]]; then
+            echo '::warning title=Build number check skipped::Could not read the latest TestFlight build number; continuing to archive.'
+            exit 0
+          fi
+
+          echo "Latest TestFlight build for $APP_VERSION: $LATEST; requested: $BUILD_NUMBER"
+          if (( BUILD_NUMBER <= LATEST )); then
+            echo "::error title=Build number already used::build_number $BUILD_NUMBER is not higher than the latest TestFlight build $LATEST for version $APP_VERSION. Re-run with build_number $((LATEST + 1)) or higher."
+            exit 1
+          fi
+
       - name: Build signed App Store archive and IPA
         if: ${{ env.MODE == 'archive' || env.MODE == 'testflight' }}
         shell: bash
