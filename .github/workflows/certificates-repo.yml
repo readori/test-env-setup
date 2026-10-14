@@ -3,12 +3,6 @@ name: certificates-repo asc-cli V2
 on:
   workflow_dispatch:
     inputs:
-      app_scheme:
-        description: "Readori core_project scheme for the final unsigned IPA (keep Readori; skipped by refresh_paobuwan_profile)"
-        required: false
-        default: "Readori"
-        type: string
-
       xcode_version:
         description: "Xcode version (optional)"
         required: false
@@ -103,50 +97,6 @@ jobs:
               exit 64
               ;;
           esac
-
-      # ============================================================
-      # 2. PRIVATE SOURCE — SSH only (build source)
-      # ============================================================
-      - name: Configure source repository SSH
-        env:
-          PRIVATE_REPO_KEY: ${{ secrets.PRIVATE_REPO_KEY }}
-        run: |
-          set -euo pipefail
-          [[ -n "${PRIVATE_REPO_KEY:-}" ]] || { echo '::error::Missing PRIVATE_REPO_KEY.'; exit 78; }
-
-          mkdir -p "$HOME/.ssh"
-          chmod 700 "$HOME/.ssh"
-          ssh-keyscan -H github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
-          chmod 600 "$HOME/.ssh/known_hosts"
-
-          printf '%s\n' "$PRIVATE_REPO_KEY" > "$HOME/.ssh/app_key"
-          chmod 600 "$HOME/.ssh/app_key"
-          ssh-keygen -y -f "$HOME/.ssh/app_key" >/dev/null || {
-            echo '::error::PRIVATE_REPO_KEY is not a valid SSH private key.'
-            exit 78
-          }
-
-          cat > "$HOME/.ssh/config" <<'EOF'
-          Host github-app
-            HostName github.com
-            User git
-            IdentityFile ~/.ssh/app_key
-            IdentitiesOnly yes
-            StrictHostKeyChecking yes
-          EOF
-          chmod 600 "$HOME/.ssh/config"
-
-          git ls-remote git@github-app:readori/readori.git HEAD >/dev/null || {
-            echo '::error::PRIVATE_REPO_KEY cannot read readori/readori.'
-            exit 78
-          }
-          echo 'Private source repository access: PASS'
-
-      - name: Clone private repo
-        run: |
-          set -euo pipefail
-          git clone --depth=1 git@github-app:readori/readori.git core_project
-          echo "[clone] $(git -C core_project rev-parse --short HEAD)"
 
       # ============================================================
       # 3. MATCH REPOSITORY — TARGET_REPO_PAT / HTTPS ONLY
@@ -685,8 +635,7 @@ jobs:
           echo "ShiftMile profile: $(basename "$SHIFTMILE_PROFILE")"
 
           python3 - <<'PYEOF'
-          import os, plistlib
-          from pathlib import Path
+          import plistlib
           with open('/tmp/readori-appstore.plist','rb') as f:
               app = plistlib.load(f)
           ent = app.get('Entitlements', {})
@@ -706,16 +655,6 @@ jobs:
               )
           print('Readori Associated Domains profile authorization: PASS ' + repr(normalized))
 
-          source_path = Path(os.environ['GITHUB_WORKSPACE']) / 'core_project' / 'Readori' / 'Supporting' / 'Readori.entitlements'
-          with source_path.open('rb') as f:
-              source = plistlib.load(f)
-          source_domains = source.get('com.apple.developer.associated-domains', [])
-          if isinstance(source_domains, str):
-              source_domains = [source_domains]
-          if required not in source_domains:
-              raise SystemExit('Source Readori.entitlements is missing exact domain: ' + required)
-          print('Readori source Associated Domains exact domain: PASS ' + required)
-
           with open('/tmp/readori-mail-appstore.plist','rb') as f:
               mail = plistlib.load(f)
           mail_ent = mail.get('Entitlements', {})
@@ -731,45 +670,6 @@ jobs:
           print('ShiftMile App Store profile bundle identity: PASS')
           PYEOF
 
-      # ============================================================
-      # 9. BUILD READORI IPA (same workflow behavior as before)
-      #    Skipped in refresh_paobuwan_profile: it builds Readori's core_project
-      #    only, so app_scheme must stay a Readori scheme (default "Readori").
-      # ============================================================
-      - name: Resolve Swift Packages
-        if: ${{ inputs.signing_mode != 'refresh_paobuwan_profile' }}
-        run: |
-          set -euo pipefail
-          cd core_project
-          swift package resolve
-
-      - name: Generate icons
-        if: ${{ inputs.signing_mode != 'refresh_paobuwan_profile' }}
-        run: |
-          set -euo pipefail
-          if [[ -f "core_project/scripts/generate_icons.swift" ]]; then
-            swift core_project/scripts/generate_icons.swift "${GITHUB_WORKSPACE}/core_project"
-          fi
-
-      - name: Build IPA
-        if: ${{ inputs.signing_mode != 'refresh_paobuwan_profile' }}
-        run: |
-          set -euo pipefail
-          mkdir -p build
-          cd core_project
-          chmod +x scripts/build_unsigned_ipa.sh
-          ./scripts/build_unsigned_ipa.sh \
-            "${{ inputs.app_scheme }}" \
-            "${GITHUB_WORKSPACE}/build"
-
-      - name: Upload artifact
-        if: ${{ inputs.signing_mode != 'refresh_paobuwan_profile' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: build
-          path: build/*.ipa
-          if-no-files-found: error
-
       - name: Summary
         if: ${{ always() }}
         run: |
@@ -784,4 +684,5 @@ jobs:
             echo '- Refresh modes: reuse existing identity and regenerate only the selected App Store profile (refresh_paobuwan_profile covers the app and its Live Activity extension)'
             echo '- APNs keys / ASC API keys / Identifiers are never deleted by this workflow'
             echo '- Apple Developer certificate/profile revocation is intentionally manual'
+            echo '- Scope: certificates and provisioning profiles only; this workflow builds no IPA'
           } >> "$GITHUB_STEP_SUMMARY"
