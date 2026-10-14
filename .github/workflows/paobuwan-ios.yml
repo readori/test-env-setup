@@ -611,9 +611,13 @@ jobs:
               echo "::error title=Maestro failed flows::${FAILED:-no [Failed] lines found}"
               # The failing command of each flow, with its error message (the console line above often has none).
               /usr/bin/python3 - "$MAESTRO_DEBUG_DIR" <<'PY' || true
-          import glob, json, os, sys
+          import glob, json, os, re, sys
+          root = sys.argv[1]
           out = []
-          for path in sorted(glob.glob(os.path.join(sys.argv[1], 'commands-*.json'))):
+          # Maestro 2.11 writes <flow name>/commands.json; older versions wrote commands-<flow>.json.
+          paths = [(os.path.basename(os.path.dirname(p)), p) for p in glob.glob(os.path.join(root, '*', 'commands.json'))]
+          paths += [(os.path.basename(p)[len('commands-'):-len('.json')], p) for p in glob.glob(os.path.join(root, 'commands-*.json'))]
+          for flow, path in sorted(paths):
               try:
                   items = json.load(open(path))
               except Exception:
@@ -627,9 +631,24 @@ jobs:
                   body = cmd.get(name)
                   body = body if isinstance(body, dict) else {}
                   label = body.get('label') or body.get('description') or ''
-                  err = ((meta.get('error') or {}).get('message') or '').replace('\n', ' ')[:300]
-                  flow = os.path.basename(path)[len('commands-'):-len('.json')]
-                  out.append(f'{flow}: {name} {label} -> {err}')
+                  err = ((meta.get('error') or {}).get('message') or '(no message)').replace('\n', ' ')[:300]
+                  line = f'{flow}: {name} {label} -> {err}'
+                  # What was on screen: accessibility texts of the failing step's hierarchy (system alerts show here too).
+                  for art in meta.get('artifacts') or []:
+                      if art.get('type') != 'SCREEN_HIERARCHY':
+                          continue
+                      try:
+                          raw = open(os.path.join(os.path.dirname(path), art.get('path', ''))).read()
+                      except Exception:
+                          continue
+                      seen = []
+                      for t in re.findall(r'"accessibilityText"\s*:\s*"([^"]+)"', raw):
+                          t = t.strip()
+                          if t and t not in seen and not re.search(r'battery|Wi-Fi|scroll bar|Cellular|^\d+:\d+ [AP]M$', t):
+                              seen.append(t)
+                      if seen:
+                          line += ' | on screen: ' + '; '.join(s[:60] for s in seen[:12])
+                  out.append(line)
                   break
           if out:
               msg = '%0A'.join(s.replace('%', '%25') for s in out)
