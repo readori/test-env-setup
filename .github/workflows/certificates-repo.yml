@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       app_scheme:
-        description: "SPM / xcodebuild scheme name"
+        description: "Readori core_project scheme for the final unsigned IPA (keep Readori; skipped by refresh_paobuwan_profile)"
         required: false
         default: "Readori"
         type: string
@@ -733,14 +733,18 @@ jobs:
 
       # ============================================================
       # 9. BUILD READORI IPA (same workflow behavior as before)
+      #    Skipped in refresh_paobuwan_profile: it builds Readori's core_project
+      #    only, so app_scheme must stay a Readori scheme (default "Readori").
       # ============================================================
       - name: Resolve Swift Packages
+        if: ${{ inputs.signing_mode != 'refresh_paobuwan_profile' }}
         run: |
           set -euo pipefail
           cd core_project
           swift package resolve
 
       - name: Generate icons
+        if: ${{ inputs.signing_mode != 'refresh_paobuwan_profile' }}
         run: |
           set -euo pipefail
           if [[ -f "core_project/scripts/generate_icons.swift" ]]; then
@@ -748,6 +752,7 @@ jobs:
           fi
 
       - name: Build IPA
+        if: ${{ inputs.signing_mode != 'refresh_paobuwan_profile' }}
         run: |
           set -euo pipefail
           mkdir -p build
@@ -758,6 +763,7 @@ jobs:
             "${GITHUB_WORKSPACE}/build"
 
       - name: Upload artifact
+        if: ${{ inputs.signing_mode != 'refresh_paobuwan_profile' }}
         uses: actions/upload-artifact@v4
         with:
           name: build
