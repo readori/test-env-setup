@@ -344,6 +344,15 @@ jobs:
           }
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$INFOPLIST_PATH"
 
+          # Source commit (8-char short SHA) for the in-app diagnostics page (T-077 reads PBWSourceCommit).
+          # Not a secret: the same short SHA is printed in this workflow's summary.
+          if [[ "${SOURCE_SHORT_SHA:-}" =~ ^[0-9a-f]{7,40}$ ]]; then
+            /usr/libexec/PlistBuddy -c "Delete :PBWSourceCommit" "$INFOPLIST_PATH" >/dev/null 2>&1 || true
+            /usr/libexec/PlistBuddy -c "Add :PBWSourceCommit string $SOURCE_SHORT_SHA" "$INFOPLIST_PATH"
+          else
+            echo '::warning::SOURCE_SHORT_SHA is missing; diagnostics will show no source commit.'
+          fi
+
           DEPLOYMENT_TARGET="$(awk -F ' = ' '/^ *IPHONEOS_DEPLOYMENT_TARGET = / {print $2; exit}' "$SETTINGS_FILE")"
           if [[ "$DEPLOYMENT_TARGET" != "$EXPECTED_MIN_IOS" ]]; then
             echo "::warning::IPHONEOS_DEPLOYMENT_TARGET is '${DEPLOYMENT_TARGET:-<empty>}'; the Opus decision (T-008) is $EXPECTED_MIN_IOS."
