@@ -51,6 +51,7 @@ jobs:
       MAIL_BUNDLE_ID: com.readori.mail
       SHIFTMILE_BUNDLE_ID: com.readori.shiftmile
       PAOBUWAN_BUNDLE_ID: com.readori.paobuwan
+      PAOBUWAN_LIVEACTIVITY_BUNDLE_ID: com.readori.paobuwan.LiveActivity
       MATCH_GIT_URL: https://github.com/readori/readori-certificates.git
       MATCH_GIT_BRANCH: main
 
@@ -86,7 +87,7 @@ jobs:
                 echo '::error::refresh_paobuwan_profile requires destructive_confirmation=WRITE.'
                 exit 64
               }
-              echo '::notice::Preserves the shared Distribution identity and other app profiles; force-regenerates only com.readori.paobuwan.'
+              echo '::notice::Preserves the shared Distribution identity and other app profiles; force-regenerates only com.readori.paobuwan and its Live Activity extension com.readori.paobuwan.LiveActivity.'
               ;;
             fresh_bootstrap_all)
               [[ "$DESTRUCTIVE_CONFIRMATION" == 'RESET_ALL_SIGNING' ]] || {
@@ -518,12 +519,14 @@ jobs:
           echo 'ShiftMile App Store profile refresh: PASS'
 
       # ============================================================
-      # 7C2. REFRESH PAOBUWAN PROFILE ONLY
+      # 7C2. REFRESH PAOBUWAN PROFILES ONLY
       #      Reuses the existing shared Distribution identity; creates/regenerates
-      #      only the com.readori.paobuwan App Store profile. The App ID
-      #      (bundle identifier) must already exist in the Apple Developer portal.
+      #      only the Paobuwan App Store profiles: the app (com.readori.paobuwan)
+      #      and its Live Activity widget extension (com.readori.paobuwan.LiveActivity).
+      #      Both App IDs must already exist in the Apple Developer portal; this
+      #      workflow never creates Identifiers.
       # ============================================================
-      - name: Refresh Paobuwan App Store profile only
+      - name: Refresh Paobuwan App Store profiles only (app + Live Activity extension)
         if: ${{ inputs.signing_mode == 'refresh_paobuwan_profile' }}
         env:
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
@@ -559,38 +562,46 @@ jobs:
             exit 78
           }
 
+          # One match call covers the app and its Live Activity widget extension,
+          # so both profiles are signed by the same shared Distribution identity.
           MATCH_READONLY=false fastlane match appstore \
-            --app_identifier "$PAOBUWAN_BUNDLE_ID" \
+            --app_identifier "$PAOBUWAN_BUNDLE_ID,$PAOBUWAN_LIVEACTIVITY_BUNDLE_ID" \
             --readonly false \
             --force \
             --generate_apple_certs false \
             --skip_confirmation true \
             "${COMMON[@]}"
 
-          # Verify the freshly written profile here: the shared validation step below is
+          # Verify the freshly written profiles here: the shared validation step below is
           # skipped for this mode because it requires the other three apps' profiles.
-          PROFILE_FOUND=0
-          for root in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
-            [[ -d "$root" ]] || continue
-            for p in "$root"/*.mobileprovision; do
-              [[ -f "$p" ]] || continue
-              tmp="$(mktemp)"
-              if security cms -D -i "$p" > "$tmp" 2>/dev/null; then
-                appid="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$tmp" 2>/dev/null || true)"
-                gettask="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$tmp" 2>/dev/null || true)"
-                if [[ "$appid" == "$ASC_TEAM_ID.$PAOBUWAN_BUNDLE_ID" && "$gettask" != 'true' ]]; then
-                  PROFILE_FOUND=1
+          # application-identifier must match exactly, so the app profile never
+          # satisfies the extension check (or the reverse).
+          for bundle in "$PAOBUWAN_BUNDLE_ID" "$PAOBUWAN_LIVEACTIVITY_BUNDLE_ID"; do
+            PROFILE_FOUND=0
+            for root in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+              [[ -d "$root" ]] || continue
+              for p in "$root"/*.mobileprovision; do
+                [[ -f "$p" ]] || continue
+                tmp="$(mktemp)"
+                if security cms -D -i "$p" > "$tmp" 2>/dev/null; then
+                  appid="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$tmp" 2>/dev/null || true)"
+                  gettask="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$tmp" 2>/dev/null || true)"
+                  if [[ "$appid" == "$ASC_TEAM_ID.$bundle" && "$gettask" != 'true' ]]; then
+                    PROFILE_FOUND=1
+                  fi
                 fi
-              fi
-              rm -f "$tmp"
+                rm -f "$tmp"
+              done
             done
+            [[ "$PROFILE_FOUND" -eq 1 ]] || {
+              echo "::error::No installed App Store profile found for $bundle after refresh."
+              echo '::error::Confirm this App ID exists in the Apple Developer portal (Identifiers), then rerun refresh_paobuwan_profile.'
+              exit 78
+            }
+            echo "App Store profile installed: $bundle"
           done
-          [[ "$PROFILE_FOUND" -eq 1 ]] || {
-            echo '::error::No installed App Store profile found for com.readori.paobuwan after refresh.'
-            exit 78
-          }
 
-          echo 'Paobuwan App Store profile refresh: PASS'
+          echo 'Paobuwan App Store profiles refresh (app + Live Activity extension): PASS'
 
       # ============================================================
       # 7D. READONLY VERIFY
@@ -602,7 +613,9 @@ jobs:
           ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
         run: |
           set -euo pipefail
-          for bundle in "$READORI_BUNDLE_ID" "$MAIL_BUNDLE_ID" "$SHIFTMILE_BUNDLE_ID" "$PAOBUWAN_BUNDLE_ID"; do
+          # The Live Activity extension is last so the four apps are verified first.
+          # If only it fails: create its App ID, then run refresh_paobuwan_profile once.
+          for bundle in "$READORI_BUNDLE_ID" "$MAIL_BUNDLE_ID" "$SHIFTMILE_BUNDLE_ID" "$PAOBUWAN_BUNDLE_ID" "$PAOBUWAN_LIVEACTIVITY_BUNDLE_ID"; do
             echo "=== Verify $bundle ==="
             MATCH_READONLY=true fastlane match appstore \
               --app_identifier "$bundle" \
@@ -760,9 +773,9 @@ jobs:
             echo "- Mode: \`${{ inputs.signing_mode }}\`"
             echo "- Match repo: \`$MATCH_GIT_URL@$MATCH_GIT_BRANCH\`"
             echo '- Match auth: HTTPS + TARGET_REPO_PAT'
-            echo '- Active App IDs: com.readori.app + com.readori.mail + com.readori.shiftmile + com.readori.paobuwan'
+            echo '- Active App IDs: com.readori.app + com.readori.mail + com.readori.shiftmile + com.readori.paobuwan (+ extension com.readori.paobuwan.LiveActivity)'
             echo '- Fresh bootstrap target: one shared Apple Distribution identity + three App Store profiles'
-            echo '- Refresh modes: reuse existing identity and regenerate only the selected App Store profile'
+            echo '- Refresh modes: reuse existing identity and regenerate only the selected App Store profile (refresh_paobuwan_profile covers the app and its Live Activity extension)'
             echo '- APNs keys / ASC API keys / Identifiers are never deleted by this workflow'
             echo '- Apple Developer certificate/profile revocation is intentionally manual'
           } >> "$GITHUB_STEP_SUMMARY"
