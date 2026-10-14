@@ -570,11 +570,18 @@ jobs:
           # clean up any half-started driver, erase and reboot the simulator, and try again (3 attempts in all).
           # A flow that actually runs and fails is never retried.
           MAESTRO_LOG="$RUNNER_TEMP/maestro-run.log"
+          # Per-command records and failure screenshots for every flow; uploaded as an artifact by the next step.
+          MAESTRO_DEBUG_DIR="$RUNNER_TEMP/maestro-debug"
+          echo "MAESTRO_DEBUG_DIR=$MAESTRO_DEBUG_DIR" >> "$GITHUB_ENV"
           DRIVER_MARKER="$RUNNER_TEMP/maestro-driver-marker"
           touch "$DRIVER_MARKER"
           for attempt in 1 2 3; do
+            rm -rf "$MAESTRO_DEBUG_DIR"
+            mkdir -p "$MAESTRO_DEBUG_DIR"
             set +e
-            maestro --device "$SIMULATOR_UDID" test e2e/ 2>&1 | tee "$MAESTRO_LOG"
+            maestro --device "$SIMULATOR_UDID" test e2e/ \
+              --debug-output "$MAESTRO_DEBUG_DIR" --flatten-debug-output \
+              --format JUNIT --output "$MAESTRO_DEBUG_DIR/report.xml" 2>&1 | tee "$MAESTRO_LOG"
             status="${PIPESTATUS[0]}"
             set -e
             [[ "$status" -eq 0 ]] && exit 0
@@ -602,9 +609,44 @@ jobs:
               # without signing in, unlike job logs.
               FAILED="$(sed -e 's/\x1b\[[0-9;]*m//g' "$MAESTRO_LOG" | grep -E '\[Failed\]|Flows? (Passed|Failed)|Element not found|Assertion is false' | head -40 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
               echo "::error title=Maestro failed flows::${FAILED:-no [Failed] lines found}"
+              # The failing command of each flow, with its error message (the console line above often has none).
+              /usr/bin/python3 - "$MAESTRO_DEBUG_DIR" <<'PY' || true
+          import glob, json, os, sys
+          out = []
+          for path in sorted(glob.glob(os.path.join(sys.argv[1], 'commands-*.json'))):
+              try:
+                  items = json.load(open(path))
+              except Exception:
+                  continue
+              for item in items:
+                  meta = item.get('metadata') or {}
+                  if meta.get('status') != 'FAILED':
+                      continue
+                  cmd = item.get('command') or {}
+                  name = next(iter(cmd), '?')
+                  body = cmd.get(name)
+                  body = body if isinstance(body, dict) else {}
+                  label = body.get('label') or body.get('description') or ''
+                  err = ((meta.get('error') or {}).get('message') or '').replace('\n', ' ')[:300]
+                  flow = os.path.basename(path)[len('commands-'):-len('.json')]
+                  out.append(f'{flow}: {name} {label} -> {err}')
+                  break
+          if out:
+              msg = '%0A'.join(s.replace('%', '%25') for s in out)
+              print(f'::error title=Maestro failing commands::{msg}')
+          PY
             fi
             exit "$status"
           done
+
+      - name: Upload Maestro debug output (commands and failure screenshots)
+        if: ${{ always() && env.MODE == 'verify' && steps.maestro_flows.outputs.found == 'true' && env.MAESTRO_DEBUG_DIR != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: maestro-debug-${{ github.run_id }}
+          path: ${{ env.MAESTRO_DEBUG_DIR }}
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Diagnose Maestro failure (UI tree after choosing a mode, log only)
         if: ${{ failure() && env.MODE == 'verify' && steps.maestro_flows.outputs.found == 'true' && env.MAESTRO_DRIVER_FAILED != 'true' }}
