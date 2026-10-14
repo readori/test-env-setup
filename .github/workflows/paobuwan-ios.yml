@@ -567,17 +567,24 @@ jobs:
           xcrun simctl install "$SIMULATOR_UDID" "$SIMULATOR_APP_PATH"
 
           # Infrastructure retry only: if Maestro's XCTest driver never comes up on the hosted runner,
-          # reboot the simulator and try once more. A flow that actually runs and fails is never retried.
+          # clean up any half-started driver, erase and reboot the simulator, and try again (3 attempts in all).
+          # A flow that actually runs and fails is never retried.
           MAESTRO_LOG="$RUNNER_TEMP/maestro-run.log"
-          for attempt in 1 2; do
+          DRIVER_MARKER="$RUNNER_TEMP/maestro-driver-marker"
+          touch "$DRIVER_MARKER"
+          for attempt in 1 2 3; do
             set +e
             maestro --device "$SIMULATOR_UDID" test e2e/ 2>&1 | tee "$MAESTRO_LOG"
             status="${PIPESTATUS[0]}"
             set -e
             [[ "$status" -eq 0 ]] && exit 0
-            if [[ "$attempt" -eq 1 ]] && grep -q 'iOS driver not ready in time' "$MAESTRO_LOG"; then
-              echo '::warning::Maestro iOS driver did not start; rebooting the simulator and retrying once.'
+            if [[ "$attempt" -lt 3 ]] && grep -q 'iOS driver not ready in time' "$MAESTRO_LOG"; then
+              echo "::warning::Maestro iOS driver did not start (attempt $attempt); erasing the simulator and retrying."
+              # A driver runner left over from the failed attempt can keep its port busy.
+              pkill -f 'maestro-driver-ios' >/dev/null 2>&1 || true
+              pkill -f 'xcodebuild.*maestro' >/dev/null 2>&1 || true
               xcrun simctl shutdown "$SIMULATOR_UDID" >/dev/null 2>&1 || true
+              xcrun simctl erase "$SIMULATOR_UDID"
               xcrun simctl boot "$SIMULATOR_UDID"
               xcrun simctl bootstatus "$SIMULATOR_UDID" -b
               xcrun simctl install "$SIMULATOR_UDID" "$SIMULATOR_APP_PATH"
@@ -585,7 +592,11 @@ jobs:
             fi
             if grep -q 'iOS driver not ready in time' "$MAESTRO_LOG"; then
               echo 'MAESTRO_DRIVER_FAILED=true' >> "$GITHUB_ENV"
-              echo '::error title=Maestro driver::iOS driver not ready in time (after one simulator reboot).'
+              # The driver's own logs (xcodebuild test runner) explain why it never came up; surface their error lines.
+              DRIVER_LINES="$(find "$HOME/.maestro" "$HOME/Library/Logs/maestro" -type f -newer "$DRIVER_MARKER" 2>/dev/null \
+                | xargs -I{} grep -hiE 'error|fail|timed out|refused|unable' {} 2>/dev/null \
+                | grep -v 'consider increasing timeout' | tail -30 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+              echo "::error title=Maestro driver::iOS driver not ready in time (3 attempts, simulator erased between attempts).%0A${DRIVER_LINES:-no driver log lines found}"
             else
               # Failed flow lines as one annotation: annotations are readable through the public API
               # without signing in, unlike job logs.
