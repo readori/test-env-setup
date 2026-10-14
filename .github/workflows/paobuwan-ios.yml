@@ -437,14 +437,27 @@ jobs:
             ARCHS="$(uname -m)" \
             ONLY_ACTIVE_ARCH=YES \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
-            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM= \
+            PROVISIONING_PROFILE_SPECIFIER= \
+            CODE_SIGNING_ALLOWED=YES \
             CODE_SIGNING_REQUIRED=NO
+          # Ad-hoc ("Sign to Run Locally") instead of unsigned: an unsigned simulator app has no
+          # entitlements, so Keychain calls (expo-secure-store: the anonymous player token) fail
+          # with errSecMissingEntitlement and the app treats the cloud check as "couldn't check"
+          # (BUG-012: every Maestro flow stopped on the restore screen).
 
           APP_PATH="$(find "$VERIFY_DERIVED/Build/Products/Release-iphonesimulator" -maxdepth 1 -type d -name '*.app' -print -quit)"
           [[ -n "$APP_PATH" && -d "$APP_PATH" ]] || {
             echo '::error::Simulator .app was not produced.'
             exit 65
           }
+          if codesign --verify "$APP_PATH" >/dev/null 2>&1; then
+            echo '::notice title=Simulator app signing::ad-hoc signature present (Keychain available to the app).'
+          else
+            echo '::warning title=Simulator app signing::app is not signed; Keychain (player token) will fail in Maestro flows.'
+          fi
 
           BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist")"
           [[ "$BUNDLE_ID" == "$EXPECTED_BUNDLE_ID" ]] || {
@@ -620,6 +633,52 @@ jobs:
               id: "mode-select-B"
           - waitForAnimationToEnd:
               timeout: 15000
+          # Then try to reach the in-app Diagnostics page (Settings -> long press the version
+          # line), whose sync / request / error rows say why a cloud call failed.
+          - runFlow:
+              when:
+                visible:
+                  id: "restore-start-fresh"
+              commands:
+                - tapOn:
+                    id: "restore-start-fresh"
+                - tapOn:
+                    id: "restore-fresh-confirm-confirm"
+                    optional: true
+                - waitForAnimationToEnd:
+                    timeout: 10000
+          - runFlow:
+              when:
+                visible:
+                  id: "run-style"
+              commands:
+                - scrollUntilVisible:
+                    element:
+                      id: "run-style-start"
+                    direction: DOWN
+                - tapOn:
+                    id: "run-style-start"
+          - extendedWaitUntil:
+              visible:
+                id: "home-settings"
+              timeout: 20000
+              optional: true
+          - tapOn:
+              id: "home-settings"
+              optional: true
+          - scrollUntilVisible:
+              element:
+                id: "settings-version"
+              direction: DOWN
+              optional: true
+          - longPressOn:
+              id: "settings-version"
+              optional: true
+          - extendedWaitUntil:
+              visible:
+                id: "diagnostics"
+              timeout: 10000
+              optional: true
           YAML
 
           maestro --device "$SIMULATOR_UDID" test "$DIAG_DIR/diagnose.yaml" || echo '::warning::Diagnostic replay itself failed; dumping the current screen anyway.'
