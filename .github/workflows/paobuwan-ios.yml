@@ -572,6 +572,12 @@ jobs:
             fi
             if grep -q 'iOS driver not ready in time' "$MAESTRO_LOG"; then
               echo 'MAESTRO_DRIVER_FAILED=true' >> "$GITHUB_ENV"
+              echo '::error title=Maestro driver::iOS driver not ready in time (after one simulator reboot).'
+            else
+              # Failed flow lines as one annotation: annotations are readable through the public API
+              # without signing in, unlike job logs.
+              FAILED="$(sed -e 's/\x1b\[[0-9;]*m//g' "$MAESTRO_LOG" | grep -E '\[Failed\]|Flows? (Passed|Failed)|Element not found|Assertion is false' | head -40 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+              echo "::error title=Maestro failed flows::${FAILED:-no [Failed] lines found}"
             fi
             exit "$status"
           done
@@ -628,6 +634,7 @@ jobs:
               print("No hierarchy JSON was produced.")
               raise SystemExit(0)
           tree = json.loads(raw[start:])
+          lines = []
           def walk(node, depth=0):
               attrs = node.get("attributes", {}) or {}
               rid = attrs.get("resource-id") or ""
@@ -641,10 +648,27 @@ jobs:
                       ("label=" + label[:80]) if label and label != text else "",
                       "disabled" if enabled == "false" else "",
                   ) if p]
-                  print("  " * min(depth, 12) + " | ".join(parts))
+                  lines.append("  " * min(depth, 12) + " | ".join(parts))
               for child in node.get("children", []) or []:
                   walk(child, depth + 1)
           walk(tree)
+          print("\n".join(lines))
+          # Also emit the tree as annotations (readable through the public API without signing in).
+          def esc(s):
+              return s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          chunks, cur = [], ""
+          for line in lines:
+              if len(cur) + len(line) + 1 > 3500:
+                  chunks.append(cur)
+                  cur = ""
+              cur += line + "\n"
+          if cur:
+              chunks.append(cur)
+          if not chunks:
+              chunks = ["(no elements with id, text or label)"]
+          total = min(len(chunks), 8)
+          for i, chunk in enumerate(chunks[:8], 1):
+              print("::notice title=Maestro UI tree " + str(i) + "/" + str(total) + "::" + esc(chunk))
           PY
           rm -rf "$DIAG_DIR"
 
