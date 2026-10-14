@@ -552,10 +552,32 @@ jobs:
           xcrun simctl bootstatus "$SIMULATOR_UDID" -b
 
           xcrun simctl install "$SIMULATOR_UDID" "$SIMULATOR_APP_PATH"
-          maestro --device "$SIMULATOR_UDID" test e2e/
+
+          # Infrastructure retry only: if Maestro's XCTest driver never comes up on the hosted runner,
+          # reboot the simulator and try once more. A flow that actually runs and fails is never retried.
+          MAESTRO_LOG="$RUNNER_TEMP/maestro-run.log"
+          for attempt in 1 2; do
+            set +e
+            maestro --device "$SIMULATOR_UDID" test e2e/ 2>&1 | tee "$MAESTRO_LOG"
+            status="${PIPESTATUS[0]}"
+            set -e
+            [[ "$status" -eq 0 ]] && exit 0
+            if [[ "$attempt" -eq 1 ]] && grep -q 'iOS driver not ready in time' "$MAESTRO_LOG"; then
+              echo '::warning::Maestro iOS driver did not start; rebooting the simulator and retrying once.'
+              xcrun simctl shutdown "$SIMULATOR_UDID" >/dev/null 2>&1 || true
+              xcrun simctl boot "$SIMULATOR_UDID"
+              xcrun simctl bootstatus "$SIMULATOR_UDID" -b
+              xcrun simctl install "$SIMULATOR_UDID" "$SIMULATOR_APP_PATH"
+              continue
+            fi
+            if grep -q 'iOS driver not ready in time' "$MAESTRO_LOG"; then
+              echo 'MAESTRO_DRIVER_FAILED=true' >> "$GITHUB_ENV"
+            fi
+            exit "$status"
+          done
 
       - name: Diagnose Maestro failure (UI tree after choosing a mode, log only)
-        if: ${{ failure() && env.MODE == 'verify' && steps.maestro_flows.outputs.found == 'true' }}
+        if: ${{ failure() && env.MODE == 'verify' && steps.maestro_flows.outputs.found == 'true' && env.MAESTRO_DRIVER_FAILED != 'true' }}
         shell: bash
         env:
           MAESTRO_DRIVER_STARTUP_TIMEOUT: '300000'
