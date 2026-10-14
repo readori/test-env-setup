@@ -1127,12 +1127,22 @@ jobs:
         run: |
           set -euo pipefail
 
+          ALTOOL_LOG="$RUNNER_TEMP/altool-validate.log"
+          set +e
           xcrun altool \
             --validate-app \
             --file "$SIGNED_IPA" \
             --type ios \
             --apiKey "$ASC_KEY_ID" \
-            --apiIssuer "$ASC_ISSUER_ID"
+            --apiIssuer "$ASC_ISSUER_ID" 2>&1 | tee "$ALTOOL_LOG"
+          altool_status="${PIPESTATUS[0]}"
+          set -e
+          if [[ "$altool_status" -ne 0 ]] || grep -qiE '^[[:space:]]*[*]{3} Error|ERROR ITMS-' "$ALTOOL_LOG"; then
+            # Apple's messages as one annotation (readable without signing in); no secrets are printed by altool.
+            MSG="$(grep -iE 'error|ITMS-|bundle version|CFBundleVersion|message' "$ALTOOL_LOG" | head -30 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+            echo "::error title=altool validate failed::${MSG:-altool exited with status $altool_status}"
+            exit 1
+          fi
 
       - name: Upload Paobuwan to TestFlight (altool)
         if: ${{ env.MODE == 'testflight' }}
@@ -1152,12 +1162,22 @@ jobs:
             exit 78
           }
 
+          ALTOOL_LOG="$RUNNER_TEMP/altool-upload.log"
+          set +e
           xcrun altool \
             --upload-app \
             --file "$SIGNED_IPA" \
             --type ios \
             --apiKey "$ASC_KEY_ID" \
-            --apiIssuer "$ASC_ISSUER_ID"
+            --apiIssuer "$ASC_ISSUER_ID" 2>&1 | tee "$ALTOOL_LOG"
+          altool_status="${PIPESTATUS[0]}"
+          set -e
+          if [[ "$altool_status" -ne 0 ]] || grep -qiE '^[[:space:]]*[*]{3} Error|ERROR ITMS-' "$ALTOOL_LOG"; then
+            # Apple's messages as one annotation (readable without signing in); no secrets are printed by altool.
+            MSG="$(grep -iE 'error|ITMS-|bundle version|CFBundleVersion|message' "$ALTOOL_LOG" | head -30 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+            echo "::error title=altool upload failed::${MSG:-altool exited with status $altool_status}"
+            exit 1
+          fi
 
           echo 'TestFlight binary upload accepted by App Store Connect.'
 
