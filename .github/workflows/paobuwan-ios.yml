@@ -50,6 +50,8 @@ env:
   PRIVATE_SOURCE_REPOSITORY: readori/paobuwan
   PRIVATE_SOURCE_PATH: source
   EXPECTED_BUNDLE_ID: com.readori.paobuwan
+  # Live Activity widget extension (T-071). Optional: refs without the extension target build as before.
+  EXPECTED_LIVE_ACTIVITY_BUNDLE_ID: com.readori.paobuwan.LiveActivity
   # Opus decision (T-008, 2026-10-11): Xcode 26.4+ on the 26.x track; min iOS 16.4.
   XCODE_MAJOR_WANTED: '26'
   XCODE_MIN_VERSION: '26.4'
@@ -349,6 +351,17 @@ jobs:
 
           rm -f "$SETTINGS_FILE"
 
+          # Live Activity widget extension target (added by the private repo's config plugin).
+          # When present it is signed with its own App Store profile, and its Info.plist takes
+          # CFBundleVersion from $(CURRENT_PROJECT_VERSION), so the xcodebuild override below
+          # keeps it equal to the app's build number (checked after the build).
+          HAS_LIVE_ACTIVITY=false
+          LA_ID_PATTERN="PRODUCT_BUNDLE_IDENTIFIER = \"?${EXPECTED_LIVE_ACTIVITY_BUNDLE_ID//./\\.}\"?;"
+          if grep -Eq "$LA_ID_PATTERN" "$IOS_DIR"/*.xcodeproj/project.pbxproj 2>/dev/null; then
+            HAS_LIVE_ACTIVITY=true
+          fi
+          echo "HAS_LIVE_ACTIVITY=$HAS_LIVE_ACTIVITY" >> "$GITHUB_ENV"
+
           echo "WORKSPACE_PATH=$WORKSPACE_PATH" >> "$GITHUB_ENV"
           echo "SCHEME=$SCHEME" >> "$GITHUB_ENV"
           echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
@@ -357,6 +370,7 @@ jobs:
           echo "Scheme: $SCHEME"
           echo "Version: $APP_VERSION ($BUILD_NUMBER)"
           echo "Deployment target: ${DEPLOYMENT_TARGET:-unknown}"
+          echo "Live Activity extension target: $HAS_LIVE_ACTIVITY"
 
       # ---------------------------------------------------------------------
       # 4. VERIFY mode: Simulator build + Maestro smoke (no signing, no secrets)
@@ -428,6 +442,27 @@ jobs:
             echo "::error::Unexpected bundle identifier in built app: $BUNDLE_ID"
             exit 65
           }
+
+          if [[ "$HAS_LIVE_ACTIVITY" == 'true' ]]; then
+            APPEX_PATH="$APP_PATH/PlugIns/LiveActivityExtension.appex"
+            [[ -d "$APPEX_PATH" ]] || {
+              echo '::error::Live Activity extension target exists but LiveActivityExtension.appex is not embedded in PlugIns.'
+              exit 65
+            }
+            APPEX_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APPEX_PATH/Info.plist")"
+            APPEX_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APPEX_PATH/Info.plist")"
+            APPEX_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APPEX_PATH/Info.plist")"
+            APP_SHORT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Info.plist")"
+            [[ "$APPEX_ID" == "$EXPECTED_LIVE_ACTIVITY_BUNDLE_ID" ]] || {
+              echo "::error::Live Activity extension bundle ID is '$APPEX_ID', expected $EXPECTED_LIVE_ACTIVITY_BUNDLE_ID."
+              exit 65
+            }
+            [[ "$APPEX_BUILD" == "$BUILD_NUMBER" && "$APPEX_VERSION" == "$APP_SHORT_VERSION" ]] || {
+              echo "::error::Extension version $APPEX_VERSION ($APPEX_BUILD) does not match the app's $APP_SHORT_VERSION ($BUILD_NUMBER)."
+              exit 65
+            }
+            echo "Live Activity extension embedded: $APPEX_ID $APPEX_VERSION ($APPEX_BUILD)"
+          fi
 
           echo "SIMULATOR_APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
           echo 'Simulator build: PASS'
@@ -607,9 +642,13 @@ jobs:
           # --- Match: shared Apple Distribution identity + Paobuwan App Store profile
           # Readonly by design: this workflow never writes to the shared certificates
           # repository. The profile is created once by certificates-repo.yml
-          # (signing_mode=refresh_paobuwan_profile).
+          # (signing_mode=refresh_paobuwan_profile), which also covers the Live Activity extension.
+          MATCH_APP_IDENTIFIERS="$EXPECTED_BUNDLE_ID"
+          if [[ "$HAS_LIVE_ACTIVITY" == 'true' ]]; then
+            MATCH_APP_IDENTIFIERS="$EXPECTED_BUNDLE_ID,$EXPECTED_LIVE_ACTIVITY_BUNDLE_ID"
+          fi
           if ! MATCH_READONLY=true fastlane match appstore \
-              --app_identifier "$EXPECTED_BUNDLE_ID" \
+              --app_identifier "$MATCH_APP_IDENTIFIERS" \
               --git_url "$MATCH_GIT_URL" \
               --git_branch "$MATCH_GIT_BRANCH" \
               --git_basic_authorization "$MATCH_AUTH" \
@@ -620,7 +659,7 @@ jobs:
               --shallow_clone true \
               --clone_branch_directly true \
               --readonly true; then
-            echo "::error::Readonly Match could not install signing assets for $EXPECTED_BUNDLE_ID."
+            echo "::error::Readonly Match could not install signing assets for $MATCH_APP_IDENTIFIERS."
             echo '::error::First run? Run certificates-repo.yml with signing_mode=refresh_paobuwan_profile and destructive_confirmation=WRITE, then retry.'
             exit 65
           fi
@@ -643,11 +682,6 @@ jobs:
           rm -rf "$PROFILE_SCAN_DIR"
           mkdir -p "$PROFILE_SCAN_DIR"
 
-          PROFILE_PATH=''
-          PROFILE_NAME=''
-          PROFILE_TEAM=''
-          GET_TASK_ALLOW=''
-
           shopt -s nullglob
           candidates=(
             "$HOME/Library/MobileDevice/Provisioning Profiles/"*.mobileprovision
@@ -655,33 +689,44 @@ jobs:
           )
           shopt -u nullglob
 
-          for profile in "${candidates[@]}"; do
-            [[ -f "$profile" ]] || continue
-            plist="$PROFILE_SCAN_DIR/$(basename "$profile").plist"
-            /usr/bin/security cms -D -i "$profile" > "$plist" 2>/dev/null || continue
+          # Prints the installed App Store profile name for one bundle ID, or exits 65.
+          locate_profile() {
+            local bundle="$1"
+            local found_path='' found_name='' found_team='' found_get_task=''
+            for profile in "${candidates[@]}"; do
+              [[ -f "$profile" ]] || continue
+              plist="$PROFILE_SCAN_DIR/$(basename "$profile").plist"
+              /usr/bin/security cms -D -i "$profile" > "$plist" 2>/dev/null || continue
 
-            app_id="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$plist" 2>/dev/null || true)"
-            [[ "$app_id" == *".$EXPECTED_BUNDLE_ID" ]] || continue
+              app_id="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$plist" 2>/dev/null || true)"
+              [[ "$app_id" == *".$bundle" ]] || continue
 
-            PROFILE_PATH="$profile"
-            PROFILE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :Name' "$plist")"
-            PROFILE_TEAM="$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$plist")"
-            GET_TASK_ALLOW="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$plist" 2>/dev/null || echo false)"
-            break
-          done
+              found_path="$profile"
+              found_name="$(/usr/libexec/PlistBuddy -c 'Print :Name' "$plist")"
+              found_team="$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$plist")"
+              found_get_task="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$plist" 2>/dev/null || echo false)"
+              break
+            done
 
-          [[ -n "$PROFILE_PATH" ]] || {
-            echo "::error::No App Store provisioning profile for $EXPECTED_BUNDLE_ID was installed by Match."
-            exit 65
+            [[ -n "$found_path" ]] || {
+              echo "::error::No App Store provisioning profile for $bundle was installed by Match." >&2
+              exit 65
+            }
+            [[ "$found_team" == "$ASC_TEAM_ID" ]] || {
+              echo "::error::Provisioning profile team for $bundle does not match ASC_TEAM_ID." >&2
+              exit 65
+            }
+            [[ "$found_get_task" != 'true' ]] || {
+              echo "::error::Installed profile for $bundle has get-task-allow=true and is not an App Store distribution profile." >&2
+              exit 65
+            }
+            printf '%s\n' "$found_name"
           }
-          [[ "$PROFILE_TEAM" == "$ASC_TEAM_ID" ]] || {
-            echo '::error::Provisioning profile team does not match ASC_TEAM_ID.'
-            exit 65
-          }
-          [[ "$GET_TASK_ALLOW" != 'true' ]] || {
-            echo '::error::Installed profile has get-task-allow=true and is not an App Store distribution profile.'
-            exit 65
-          }
+
+          PROFILE_NAME="$(locate_profile "$EXPECTED_BUNDLE_ID")"
+          if [[ "$HAS_LIVE_ACTIVITY" == 'true' ]]; then
+            LA_PROFILE_NAME="$(locate_profile "$EXPECTED_LIVE_ACTIVITY_BUNDLE_ID")"
+          fi
 
           security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -q 'Apple Distribution' || {
             echo '::error::No Apple Distribution signing identity was installed into the ephemeral keychain.'
@@ -691,6 +736,10 @@ jobs:
           rm -rf "$PROFILE_SCAN_DIR"
           echo "APPSTORE_PROFILE_NAME=$PROFILE_NAME" >> "$GITHUB_ENV"
           echo "Provisioning profile: $PROFILE_NAME"
+          if [[ "$HAS_LIVE_ACTIVITY" == 'true' ]]; then
+            echo "LIVE_ACTIVITY_PROFILE_NAME=$LA_PROFILE_NAME" >> "$GITHUB_ENV"
+            echo "Live Activity extension profile: $LA_PROFILE_NAME"
+          fi
 
       - name: Build signed App Store archive and IPA
         if: ${{ env.MODE == 'archive' || env.MODE == 'testflight' }}
@@ -707,18 +756,77 @@ jobs:
           rm -rf "$ARCHIVE_PATH" "$EXPORT_DIR" "$EXPORT_OPTIONS"
           mkdir -p "$EXPORT_DIR"
 
-          xcodebuild archive \
-            -quiet \
-            -workspace "$WORKSPACE_PATH" \
-            -scheme "$SCHEME" \
-            -configuration Release \
-            -destination 'generic/platform=iOS' \
-            -archivePath "$ARCHIVE_PATH" \
-            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
-            CODE_SIGN_STYLE=Manual \
-            DEVELOPMENT_TEAM="$ASC_TEAM_ID" \
-            CODE_SIGN_IDENTITY='Apple Distribution' \
-            PROVISIONING_PROFILE_SPECIFIER="$APPSTORE_PROFILE_NAME"
+          if [[ "$HAS_LIVE_ACTIVITY" == 'true' ]]; then
+            # Two signed targets (app + Live Activity extension) need different profiles, so the
+            # profile cannot be a global xcodebuild override. Write it per target into the app's
+            # Release configuration (xcodeproj ships with the pinned fastlane gem set).
+            PBXPROJ_DIR=''
+            for proj in "$(dirname "$WORKSPACE_PATH")"/*.xcodeproj; do
+              [[ -d "$proj" ]] && PBXPROJ_DIR="$proj"
+            done
+            [[ -n "$PBXPROJ_DIR" ]] || {
+              echo '::error::App .xcodeproj not found next to the workspace.'
+              exit 66
+            }
+            export SIGN_APP_ID="$EXPECTED_BUNDLE_ID"
+            export SIGN_APP_PROFILE="$APPSTORE_PROFILE_NAME"
+            export SIGN_LA_ID="$EXPECTED_LIVE_ACTIVITY_BUNDLE_ID"
+            export SIGN_LA_PROFILE="$LIVE_ACTIVITY_PROFILE_NAME"
+            export SIGN_TEAM_ID="$ASC_TEAM_ID"
+            ruby - "$PBXPROJ_DIR" <<'RUBY'
+          require 'xcodeproj'
+          project = Xcodeproj::Project.open(ARGV[0])
+          profiles = {
+            ENV.fetch('SIGN_APP_ID') => ENV.fetch('SIGN_APP_PROFILE'),
+            ENV.fetch('SIGN_LA_ID') => ENV.fetch('SIGN_LA_PROFILE'),
+          }
+          signed = {}
+          project.native_targets.each do |target|
+            target.build_configurations.each do |config|
+              next unless config.name == 'Release'
+              bundle = config.build_settings['PRODUCT_BUNDLE_IDENTIFIER'].to_s.delete('"')
+              next unless profiles.key?(bundle)
+              config.build_settings['CODE_SIGN_STYLE'] = 'Manual'
+              config.build_settings['DEVELOPMENT_TEAM'] = ENV.fetch('SIGN_TEAM_ID')
+              config.build_settings['CODE_SIGN_IDENTITY'] = 'Apple Distribution'
+              config.build_settings['PROVISIONING_PROFILE_SPECIFIER'] = profiles[bundle]
+              signed[bundle] = true
+            end
+          end
+          missing = profiles.keys.reject { |bundle| signed[bundle] }
+          unless missing.empty?
+            puts "::error::No Release target found for: #{missing.join(', ')}"
+            exit 66
+          end
+          project.save
+          puts "Per-target signing set for #{signed.size} targets."
+          RUBY
+
+            xcodebuild archive \
+              -quiet \
+              -workspace "$WORKSPACE_PATH" \
+              -scheme "$SCHEME" \
+              -configuration Release \
+              -destination 'generic/platform=iOS' \
+              -archivePath "$ARCHIVE_PATH" \
+              CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+              CODE_SIGN_STYLE=Manual \
+              DEVELOPMENT_TEAM="$ASC_TEAM_ID" \
+              CODE_SIGN_IDENTITY='Apple Distribution'
+          else
+            xcodebuild archive \
+              -quiet \
+              -workspace "$WORKSPACE_PATH" \
+              -scheme "$SCHEME" \
+              -configuration Release \
+              -destination 'generic/platform=iOS' \
+              -archivePath "$ARCHIVE_PATH" \
+              CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+              CODE_SIGN_STYLE=Manual \
+              DEVELOPMENT_TEAM="$ASC_TEAM_ID" \
+              CODE_SIGN_IDENTITY='Apple Distribution' \
+              PROVISIONING_PROFILE_SPECIFIER="$APPSTORE_PROFILE_NAME"
+          fi
 
           ARCHIVED_APP="$(find "$ARCHIVE_PATH/Products/Applications" -maxdepth 1 -type d -name '*.app' -print -quit 2>/dev/null || true)"
           [[ -n "$ARCHIVED_APP" && -d "$ARCHIVED_APP" ]] || {
@@ -729,8 +837,16 @@ jobs:
           export BUNDLE_ID_FOR_PLIST="$EXPECTED_BUNDLE_ID"
           export PROFILE_NAME_FOR_PLIST="$APPSTORE_PROFILE_NAME"
           export TEAM_ID_FOR_PLIST="$ASC_TEAM_ID"
+          if [[ "$HAS_LIVE_ACTIVITY" == 'true' ]]; then
+            export LA_BUNDLE_ID_FOR_PLIST="$EXPECTED_LIVE_ACTIVITY_BUNDLE_ID"
+            export LA_PROFILE_NAME_FOR_PLIST="$LIVE_ACTIVITY_PROFILE_NAME"
+          fi
           python3 - "$EXPORT_OPTIONS" <<'PY'
           import os, plistlib, sys
+
+          profiles = {os.environ["BUNDLE_ID_FOR_PLIST"]: os.environ["PROFILE_NAME_FOR_PLIST"]}
+          if os.environ.get("LA_BUNDLE_ID_FOR_PLIST"):
+              profiles[os.environ["LA_BUNDLE_ID_FOR_PLIST"]] = os.environ["LA_PROFILE_NAME_FOR_PLIST"]
 
           payload = {
               "method": "app-store-connect",
@@ -738,9 +854,7 @@ jobs:
               "signingStyle": "manual",
               "signingCertificate": "Apple Distribution",
               "teamID": os.environ["TEAM_ID_FOR_PLIST"],
-              "provisioningProfiles": {
-                  os.environ["BUNDLE_ID_FOR_PLIST"]: os.environ["PROFILE_NAME_FOR_PLIST"]
-              },
+              "provisioningProfiles": profiles,
               "manageAppVersionAndBuildNumber": False,
               "stripSwiftSymbols": True,
               "uploadSymbols": True,
@@ -790,6 +904,31 @@ jobs:
             echo "::error::Signed IPA bundle ID mismatch: $SIGNED_BUNDLE_ID"
             exit 65
           }
+
+          if [[ "$HAS_LIVE_ACTIVITY" == 'true' ]]; then
+            SIGNED_APPEX="$SIGNED_APP/PlugIns/LiveActivityExtension.appex"
+            [[ -d "$SIGNED_APPEX" ]] || {
+              echo '::error::Signed IPA is missing PlugIns/LiveActivityExtension.appex.'
+              exit 65
+            }
+            test -f "$SIGNED_APPEX/embedded.mobileprovision" || {
+              echo '::error::Live Activity extension is missing embedded.mobileprovision.'
+              exit 65
+            }
+            APPEX_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$SIGNED_APPEX/Info.plist")"
+            APPEX_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$SIGNED_APPEX/Info.plist")"
+            APPEX_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$SIGNED_APPEX/Info.plist")"
+            APP_SHORT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$SIGNED_APP/Info.plist")"
+            [[ "$APPEX_ID" == "$EXPECTED_LIVE_ACTIVITY_BUNDLE_ID" ]] || {
+              echo "::error::Signed extension bundle ID mismatch: $APPEX_ID"
+              exit 65
+            }
+            [[ "$APPEX_BUILD" == "$BUILD_NUMBER" && "$APPEX_VERSION" == "$APP_SHORT_VERSION" ]] || {
+              echo "::error::Signed extension version $APPEX_VERSION ($APPEX_BUILD) does not match the app's $APP_SHORT_VERSION ($BUILD_NUMBER)."
+              exit 65
+            }
+            echo "Live Activity extension signed and embedded: $APPEX_ID $APPEX_VERSION ($APPEX_BUILD)"
+          fi
 
           MIN_OS="$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$SIGNED_APP/Info.plist" 2>/dev/null || true)"
           if [[ "$MIN_OS" != "$EXPECTED_MIN_IOS" ]]; then
@@ -867,6 +1006,9 @@ jobs:
             echo "- Mode: \`${MODE}\`"
             echo "- Version: \`${APP_VERSION}\` (${BUILD_NUMBER})"
             echo "- Bundle ID: \`${EXPECTED_BUNDLE_ID}\`"
+            if [[ "${HAS_LIVE_ACTIVITY:-false}" == 'true' ]]; then
+              echo "- Live Activity extension: \`${EXPECTED_LIVE_ACTIVITY_BUNDLE_ID}\` (embedded, version and build checked)"
+            fi
             echo "- Private source: \`${PRIVATE_SOURCE_REPOSITORY}@${SOURCE_REF}\` (\`${SOURCE_SHORT_SHA}\`)"
             echo "- Xcode: \`$(xcodebuild -version | head -1)\`"
             if [[ "$MODE" == 'verify' ]]; then
