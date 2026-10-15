@@ -567,7 +567,7 @@ jobs:
           xcrun simctl install "$SIMULATOR_UDID" "$SIMULATOR_APP_PATH"
 
           # Infrastructure retry only: if Maestro's XCTest driver never comes up on the hosted runner,
-          # clean up any half-started driver, erase and reboot the simulator, and try again (3 attempts in all).
+          # or dies mid-run, clean up any half-started driver, erase and reboot the simulator, and try again (3 attempts in all).
           # A flow that actually runs and fails is never retried.
           MAESTRO_LOG="$RUNNER_TEMP/maestro-run.log"
           # Per-command records and failure screenshots for every flow; uploaded as an artifact by the next step.
@@ -585,8 +585,18 @@ jobs:
             status="${PIPESTATUS[0]}"
             set -e
             [[ "$status" -eq 0 ]] && exit 0
-            if [[ "$attempt" -lt 3 ]] && grep -q 'iOS driver not ready in time' "$MAESTRO_LOG"; then
-              echo "::warning::Maestro iOS driver did not start (attempt $attempt); erasing the simulator and retrying."
+            # The driver can also die in the middle of a run (XCTest runner gone, port refused): Maestro then latches
+            # "Device unreachable" and every later flow fails without running. Same infrastructure retry, whole suite again.
+            DRIVER_LOST=false
+            if grep -qE 'Transport unreachable|Device unreachable' "$MAESTRO_LOG" "$MAESTRO_DEBUG_DIR/maestro.log" 2>/dev/null; then
+              DRIVER_LOST=true
+            fi
+            if [[ "$attempt" -lt 3 ]] && { grep -q 'iOS driver not ready in time' "$MAESTRO_LOG" || [[ "$DRIVER_LOST" == true ]]; }; then
+              if [[ "$DRIVER_LOST" == true ]]; then
+                echo "::warning::Maestro iOS driver became unreachable mid-run (attempt $attempt); erasing the simulator and rerunning all flows."
+              else
+                echo "::warning::Maestro iOS driver did not start (attempt $attempt); erasing the simulator and retrying."
+              fi
               # A driver runner left over from the failed attempt can keep its port busy.
               pkill -f 'maestro-driver-ios' >/dev/null 2>&1 || true
               pkill -f 'xcodebuild.*maestro' >/dev/null 2>&1 || true
