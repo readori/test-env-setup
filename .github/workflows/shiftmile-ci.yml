@@ -71,7 +71,9 @@ env:
 jobs:
   ios:
     name: Build ShiftMile iOS
-    runs-on: macos-26
+    # Must provide Xcode 27. Override with the SHIFTMILE_MACOS_RUNNER repository variable if the
+    # default image does not ship it yet (for example a dedicated Xcode 27 runner image).
+    runs-on: ${{ vars.SHIFTMILE_MACOS_RUNNER || 'macos-26' }}
     timeout-minutes: 75
     permissions:
       contents: write
@@ -224,40 +226,38 @@ jobs:
           echo "Lifetime Pro: $EXPECTED_IAP_PRODUCT_ID"
 
       # ---------------------------------------------------------------------
-      # 2. Toolchain — use Xcode 26 on GitHub's macOS 26 public runner
+      # 2. Toolchain — Xcode 27 (iOS 27 SDK) is mandatory for every ShiftMile build
       # ---------------------------------------------------------------------
-      - name: Select Xcode 26
+      - name: Select Xcode 27
         shell: bash
         run: |
           set -euo pipefail
 
-          select_xcode() {
-            local app="$1"
-            if [[ -d "$app/Contents/Developer" ]]; then
-              sudo xcode-select -s "$app/Contents/Developer"
-              echo "Selected Xcode: $app"
-              return 0
-            fi
-            return 1
-          }
-
-          select_xcode /Applications/Xcode_26.6.app || \
-          select_xcode /Applications/Xcode_26.5.app || \
-          select_xcode /Applications/Xcode_26.4.app || \
-          select_xcode /Applications/Xcode_26.3.app || \
-          select_xcode /Applications/Xcode_26.2.app || \
-          select_xcode /Applications/Xcode_26.1.app || \
-          select_xcode /Applications/Xcode_26.app || \
-          select_xcode /Applications/Xcode.app || {
-            echo '::error::No Xcode installation was found.'
+          # Newest installed Xcode 27.x (GA or RC; App Store Connect accepts RC builds). No Xcode 26
+          # fallback: an iOS 26 SDK build would run iPhone Duo's inner display in compatibility
+          # size, and the iOS 27 SDK is the expected 2027 upload minimum.
+          XCODE_APP="$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -1 || true)"
+          if [[ -z "$XCODE_APP" ]] && [[ -d /Applications/Xcode.app ]]; then
+            DEFAULT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' /Applications/Xcode.app/Contents/Info.plist 2>/dev/null || true)"
+            [[ "${DEFAULT_VERSION%%.*}" == "27" ]] && XCODE_APP=/Applications/Xcode.app
+          fi
+          if [[ -z "$XCODE_APP" ]]; then
+            echo '::error::Xcode 27 is not installed on this runner. Point the SHIFTMILE_MACOS_RUNNER repository variable at an image that ships Xcode 27.'
             ls -1 /Applications | grep '^Xcode' || true
             exit 69
-          }
+          fi
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          echo "Selected Xcode: $XCODE_APP"
 
           XCODE_VERSION="$(xcodebuild -version | awk 'NR==1 {print $2}')"
           XCODE_MAJOR="${XCODE_VERSION%%.*}"
-          if ! [[ "$XCODE_MAJOR" =~ ^[0-9]+$ ]] || (( XCODE_MAJOR != 26 )); then
-            echo "::error::ShiftMile CI currently requires Xcode 26.x; selected $XCODE_VERSION"
+          if ! [[ "$XCODE_MAJOR" =~ ^[0-9]+$ ]] || (( XCODE_MAJOR != 27 )); then
+            echo "::error::ShiftMile CI requires Xcode 27.x; selected $XCODE_VERSION"
+            exit 69
+          fi
+          SDK_MAJOR="$(xcrun --sdk iphoneos --show-sdk-version | cut -d. -f1)"
+          if (( SDK_MAJOR < 27 )); then
+            echo "::error::ShiftMile CI requires the iOS 27 SDK; found $(xcrun --sdk iphoneos --show-sdk-version)"
             exit 69
           fi
 
@@ -584,7 +584,7 @@ jobs:
       # 5B. App Store signing / Archive / TestFlight
       #     - certificates/profiles: readori/readori-certificates via Match
       #     - one TARGET_REPO_PAT is used for private source + Match certificates repo
-      #     - upload: Apple's Xcode 26 altool with App Store Connect API key
+      #     - upload: Apple's Xcode 27 altool with App Store Connect API key
       # ---------------------------------------------------------------------
       - name: Validate App Store signing secrets
         if: ${{ env.DISTRIBUTION == 'archive' || env.DISTRIBUTION == 'testflight' || env.DISTRIBUTION == 'both' }}
