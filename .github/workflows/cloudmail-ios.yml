@@ -134,11 +134,14 @@ jobs:
 
           # Pick the newest non-beta Xcode of the requested major version by its
           # real CFBundleShortVersionString (file names such as Xcode_27.app vs
-          # Xcode_27.1.app do not sort reliably).
+          # Xcode_27.1.app do not sort reliably). Runner images expose betas through
+          # symlinks without "beta" in the name (Xcode_27.2.app -> Xcode_27.2_beta_2.app),
+          # so filter on the resolved path: App Store Connect rejects beta-built uploads.
           XCODE_APP=""
           BEST_VERSION=""
-          for app in /Applications/Xcode*.app; do
-            [[ -d "$app/Contents/Developer" ]] || continue
+          for link in /Applications/Xcode*.app; do
+            [[ -d "$link/Contents/Developer" ]] || continue
+            app="$(cd "$link" && pwd -P)"
             case "$app" in *[Bb]eta*) continue ;; esac
             version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || true)"
             [[ "${version%%.*}" == "$WANT_MAJOR" ]] || continue
@@ -161,6 +164,10 @@ jobs:
           sudo xcode-select -s "$XCODE_APP/Contents/Developer"
           echo "Selected Xcode: $XCODE_APP ($BEST_VERSION)"
           xcodebuild -version
+          if xcodebuild -version | grep -qi beta || [[ "$(xcode-select -p)" == *[Bb]eta* ]]; then
+            echo "::error::Selected Xcode is a beta; App Store Connect rejects beta-built uploads."
+            exit 1
+          fi
 
           IOS_SDK="$(xcrun --sdk iphoneos --show-sdk-version)"
           echo "iPhoneOS SDK: $IOS_SDK"
