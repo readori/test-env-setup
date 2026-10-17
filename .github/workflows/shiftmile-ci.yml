@@ -511,7 +511,7 @@ jobs:
             echo "Private source commit: $SOURCE_COMMIT"
             echo "Bundle identifier: $EXPECTED_BUNDLE_ID"
             echo "GitHub public CI run: $GITHUB_RUN_ID / attempt $GITHUB_RUN_ATTEMPT"
-            echo "Xcode: $(xcodebuild -version | head -1)"
+            echo "Xcode: $(xcodebuild -version | awk 'NR == 1')"
             echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
             echo
             echo 'SHA-256:'
@@ -1167,7 +1167,7 @@ jobs:
             echo "- Bundle ID: \`${EXPECTED_BUNDLE_ID}\`"
             echo "- Private source: \`${PRIVATE_SOURCE_REPOSITORY}@${SOURCE_REF}\`"
             echo "- Source commit: \`${SOURCE_SHORT_SHA}\`"
-            echo "- Xcode: \`$(xcodebuild -version | head -1)\`"
+            echo "- Xcode: \`$(xcodebuild -version | awk 'NR == 1')\`"
             echo "- Tests: \`passed\`"
 
             if [[ "$DISTRIBUTION" == 'sideload' || "$DISTRIBUTION" == 'both' ]]; then
