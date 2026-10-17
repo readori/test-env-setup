@@ -71,9 +71,10 @@ env:
 jobs:
   ios:
     name: Build ShiftMile iOS
-    # Must provide Xcode 27. Override with the SHIFTMILE_MACOS_RUNNER repository variable if the
-    # default image does not ship it yet (for example a dedicated Xcode 27 runner image).
-    runs-on: ${{ vars.SHIFTMILE_MACOS_RUNNER || 'macos-26' }}
+    # Must provide Xcode 27. The standard macos-26 image stops at Xcode 26.6; GitHub's dedicated
+    # `xcode-27` image (GA 2026-10-15, macOS 27, Apple silicon) ships Xcode 27.x. Use
+    # `xcode-27-xlarge` via the SHIFTMILE_MACOS_RUNNER repository variable for a bigger machine.
+    runs-on: ${{ vars.SHIFTMILE_MACOS_RUNNER || 'xcode-27' }}
     timeout-minutes: 75
     permissions:
       contents: write
