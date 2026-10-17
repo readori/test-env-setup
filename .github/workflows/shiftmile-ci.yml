@@ -229,31 +229,59 @@ jobs:
       # ---------------------------------------------------------------------
       # 2. Toolchain — Xcode 27 (iOS 27 SDK) is mandatory for every ShiftMile build
       # ---------------------------------------------------------------------
-      - name: Select Xcode 27
+      - name: Select Xcode 27 (release builds only, never beta)
         shell: bash
+        env:
+          # Optional repository variable to pin an exact release, e.g. 27.1 or 27.0.1.
+          SHIFTMILE_XCODE_VERSION: ${{ vars.SHIFTMILE_XCODE_VERSION }}
         run: |
           set -euo pipefail
 
-          # Newest installed Xcode 27.x (GA or RC; App Store Connect accepts RC builds). No Xcode 26
-          # fallback: an iOS 26 SDK build would run iPhone Duo's inner display in compatibility
-          # size, and the iOS 27 SDK is the expected 2027 upload minimum.
-          XCODE_APP="$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -1 || true)"
-          if [[ -z "$XCODE_APP" ]] && [[ -d /Applications/Xcode.app ]]; then
-            DEFAULT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' /Applications/Xcode.app/Contents/Info.plist 2>/dev/null || true)"
-            [[ "${DEFAULT_VERSION%%.*}" == "27" ]] && XCODE_APP=/Applications/Xcode.app
-          fi
+          # The xcode-27 image installs several Xcode 27.x, including betas (2026-10: 27.2 beta).
+          # App Store Connect rejects beta-built binaries ("This build is using a beta version of
+          # Xcode"), so pick the newest *non-beta* 27.x: GM, or the RC listed on Apple's releases
+          # page. Apple beta build numbers end in a lowercase letter (e.g. 27C5032e); GM/RC don't.
+          # No Xcode 26 fallback: ShiftMile ships with the iOS 27 SDK.
+          PIN="${SHIFTMILE_XCODE_VERSION:-}"
+          XCODE_APP=""
+          BEST_VERSION=""
+          for app in /Applications/Xcode_27*.app /Applications/Xcode.app; do
+            [[ -d "$app/Contents/Developer" ]] || continue
+            version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || true)"
+            build="$(/usr/libexec/PlistBuddy -c 'Print :ProductBuildVersion' "$app/Contents/version.plist" 2>/dev/null || true)"
+            [[ "${version%%.*}" == "27" ]] || continue
+            if [[ -z "$build" || "$build" =~ [a-z]$ || "$app" == *[Bb]eta* ]]; then
+              echo "Skipping beta/unknown Xcode: $app ($version, build ${build:-?})"
+              continue
+            fi
+            if [[ -n "$PIN" && "$version" != "$PIN" ]]; then
+              echo "Skipping $app ($version): SHIFTMILE_XCODE_VERSION pins $PIN"
+              continue
+            fi
+            echo "Release Xcode candidate: $app ($version, build $build)"
+            if [[ -z "$BEST_VERSION" ]] || { [[ "$version" != "$BEST_VERSION" ]] && \
+                 [[ "$(printf '%s\n%s\n' "$BEST_VERSION" "$version" | sort -V | tail -1)" == "$version" ]]; }; then
+              XCODE_APP="$app"
+              BEST_VERSION="$version"
+            fi
+          done
           if [[ -z "$XCODE_APP" ]]; then
-            echo '::error::Xcode 27 is not installed on this runner. Point the SHIFTMILE_MACOS_RUNNER repository variable at an image that ships Xcode 27.'
+            echo '::error::No release (non-beta) Xcode 27 is installed on this runner. Use the xcode-27 runner image, or fix SHIFTMILE_XCODE_VERSION.'
             ls -1 /Applications | grep '^Xcode' || true
             exit 69
           fi
           sudo xcode-select -s "$XCODE_APP/Contents/Developer"
-          echo "Selected Xcode: $XCODE_APP"
+          echo "Selected Xcode: $XCODE_APP ($BEST_VERSION)"
 
           XCODE_VERSION="$(xcodebuild -version | awk 'NR==1 {print $2}')"
+          XCODE_BUILD="$(xcodebuild -version | awk '/Build version/ {print $3}')"
           XCODE_MAJOR="${XCODE_VERSION%%.*}"
           if ! [[ "$XCODE_MAJOR" =~ ^[0-9]+$ ]] || (( XCODE_MAJOR != 27 )); then
             echo "::error::ShiftMile CI requires Xcode 27.x; selected $XCODE_VERSION"
+            exit 69
+          fi
+          if [[ "$XCODE_BUILD" =~ [a-z]$ ]]; then
+            echo "::error::Selected Xcode $XCODE_VERSION ($XCODE_BUILD) is a beta; App Store Connect will refuse the build."
             exit 69
           fi
           SDK_MAJOR="$(xcrun --sdk iphoneos --show-sdk-version | cut -d. -f1)"
