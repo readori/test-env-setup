@@ -1,0 +1,267 @@
+name: Readori Legado Reference
+
+# Runs entirely in the PUBLIC repository readori/test-env-setup. No secrets are used or required.
+#
+# Purpose: measure Readori's book-source usability RELATIVE to Legado. For one source package this job
+#   1. runs the real Legado engine (checkout of readori/legado) over the live network with Legado's own
+#      CheckSourceService flow (search, discovery, info, TOC, content), and
+#   2. runs Readori's Python validator (App semantics, --app-version) on the very same package,
+#      in parallel so both see the same network window, then
+#   3. writes a parity report: relative rate = |Legado pass AND Readori pass| / |Legado pass| (target >= 95%)
+#      plus the per-source work lists (Legado-only / Readori-only).
+#
+# Inputs are never interpolated into shell code: every step receives them through env: and validates them first.
+# The validator tooling comes from the public mirror readori/readori-CheckSources (tools/source-validator).
+
+on:
+  workflow_dispatch:
+    inputs:
+      sources_url:
+        description: "Optional https URL of a book-source JSON (array or wrapper object). Empty = use sources_path."
+        required: false
+        default: ""
+        type: string
+      sources_path:
+        description: "Source JSON inside readori-CheckSources (used when sources_url is empty)"
+        required: false
+        default: "legado_reference/samples/smoke.json"
+        type: string
+      legado_ref:
+        description: "readori/legado branch, tag or SHA"
+        required: false
+        default: "master"
+        type: string
+      concurrency:
+        description: "Parallel sources for the Legado run"
+        required: false
+        default: "8"
+        type: string
+      timeout_seconds:
+        description: "Per-source timeout in seconds (Legado default is 180)"
+        required: false
+        default: "180"
+        type: string
+      limit:
+        description: "Only the first N unique sources (0 = all); applied once, so both engines see the same set"
+        required: false
+        default: "0"
+        type: string
+      app_version:
+        description: "Readori validator App profile"
+        required: false
+        default: "1.1.1"
+        type: choice
+        options:
+          - "1.1.1"
+          - "1.1.2"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: readori-legado-reference
+  cancel-in-progress: false
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  reference:
+    name: Legado live reference and parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - name: Validate inputs
+        env:
+          IN_SOURCES_URL: ${{ inputs.sources_url }}
+          IN_SOURCES_PATH: ${{ inputs.sources_path }}
+          IN_LEGADO_REF: ${{ inputs.legado_ref }}
+          IN_CONCURRENCY: ${{ inputs.concurrency }}
+          IN_TIMEOUT: ${{ inputs.timeout_seconds }}
+          IN_LIMIT: ${{ inputs.limit }}
+          IN_APP_VERSION: ${{ inputs.app_version }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$IN_LEGADO_REF" =~ ^[A-Za-z0-9._/-]{1,100}$ ]] || fail "legado_ref has unexpected characters"
+          [[ "$IN_CONCURRENCY" =~ ^[0-9]{1,2}$ ]] && [ "$IN_CONCURRENCY" -ge 1 ] && [ "$IN_CONCURRENCY" -le 32 ] || fail "concurrency must be 1..32"
+          [[ "$IN_TIMEOUT" =~ ^[0-9]{1,4}$ ]] && [ "$IN_TIMEOUT" -ge 10 ] && [ "$IN_TIMEOUT" -le 1800 ] || fail "timeout_seconds must be 10..1800"
+          [[ "$IN_LIMIT" =~ ^[0-9]{1,6}$ ]] || fail "limit must be a non-negative integer"
+          [[ "$IN_APP_VERSION" =~ ^1[.]1[.][12]$ ]] || fail "app_version must be 1.1.1 or 1.1.2"
+          if [ -n "$IN_SOURCES_URL" ]; then
+            [[ "$IN_SOURCES_URL" =~ ^https://[^[:space:]]+$ ]] || fail "sources_url must be an https URL without spaces"
+            echo "::add-mask::$IN_SOURCES_URL"
+          else
+            [[ "$IN_SOURCES_PATH" =~ ^[A-Za-z0-9._/+-]{1,200}$ ]] || fail "sources_path has unexpected characters"
+            [[ "$IN_SOURCES_PATH" != /* ]] || fail "sources_path must be relative"
+            [[ "$IN_SOURCES_PATH" != *..* ]] || fail "sources_path must not contain .."
+          fi
+
+      - name: Checkout readori/legado
+        uses: actions/checkout@v4
+        with:
+          repository: readori/legado
+          ref: ${{ inputs.legado_ref }}
+          path: legado
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout readori/readori-CheckSources
+        uses: actions/checkout@v4
+        with:
+          repository: readori/readori-CheckSources
+          ref: main
+          path: checksources
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        # Legado app/build.gradle: jvmToolchain(17), Java 17 source/target; AGP 8.13.2 needs JDK 17+;
+        # upstream legado CI builds with temurin 17.
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Cache Gradle and Robolectric downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.m2/repository/org/robolectric
+          key: legado-live-gradle-${{ runner.os }}-${{ hashFiles('legado/gradle/libs.versions.toml', 'legado/gradle/wrapper/gradle-wrapper.properties', 'legado/settings.gradle', 'legado/build.gradle', 'legado/app/build.gradle') }}
+          restore-keys: |
+            legado-live-gradle-${{ runner.os }}-
+
+      - name: Check Android SDK (preinstalled on ubuntu-latest)
+        continue-on-error: true
+        run: |
+          echo "ANDROID_HOME=${ANDROID_HOME:-<unset>} ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<unset>}"
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK" && test -d "$SDK" || { echo "::warning::no preinstalled Android SDK found"; exit 0; }
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ -x "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses > /dev/null || true
+            "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0" > /dev/null || true
+          fi
+          ls "$SDK/platforms" || true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install validator dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r checksources/requirements-validate-sources.txt
+          python -c "import quickjs, lxml, requests; print('validator dependencies OK')"
+
+      - name: Fetch sources
+        env:
+          IN_SOURCES_URL: ${{ inputs.sources_url }}
+          IN_SOURCES_PATH: ${{ inputs.sources_path }}
+        run: |
+          set -euo pipefail
+          WORK="$GITHUB_WORKSPACE/work"
+          mkdir -p "$WORK"
+          if [ -n "$IN_SOURCES_URL" ]; then
+            curl --fail --silent --show-error --location \
+              --proto '=https' --proto-redir '=https' \
+              --max-filesize 104857600 --max-time 600 --retry 2 \
+              --output "$WORK/raw-sources.json" --url "$IN_SOURCES_URL"
+          else
+            SRC="$GITHUB_WORKSPACE/checksources/$IN_SOURCES_PATH"
+            RESOLVED="$(readlink -f -- "$SRC")"
+            case "$RESOLVED" in
+              "$GITHUB_WORKSPACE/checksources/"*) ;;
+              *) echo "::error::sources_path escapes the readori-CheckSources checkout"; exit 1 ;;
+            esac
+            test -f "$RESOLVED" || { echo "::error::sources_path not found in readori-CheckSources"; exit 1; }
+            cp -- "$RESOLVED" "$WORK/raw-sources.json"
+          fi
+          echo "raw source file: $(wc -c < "$WORK/raw-sources.json") bytes"
+
+      - name: Prepare sources (normalize, de-duplicate, limit)
+        env:
+          IN_LIMIT: ${{ inputs.limit }}
+        run: |
+          set -euo pipefail
+          python checksources/legado_reference/prepare_sources.py \
+            --input work/raw-sources.json --output work/sources.json --limit "$IN_LIMIT"
+
+      - name: Run Legado (live) and the Readori validator in parallel
+        id: run_both
+        env:
+          IN_CONCURRENCY: ${{ inputs.concurrency }}
+          IN_TIMEOUT: ${{ inputs.timeout_seconds }}
+          IN_APP_VERSION: ${{ inputs.app_version }}
+        run: |
+          set -uo pipefail
+          WORK="$GITHUB_WORKSPACE/work"
+          python checksources/legado_reference/run_legado_live_reference.py \
+            --legado-root legado \
+            --sources "$WORK/sources.json" \
+            --output "$WORK/legado_report.json" \
+            --concurrency "$IN_CONCURRENCY" \
+            --timeout "$IN_TIMEOUT" \
+            > "$WORK/legado_run.log" 2>&1 &
+          LEGADO_PID=$!
+          python checksources/validator/validate_source_packages.py \
+            --input "$WORK/sources.json" \
+            --app-version "$IN_APP_VERSION" \
+            --pipeline staged \
+            --source-timeout "$IN_TIMEOUT" \
+            --report-path "$WORK/report.json" \
+            --report-only \
+            --no-mirror \
+            > "$WORK/readori_run.log" 2>&1 &
+          READORI_PID=$!
+          TICK=0
+          while kill -0 "$LEGADO_PID" 2>/dev/null || kill -0 "$READORI_PID" 2>/dev/null; do
+            sleep 30
+            TICK=$((TICK + 1))
+            if [ $((TICK % 10)) -eq 0 ]; then
+              echo "--- heartbeat $(date -u +%H:%M:%S)"
+              echo "legado : $(tail -n 1 "$WORK/legado_run.log" | cut -c1-200)"
+              echo "readori: $(tail -n 1 "$WORK/readori_run.log" | cut -c1-200)"
+            fi
+          done
+          wait "$LEGADO_PID"; LEGADO_RC=$?
+          wait "$READORI_PID"; READORI_RC=$?
+          echo "legado_rc=$LEGADO_RC" >> "$GITHUB_OUTPUT"
+          echo "readori_rc=$READORI_RC" >> "$GITHUB_OUTPUT"
+          echo "=== Legado run (last 40 lines) ==="; tail -n 40 "$WORK/legado_run.log" || true
+          echo "=== Readori run (last 15 lines) ==="; tail -n 15 "$WORK/readori_run.log" || true
+          if [ "$LEGADO_RC" -ne 0 ] || [ "$READORI_RC" -ne 0 ]; then
+            echo "::error::legado exit=$LEGADO_RC readori exit=$READORI_RC"
+            exit 1
+          fi
+
+      - name: Compare parity
+        if: ${{ !cancelled() && steps.run_both.conclusion != 'skipped' }}
+        run: |
+          set -euo pipefail
+          python checksources/legado_reference/compare_parity.py \
+            --legado work/legado_report.json --readori work/report.json --output-dir work
+          head -c 900000 work/parity.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: legado-reference-${{ github.run_id }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            work/legado_report.json
+            work/report.json
+            work/parity.json
+            work/parity.md
+            work/*.log
+            legado/app/build/reports/tests/**
+            legado/app/build/test-results/**
