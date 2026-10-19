@@ -6,7 +6,8 @@ name: Readori Legado Reference
 #   1. runs the real Legado engine (checkout of readori/legado) over the live network with Legado's own
 #      CheckSourceService flow (search, discovery, info, TOC, content), and
 #   2. runs Readori's Python validator (App semantics, --app-version) on the very same package,
-#      in parallel so both see the same network window, then
+#      in parallel so both see the same network window. Same verdict basis as Legado's CheckSource: one pass
+#      per source and the same per-source timeout (quick scan uses it too; no stability re-test rounds), then
 #   3. writes a parity report: relative rate = |Legado pass AND Readori pass| / |Legado pass| (target >= 95%)
 #      plus the per-source work lists (Legado-only / Readori-only).
 #
@@ -215,7 +216,10 @@ jobs:
             --input "$WORK/sources.json" \
             --app-version "$IN_APP_VERSION" \
             --pipeline staged \
+            --quick-timeout "$IN_TIMEOUT" \
             --source-timeout "$IN_TIMEOUT" \
+            --rounds 1 \
+            --min-pass-rounds 1 \
             --report-path "$WORK/report.json" \
             --report-only \
             --no-mirror \
