@@ -619,7 +619,7 @@ jobs:
         shell: bash
         timeout-minutes: 20
         run: |
-          set -uo pipefail
+          set +e -uo pipefail  # runner shell adds -e; keep going to record the status
 
           XUNIT_DIR="$RUNNER_TEMP/lexcore-xunit"
           rm -rf "$XUNIT_DIR"
@@ -934,7 +934,7 @@ jobs:
         shell: bash
         timeout-minutes: 30
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
 
           TEST_DERIVED="$RUNNER_TEMP/DerivedData-English-Test"
           rm -rf "$TEST_DERIVED"
@@ -1007,7 +1007,7 @@ jobs:
         shell: bash
         timeout-minutes: 20
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           UNIT_XCRESULT="$RUNNER_TEMP/English-Unit.xcresult"
           rm -rf "$UNIT_XCRESULT"
           echo "UNIT_XCRESULT=$UNIT_XCRESULT" >> "$GITHUB_ENV"
@@ -1030,7 +1030,7 @@ jobs:
         shell: bash
         timeout-minutes: 25
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           UI_XCRESULT="$RUNNER_TEMP/English-UI.xcresult"
           rm -rf "$UI_XCRESULT"
           echo "UI_XCRESULT=$UI_XCRESULT" >> "$GITHUB_ENV"
