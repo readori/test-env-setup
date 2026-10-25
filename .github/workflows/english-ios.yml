@@ -1,0 +1,1633 @@
+# English (Readori vocabulary app) iOS CI.
+#
+# Public CI repository readori/test-env-setup -> private source readori/english
+# (native SwiftUI, XcodeGen project.yml -> EnglishApp.xcodeproj, local Swift package
+# Packages/LexCore, Node content pipeline tools/content-pipeline).
+# Modeled on paobuwan-ios.yml (signing, build number, altool) and cloudmail-ios.yml (xcresult).
+#
+# Safety rules (public repo, public logs):
+#   - workflow_dispatch only; never pull_request.
+#   - third-party actions pinned to commit SHAs; xcodebuild always -quiet.
+#   - derived secret values are add-mask'ed; private source/config files are never printed
+#     (only comparison results, test names, failure messages and file:line references).
+#   - no Actions artifact, no Release: the signed IPA never leaves the runner.
+#   - signing material (keychain, ASC key, Match) is created only in signed modes, after every
+#     private-source build/test/pipeline step has run.
+#   - actions/cache holds ONLY content generated from the public word-atlas dataset (CC BY 4.0)
+#     and its AAC transcode; never private source, build products, or signing material.
+#
+# Modes:
+#   verify       LexCore swift test; content pipeline --sample 300 (no transcode); xcodegen;
+#                simulator build-for-testing; EnglishAppTests; EnglishAppUITests smoke. No signing.
+#   verify-full  verify + full content with AAC transcode + unsigned Release device build,
+#                app / IPA size report in the Job Summary (warning above 200 MB).
+#   archive      LexCore swift test, full content, Match readonly, signed archive + export,
+#                altool validate. The IPA is discarded with the runner.
+#   testflight   archive + build-number preflight + altool upload to TestFlight.
+name: English iOS CI
+
+run-name: English iOS · ${{ inputs.mode || 'verify' }} · ${{ inputs.ref || 'main' }}${{ inputs.build_number && format(' · build {0}', inputs.build_number) || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'verify = sample content + simulator tests (no signing, ~20 min); verify-full = full content + audio transcode + size report; archive = signed IPA + altool validate (IPA is not kept); testflight = archive + upload to TestFlight'
+        required: true
+        default: 'verify'
+        type: choice
+        options:
+          - verify
+          - verify-full
+          - archive
+          - testflight
+      ref:
+        description: 'Private readori/english branch, tag, or SHA'
+        required: true
+        default: 'main'
+        type: string
+      build_number:
+        description: 'Build number (CFBundleVersion). Required for archive / testflight: a whole number higher than the last build uploaded to App Store Connect. verify modes: leave empty (uses the run number).'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: english-ios-${{ inputs.ref || 'main' }}-${{ inputs.mode || 'verify' }}
+  cancel-in-progress: false
+
+env:
+  PRIVATE_SOURCE_REPOSITORY: readori/english
+  PRIVATE_SOURCE_PATH: source
+  # Project contract shared with the iOS architect (project.yml).
+  PROJECT_SPEC: project.yml
+  PROJECT_NAME: EnglishApp
+  SCHEME: EnglishApp
+  APP_TARGET: EnglishApp
+  WIDGETS_TARGET: EnglishWidgets
+  UNIT_TEST_TARGET: EnglishAppTests
+  UI_TEST_TARGET: EnglishAppUITests
+  EXPECTED_BUNDLE_ID: com.readori.english
+  EXPECTED_WIDGETS_BUNDLE_ID: com.readori.english.widgets
+  EXPECTED_APP_GROUP: group.com.readori.english
+  EXPECTED_MIN_IOS: '17.0'
+  XCODE_MAJOR_WANTED: '26'
+  XCODE_MIN_VERSION: '26.4'
+  LEXCORE_PATH: Packages/LexCore
+  GENERATED_RESOURCES_DIR: App/Resources/Generated
+  # XcodeGen: pinned release zip + SHA-256. The digest is GitHub's own asset digest for
+  # https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip (4278764 bytes,
+  # published 2026-07-16). The job refuses to run a download that does not match.
+  XCODEGEN_VERSION: '2.46.0'
+  XCODEGEN_SHA256: '4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806'
+  # Content source: public dataset, pinned commit. Only data/ and public/atlas/ are checked out.
+  WORD_ATLAS_URL: https://github.com/readori/word-atlas.git
+  WORD_ATLAS_SHA: c7d4a9f7c1a894b8f40e4e5fe3cf9ce2976ef705
+  CONTENT_SAMPLE_SIZE: '300'
+  # Bump to invalidate every content / audio cache entry.
+  CONTENT_CACHE_VERSION: v1
+  # App Store download-size budget for the Job Summary warning (MB, 1 MB = 1,000,000 bytes).
+  IPA_WARN_MB: '200'
+  MATCH_GIT_URL: https://github.com/readori/readori-certificates.git
+  MATCH_GIT_BRANCH: main
+  FASTLANE_VERSION: '2.238.0'
+  CI: '1'
+  LANG: en_US.UTF-8
+
+jobs:
+  ios:
+    name: Build English iOS
+    runs-on: macos-26
+    # verify ~20 min; verify-full / archive on a cold content cache include the AAC transcode.
+    timeout-minutes: 150
+
+    env:
+      MODE: ${{ inputs.mode || 'verify' }}
+      SOURCE_REF: ${{ inputs.ref || 'main' }}
+      BUILD_NUMBER_INPUT: ${{ inputs.build_number || '' }}
+      # verify uses the sample; every other mode needs the full catalog with AAC audio.
+      CONTENT_MODE: ${{ (inputs.mode == 'verify' || inputs.mode == '') && 'sample300' || 'full-m4a' }}
+
+    steps:
+      # ---------------------------------------------------------------------
+      # 0. Request validation BEFORE any private-source checkout
+      # ---------------------------------------------------------------------
+      - name: Validate request and required secrets
+        shell: bash
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+          ENGLISH_ASC_APP_ID: ${{ secrets.ENGLISH_ASC_APP_ID }}
+        run: |
+          set -euo pipefail
+
+          case "$MODE" in
+            verify|verify-full|archive|testflight) ;;
+            *)
+              echo "::error::Unsupported mode: $MODE"
+              exit 64
+              ;;
+          esac
+
+          [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || {
+            echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only).'
+            exit 64
+          }
+          [[ "$WORD_ATLAS_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo '::error::WORD_ATLAS_SHA must be a full 40-character commit SHA.'
+            exit 64
+          }
+
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || {
+            echo '::error::Missing public-repo secret TARGET_REPO_PAT.'
+            echo '::error::It needs Contents read access to readori/english (and to readori-certificates for signed modes).'
+            exit 78
+          }
+
+          if [[ "$MODE" == 'archive' || "$MODE" == 'testflight' ]]; then
+            required=(MATCH_PASSWORD ASC_ISSUER_ID ASC_KEY_ID ASC_PRIVATE_KEY ASC_TEAM_ID)
+            if [[ "$MODE" == 'testflight' ]]; then
+              required+=(ENGLISH_ASC_APP_ID)
+            fi
+            missing=0
+            for name in "${required[@]}"; do
+              if [[ -z "${!name:-}" ]]; then
+                echo "::error::Missing public-repo secret required for $MODE mode: $name"
+                missing=1
+              fi
+            done
+            (( missing == 0 )) || exit 78
+
+            if [[ "$MODE" == 'testflight' ]]; then
+              [[ "$ENGLISH_ASC_APP_ID" =~ ^[0-9]+$ ]] || {
+                echo '::error::ENGLISH_ASC_APP_ID must be the numeric App Store Connect Apple ID of the English app.'
+                exit 78
+              }
+            fi
+          fi
+
+          if [[ -n "$BUILD_NUMBER_INPUT" ]]; then
+            [[ "$BUILD_NUMBER_INPUT" =~ ^[1-9][0-9]{0,8}$ ]] || {
+              echo '::error::build_number must be a whole number (1-999999999) with no leading zeros, spaces, or dots.'
+              exit 64
+            }
+          elif [[ "$MODE" == 'archive' || "$MODE" == 'testflight' ]]; then
+            echo "::error::build_number is required for $MODE mode: enter a number higher than the last build uploaded to App Store Connect."
+            exit 64
+          fi
+
+          echo "Mode: $MODE"
+          echo "Content mode: $CONTENT_MODE"
+          echo "Private source ref: $SOURCE_REF"
+          echo "Build number input: ${BUILD_NUMBER_INPUT:-<empty, verify modes use the run number>}"
+
+      - name: Write CI helper scripts (public, part of this workflow)
+        shell: bash
+        run: |
+          set -euo pipefail
+          HELPERS="$RUNNER_TEMP/english-ci-helpers"
+          rm -rf "$HELPERS"
+          mkdir -p "$HELPERS"
+          echo "CI_HELPERS=$HELPERS" >> "$GITHUB_ENV"
+
+          # ---- test_summary.py: LexCore xUnit + xcresult bundles -> Job Summary + log -------
+          # Prints counts, failing test identifiers, failure messages and file:line only.
+          cat > "$HELPERS/test_summary.py" <<'PY'
+          import glob, json, os, subprocess, sys
+          import xml.etree.ElementTree as ET
+
+          rows, failures, notes = [], [], []
+
+          def status_of(name):
+              v = os.environ.get(name, "")
+              return int(v) if v.lstrip("-").isdigit() else None
+
+          def clip(s, n=400):
+              s = " ".join(str(s or "").split())
+              return s if len(s) <= n else s[: n - 1] + "…"
+
+          def md(s):
+              return clip(s).replace("|", "\\|").replace("<", "&lt;")
+
+          def esc(s):
+              return str(s).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+          # ---- LexCore: swift test --xunit-output (XCTest and, on Swift 6+, swift-testing files)
+          def lexcore():
+              st = status_of("LEXCORE_STATUS")
+              if st is None:
+                  return
+              files = sorted(glob.glob(os.path.join(os.environ.get("LEXCORE_XUNIT_DIR", "/nonexistent"), "*.xml")))
+              total = failed = skipped = 0
+              for f in files:
+                  try:
+                      root = ET.parse(f).getroot()
+                  except Exception as exc:
+                      notes.append(f"LexCore: could not parse {os.path.basename(f)}: {exc}")
+                      continue
+                  for case in root.iter("testcase"):
+                      total += 1
+                      bad = [c for c in case if c.tag in ("failure", "error")]
+                      if any(c.tag == "skipped" for c in case):
+                          skipped += 1
+                      if bad:
+                          failed += 1
+                          ident = f"{case.get('classname', '')}/{case.get('name', '')}".strip("/")
+                          msgs = [clip((c.get("message") or "") + " " + (c.text or ""), 600) for c in bad]
+                          failures.append(("LexCore (swift test)", ident, msgs))
+              if not files:
+                  result = "passed (no xUnit file)" if st == 0 else f"FAILED (exit {st}, no xUnit file: build error? see the swift test step log)"
+                  rows.append(("LexCore (swift test)", result, "-", "-", "-", "-"))
+                  return
+              result = "passed" if st == 0 and failed == 0 else f"FAILED (exit {st})"
+              rows.append(("LexCore (swift test)", result, total, total - failed - skipped, failed, skipped))
+
+          # ---- xcresult bundles (Xcode 16+ xcresulttool "test-results" API)
+          def xcresult(label, path_var, status_var):
+              st = status_of(status_var)
+              path = os.environ.get(path_var, "")
+              if st is None:
+                  return
+              if not path or not os.path.isdir(path):
+                  rows.append((label, f"FAILED (exit {st}, no result bundle)" if st else "skipped", "-", "-", "-", "-"))
+                  return
+              def tool(kind):
+                  p = subprocess.run(["xcrun", "xcresulttool", "get", "test-results", kind, "--path", path, "--compact"],
+                                     capture_output=True, text=True, timeout=300)
+                  if p.returncode != 0:
+                      raise RuntimeError(clip(p.stderr, 300))
+                  return json.loads(p.stdout)
+              try:
+                  s = tool("summary")
+              except Exception as exc:
+                  rows.append((label, f"exit {st}; xcresulttool failed: {exc}", "-", "-", "-", "-"))
+                  return
+              total = s.get("totalTestCount", 0)
+              passed, failed = s.get("passedTests", 0), s.get("failedTests", 0)
+              skipped = s.get("skippedTests", 0) + s.get("expectedFailures", 0)
+              ok = st == 0 and failed == 0
+              result = "passed" if ok else f"FAILED (exit {st})"
+              if total == 0 and st == 0:
+                  result = "passed (0 tests ran)"
+              rows.append((label, result, total, passed, failed, skipped))
+              # Detailed failure messages (file:line) from the test tree; fall back to summary.
+              found = False
+              try:
+                  tree = tool("tests")
+                  def walk(node, trail):
+                      nonlocal found
+                      kind = node.get("nodeType", "")
+                      name = node.get("name", "")
+                      here = trail + [name] if kind in ("Unit test bundle", "UI test bundle", "Test Suite", "Test Case") else trail
+                      if kind == "Test Case" and node.get("result") == "Failed":
+                          msgs = []
+                          def collect(n):
+                              if n.get("nodeType") in ("Failure Message", "Runtime Warning", "Source Code Reference"):
+                                  msgs.append(clip(n.get("name", ""), 600))
+                              for c in n.get("children", []) or []:
+                                  collect(c)
+                          for c in node.get("children", []) or []:
+                              collect(c)
+                          failures.append((label, node.get("nodeIdentifier") or "/".join(here), msgs or ["(no failure message)"]))
+                          found = True
+                      for c in node.get("children", []) or []:
+                          walk(c, here)
+                  for n in tree.get("testNodes", []) or []:
+                      walk(n, [])
+              except Exception as exc:
+                  notes.append(f"{label}: could not read the test tree ({exc}); using the summary list.")
+              if not found:
+                  for f in s.get("testFailures", []) or []:
+                      failures.append((label, f.get("testIdentifierString") or f"{f.get('targetName', '')}/{f.get('testName', '')}",
+                                       [clip(f.get("failureText", ""), 600)]))
+
+          lexcore()
+          xcresult("EnglishAppTests (unit)", "UNIT_XCRESULT", "UNIT_STATUS")
+          xcresult("EnglishAppUITests (smoke)", "UI_XCRESULT", "UI_STATUS")
+
+          bft = status_of("BUILD_FOR_TESTING_STATUS")
+          out = ["## Test results", ""]
+          if bft not in (None, 0):
+              out += [f"> build-for-testing failed (exit {bft}); app tests did not run. See the compiler errors in the step log.", ""]
+          if rows:
+              out += ["| Suite | Result | Total | Passed | Failed | Skipped |", "|---|---|---:|---:|---:|---:|"]
+              out += [f"| {r[0]} | {md(r[1])} | {r[2]} | {r[3]} | {r[4]} | {r[5]} |" for r in rows]
+          else:
+              out += ["No test step ran."]
+          if failures:
+              out += ["", f"### Failed tests ({len(failures)})", ""]
+              for suite, ident, msgs in failures[:60]:
+                  out.append(f"- **{md(suite)}** `{md(ident)}`")
+                  for m in msgs[:4]:
+                      out.append(f"  - {md(m)}")
+              if len(failures) > 60:
+                  out.append(f"- … and {len(failures) - 60} more (see the step log).")
+          if notes:
+              out += [""] + [f"> {md(n)}" for n in notes]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+              fh.write("\n".join(out) + "\n\n")
+
+          # Log: everything, plus annotations for the first failures.
+          for r in rows:
+              print(f"{r[0]}: {r[1]}  total={r[2]} passed={r[3]} failed={r[4]} skipped={r[5]}")
+          if failures:
+              print("::group::Failed tests (identifiers, assertion messages, file:line)")
+              for suite, ident, msgs in failures:
+                  print(f"[{suite}] {ident}")
+                  for m in msgs:
+                      print(f"    {m}")
+              print("::endgroup::")
+              for suite, ident, msgs in failures[:15]:
+                  print(f"::error title=Test failed ({esc(suite)})::{esc(ident)}%0A{esc(chr(10).join(msgs[:3]))}")
+          for n in notes:
+              print(f"::warning::{esc(n)}")
+          PY
+
+          # ---- size_report.py: app bundle / IPA / content / packs sizes -> Job Summary -------
+          cat > "$HELPERS/size_report.py" <<'PY'
+          import argparse, os, sys
+
+          ap = argparse.ArgumentParser()
+          ap.add_argument("--title", required=True)
+          ap.add_argument("--app", required=True)
+          ap.add_argument("--ipa", required=True)
+          ap.add_argument("--ipa-label", default="IPA")
+          ap.add_argument("--content-dir")
+          ap.add_argument("--warn-mb", type=float, default=200)
+          a = ap.parse_args()
+
+          MB = 1_000_000
+          def mb(n): return f"{n / MB:,.1f} MB"
+          def du(p):
+              if os.path.isfile(p): return os.path.getsize(p)
+              t = 0
+              for root, _, files in os.walk(p):
+                  for f in files:
+                      fp = os.path.join(root, f)
+                      if not os.path.islink(fp): t += os.path.getsize(fp)
+              return t
+
+          app_total, ipa = du(a.app), os.path.getsize(a.ipa)
+          files = []
+          for root, _, names in os.walk(a.app):
+              for n in names:
+                  fp = os.path.join(root, n)
+                  if not os.path.islink(fp):
+                      files.append((os.path.getsize(fp), os.path.relpath(fp, a.app)))
+          files.sort(reverse=True)
+          groups = {}
+          for size, rel in files:
+              top = rel.split(os.sep)[0]
+              key = top + "/" if os.path.isdir(os.path.join(a.app, top)) else top
+              groups[key] = groups.get(key, 0) + size
+
+          out = [f"## {a.title}", "",
+                 f"- {a.ipa_label}: **{mb(ipa)}** (zip of Payload/; App Store thinning usually makes the download a little smaller)",
+                 f"- App bundle on disk (uncompressed): **{mb(app_total)}**", ""]
+          over = ipa > a.warn_mb * MB
+          if over:
+              out += [f"> ⚠️ {a.ipa_label} {mb(ipa)} is above the {a.warn_mb:.0f} MB budget.", ""]
+          out += ["### Bundle by top-level item", "", "| Item | Size |", "|---|---:|"]
+          out += [f"| `{k}` | {mb(v)} |" for k, v in sorted(groups.items(), key=lambda kv: -kv[1])[:20]]
+          out += ["", "### Largest files in the app bundle", "", "| File | Size |", "|---|---:|"]
+          out += [f"| `{rel}` | {mb(size)} |" for size, rel in files[:25]]
+          if a.content_dir and os.path.isdir(a.content_dir):
+              out += ["", "### Generated content (word-atlas pipeline)", "", "| File | Size | In app |", "|---|---:|---|"]
+              for n in ("content.sqlite", "media-core.sqlite", "ATTRIBUTION.md", "packs.json", "report.md"):
+                  p = os.path.join(a.content_dir, n)
+                  if os.path.isfile(p):
+                      inapp = "yes" if n in ("content.sqlite", "media-core.sqlite", "ATTRIBUTION.md") else "no"
+                      out.append(f"| `{n}` | {mb(os.path.getsize(p))} | {inapp} |")
+              tsv = os.path.join(a.content_dir, "packs-sizes.tsv")
+              if os.path.isfile(tsv):
+                  packs = [l.rstrip("\n").split("\t") for l in open(tsv, encoding="utf-8") if l.strip()]
+                  total = sum(int(s) for s, _ in packs)
+                  out += ["", f"### Download packs (not in the app; CDN later) — total {mb(total)}", "", "| Pack | Size |", "|---|---:|"]
+                  out += [f"| `{n}` | {mb(int(s))} |" for s, n in packs]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+              fh.write("\n".join(out) + "\n\n")
+          print(f"{a.ipa_label}: {mb(ipa)}; app bundle: {mb(app_total)}")
+          for size, rel in files[:15]:
+              print(f"  {mb(size):>12}  {rel}")
+          if over:
+              print(f"::warning title=App size::{a.ipa_label} {mb(ipa)} exceeds the {a.warn_mb:.0f} MB budget (see the Job Summary).")
+          PY
+
+          # ---- check_bundle.sh <app> <warn|strict> [signed]: built-product contract checks ----
+          # Bundle IDs, build numbers, embedded widgets extension, bundled content, no download
+          # packs in the app, and (signed) App Group in the signed entitlements. Prints results only.
+          cat > "$HELPERS/check_bundle.sh" <<'SH'
+          #!/bin/bash
+          set -euo pipefail
+          APP="$1"; LEVEL="$2"; SIGNED="${3:-}"
+          fails=0
+          problem() { if [[ "$LEVEL" == strict ]]; then echo "::error::$1"; fails=1; else echo "::warning::$1"; fi; }
+          fatal() { echo "::error::$1"; fails=1; }
+          plist() { /usr/libexec/PlistBuddy -c "Print :$2" "$1/Info.plist" 2>/dev/null || true; }
+
+          [[ "$(plist "$APP" CFBundleIdentifier)" == "$EXPECTED_BUNDLE_ID" ]] || fatal "App bundle ID is '$(plist "$APP" CFBundleIdentifier)', expected $EXPECTED_BUNDLE_ID."
+          APP_BUILD="$(plist "$APP" CFBundleVersion)"
+          APP_VERSION_BUILT="$(plist "$APP" CFBundleShortVersionString)"
+          [[ "$APP_BUILD" == "$BUILD_NUMBER" ]] || problem "App CFBundleVersion is '$APP_BUILD', expected $BUILD_NUMBER (Info.plist must use \$(CURRENT_PROJECT_VERSION))."
+
+          APPEX=''
+          shopt -s nullglob
+          for ext in "$APP"/PlugIns/*.appex; do
+            [[ "$(plist "$ext" CFBundleIdentifier)" == "$EXPECTED_WIDGETS_BUNDLE_ID" ]] && APPEX="$ext"
+          done
+          shopt -u nullglob
+          if [[ -z "$APPEX" ]]; then
+            fatal "Widgets extension $EXPECTED_WIDGETS_BUNDLE_ID is not embedded in PlugIns/."
+          else
+            [[ "$(plist "$APPEX" CFBundleVersion)" == "$APP_BUILD" && "$(plist "$APPEX" CFBundleShortVersionString)" == "$APP_VERSION_BUILT" ]] \
+              || problem "Widgets version $(plist "$APPEX" CFBundleShortVersionString) ($(plist "$APPEX" CFBundleVersion)) does not match the app's $APP_VERSION_BUILT ($APP_BUILD)."
+            echo "Widgets extension embedded: $(basename "$APPEX")"
+          fi
+
+          for f in content.sqlite media-core.sqlite ATTRIBUTION.md; do
+            [[ -n "$(find "$APP" -type f -name "$f" -print -quit)" ]] || problem "$f is not in the app bundle (project.yml must reference $GENERATED_RESOURCES_DIR)."
+          done
+          STRAY="$(find "$APP" -type f \( -name 'media-*.sqlite' ! -name 'media-core.sqlite' -o -name 'packs.json' \) -print -quit)"
+          [[ -z "$STRAY" ]] || fatal "Download pack file $(basename "$STRAY") is inside the app bundle; packs/ must stay out of the app."
+
+          if [[ "$SIGNED" == signed && -n "$APPEX" ]]; then
+            test -f "$APPEX/embedded.mobileprovision" || fatal 'Widgets extension is missing embedded.mobileprovision.'
+            for bin in "$APP" "$APPEX"; do
+              if codesign -d --entitlements - --xml "$bin" 2>/dev/null | python3 -c '
+          import plistlib, sys
+          raw = sys.stdin.buffer.read()
+          ent = plistlib.loads(raw) if raw.strip() else {}
+          sys.exit(0 if sys.argv[1] in ent.get("com.apple.security.application-groups", []) else 1)
+          ' "$EXPECTED_APP_GROUP"; then
+                echo "Signed App Group entitlement ($(basename "$bin")): PASS"
+              else
+                fatal "Signed $(basename "$bin") does not carry App Group $EXPECTED_APP_GROUP."
+              fi
+            done
+          fi
+
+          (( fails == 0 )) || exit 65
+          echo "Bundle contract check ($LEVEL${SIGNED:+, $SIGNED}): PASS"
+          SH
+          chmod +x "$HELPERS/check_bundle.sh"
+          bash -n "$HELPERS/check_bundle.sh"
+
+          python3 -m py_compile "$HELPERS/test_summary.py" "$HELPERS/size_report.py"
+          echo 'CI helpers written.'
+
+      # ---------------------------------------------------------------------
+      # 1. PUBLIC CI repository -> PRIVATE source repository
+      # ---------------------------------------------------------------------
+      - name: Checkout private English source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/english
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+          persist-credentials: false
+          lfs: false
+          clean: true
+
+      - name: Verify private source layout
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE_ABS="$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH"
+          required=("$PROJECT_SPEC" "$LEXCORE_PATH/Package.swift" tools/content-pipeline/run-all.mjs)
+          if [[ "$CONTENT_MODE" == 'full-m4a' ]]; then
+            required+=(tools/content-pipeline/convert-audio-macos.sh)
+          fi
+          for f in "${required[@]}"; do
+            [[ -f "$SOURCE_ABS/$f" ]] || {
+              echo "::error::Private source is missing $f."
+              exit 66
+            }
+          done
+
+          # Generated content must never be committed (it is copied in by this workflow).
+          if [[ -n "$(git -C "$SOURCE_ABS" ls-files -- "$GENERATED_RESOURCES_DIR" | head -1)" ]]; then
+            echo "::warning::$GENERATED_RESOURCES_DIR has tracked files in git; CI overwrites them. Keep that directory git-ignored."
+          fi
+
+          SOURCE_COMMIT="$(git -C "$SOURCE_ABS" rev-parse HEAD)"
+          echo "SOURCE_ABS=$SOURCE_ABS" >> "$GITHUB_ENV"
+          echo "SOURCE_COMMIT=$SOURCE_COMMIT" >> "$GITHUB_ENV"
+          echo "SOURCE_SHORT_SHA=${SOURCE_COMMIT:0:8}" >> "$GITHUB_ENV"
+          echo "Private source: $PRIVATE_SOURCE_REPOSITORY@$SOURCE_REF (${SOURCE_COMMIT:0:8})"
+          echo 'Layout check: PASS'
+
+      # ---------------------------------------------------------------------
+      # 2. Toolchain: Node 24 (node:sqlite) + Xcode 26.4+ (+ early simulator boot)
+      # ---------------------------------------------------------------------
+      - name: Set up Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Select Xcode 26.4+
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          XCODE_APP=''
+          BEST_VERSION=''
+          for app in /Applications/Xcode*.app; do
+            [[ -d "$app/Contents/Developer" ]] || continue
+            case "$app" in *[Bb]eta*) continue ;; esac
+            version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || true)"
+            [[ "${version%%.*}" == "$XCODE_MAJOR_WANTED" ]] || continue
+            if [[ -z "$BEST_VERSION" ]] || [[ "$(printf '%s\n%s\n' "$BEST_VERSION" "$version" | sort -V | tail -1)" == "$version" ]]; then
+              BEST_VERSION="$version"
+              XCODE_APP="$app"
+            fi
+          done
+
+          if [[ -z "$XCODE_APP" ]]; then
+            echo "::error::No Xcode ${XCODE_MAJOR_WANTED}.x installation was found on this runner."
+            ls -1 /Applications | grep '^Xcode' || true
+            exit 69
+          fi
+          if [[ "$(printf '%s\n%s\n' "$XCODE_MIN_VERSION" "$BEST_VERSION" | sort -V | head -1)" != "$XCODE_MIN_VERSION" ]]; then
+            echo "::error::English CI requires Xcode $XCODE_MIN_VERSION or later on the 26.x track; newest found: $BEST_VERSION"
+            exit 69
+          fi
+
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          echo "Selected Xcode: $XCODE_APP ($BEST_VERSION)"
+          xcodebuild -version
+          swift --version 2>&1 | head -1
+          echo "Node: $(node --version)"
+          echo "Runner architecture: $(uname -m)"
+
+      - name: Select and boot an iPhone Simulator (iOS 17+)
+        if: ${{ env.MODE == 'verify' || env.MODE == 'verify-full' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Newest iOS runtime >= the deployment target; prefer a plain "iPhone NN" / "iPhone NN Pro".
+          SIMULATOR_UDID="$(xcrun simctl list devices available -j | /usr/bin/python3 -c '
+          import json, re, sys
+          payload = json.load(sys.stdin)
+          best = None
+          for runtime, devices in payload.get("devices", {}).items():
+              m = re.search(r"SimRuntime\.iOS-(\d+)-(\d+)", runtime)
+              if not m or int(m.group(1)) < 17:
+                  continue
+              ver = (int(m.group(1)), int(m.group(2)))
+              for d in devices:
+                  name = d.get("name", "")
+                  if not (d.get("isAvailable") and name.startswith("iPhone")):
+                      continue
+                  pref = 0 if re.fullmatch(r"iPhone \d+( Pro)?", name) else 1
+                  key = (ver, -pref)
+                  if best is None or key > best[0]:
+                      best = (key, d["udid"], name, "%d.%d" % ver)
+          print("" if best is None else "%s %s|%s" % (best[1], best[3], best[2]))
+          ')"
+
+          if [[ -z "$SIMULATOR_UDID" ]]; then
+            xcrun simctl list devices available
+            echo '::error::No available iPhone Simulator with iOS 17 or later was found.'
+            exit 69
+          fi
+          SIM_DESC="${SIMULATOR_UDID#* }"
+          SIMULATOR_UDID="${SIMULATOR_UDID%% *}"
+          echo "SIMULATOR_UDID=$SIMULATOR_UDID" >> "$GITHUB_ENV"
+          echo "SIMULATOR_DESC=iOS ${SIM_DESC%%|*} · ${SIM_DESC#*|}" >> "$GITHUB_ENV"
+
+          # Boot now (asynchronously) so it is ready by the time the tests run.
+          xcrun simctl boot "$SIMULATOR_UDID" >/dev/null 2>&1 || true
+          echo "Booting simulator: iOS ${SIM_DESC%%|*} · ${SIM_DESC#*|} ($SIMULATOR_UDID)"
+
+      # ---------------------------------------------------------------------
+      # 3. LexCore (pure Swift package): swift test. The result is recorded, and
+      #    enforced by the "Enforce test results" step (so app tests still run).
+      # ---------------------------------------------------------------------
+      - name: LexCore swift test
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        shell: bash
+        timeout-minutes: 20
+        run: |
+          set -uo pipefail
+
+          XUNIT_DIR="$RUNNER_TEMP/lexcore-xunit"
+          rm -rf "$XUNIT_DIR"
+          mkdir -p "$XUNIT_DIR"
+          echo "LEXCORE_XUNIT_DIR=$XUNIT_DIR" >> "$GITHUB_ENV"
+
+          # --parallel: SwiftPM only writes the XCTest xUnit file in parallel mode.
+          swift test \
+            --package-path "$LEXCORE_PATH" \
+            --scratch-path "$RUNNER_TEMP/lexcore-build" \
+            --parallel \
+            --xunit-output "$XUNIT_DIR/lexcore.xml"
+          status=$?
+          echo "LEXCORE_STATUS=$status" >> "$GITHUB_ENV"
+          if [[ "$status" -ne 0 ]]; then
+            echo "::error title=LexCore::swift test failed (exit $status). Failures are listed in the Job Summary."
+          else
+            echo 'LexCore swift test: PASS'
+          fi
+          exit 0
+
+      # ---------------------------------------------------------------------
+      # 4. Content: word-atlas (pinned) -> tools/content-pipeline -> App/Resources/Generated
+      #    Cached by (word-atlas SHA + content-pipeline hash + content mode).
+      # ---------------------------------------------------------------------
+      - name: Restore generated content cache
+        id: content_cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/english-content
+          key: english-content-${{ env.CONTENT_CACHE_VERSION }}-${{ env.CONTENT_MODE }}-${{ env.WORD_ATLAS_SHA }}-${{ hashFiles('source/tools/content-pipeline/**') }}
+
+      - name: Fetch word-atlas (pinned commit; data/ and public/atlas/ only)
+        if: ${{ steps.content_cache.outputs.cache-hit != 'true' }}
+        shell: bash
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+
+          ATLAS_DIR="$RUNNER_TEMP/word-atlas"
+          rm -rf "$ATLAS_DIR"
+          mkdir -p "$ATLAS_DIR"
+          cd "$ATLAS_DIR"
+
+          git init -q
+          git remote add origin "$WORD_ATLAS_URL"
+          # Partial clone (trees first, blobs on checkout) + cone-mode sparse checkout:
+          # repository root files (LICENSE, CONTENT_LICENSE.md, ...) + data/ + public/atlas/.
+          git config core.sparseCheckout true
+          git config core.sparseCheckoutCone true
+          printf '%s\n' '/*' '!/*/' '/data/' '/public/' '!/public/*/' '/public/atlas/' > .git/info/sparse-checkout
+
+          for attempt in 1 2 3; do
+            if git -c protocol.version=2 fetch -q --depth 1 --filter=blob:none --no-tags origin "$WORD_ATLAS_SHA"; then
+              break
+            fi
+            [[ "$attempt" -lt 3 ]] || { echo '::error::Could not fetch the pinned word-atlas commit.'; exit 69; }
+            echo "::warning::word-atlas fetch failed (attempt $attempt); retrying."
+            sleep 10
+          done
+          git -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
+
+          HEAD_SHA="$(git rev-parse HEAD)"
+          [[ "$HEAD_SHA" == "$WORD_ATLAS_SHA" ]] || {
+            echo "::error::word-atlas HEAD is $HEAD_SHA, expected $WORD_ATLAS_SHA."
+            exit 65
+          }
+          for f in data/word-atlas.json public/atlas/index.json; do
+            [[ -f "$f" ]] || { echo "::error::word-atlas checkout is missing $f."; exit 66; }
+          done
+
+          echo "ATLAS_DIR=$ATLAS_DIR" >> "$GITHUB_ENV"
+          echo "word-atlas ${WORD_ATLAS_SHA:0:8}: $(git ls-files | wc -l | tr -d ' ') files checked out"
+          du -sh data public/atlas/* 2>/dev/null || true
+
+      - name: Restore transcoded audio cache (AAC)
+        id: m4a_cache
+        if: ${{ steps.content_cache.outputs.cache-hit != 'true' && env.CONTENT_MODE == 'full-m4a' }}
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/word-atlas-m4a
+          key: english-m4a-${{ env.CONTENT_CACHE_VERSION }}-${{ env.WORD_ATLAS_SHA }}-${{ hashFiles('source/tools/content-pipeline/convert-audio-macos.sh') }}
+
+      - name: Transcode word-atlas MP3 to AAC (afconvert)
+        if: ${{ steps.content_cache.outputs.cache-hit != 'true' && env.CONTENT_MODE == 'full-m4a' && steps.m4a_cache.outputs.cache-hit != 'true' }}
+        shell: bash
+        timeout-minutes: 75
+        run: |
+          set -euo pipefail
+          M4A_DIR="$RUNNER_TEMP/word-atlas-m4a"
+          rm -rf "$M4A_DIR"
+          mkdir -p "$M4A_DIR"
+
+          START=$SECONDS
+          bash "$SOURCE_ABS/tools/content-pipeline/convert-audio-macos.sh" "$ATLAS_DIR/public/atlas/audio" "$M4A_DIR"
+
+          COUNT="$(find "$M4A_DIR" -type f -name '*.m4a' | wc -l | tr -d ' ')"
+          (( COUNT > 0 )) || { echo '::error::Audio transcode produced no .m4a files.'; exit 65; }
+          echo "Transcoded $COUNT files in $(( (SECONDS - START) / 60 )) min; $(du -sh "$M4A_DIR" | cut -f1) total"
+
+      - name: Save transcoded audio cache (AAC)
+        if: ${{ steps.content_cache.outputs.cache-hit != 'true' && env.CONTENT_MODE == 'full-m4a' && steps.m4a_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/word-atlas-m4a
+          key: ${{ steps.m4a_cache.outputs.cache-primary-key }}
+
+      - name: Run content pipeline
+        if: ${{ steps.content_cache.outputs.cache-hit != 'true' }}
+        shell: bash
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+
+          OUT_DIR="$RUNNER_TEMP/content-out"
+          STAGE="$RUNNER_TEMP/english-content"
+          rm -rf "$OUT_DIR" "$STAGE"
+          mkdir -p "$OUT_DIR" "$STAGE"
+
+          ARGS=(--source "$ATLAS_DIR" --out "$OUT_DIR")
+          if [[ "$CONTENT_MODE" == 'sample300' ]]; then
+            ARGS+=(--sample "$CONTENT_SAMPLE_SIZE")
+          else
+            ARGS+=(--audio-dir "$RUNNER_TEMP/word-atlas-m4a")
+          fi
+
+          START=$SECONDS
+          node "$SOURCE_ABS/tools/content-pipeline/run-all.mjs" "${ARGS[@]}"
+          echo "Content pipeline finished in $(( SECONDS - START ))s"
+
+          for f in content.sqlite media-core.sqlite ATTRIBUTION.md packs.json report.md; do
+            [[ -s "$OUT_DIR/$f" ]] || { echo "::error::Content pipeline did not produce $f."; exit 65; }
+            cp "$OUT_DIR/$f" "$STAGE/$f"
+          done
+          [[ -d "$OUT_DIR/packs" ]] || { echo '::error::Content pipeline did not produce packs/.'; exit 65; }
+          # Pack files themselves are not cached or bundled (CDN upload is a later step); keep their sizes.
+          python3 - "$OUT_DIR/packs" > "$STAGE/packs-sizes.tsv" <<'PY'
+          import os, sys
+          d = sys.argv[1]
+          for n in sorted(os.listdir(d)):
+              p = os.path.join(d, n)
+              if os.path.isfile(p):
+                  print(f"{os.path.getsize(p)}\t{n}")
+          PY
+          printf '%s\n' "$WORD_ATLAS_SHA" > "$STAGE/word-atlas.sha"
+          ls -l "$STAGE"
+
+          # Free disk for the Xcode build.
+          rm -rf "$ATLAS_DIR" "$OUT_DIR" "$RUNNER_TEMP/word-atlas-m4a"
+
+      - name: Save generated content cache
+        if: ${{ steps.content_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/english-content
+          key: ${{ steps.content_cache.outputs.cache-primary-key }}
+
+      - name: Install generated content into App/Resources/Generated
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/english-content"
+          for f in content.sqlite media-core.sqlite ATTRIBUTION.md packs.json report.md packs-sizes.tsv word-atlas.sha; do
+            [[ -f "$STAGE/$f" ]] || { echo "::error::Generated content is incomplete (missing $f); bump CONTENT_CACHE_VERSION and rerun."; exit 65; }
+          done
+          [[ "$(cat "$STAGE/word-atlas.sha")" == "$WORD_ATLAS_SHA" ]] || { echo '::error::Cached content was built from another word-atlas commit.'; exit 65; }
+
+          DEST="$SOURCE_ABS/$GENERATED_RESOURCES_DIR"
+          mkdir -p "$DEST"
+          # Only these three go into the app; packs/ stays out of the bundle.
+          for f in content.sqlite media-core.sqlite ATTRIBUTION.md; do
+            cp "$STAGE/$f" "$DEST/$f"
+          done
+          echo "CONTENT_STAGE=$STAGE" >> "$GITHUB_ENV"
+          echo "Content ($CONTENT_MODE, cache hit: ${{ steps.content_cache.outputs.cache-hit == 'true' }}):"
+          ls -l "$DEST"
+
+      # ---------------------------------------------------------------------
+      # 5. XcodeGen (pinned + checksum) -> EnglishApp.xcodeproj; resolve settings
+      # ---------------------------------------------------------------------
+      - name: Install pinned XcodeGen
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$XCODEGEN_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo '::error::XCODEGEN_SHA256 is not pinned.'; exit 78; }
+
+          ZIP="$RUNNER_TEMP/xcodegen-$XCODEGEN_VERSION.zip"
+          DIR="$RUNNER_TEMP/xcodegen-$XCODEGEN_VERSION"
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip" \
+            --output "$ZIP"
+          ACTUAL="$(shasum -a 256 "$ZIP" | awk '{print $1}')"
+          [[ "$ACTUAL" == "$XCODEGEN_SHA256" ]] || {
+            echo '::error::XcodeGen download checksum mismatch.'
+            echo "::error::expected $XCODEGEN_SHA256"
+            echo "::error::actual   $ACTUAL"
+            exit 65
+          }
+          rm -rf "$DIR"
+          mkdir -p "$DIR"
+          unzip -q "$ZIP" -d "$DIR"
+          BIN="$(find "$DIR" -type f -path '*/bin/xcodegen' -print -quit)"
+          [[ -n "$BIN" ]] || { echo '::error::xcodegen binary not found in the release zip.'; exit 66; }
+          chmod +x "$BIN"
+          echo "$(dirname "$BIN")" >> "$GITHUB_PATH"
+          "$BIN" --version
+
+      - name: Generate Xcode project (XcodeGen)
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodegen generate --spec "$PROJECT_SPEC" --quiet
+          [[ -d "$PROJECT_NAME.xcodeproj" ]] || {
+            echo "::error::XcodeGen did not create $PROJECT_NAME.xcodeproj at the repository root."
+            exit 66
+          }
+          echo "PROJECT_PATH=$SOURCE_ABS/$PROJECT_NAME.xcodeproj" >> "$GITHUB_ENV"
+          echo "Generated $PROJECT_NAME.xcodeproj"
+
+      - name: Resolve targets, bundle IDs, version and build number
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          xcodebuild -list -json -project "$PROJECT_PATH" > "$RUNNER_TEMP/english-xcode-list.json"
+          if ! xcodebuild -showBuildSettings -json -project "$PROJECT_PATH" -alltargets -configuration Release \
+              2>"$RUNNER_TEMP/english-build-settings.err" > "$RUNNER_TEMP/english-build-settings.json"; then
+            echo '::error::xcodebuild -showBuildSettings failed:'
+            grep -iE 'error' "$RUNNER_TEMP/english-build-settings.err" | tail -20 || true
+            exit 65
+          fi
+
+          BUILD_NUMBER="${BUILD_NUMBER_INPUT:-${GITHUB_RUN_NUMBER}}"
+          [[ "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "::error::Build number is not a positive integer: $BUILD_NUMBER"; exit 64; }
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+
+          # Prints only comparison results; never the settings or entitlement files themselves.
+          python3 - "$RUNNER_TEMP/english-xcode-list.json" "$RUNNER_TEMP/english-build-settings.json" <<'PY'
+          import json, os, plistlib, re, sys
+          env = os.environ
+          strict = env["MODE"] in ("archive", "testflight")
+          lst = json.load(open(sys.argv[1])).get("project", {})
+          targets, schemes = lst.get("targets", []), lst.get("schemes", [])
+          settings = {e.get("target"): e.get("buildSettings", {}) for e in json.load(open(sys.argv[2]))}
+          errors, warnings, out = [], [], {}
+
+          if env["SCHEME"] not in schemes:
+              errors.append(f"Scheme {env['SCHEME']} not found (schemes: {', '.join(schemes[:20])}).")
+          for t in (env["APP_TARGET"], env["WIDGETS_TARGET"], env["UNIT_TEST_TARGET"]):
+              if t not in targets:
+                  errors.append(f"Target {t} not found in the generated project.")
+          if env["UI_TEST_TARGET"] not in targets:
+              warnings.append(f"Target {env['UI_TEST_TARGET']} not found; UI smoke tests will be skipped.")
+
+          def check_target(name, bundle, prefix):
+              s = settings.get(name)
+              if not s:
+                  return
+              got = s.get("PRODUCT_BUNDLE_IDENTIFIER", "")
+              if got != bundle:
+                  errors.append(f"{name}: PRODUCT_BUNDLE_IDENTIFIER is '{got or '<empty>'}', expected {bundle}.")
+              dt = s.get("IPHONEOS_DEPLOYMENT_TARGET", "")
+              if dt != env["EXPECTED_MIN_IOS"]:
+                  warnings.append(f"{name}: IPHONEOS_DEPLOYMENT_TARGET is '{dt or '<empty>'}', the project contract is {env['EXPECTED_MIN_IOS']}.")
+              ent = s.get("CODE_SIGN_ENTITLEMENTS", "")
+              group_ok = False
+              if ent:
+                  p = os.path.join(s.get("SRCROOT", env["SOURCE_ABS"]), ent)
+                  try:
+                      groups = plistlib.load(open(p, "rb")).get("com.apple.security.application-groups", [])
+                      group_ok = env["EXPECTED_APP_GROUP"] in groups
+                  except Exception:
+                      group_ok = False
+              if not group_ok:
+                  msg = f"{name}: entitlements do not list App Group {env['EXPECTED_APP_GROUP']}."
+                  (errors if strict else warnings).append(msg)
+              out[prefix + "_APP_GROUP_OK"] = "true" if group_ok else "false"
+              return s
+
+          app = check_target(env["APP_TARGET"], env["EXPECTED_BUNDLE_ID"], "APP")
+          check_target(env["WIDGETS_TARGET"], env["EXPECTED_WIDGETS_BUNDLE_ID"], "WIDGETS")
+          if app:
+              ver = app.get("MARKETING_VERSION", "")
+              if not re.fullmatch(r"[0-9]+(\.[0-9]+){1,2}", ver):
+                  errors.append(f"MARKETING_VERSION must look like 1.0 or 1.0.0; got '{ver or '<empty>'}'.")
+              out["APP_VERSION"] = ver
+              out["DEPLOYMENT_TARGET"] = app.get("IPHONEOS_DEPLOYMENT_TARGET", "")
+          out["HAS_UI_TESTS"] = "true" if env["UI_TEST_TARGET"] in targets else "false"
+
+          for w in warnings:
+              print(f"::warning::{w}")
+          for e in errors:
+              print(f"::error::{e}")
+          with open(env["GITHUB_ENV"], "a") as fh:
+              for k, v in out.items():
+                  fh.write(f"{k}={v}\n")
+          for k, v in sorted(out.items()):
+              print(f"{k}: {v}")
+          if errors:
+              sys.exit(65)
+          print("Project contract check: PASS")
+          PY
+          rm -f "$RUNNER_TEMP/english-build-settings.json" "$RUNNER_TEMP/english-build-settings.err"
+          echo "Build number: $BUILD_NUMBER"
+
+      # ---------------------------------------------------------------------
+      # 6. VERIFY modes: simulator build-for-testing, unit tests, UI smoke
+      # ---------------------------------------------------------------------
+      - name: Build for testing (iOS Simulator, Debug)
+        if: ${{ env.MODE == 'verify' || env.MODE == 'verify-full' }}
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          set -uo pipefail
+
+          TEST_DERIVED="$RUNNER_TEMP/DerivedData-English-Test"
+          rm -rf "$TEST_DERIVED"
+          echo "TEST_DERIVED=$TEST_DERIVED" >> "$GITHUB_ENV"
+
+          # Ad-hoc "Sign to Run Locally": simulator builds keep their entitlements (App Group)
+          # without a team or profile. -quiet keeps project metadata out of this PUBLIC log.
+          xcodebuild build-for-testing \
+            -quiet \
+            -project "$PROJECT_PATH" \
+            -scheme "$SCHEME" \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
+            -derivedDataPath "$TEST_DERIVED" \
+            ARCHS="$(uname -m)" \
+            ONLY_ACTIVE_ARCH=YES \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM= \
+            PROVISIONING_PROFILE_SPECIFIER= \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGNING_REQUIRED=NO
+          status=$?
+          echo "BUILD_FOR_TESTING_STATUS=$status" >> "$GITHUB_ENV"
+          if [[ "$status" -ne 0 ]]; then
+            echo "::error title=Build failed::xcodebuild build-for-testing exited $status (compiler errors above)."
+            exit "$status"
+          fi
+          set -e
+
+          XCTESTRUN="$(find "$TEST_DERIVED/Build/Products" -maxdepth 1 -name '*.xctestrun' -print -quit)"
+          [[ -n "$XCTESTRUN" ]] || { echo '::error::build-for-testing produced no .xctestrun file.'; exit 66; }
+          echo "XCTESTRUN=$XCTESTRUN" >> "$GITHUB_ENV"
+
+          # Which test bundles were actually built (scheme test action).
+          TEST_TARGETS="$(python3 - "$XCTESTRUN" <<'PY'
+          import plistlib, sys
+          d = plistlib.load(open(sys.argv[1], "rb"))
+          names = []
+          for cfg in d.get("TestConfigurations", []) or []:
+              for t in cfg.get("TestTargets", []) or []:
+                  names.append(t.get("BlueprintName", ""))
+          if not names:  # xctestrun format version 1
+              names = [k for k, v in d.items() if isinstance(v, dict) and "TestBundlePath" in v]
+          print(" ".join(sorted(set(n for n in names if n))))
+          PY
+          )"
+          echo "Test bundles in scheme: ${TEST_TARGETS:-<none>}"
+          [[ " $TEST_TARGETS " == *" $UNIT_TEST_TARGET "* ]] || {
+            echo "::error::$UNIT_TEST_TARGET is not in the $SCHEME scheme's test action."
+            exit 66
+          }
+          if [[ " $TEST_TARGETS " == *" $UI_TEST_TARGET "* ]]; then
+            echo 'RUN_UI_TESTS=true' >> "$GITHUB_ENV"
+          else
+            echo "::warning::$UI_TEST_TARGET is not in the $SCHEME scheme's test action; UI smoke skipped."
+            echo 'RUN_UI_TESTS=false' >> "$GITHUB_ENV"
+          fi
+
+          # Built app: bundle IDs, embedded widget extension, bundled content, no download packs.
+          APP_PATH="$TEST_DERIVED/Build/Products/Debug-iphonesimulator/$APP_TARGET.app"
+          [[ -d "$APP_PATH" ]] || APP_PATH="$(find "$TEST_DERIVED/Build/Products/Debug-iphonesimulator" -maxdepth 1 -type d -name '*.app' ! -name '*-Runner.app' -print -quit)"
+          [[ -n "$APP_PATH" && -d "$APP_PATH" ]] || { echo '::error::Simulator .app was not produced.'; exit 65; }
+          bash "$CI_HELPERS/check_bundle.sh" "$APP_PATH" "$( [[ "$MODE" == 'verify' ]] && echo warn || echo strict )"
+
+      - name: Run unit tests (EnglishAppTests)
+        if: ${{ env.MODE == 'verify' || env.MODE == 'verify-full' }}
+        shell: bash
+        timeout-minutes: 20
+        run: |
+          set -uo pipefail
+          UNIT_XCRESULT="$RUNNER_TEMP/English-Unit.xcresult"
+          rm -rf "$UNIT_XCRESULT"
+          echo "UNIT_XCRESULT=$UNIT_XCRESULT" >> "$GITHUB_ENV"
+
+          xcrun simctl bootstatus "$SIMULATOR_UDID" -b >/dev/null
+          xcodebuild test-without-building \
+            -quiet \
+            -xctestrun "$XCTESTRUN" \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
+            -resultBundlePath "$UNIT_XCRESULT" \
+            -only-testing:"$UNIT_TEST_TARGET" \
+            -parallel-testing-enabled NO
+          status=$?
+          echo "UNIT_STATUS=$status" >> "$GITHUB_ENV"
+          [[ "$status" -eq 0 ]] && echo 'Unit tests: PASS' || echo "::error title=Unit tests::$UNIT_TEST_TARGET failed (exit $status). Details in the Job Summary."
+          exit 0
+
+      - name: Run UI smoke tests (EnglishAppUITests)
+        if: ${{ (env.MODE == 'verify' || env.MODE == 'verify-full') && env.RUN_UI_TESTS == 'true' }}
+        shell: bash
+        timeout-minutes: 25
+        run: |
+          set -uo pipefail
+          UI_XCRESULT="$RUNNER_TEMP/English-UI.xcresult"
+          rm -rf "$UI_XCRESULT"
+          echo "UI_XCRESULT=$UI_XCRESULT" >> "$GITHUB_ENV"
+
+          xcrun simctl bootstatus "$SIMULATOR_UDID" -b >/dev/null
+          # One retry per failing UI test absorbs hosted-runner simulator hiccups; a test that
+          # fails twice fails the run. Retries are visible in the xcresult summary.
+          xcodebuild test-without-building \
+            -quiet \
+            -xctestrun "$XCTESTRUN" \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
+            -resultBundlePath "$UI_XCRESULT" \
+            -only-testing:"$UI_TEST_TARGET" \
+            -parallel-testing-enabled NO \
+            -retry-tests-on-failure \
+            -test-iterations 2
+          status=$?
+          echo "UI_STATUS=$status" >> "$GITHUB_ENV"
+          [[ "$status" -eq 0 ]] && echo 'UI smoke tests: PASS' || echo "::error title=UI smoke tests::$UI_TEST_TARGET failed (exit $status). Details in the Job Summary."
+          exit 0
+
+      - name: verify-full — Release device build (unsigned) and size report
+        if: ${{ env.MODE == 'verify-full' }}
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+
+          SIZE_DERIVED="$RUNNER_TEMP/DerivedData-English-Size"
+          rm -rf "$SIZE_DERIVED"
+          # Same configuration and architecture as the App Store build, without signing.
+          xcodebuild build \
+            -quiet \
+            -project "$PROJECT_PATH" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$SIZE_DERIVED" \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            DEVELOPMENT_TEAM=
+
+          APP_PATH="$SIZE_DERIVED/Build/Products/Release-iphoneos/$APP_TARGET.app"
+          [[ -d "$APP_PATH" ]] || { echo '::error::Release device .app was not produced.'; exit 65; }
+          bash "$CI_HELPERS/check_bundle.sh" "$APP_PATH" strict
+
+          # IPA estimate: the same zip layout the exporter produces (Payload/<App>.app).
+          EST_DIR="$RUNNER_TEMP/English-Size-Estimate"
+          rm -rf "$EST_DIR"
+          mkdir -p "$EST_DIR/Payload"
+          ditto "$APP_PATH" "$EST_DIR/Payload/$(basename "$APP_PATH")"
+          ( cd "$EST_DIR" && zip -qry -X English-estimate.ipa Payload )
+
+          python3 "$CI_HELPERS/size_report.py" \
+            --title 'App size (verify-full, unsigned Release build)' \
+            --app "$APP_PATH" \
+            --ipa "$EST_DIR/English-estimate.ipa" \
+            --ipa-label 'Estimated IPA' \
+            --content-dir "$CONTENT_STAGE" \
+            --warn-mb "$IPA_WARN_MB"
+          rm -rf "$EST_DIR" "$SIZE_DERIVED"
+
+      # ---------------------------------------------------------------------
+      # 7. Test summary (always) and gate (before any signing material exists)
+      # ---------------------------------------------------------------------
+      - name: Test results summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          [[ -f "${CI_HELPERS:-/nonexistent}/test_summary.py" ]] || { echo 'No helpers; nothing to summarize.'; exit 0; }
+          python3 "$CI_HELPERS/test_summary.py" || echo '::warning::Test summary script failed.'
+
+      - name: Enforce test results
+        shell: bash
+        run: |
+          set -euo pipefail
+          failed=0
+          for name in LEXCORE_STATUS UNIT_STATUS UI_STATUS; do
+            value="${!name:-}"
+            if [[ -n "$value" && "$value" != '0' ]]; then
+              echo "::error::$name=$value"
+              failed=1
+            fi
+          done
+          (( failed == 0 )) || { echo '::error::Tests failed; see the Job Summary for failing tests.'; exit 1; }
+          echo 'All recorded test steps passed.'
+
+      # ---------------------------------------------------------------------
+      # 8. ARCHIVE / TESTFLIGHT: Match signing (readonly), archive, export, altool
+      # ---------------------------------------------------------------------
+      - name: Install pinned fastlane for Match only
+        if: ${{ env.MODE == 'archive' || env.MODE == 'testflight' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FASTLANE_GEM_HOME="$RUNNER_TEMP/fastlane-gems"
+          rm -rf "$FASTLANE_GEM_HOME"
+          mkdir -p "$FASTLANE_GEM_HOME"
+
+          export GEM_HOME="$FASTLANE_GEM_HOME"
+          export GEM_PATH="$FASTLANE_GEM_HOME"
+          export PATH="$FASTLANE_GEM_HOME/bin:$PATH"
+
+          gem install --no-document fastlane -v "$FASTLANE_VERSION"
+          fastlane --version
+
+          echo "GEM_HOME=$FASTLANE_GEM_HOME" >> "$GITHUB_ENV"
+          echo "GEM_PATH=$FASTLANE_GEM_HOME" >> "$GITHUB_ENV"
+          echo "$FASTLANE_GEM_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Create ephemeral keychain, write ASC key, install signing assets with Match
+        if: ${{ env.MODE == 'archive' || env.MODE == 'testflight' }}
+        shell: bash
+        env:
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          # --- ephemeral keychain (password never leaves this step) ---------
+          KEYCHAIN_NAME="english-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.keychain-db"
+          KEYCHAIN_PATH="$HOME/Library/Keychains/$KEYCHAIN_NAME"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_NAME"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+
+          LOGIN_KEYCHAIN="$(security default-keychain -d user | tr -d '"' | xargs)"
+          echo "ORIGINAL_DEFAULT_KEYCHAIN=$LOGIN_KEYCHAIN" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_NAME=$KEYCHAIN_NAME" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          security default-keychain -d user -s "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" "$LOGIN_KEYCHAIN"
+
+          # --- App Store Connect API key (Match + altool) -------------------
+          ASC_DIR="$RUNNER_TEMP/english-asc"
+          mkdir -p "$ASC_DIR" "$HOME/.appstoreconnect/private_keys"
+          P8_PATH="$ASC_DIR/AuthKey_${ASC_KEY_ID}.p8"
+          API_KEY_JSON="$ASC_DIR/api-key.json"
+
+          printf '%s\n' "$ASC_PRIVATE_KEY" > "$P8_PATH"
+          chmod 600 "$P8_PATH"
+          grep -q 'BEGIN PRIVATE KEY' "$P8_PATH" || {
+            echo '::error::ASC_PRIVATE_KEY does not look like an App Store Connect .p8 private key.'
+            exit 78
+          }
+          cp "$P8_PATH" "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          chmod 600 "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+
+          export P8_PATH_FOR_PY="$P8_PATH"
+          python3 - "$API_KEY_JSON" <<'PY'
+          import json, os, sys
+          from pathlib import Path
+
+          p8 = Path(os.environ["P8_PATH_FOR_PY"]).read_text(encoding="utf-8")
+          payload = {
+              "key_id": os.environ["ASC_KEY_ID"],
+              "issuer_id": os.environ["ASC_ISSUER_ID"],
+              "key": p8,
+              "in_house": False,
+          }
+          Path(sys.argv[1]).write_text(json.dumps(payload), encoding="utf-8")
+          PY
+          chmod 600 "$API_KEY_JSON"
+
+          echo "ASC_P8_PATH=$P8_PATH" >> "$GITHUB_ENV"
+          echo "ASC_API_KEY_JSON=$API_KEY_JSON" >> "$GITHUB_ENV"
+          echo "ASC_KEY_ID=$ASC_KEY_ID" >> "$GITHUB_ENV"
+
+          # --- Match repository authentication (readonly) -------------------
+          MATCH_AUTH="$(printf '%s:%s' 'readori' "$TARGET_REPO_PAT" | base64 | tr -d '\n')"
+          echo "::add-mask::$MATCH_AUTH"
+
+          MATCH_BRANCH_SHA="$(
+            git -c http.extraheader="AUTHORIZATION: basic $MATCH_AUTH" \
+              ls-remote --heads "$MATCH_GIT_URL" "refs/heads/$MATCH_GIT_BRANCH" \
+            | awk 'NR==1 {print $1}'
+          )"
+          [[ -n "$MATCH_BRANCH_SHA" ]] || {
+            echo "::error::Match branch '$MATCH_GIT_BRANCH' is not readable in readori/readori-certificates (TARGET_REPO_PAT scope?)."
+            exit 66
+          }
+          echo "Match branch: $MATCH_GIT_BRANCH (${MATCH_BRANCH_SHA:0:8})"
+
+          # --- Match: shared Apple Distribution identity + English App Store profiles
+          # Readonly by design: this workflow never writes to the shared certificates repository.
+          # The two profiles (app + widgets extension) are created by certificates-repo.yml
+          # (signing_mode=refresh_english_profile).
+          MATCH_APP_IDENTIFIERS="$EXPECTED_BUNDLE_ID,$EXPECTED_WIDGETS_BUNDLE_ID"
+          if ! MATCH_READONLY=true fastlane match appstore \
+              --app_identifier "$MATCH_APP_IDENTIFIERS" \
+              --git_url "$MATCH_GIT_URL" \
+              --git_branch "$MATCH_GIT_BRANCH" \
+              --git_basic_authorization "$MATCH_AUTH" \
+              --team_id "$ASC_TEAM_ID" \
+              --api_key_path "$API_KEY_JSON" \
+              --keychain_name "$KEYCHAIN_NAME" \
+              --keychain_password "$KEYCHAIN_PASSWORD" \
+              --shallow_clone true \
+              --clone_branch_directly true \
+              --readonly true; then
+            echo "::error::Readonly Match could not install signing assets for $MATCH_APP_IDENTIFIERS."
+            echo '::error::First run? Run certificates-repo.yml with signing_mode=refresh_english_profile and destructive_confirmation=WRITE, then retry.'
+            exit 65
+          fi
+
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH" >/dev/null
+
+      - name: Locate and validate installed App Store profiles (app + widgets, App Group)
+        if: ${{ env.MODE == 'archive' || env.MODE == 'testflight' }}
+        shell: bash
+        env:
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          PROFILE_SCAN_DIR="$RUNNER_TEMP/english-profile-scan"
+          rm -rf "$PROFILE_SCAN_DIR"
+          mkdir -p "$PROFILE_SCAN_DIR"
+
+          shopt -s nullglob
+          candidates=(
+            "$HOME/Library/MobileDevice/Provisioning Profiles/"*.mobileprovision
+            "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/"*.mobileprovision
+          )
+          shopt -u nullglob
+
+          # Prints the installed App Store profile name for one bundle ID, or exits 65.
+          locate_profile() {
+            local bundle="$1"
+            local found_path='' found_name='' found_team='' found_get_task='' found_plist=''
+            for profile in "${candidates[@]}"; do
+              [[ -f "$profile" ]] || continue
+              plist="$PROFILE_SCAN_DIR/$(basename "$profile").plist"
+              /usr/bin/security cms -D -i "$profile" > "$plist" 2>/dev/null || continue
+
+              app_id="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$plist" 2>/dev/null || true)"
+              [[ "$app_id" == "$ASC_TEAM_ID.$bundle" ]] || continue
+
+              found_path="$profile"
+              found_plist="$plist"
+              found_name="$(/usr/libexec/PlistBuddy -c 'Print :Name' "$plist")"
+              found_team="$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$plist")"
+              found_get_task="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$plist" 2>/dev/null || echo false)"
+              break
+            done
+
+            [[ -n "$found_path" ]] || {
+              echo "::error::No App Store provisioning profile for $bundle was installed by Match." >&2
+              exit 65
+            }
+            [[ "$found_team" == "$ASC_TEAM_ID" ]] || {
+              echo "::error::Provisioning profile team for $bundle does not match ASC_TEAM_ID." >&2
+              exit 65
+            }
+            [[ "$found_get_task" != 'true' ]] || {
+              echo "::error::Installed profile for $bundle has get-task-allow=true and is not an App Store distribution profile." >&2
+              exit 65
+            }
+            # App Group must be authorized by the profile (assigned to the App ID in the portal).
+            python3 - "$found_plist" "$EXPECTED_APP_GROUP" "$bundle" >&2 <<'PY'
+          import plistlib, sys
+          ent = plistlib.load(open(sys.argv[1], "rb")).get("Entitlements", {})
+          groups = ent.get("com.apple.security.application-groups", [])
+          if isinstance(groups, str):
+              groups = [groups]
+          if sys.argv[2] not in groups:
+              print(f"::error::App Store profile for {sys.argv[3]} does not include App Group {sys.argv[2]}. "
+                    "Assign the group to this App ID in the Apple Developer portal, then run certificates-repo.yml "
+                    "signing_mode=refresh_english_profile.")
+              sys.exit(65)
+          print(f"App Group in profile for {sys.argv[3]}: PASS")
+          PY
+            printf '%s\n' "$found_name"
+          }
+
+          PROFILE_NAME="$(locate_profile "$EXPECTED_BUNDLE_ID")"
+          WIDGETS_PROFILE_NAME="$(locate_profile "$EXPECTED_WIDGETS_BUNDLE_ID")"
+
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -q 'Apple Distribution' || {
+            echo '::error::No Apple Distribution signing identity was installed into the ephemeral keychain.'
+            exit 65
+          }
+
+          rm -rf "$PROFILE_SCAN_DIR"
+          echo "APPSTORE_PROFILE_NAME=$PROFILE_NAME" >> "$GITHUB_ENV"
+          echo "WIDGETS_PROFILE_NAME=$WIDGETS_PROFILE_NAME" >> "$GITHUB_ENV"
+          echo "App profile: $PROFILE_NAME"
+          echo "Widgets profile: $WIDGETS_PROFILE_NAME"
+
+      - name: Check build number is higher than the latest TestFlight build
+        if: ${{ env.MODE == 'testflight' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          set +e
+          LATEST_OUTPUT="$(
+            fastlane run latest_testflight_build_number \
+              api_key_path:"$ASC_API_KEY_JSON" \
+              app_identifier:"$EXPECTED_BUNDLE_ID" \
+              version:"$APP_VERSION" \
+              initial_build_number:0 2>&1
+          )"
+          query_status=$?
+          set -e
+          LATEST="$(printf '%s\n' "$LATEST_OUTPUT" | sed -n 's/.*Result: \([0-9][0-9]*\).*/\1/p' | tail -1)"
+
+          if [[ "$query_status" -ne 0 || -z "$LATEST" ]]; then
+            echo '::warning title=Build number check skipped::Could not read the latest TestFlight build number; continuing to archive.'
+            exit 0
+          fi
+
+          echo "Latest TestFlight build for $APP_VERSION: $LATEST; requested: $BUILD_NUMBER"
+          if (( BUILD_NUMBER <= LATEST )); then
+            echo "::error title=Build number already used::build_number $BUILD_NUMBER is not higher than the latest TestFlight build $LATEST for version $APP_VERSION. Re-run with build_number $((LATEST + 1)) or higher."
+            exit 1
+          fi
+
+      - name: Build signed App Store archive and IPA
+        if: ${{ env.MODE == 'archive' || env.MODE == 'testflight' }}
+        shell: bash
+        timeout-minutes: 40
+        env:
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          ARCHIVE_PATH="$RUNNER_TEMP/English.xcarchive"
+          EXPORT_DIR="$RUNNER_TEMP/English-AppStore-Export"
+          EXPORT_OPTIONS="$RUNNER_TEMP/English-ExportOptions.plist"
+          rm -rf "$ARCHIVE_PATH" "$EXPORT_DIR" "$EXPORT_OPTIONS"
+          mkdir -p "$EXPORT_DIR"
+
+          # Two signed targets (app + widgets extension) need different profiles, so the profile
+          # cannot be a global xcodebuild override. Write it per target into the generated
+          # project's Release configuration (xcodeproj gem ships with the pinned fastlane).
+          export SIGN_APP_TARGET="$APP_TARGET" SIGN_APP_ID="$EXPECTED_BUNDLE_ID" SIGN_APP_PROFILE="$APPSTORE_PROFILE_NAME"
+          export SIGN_EXT_TARGET="$WIDGETS_TARGET" SIGN_EXT_ID="$EXPECTED_WIDGETS_BUNDLE_ID" SIGN_EXT_PROFILE="$WIDGETS_PROFILE_NAME"
+          export SIGN_TEAM_ID="$ASC_TEAM_ID"
+          ruby - "$PROJECT_PATH" <<'RUBY'
+          require 'xcodeproj'
+          project = Xcodeproj::Project.open(ARGV[0])
+          wanted = {
+            ENV.fetch('SIGN_APP_TARGET') => [ENV.fetch('SIGN_APP_ID'), ENV.fetch('SIGN_APP_PROFILE')],
+            ENV.fetch('SIGN_EXT_TARGET') => [ENV.fetch('SIGN_EXT_ID'), ENV.fetch('SIGN_EXT_PROFILE')],
+          }
+          signed = {}
+          project.native_targets.each do |target|
+            next unless wanted.key?(target.name)
+            bundle, profile = wanted[target.name]
+            target.build_configurations.each do |config|
+              next unless config.name == 'Release'
+              declared = config.build_settings['PRODUCT_BUNDLE_IDENTIFIER'].to_s.delete('"')
+              if !declared.empty? && declared != bundle
+                puts "::error::Target #{target.name} declares bundle ID #{declared}, expected #{bundle}."
+                exit 65
+              end
+              config.build_settings['CODE_SIGN_STYLE'] = 'Manual'
+              config.build_settings['DEVELOPMENT_TEAM'] = ENV.fetch('SIGN_TEAM_ID')
+              config.build_settings['CODE_SIGN_IDENTITY'] = 'Apple Distribution'
+              config.build_settings['PROVISIONING_PROFILE_SPECIFIER'] = profile
+              signed[target.name] = true
+            end
+          end
+          missing = wanted.keys.reject { |name| signed[name] }
+          unless missing.empty?
+            puts "::error::No Release configuration found for target(s): #{missing.join(', ')}"
+            exit 66
+          end
+          project.save
+          puts "Per-target signing set for #{signed.size} targets."
+          RUBY
+
+          xcodebuild archive \
+            -quiet \
+            -project "$PROJECT_PATH" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$ARCHIVE_PATH" \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="$ASC_TEAM_ID" \
+            CODE_SIGN_IDENTITY='Apple Distribution'
+
+          ARCHIVED_APP="$(find "$ARCHIVE_PATH/Products/Applications" -maxdepth 1 -type d -name '*.app' -print -quit 2>/dev/null || true)"
+          [[ -n "$ARCHIVED_APP" && -d "$ARCHIVED_APP" ]] || { echo '::error::Signed xcarchive was not produced.'; exit 65; }
+
+          export BUNDLE_ID_FOR_PLIST="$EXPECTED_BUNDLE_ID" PROFILE_NAME_FOR_PLIST="$APPSTORE_PROFILE_NAME"
+          export EXT_BUNDLE_ID_FOR_PLIST="$EXPECTED_WIDGETS_BUNDLE_ID" EXT_PROFILE_NAME_FOR_PLIST="$WIDGETS_PROFILE_NAME"
+          export TEAM_ID_FOR_PLIST="$ASC_TEAM_ID"
+          python3 - "$EXPORT_OPTIONS" <<'PY'
+          import os, plistlib, sys
+          payload = {
+              "method": "app-store-connect",
+              "destination": "export",
+              "signingStyle": "manual",
+              "signingCertificate": "Apple Distribution",
+              "teamID": os.environ["TEAM_ID_FOR_PLIST"],
+              "provisioningProfiles": {
+                  os.environ["BUNDLE_ID_FOR_PLIST"]: os.environ["PROFILE_NAME_FOR_PLIST"],
+                  os.environ["EXT_BUNDLE_ID_FOR_PLIST"]: os.environ["EXT_PROFILE_NAME_FOR_PLIST"],
+              },
+              "manageAppVersionAndBuildNumber": False,
+              "stripSwiftSymbols": True,
+              "uploadSymbols": True,
+          }
+          with open(sys.argv[1], "wb") as fh:
+              plistlib.dump(payload, fh)
+          PY
+
+          xcodebuild -exportArchive \
+            -quiet \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportPath "$EXPORT_DIR" \
+            -exportOptionsPlist "$EXPORT_OPTIONS"
+
+          SIGNED_IPA="$(find "$EXPORT_DIR" -maxdepth 1 -type f -name '*.ipa' -print -quit)"
+          [[ -n "$SIGNED_IPA" && -f "$SIGNED_IPA" ]] || {
+            echo '::error::Signed App Store IPA was not exported.'
+            find "$EXPORT_DIR" -maxdepth 2 -type f -print || true
+            exit 65
+          }
+
+          # Verify the exported IPA without printing its contents.
+          VERIFY_DIR="$RUNNER_TEMP/English-Signed-Verify"
+          rm -rf "$VERIFY_DIR"
+          mkdir -p "$VERIFY_DIR"
+          unzip -q "$SIGNED_IPA" -d "$VERIFY_DIR"
+          SIGNED_APP="$(find "$VERIFY_DIR/Payload" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          [[ -n "$SIGNED_APP" ]] || { echo '::error::Exported IPA has no .app payload.'; exit 65; }
+
+          test -f "$SIGNED_APP/embedded.mobileprovision" || { echo '::error::Signed IPA is missing embedded.mobileprovision.'; exit 65; }
+          codesign --verify --deep --strict "$SIGNED_APP"
+          bash "$CI_HELPERS/check_bundle.sh" "$SIGNED_APP" strict signed
+
+          MIN_OS="$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$SIGNED_APP/Info.plist" 2>/dev/null || true)"
+          if [[ "$MIN_OS" != "$EXPECTED_MIN_IOS" ]]; then
+            echo "::warning::MinimumOSVersion is '${MIN_OS:-<empty>}'; the project contract is $EXPECTED_MIN_IOS."
+          fi
+          NON_EXEMPT="$(/usr/libexec/PlistBuddy -c 'Print :ITSAppUsesNonExemptEncryption' "$SIGNED_APP/Info.plist" 2>/dev/null || true)"
+          if [[ -z "$NON_EXEMPT" ]]; then
+            echo '::warning::ITSAppUsesNonExemptEncryption is not set; App Store Connect will ask the export-compliance question for every build.'
+          fi
+
+          python3 "$CI_HELPERS/size_report.py" \
+            --title "App size ($MODE, signed IPA)" \
+            --app "$SIGNED_APP" \
+            --ipa "$SIGNED_IPA" \
+            --ipa-label 'Signed IPA' \
+            --content-dir "$CONTENT_STAGE" \
+            --warn-mb "$IPA_WARN_MB"
+
+          rm -rf "$VERIFY_DIR"
+          echo "SIGNED_IPA=$SIGNED_IPA" >> "$GITHUB_ENV"
+          echo "Signed IPA: $(basename "$SIGNED_IPA")"
+          ls -lh "$SIGNED_IPA"
+
+      - name: Validate App Store package with Apple (altool)
+        if: ${{ env.MODE == 'archive' || env.MODE == 'testflight' }}
+        shell: bash
+        env:
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          set -euo pipefail
+
+          ALTOOL_LOG="$RUNNER_TEMP/altool-validate.log"
+          set +e
+          xcrun altool \
+            --validate-app \
+            --file "$SIGNED_IPA" \
+            --type ios \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID" 2>&1 | tee "$ALTOOL_LOG"
+          altool_status="${PIPESTATUS[0]}"
+          set -e
+          if [[ "$altool_status" -ne 0 ]] || grep -qiE '^[[:space:]]*[*]{3} Error|ERROR ITMS-' "$ALTOOL_LOG"; then
+            MSG="$(grep -iE 'error|ITMS-|bundle version|CFBundleVersion|message' "$ALTOOL_LOG" | head -30 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+            echo "::error title=altool validate failed::${MSG:-altool exited with status $altool_status}"
+            exit 1
+          fi
+
+      - name: Upload English to TestFlight (altool)
+        if: ${{ env.MODE == 'testflight' }}
+        shell: bash
+        env:
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          # Numeric App Store Connect app id. altool --upload-app resolves the app from the IPA's
+          # bundle ID; the id is checked here only to prove the App record was configured.
+          ENGLISH_ASC_APP_ID: ${{ secrets.ENGLISH_ASC_APP_ID }}
+        run: |
+          set -euo pipefail
+
+          [[ "$ENGLISH_ASC_APP_ID" =~ ^[0-9]+$ ]] || {
+            echo '::error::ENGLISH_ASC_APP_ID must be the numeric App Store Connect Apple ID.'
+            exit 78
+          }
+
+          ALTOOL_LOG="$RUNNER_TEMP/altool-upload.log"
+          set +e
+          xcrun altool \
+            --upload-app \
+            --file "$SIGNED_IPA" \
+            --type ios \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID" 2>&1 | tee "$ALTOOL_LOG"
+          altool_status="${PIPESTATUS[0]}"
+          set -e
+          if [[ "$altool_status" -ne 0 ]] || grep -qiE '^[[:space:]]*[*]{3} Error|ERROR ITMS-' "$ALTOOL_LOG"; then
+            MSG="$(grep -iE 'error|ITMS-|bundle version|CFBundleVersion|message' "$ALTOOL_LOG" | head -30 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+            echo "::error title=altool upload failed::${MSG:-altool exited with status $altool_status}"
+            exit 1
+          fi
+
+          echo 'TestFlight binary upload accepted by App Store Connect.'
+
+      # ---------------------------------------------------------------------
+      # 9. Summary
+      # ---------------------------------------------------------------------
+      - name: Build summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          {
+            echo "## English iOS CI · ${MODE} · ${{ job.status }}"
+            echo
+            echo "- Version: \`${APP_VERSION:-?}\` (${BUILD_NUMBER:-?})"
+            echo "- Bundle IDs: \`${EXPECTED_BUNDLE_ID}\` + \`${EXPECTED_WIDGETS_BUNDLE_ID}\` · App Group \`${EXPECTED_APP_GROUP}\`"
+            echo "- Private source: \`${PRIVATE_SOURCE_REPOSITORY}@${SOURCE_REF}\` (\`${SOURCE_SHORT_SHA:-?}\`)"
+            echo "- Content: \`${CONTENT_MODE}\` from word-atlas \`${WORD_ATLAS_SHA:0:8}\` · cache hit: \`${{ steps.content_cache.outputs.cache-hit == 'true' }}\`"
+            echo "- Xcode: \`$(xcodebuild -version 2>/dev/null | head -1)\` · XcodeGen \`${XCODEGEN_VERSION}\`"
+            if [[ -n "${SIMULATOR_DESC:-}" ]]; then
+              echo "- Simulator: ${SIMULATOR_DESC}"
+            fi
+            case "$MODE" in
+              archive) echo '- Signed IPA: Apple validation passed if this job succeeded (the IPA is not uploaded anywhere; the runner is discarded).' ;;
+              testflight) echo '- TestFlight: Apple validation and binary upload succeeded if this job succeeded.' ;;
+            esac
+            if [[ -f "${CONTENT_STAGE:-/nonexistent}/report.md" ]]; then
+              echo
+              echo '<details><summary>Content pipeline report (report.md)</summary>'
+              echo
+              head -n 150 "$CONTENT_STAGE/report.md"
+              echo
+              echo '</details>'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------------
+      # 10. Cleanup signing material and simulator, even after failures
+      # ---------------------------------------------------------------------
+      - name: Cleanup signing material and simulator
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          if [[ -n "${SIMULATOR_UDID:-}" ]]; then
+            xcrun simctl shutdown "$SIMULATOR_UDID" >/dev/null 2>&1 || true
+          fi
+
+          if [[ -n "${ORIGINAL_DEFAULT_KEYCHAIN:-}" ]]; then
+            security default-keychain -d user -s "$ORIGINAL_DEFAULT_KEYCHAIN" >/dev/null 2>&1 || true
+            security list-keychains -d user -s "$ORIGINAL_DEFAULT_KEYCHAIN" >/dev/null 2>&1 || true
+          fi
+          if [[ -n "${KEYCHAIN_NAME:-}" ]]; then
+            security delete-keychain "$KEYCHAIN_NAME" >/dev/null 2>&1 || true
+          fi
+
+          if [[ -n "${ASC_P8_PATH:-}" ]]; then
+            rm -f "$ASC_P8_PATH" >/dev/null 2>&1 || true
+          fi
+          if [[ -n "${ASC_API_KEY_JSON:-}" ]]; then
+            rm -f "$ASC_API_KEY_JSON" >/dev/null 2>&1 || true
+          fi
+          if [[ -n "${ASC_KEY_ID:-}" ]]; then
+            rm -f "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8" >/dev/null 2>&1 || true
+          fi
+
+          rm -rf "$RUNNER_TEMP/english-asc" "$RUNNER_TEMP/english-profile-scan" "$RUNNER_TEMP/English-Signed-Verify" \
+            "$RUNNER_TEMP/English.xcarchive" "$RUNNER_TEMP/English-AppStore-Export" >/dev/null 2>&1 || true
