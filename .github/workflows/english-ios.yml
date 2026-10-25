@@ -716,8 +716,8 @@ jobs:
           START=$SECONDS
           bash "$SOURCE_ABS/tools/content-pipeline/convert-audio-macos.sh" "$ATLAS_DIR/public/atlas/audio" "$M4A_DIR"
 
-          COUNT="$(find "$M4A_DIR" -type f -name '*.m4a' | wc -l | tr -d ' ')"
-          (( COUNT > 0 )) || { echo '::error::Audio transcode produced no .m4a files.'; exit 65; }
+          COUNT="$(find "$M4A_DIR" -type f \( -name '*.aac' -o -name '*.m4a' \) | wc -l | tr -d ' ')"
+          (( COUNT > 0 )) || { echo '::error::Audio transcode produced no .aac or .m4a files.'; exit 65; }
           echo "Transcoded $COUNT files in $(( (SECONDS - START) / 60 )) min; $(du -sh "$M4A_DIR" | cut -f1) total"
 
       - name: Save transcoded audio cache (AAC)
