@@ -26,6 +26,13 @@
 #   archive      LexCore swift test, full content, Match readonly, signed archive + export,
 #                altool validate. The IPA is discarded with the runner.
 #   testflight   archive + build-number preflight + altool upload to TestFlight.
+#   screenshots  (T-060) App Store screenshots: full content (as verify-full), a 6.9" simulator (1320x2868 or the job
+#                fails), status bar 9:41 / full signal / full battery, then StoreScreenshotTests twice (-testLanguage en
+#                -testRegion US, then zh-Hans / CN). The PNGs go to an orphan branch store-screenshots/run-<run_id> of the
+#                PRIVATE repo readori/english (screenshots/<lang>/*.png + manifest.json with sizes and sha256), pushed
+#                with TARGET_REPO_PAT, which therefore needs Contents: write on readori/english in this mode only.
+#                Nothing is uploaded as an artifact; the public log carries file names, sizes and counts, never an image.
+#                No LexCore tests, no signing.
 # Every mode also builds the 5 focus soundscapes and transcodes them to AAC (m4a, ~9 MB in total) into
 # App/Resources/Generated/Soundscapes; they are not cached (see step 4b). Source: the ElevenLabs clips committed in
 # tools/sfx-gen/eleven/clips (assembled into 3:00 loops, T-048); without them the synthesised loops of tools/sfx-gen are used.
@@ -37,7 +44,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'verify = sample content + simulator tests (no signing, ~20 min); verify-full = full content + audio transcode + size report; archive = signed IPA + altool validate (IPA is not kept); testflight = archive + upload to TestFlight'
+        description: 'verify = sample content + simulator tests (no signing, ~20 min); verify-full = full content + audio transcode + size report; archive = signed IPA + altool validate (IPA is not kept); testflight = archive + upload to TestFlight; screenshots = App Store screenshots on a 6.9-inch simulator, pushed to a private branch (needs a write-enabled TARGET_REPO_PAT)'
         required: true
         default: 'verify'
         type: choice
@@ -46,6 +53,7 @@ on:
           - verify-full
           - archive
           - testflight
+          - screenshots
       ref:
         description: 'Private readori/english branch, tag, or SHA'
         required: true
@@ -134,7 +142,7 @@ jobs:
           set -euo pipefail
 
           case "$MODE" in
-            verify|verify-full|archive|testflight) ;;
+            verify|verify-full|archive|testflight|screenshots) ;;
             *)
               echo "::error::Unsupported mode: $MODE"
               exit 64
@@ -316,6 +324,8 @@ jobs:
           lexcore()
           xcresult("EnglishAppTests (unit)", "UNIT_XCRESULT", "UNIT_STATUS")
           xcresult("EnglishAppUITests (smoke)", "UI_XCRESULT", "UI_STATUS")
+          xcresult("StoreScreenshotTests (en)", "SHOTS_EN_XCRESULT", "SHOTS_EN_STATUS")
+          xcresult("StoreScreenshotTests (zh-Hans)", "SHOTS_ZH_XCRESULT", "SHOTS_ZH_STATUS")
 
           bft = status_of("BUILD_FOR_TESTING_STATUS")
           out = ["## Test results", ""]
@@ -619,11 +629,78 @@ jobs:
           xcrun simctl boot "$SIMULATOR_UDID" >/dev/null 2>&1 || true
           echo "Booting simulator: iOS ${SIM_DESC%%|*} · ${SIM_DESC#*|} ($SIMULATOR_UDID)"
 
+      - name: Select and boot a 6.9-inch iPhone Simulator (screenshots)
+        if: ${{ env.MODE == 'screenshots' }}
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+
+          # App Store 6.9-inch screenshots are 1320x2868: iPhone 17 Pro Max, else iPhone 16 Pro Max (newest iOS runtime).
+          SIMULATOR_UDID="$(xcrun simctl list devices available -j | /usr/bin/python3 -c '
+          import json, re, sys
+          payload = json.load(sys.stdin)
+          wanted = ["iPhone 17 Pro Max", "iPhone 16 Pro Max"]
+          best = None
+          for runtime, devices in payload.get("devices", {}).items():
+              m = re.search(r"SimRuntime\.iOS-(\d+)-(\d+)", runtime)
+              if not m or int(m.group(1)) < 17:
+                  continue
+              ver = (int(m.group(1)), int(m.group(2)))
+              for d in devices:
+                  name = d.get("name", "")
+                  if not d.get("isAvailable") or name not in wanted:
+                      continue
+                  key = (-wanted.index(name), ver)
+                  if best is None or key > best[0]:
+                      best = (key, d["udid"], name, "%d.%d" % ver)
+          print("" if best is None else "%s %s|%s" % (best[1], best[3], best[2]))
+          ')"
+
+          if [[ -z "$SIMULATOR_UDID" ]]; then
+            xcrun simctl list devices available | grep -E 'iPhone .* Pro Max' || true
+            echo '::error::Neither "iPhone 17 Pro Max" nor "iPhone 16 Pro Max" is available with an iOS 17+ runtime; the 6.9-inch screenshots need one of them.'
+            exit 69
+          fi
+          SIM_DESC="${SIMULATOR_UDID#* }"
+          SIMULATOR_UDID="${SIMULATOR_UDID%% *}"
+          echo "SIMULATOR_UDID=$SIMULATOR_UDID" >> "$GITHUB_ENV"
+          echo "SIMULATOR_DESC=iOS ${SIM_DESC%%|*} · ${SIM_DESC#*|}" >> "$GITHUB_ENV"
+
+          xcrun simctl boot "$SIMULATOR_UDID" >/dev/null 2>&1 || true
+          xcrun simctl bootstatus "$SIMULATOR_UDID" -b >/dev/null
+          echo "Booted simulator: iOS ${SIM_DESC%%|*} · ${SIM_DESC#*|}"
+
+          # The real pixel size of the screen, from a probe screenshot (deleted straight away, never printed or kept).
+          PROBE="$RUNNER_TEMP/sim-probe.png"
+          rm -f "$PROBE"
+          xcrun simctl io "$SIMULATOR_UDID" screenshot --type=png "$PROBE" >/dev/null 2>&1 || {
+            echo '::error::Could not take a probe screenshot to check the simulator resolution.'
+            exit 70
+          }
+          SIZE="$(python3 - "$PROBE" <<'PY'
+          import struct, sys
+          head = open(sys.argv[1], "rb").read(32)
+          if head[:8] != b"\x89PNG\r\n\x1a\n":
+              print("not-a-png")
+          else:
+              w, h = struct.unpack(">II", head[16:24])
+              print("%dx%d" % (w, h))
+          PY
+          )"
+          rm -f "$PROBE"
+          echo "Simulator screen: $SIZE"
+          if [[ "$SIZE" != '1320x2868' ]]; then
+            echo "::error::The simulator screen is $SIZE, but the App Store 6.9-inch screenshots must be 1320x2868. Failing instead of taking wrong-sized screenshots."
+            exit 70
+          fi
+
       # ---------------------------------------------------------------------
       # 3. LexCore (pure Swift package): swift test. The result is recorded, and
       #    enforced by the "Enforce test results" step (so app tests still run).
       # ---------------------------------------------------------------------
       - name: LexCore swift test
+        if: ${{ env.MODE != 'screenshots' }}
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
         shell: bash
         timeout-minutes: 20
@@ -1009,7 +1086,7 @@ jobs:
       # 6. VERIFY modes: simulator build-for-testing, unit tests, UI smoke
       # ---------------------------------------------------------------------
       - name: Build for testing (iOS Simulator, Debug)
-        if: ${{ env.MODE == 'verify' || env.MODE == 'verify-full' }}
+        if: ${{ env.MODE == 'verify' || env.MODE == 'verify-full' || env.MODE == 'screenshots' }}
         shell: bash
         timeout-minutes: 30
         run: |
@@ -1176,6 +1253,212 @@ jobs:
           rm -rf "$EST_DIR" "$SIZE_DERIVED"
 
       # ---------------------------------------------------------------------
+      # 6b. SCREENSHOTS mode (T-060): StoreScreenshotTests in English and Chinese, then a private branch
+      # ---------------------------------------------------------------------
+      - name: Take the App Store screenshots (en, then zh-Hans)
+        if: ${{ env.MODE == 'screenshots' && env.RUN_UI_TESTS == 'true' }}
+        shell: bash
+        timeout-minutes: 60
+        run: |
+          set +e -uo pipefail
+
+          SHOTS_ROOT="$RUNNER_TEMP/store-screenshots"
+          rm -rf "$SHOTS_ROOT"
+          mkdir -p "$SHOTS_ROOT"
+          echo "SHOTS_ROOT=$SHOTS_ROOT" >> "$GITHUB_ENV"
+
+          xcrun simctl bootstatus "$SIMULATOR_UDID" -b >/dev/null
+
+          # take <key EN|ZH> <language> <region>: one pass of StoreScreenshotTests. The test is skipped unless
+          # STORE_SCREENSHOT_DIR is set; xcodebuild hands TEST_RUNNER_* variables to the test runner without the prefix.
+          take() {
+            local key="$1" lang="$2" region="$3"
+            local xcresult="$RUNNER_TEMP/English-Shots-$lang.xcresult"
+            rm -rf "$xcresult"
+            echo "SHOTS_${key}_XCRESULT=$xcresult" >> "$GITHUB_ENV"
+
+            # 9:41, full signal, full battery (re-applied before each pass; an override lasts until the simulator reboots).
+            xcrun simctl status_bar "$SIMULATOR_UDID" override \
+              --time 9:41 \
+              --dataNetwork wifi --wifiMode active --wifiBars 3 \
+              --cellularMode active --cellularBars 4 \
+              --batteryState charged --batteryLevel 100
+
+            echo "Screenshots: $lang ($region)"
+            TEST_RUNNER_STORE_SCREENSHOT_DIR="$SHOTS_ROOT" \
+            TEST_RUNNER_STORE_SCREENSHOT_LANG="$lang" \
+            xcodebuild test-without-building \
+              -quiet \
+              -xctestrun "$XCTESTRUN" \
+              -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
+              -resultBundlePath "$xcresult" \
+              -only-testing:"$UI_TEST_TARGET/StoreScreenshotTests" \
+              -parallel-testing-enabled NO \
+              -retry-tests-on-failure \
+              -test-iterations 2 \
+              -testLanguage "$lang" \
+              -testRegion "$region"
+            local status=$?
+            echo "SHOTS_${key}_STATUS=$status" >> "$GITHUB_ENV"
+            if [[ "$status" -eq 0 ]]; then
+              echo "StoreScreenshotTests ($lang): PASS"
+            else
+              echo "::error title=Screenshots ($lang)::StoreScreenshotTests failed (exit $status). Details in the Job Summary."
+            fi
+          }
+
+          take EN en US
+          take ZH zh-Hans CN
+          exit 0
+
+      - name: Check the screenshots and push them to a private branch
+        if: ${{ always() && env.MODE == 'screenshots' && env.SHOTS_ROOT != '' }}
+        shell: bash
+        timeout-minutes: 20
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          set +e -uo pipefail
+
+          BRANCH="store-screenshots/run-${GITHUB_RUN_ID}"
+          STAGE="$RUNNER_TEMP/store-shots-repo"
+          SUMMARY="$RUNNER_TEMP/store-shots-summary.md"
+          rm -rf "$STAGE" "$SUMMARY"
+          mkdir -p "$STAGE/screenshots"
+
+          # 1) Check: every language has the eight main screenshots (01..08), all 1320x2868 PNG files. The check copies the
+          #    files into the branch folder and writes manifest.json (sizes, pixel sizes, sha256). It prints file names,
+          #    sizes and counts only; it never reads or prints an image.
+          python3 - "$SHOTS_ROOT" "$STAGE" "$SUMMARY" <<'PY'
+          import hashlib, json, os, re, shutil, struct, sys
+
+          root, stage, summary = sys.argv[1], sys.argv[2], sys.argv[3]
+          LANGS = ["en", "zh-Hans"]
+          WANT = (1320, 2868)
+          NAME = re.compile(r"^(0[1-8])-[a-z0-9]+(-[a-z0-9]+)*\.png$")
+          errors, files, lines = [], [], []
+
+          def png_size(path):
+              with open(path, "rb") as fh:
+                  head = fh.read(32)
+              if head[:8] != b"\x89PNG\r\n\x1a\n":
+                  return None
+              return struct.unpack(">II", head[16:24])
+
+          for lang in LANGS:
+              folder = os.path.join(root, lang)
+              names = sorted(n for n in os.listdir(folder) if n.endswith(".png")) if os.path.isdir(folder) else []
+              mains = set()
+              for name in names:
+                  m = NAME.match(name)
+                  path = os.path.join(folder, name)
+                  size = png_size(path)
+                  if not m:
+                      errors.append(f"{lang}/{name}: unexpected file name (expected <nn>-<name>.png with nn 01..08).")
+                      continue
+                  if size is None:
+                      errors.append(f"{lang}/{name}: not a PNG file.")
+                      continue
+                  if size != WANT:
+                      errors.append(f"{lang}/{name}: {size[0]}x{size[1]} pixels, expected {WANT[0]}x{WANT[1]}.")
+                      continue
+                  if not name.endswith("-alt.png"):
+                      mains.add(m.group(1))
+                  data = open(path, "rb").read()
+                  dest_dir = os.path.join(stage, "screenshots", lang)
+                  os.makedirs(dest_dir, exist_ok=True)
+                  shutil.copyfile(path, os.path.join(dest_dir, name))
+                  files.append({
+                      "path": f"screenshots/{lang}/{name}",
+                      "width": size[0], "height": size[1],
+                      "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                  })
+                  lines.append((lang, name, size, len(data)))
+              missing = [f"{n:02d}" for n in range(1, 9) if f"{n:02d}" not in mains]
+              if missing:
+                  errors.append(f"{lang}: main screenshot(s) {', '.join(missing)} missing or invalid.")
+              count = sum(1 for f in files if f["path"].startswith(f"screenshots/{lang}/"))
+              print(f"{lang}: {count} valid PNG files, {len(mains)} of 8 main screens")
+
+          manifest = {
+              "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+              "source_commit": os.environ.get("SOURCE_COMMIT", ""),
+              "simulator": os.environ.get("SIMULATOR_DESC", ""),
+              "files": files,
+          }
+          with open(os.path.join(stage, "manifest.json"), "w", encoding="utf-8") as fh:
+              json.dump(manifest, fh, indent=2)
+              fh.write("\n")
+
+          for lang, name, size, nbytes in lines:
+              print(f"  {lang}/{name}  {size[0]}x{size[1]}  {nbytes:,} bytes")
+          out = ["## Store screenshots", "", "| Language | File | Pixels | Size |", "|---|---|---|---:|"]
+          out += [f"| {l} | `{n}` | {s[0]}x{s[1]} | {b / 1_000_000:.2f} MB |" for l, n, s, b in lines]
+          if errors:
+              out += ["", "### Problems", ""] + [f"- {e}" for e in errors]
+          with open(summary, "w", encoding="utf-8") as fh:
+              fh.write("\n".join(out) + "\n\n")
+          for e in errors:
+              print(f"::error title=Screenshots::{e}")
+          sys.exit(1 if errors else 0)
+          PY
+          check=$?
+          echo "SHOTS_CHECK_STATUS=$check" >> "$GITHUB_ENV"
+
+          # 2) Push what is valid (even a partial set, for inspection) to an orphan branch of the PRIVATE repository.
+          push_failed() {
+            echo "SHOTS_PUSH_STATUS=1" >> "$GITHUB_ENV"
+            echo "::error title=Screenshot push::$1"
+            [[ -f "$SUMMARY" ]] && cat "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+            echo "> The screenshots were NOT pushed: $1" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+
+          COUNT="$(find "$STAGE/screenshots" -type f -name '*.png' | wc -l | tr -d ' ')"
+          [[ "$COUNT" -gt 0 ]] || push_failed 'No valid screenshots were produced, so there is nothing to push.'
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || push_failed 'The TARGET_REPO_PAT secret is empty.'
+
+          AUTH="$(printf 'x-access-token:%s' "$TARGET_REPO_PAT" | base64 | tr -d '\n')"
+          echo "::add-mask::$AUTH"
+
+          cd "$STAGE" || push_failed 'The staging folder is missing.'
+          export GIT_TERMINAL_PROMPT=0
+          git init -q -b "$BRANCH" || push_failed 'git init failed.'
+          git remote add origin "https://github.com/${PRIVATE_SOURCE_REPOSITORY}.git"
+          git add screenshots manifest.json || push_failed 'git add failed.'
+          git -c user.name='english-ci' -c user.email='english-ci@users.noreply.github.com' \
+            commit -q -m "Store screenshots from CI run ${GITHUB_RUN_ID}" || push_failed 'git commit failed.'
+          PUSHED_SHA="$(git rev-parse --short=8 HEAD)"
+
+          PUSH_LOG="$RUNNER_TEMP/store-shots-push.log"
+          git -c credential.helper= \
+              -c http.postBuffer=524288000 \
+              -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH" \
+              push --quiet origin "HEAD:refs/heads/$BRANCH" > "$PUSH_LOG" 2>&1
+          push_status=$?
+          if [[ "$push_status" -ne 0 ]]; then
+            echo '--- git push output (token masked) ---'
+            sed "s#${AUTH}#***#g" "$PUSH_LOG" | tail -n 8
+            if grep -qiE '403|denied|permission|not permitted|forbidden' "$PUSH_LOG"; then
+              push_failed "git push to ${PRIVATE_SOURCE_REPOSITORY} was refused (exit $push_status). TARGET_REPO_PAT has no write access: give it Contents: Read and write on ${PRIVATE_SOURCE_REPOSITORY} (the other modes only need read)."
+            elif grep -qiE '404|not found|repository .* not' "$PUSH_LOG"; then
+              push_failed "git push could not find ${PRIVATE_SOURCE_REPOSITORY} (exit $push_status). TARGET_REPO_PAT cannot see that repository."
+            else
+              push_failed "git push to ${PRIVATE_SOURCE_REPOSITORY} failed (exit $push_status); see the output above."
+            fi
+          fi
+          rm -f "$PUSH_LOG"
+
+          echo "SHOTS_PUSH_STATUS=0" >> "$GITHUB_ENV"
+          echo "Pushed branch $BRANCH to ${PRIVATE_SOURCE_REPOSITORY} ($PUSHED_SHA): $COUNT PNG files + manifest.json"
+          {
+            cat "$SUMMARY"
+            echo "Pushed to branch \`$BRANCH\` of the private repository (\`$PUSHED_SHA\`): $COUNT PNG files and manifest.json."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      # ---------------------------------------------------------------------
       # 7. Test summary (always) and gate (before any signing material exists)
       # ---------------------------------------------------------------------
       - name: Test results summary
@@ -1191,7 +1474,7 @@ jobs:
         run: |
           set -euo pipefail
           failed=0
-          for name in LEXCORE_STATUS UNIT_STATUS UI_STATUS; do
+          for name in LEXCORE_STATUS UNIT_STATUS UI_STATUS SHOTS_EN_STATUS SHOTS_ZH_STATUS SHOTS_CHECK_STATUS SHOTS_PUSH_STATUS; do
             value="${!name:-}"
             if [[ -n "$value" && "$value" != '0' ]]; then
               echo "::error::$name=$value"
@@ -1678,6 +1961,7 @@ jobs:
             case "$MODE" in
               archive) echo '- Signed IPA: Apple validation passed if this job succeeded (the IPA is not uploaded anywhere; the runner is discarded).' ;;
               testflight) echo '- TestFlight: Apple validation and binary upload succeeded if this job succeeded.' ;;
+              screenshots) echo "- Screenshots: pushed to branch \`store-screenshots/run-${GITHUB_RUN_ID}\` of the private repository if this job succeeded (file names and counts are in the step log; nothing is uploaded as an artifact)." ;;
             esac
             if [[ -f "${CONTENT_STAGE:-/nonexistent}/report.md" ]]; then
               echo
@@ -1699,8 +1983,12 @@ jobs:
           set +e
 
           if [[ -n "${SIMULATOR_UDID:-}" ]]; then
+            xcrun simctl status_bar "$SIMULATOR_UDID" clear >/dev/null 2>&1 || true
             xcrun simctl shutdown "$SIMULATOR_UDID" >/dev/null 2>&1 || true
           fi
+          # Screenshot staging (private images): gone with the runner, removed here as well.
+          rm -rf "$RUNNER_TEMP/store-screenshots" "$RUNNER_TEMP/store-shots-repo" "$RUNNER_TEMP/store-shots-summary.md" \
+            "$RUNNER_TEMP/store-shots-push.log" "$RUNNER_TEMP/sim-probe.png" >/dev/null 2>&1 || true
 
           if [[ -n "${ORIGINAL_DEFAULT_KEYCHAIN:-}" ]]; then
             security default-keychain -d user -s "$ORIGINAL_DEFAULT_KEYCHAIN" >/dev/null 2>&1 || true
