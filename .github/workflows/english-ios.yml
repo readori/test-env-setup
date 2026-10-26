@@ -1385,7 +1385,7 @@ jobs:
               exit 65
             }
             # App Group must be authorized by the profile (assigned to the App ID in the portal).
-            python3 - "$found_plist" "$EXPECTED_APP_GROUP" "$bundle" >&2 <<'PY'
+            python3 - "$found_plist" "$EXPECTED_APP_GROUP" "$bundle" "$EXPECTED_BUNDLE_ID" >&2 <<'PY'
           import plistlib, sys
           ent = plistlib.load(open(sys.argv[1], "rb")).get("Entitlements", {})
           groups = ent.get("com.apple.security.application-groups", [])
@@ -1397,6 +1397,18 @@ jobs:
                     "signing_mode=refresh_english_profile.")
               sys.exit(65)
           print(f"App Group in profile for {sys.argv[3]}: PASS")
+          # iCloud sync (T-056): the app's profile must carry the CloudKit container and push.
+          if sys.argv[3] == sys.argv[4]:
+              containers = ent.get("com.apple.developer.icloud-container-identifiers", [])
+              if isinstance(containers, str):
+                  containers = [containers]
+              if "iCloud.com.readori.english" not in containers or "aps-environment" not in ent:
+                  print(f"::error::App Store profile for {sys.argv[3]} lacks the iCloud container "
+                        "iCloud.com.readori.english or Push Notifications. Enable iCloud (CloudKit, with that container) "
+                        "and Push Notifications on the App ID, then run certificates-repo.yml "
+                        "signing_mode=refresh_english_profile.")
+                  sys.exit(65)
+              print(f"iCloud container and push in profile for {sys.argv[3]}: PASS")
           PY
             printf '%s\n' "$found_name"
           }
