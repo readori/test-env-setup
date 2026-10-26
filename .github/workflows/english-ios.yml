@@ -14,7 +14,9 @@
 #   - signing material (keychain, ASC key, Match) is created only in signed modes, after every
 #     private-source build/test/pipeline step has run.
 #   - actions/cache holds ONLY content generated from the public word-atlas dataset (CC BY 4.0)
-#     and its AAC transcode; never private source, build products, or signing material.
+#     and its AAC transcode; never private source, build products, or signing material. (Exception since T-016 / T-045: the cached
+#     content.sqlite and media-core.sqlite also hold the 70 extra Basic words' own text, pictures and recordings, which we authored
+#     and ship in the app anyway; accepted by the main session 2026-10-26: the same files are in every shipped build.)
 #
 # Modes:
 #   verify       LexCore swift test; content pipeline --sample 300 (no transcode); xcodegen;
@@ -732,6 +734,32 @@ jobs:
         with:
           path: ${{ runner.temp }}/word-atlas-m4a
           key: ${{ steps.m4a_cache.outputs.cache-primary-key }}
+
+      # Recordings of the 70 extra Basic 850 words (tools/content-pipeline/extra-media/audio, committed as MP3 by the owner, T-045):
+      # transcode them into a separate directory (the ratio check of the script is per run) and merge into the AAC directory. This happens
+      # after the cache save above, so the cached directory only ever holds word-atlas audio; a change to extra-media/ invalidates the
+      # generated-content cache through hashFiles('source/tools/content-pipeline/**').
+      - name: Transcode extra-word recordings (AAC)
+        if: ${{ steps.content_cache.outputs.cache-hit != 'true' && env.CONTENT_MODE == 'full-m4a' }}
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          EXTRA_AUDIO="$SOURCE_ABS/tools/content-pipeline/extra-media/audio"
+          M4A_DIR="$RUNNER_TEMP/word-atlas-m4a"
+          if [[ ! -d "$EXTRA_AUDIO" || -z "$(find "$EXTRA_AUDIO" -type f -name '*.mp3' -print -quit)" ]]; then
+            echo 'No extra-word recordings committed; those words keep no audio in this build.'
+            exit 0
+          fi
+          EXTRA_AAC="$RUNNER_TEMP/extra-aac"
+          rm -rf "$EXTRA_AAC"
+          mkdir -p "$EXTRA_AAC"
+          bash "$SOURCE_ABS/tools/content-pipeline/convert-audio-macos.sh" "$EXTRA_AUDIO" "$EXTRA_AAC"
+          cp -R "$EXTRA_AAC"/. "$M4A_DIR"/
+          COUNT="$(find "$EXTRA_AAC" -type f -name '*.aac' | wc -l | tr -d ' ')"
+          (( COUNT > 0 )) || { echo '::error::Extra-word transcode produced no .aac files.'; exit 65; }
+          echo "Merged $COUNT extra-word recordings into the AAC directory"
+          rm -rf "$EXTRA_AAC"
 
       - name: Run content pipeline
         if: ${{ steps.content_cache.outputs.cache-hit != 'true' }}
