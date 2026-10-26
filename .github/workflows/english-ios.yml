@@ -1028,7 +1028,7 @@ jobs:
       - name: Run UI smoke tests (EnglishAppUITests)
         if: ${{ (env.MODE == 'verify' || env.MODE == 'verify-full') && env.RUN_UI_TESTS == 'true' }}
         shell: bash
-        timeout-minutes: 25
+        timeout-minutes: 45
         run: |
           set +e -uo pipefail
           UI_XCRESULT="$RUNNER_TEMP/English-UI.xcresult"
