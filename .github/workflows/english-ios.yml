@@ -1227,6 +1227,10 @@ jobs:
             if grep -q -- '--strict-readings' "$SOURCE_ABS/tools/content-pipeline/run-all.mjs"; then
               ARGS+=(--strict-readings)
             fi
+            # Full content also holds every public-domain book (T-086; the texts are in books/source/, sources before 1.1.0 have no books).
+            if grep -q -- '--strict-books' "$SOURCE_ABS/tools/content-pipeline/run-all.mjs"; then
+              ARGS+=(--strict-books)
+            fi
           fi
 
           START=$SECONDS
