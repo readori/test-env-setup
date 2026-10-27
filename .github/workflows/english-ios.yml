@@ -129,7 +129,7 @@ jobs:
     name: Build English iOS
     runs-on: macos-26
     # verify ~20 min; verify-full / archive on a cold content cache include the AAC transcode.
-    timeout-minutes: 150
+    timeout-minutes: 200
 
     env:
       MODE: ${{ inputs.mode || 'verify' }}
@@ -1560,7 +1560,8 @@ jobs:
       - name: Run UI smoke tests (EnglishAppUITests)
         if: ${{ (env.MODE == 'verify' || env.MODE == 'verify-full') && env.RUN_UI_TESTS == 'true' }}
         shell: bash
-        timeout-minutes: 45
+        # About 90 UI tests since v1.1 (reading, read-aloud, collection); a hung test is cut off after 3-5 minutes.
+        timeout-minutes: 80
         run: |
           set +e -uo pipefail
           UI_XCRESULT="$RUNNER_TEMP/English-UI.xcresult"
@@ -1578,7 +1579,10 @@ jobs:
             -only-testing:"$UI_TEST_TARGET" \
             -parallel-testing-enabled NO \
             -retry-tests-on-failure \
-            -test-iterations 2
+            -test-iterations 2 \
+            -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 180 \
+            -maximum-test-execution-time-allowance 300
           status=$?
           echo "UI_STATUS=$status" >> "$GITHUB_ENV"
           [[ "$status" -eq 0 ]] && echo 'UI smoke tests: PASS' || echo "::error title=UI smoke tests::$UI_TEST_TARGET failed (exit $status). Details in the Job Summary."
