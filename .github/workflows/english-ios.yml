@@ -358,6 +358,7 @@ jobs:
           lexcore()
           xcresult("EnglishAppTests (unit)", "UNIT_XCRESULT", "UNIT_STATUS")
           xcresult("EnglishAppUITests (smoke)", "UI_XCRESULT", "UI_STATUS")
+          xcresult("IPadSmokeTests (iPad)", "IPAD_XCRESULT", "IPAD_STATUS")
           xcresult("StoreScreenshotTests (en)", "SHOTS_EN_XCRESULT", "SHOTS_EN_STATUS")
           xcresult("StoreScreenshotTests (zh-Hans)", "SHOTS_ZH_XCRESULT", "SHOTS_ZH_STATUS")
 
@@ -1592,6 +1593,71 @@ jobs:
           [[ "$status" -eq 0 ]] && echo 'UI smoke tests: PASS' || echo "::error title=UI smoke tests::$UI_TEST_TARGET failed (exit $status). Details in the Job Summary."
           exit 0
 
+      - name: Run iPad smoke tests (IPadSmokeTests, 13-inch iPad Simulator)
+        if: ${{ (env.MODE == 'verify' || env.MODE == 'verify-full') && env.RUN_UI_TESTS == 'true' }}
+        shell: bash
+        # T-090: a few UI tests on an iPad (launch, rotation, session, word card, reading, settings, share sheet).
+        # The same simulator build runs here; every other UI test class skips itself or is not selected.
+        timeout-minutes: 40
+        run: |
+          set +e -uo pipefail
+          IPAD_XCRESULT="$RUNNER_TEMP/English-iPad.xcresult"
+          rm -rf "$IPAD_XCRESULT"
+          echo "IPAD_XCRESULT=$IPAD_XCRESULT" >> "$GITHUB_ENV"
+
+          # Newest iOS runtime >= 17; prefer a 13-inch iPad Pro, then any 13-inch iPad, then any iPad.
+          IPAD_UDID="$(xcrun simctl list devices available -j | /usr/bin/python3 -c '
+          import json, re, sys
+          payload = json.load(sys.stdin)
+          best = None
+          for runtime, devices in payload.get("devices", {}).items():
+              m = re.search(r"SimRuntime\.iOS-(\d+)-(\d+)", runtime)
+              if not m or int(m.group(1)) < 17:
+                  continue
+              ver = (int(m.group(1)), int(m.group(2)))
+              for d in devices:
+                  name = d.get("name", "")
+                  if not (d.get("isAvailable") and name.startswith("iPad")):
+                      continue
+                  pref = 2 if ("Pro" in name and "13-inch" in name) else (1 if "13-inch" in name else 0)
+                  key = (ver, pref)
+                  if best is None or key > best[0]:
+                      best = (key, d["udid"], name, "%d.%d" % ver)
+          print("" if best is None else "%s %s|%s" % (best[1], best[3], best[2]))
+          ')"
+          if [[ -z "$IPAD_UDID" ]]; then
+            echo '::error title=iPad smoke tests::No available iPad Simulator with iOS 17 or later was found.'
+            echo "IPAD_STATUS=69" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          IPAD_DESC="${IPAD_UDID#* }"
+          IPAD_UDID="${IPAD_UDID%% *}"
+          echo "iPad simulator: iOS ${IPAD_DESC%%|*} · ${IPAD_DESC#*|} ($IPAD_UDID)"
+          echo "IPAD_UDID=$IPAD_UDID" >> "$GITHUB_ENV"
+
+          # Free the iPhone simulator's memory first; the iPad gets the runner to itself.
+          xcrun simctl shutdown "$SIMULATOR_UDID" >/dev/null 2>&1 || true
+          xcrun simctl boot "$IPAD_UDID" >/dev/null 2>&1 || true
+          xcrun simctl bootstatus "$IPAD_UDID" -b >/dev/null
+
+          xcodebuild test-without-building \
+            -quiet \
+            -xctestrun "$XCTESTRUN" \
+            -destination "platform=iOS Simulator,id=$IPAD_UDID" \
+            -resultBundlePath "$IPAD_XCRESULT" \
+            -only-testing:"$UI_TEST_TARGET/IPadSmokeTests" \
+            -parallel-testing-enabled NO \
+            -retry-tests-on-failure \
+            -test-iterations 2 \
+            -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 300 \
+            -maximum-test-execution-time-allowance 900
+          status=$?
+          echo "IPAD_STATUS=$status" >> "$GITHUB_ENV"
+          xcrun simctl shutdown "$IPAD_UDID" >/dev/null 2>&1 || true
+          [[ "$status" -eq 0 ]] && echo 'iPad smoke tests: PASS' || echo "::error title=iPad smoke tests::IPadSmokeTests failed (exit $status). Details in the Job Summary."
+          exit 0
+
       - name: verify-full — Release device build (unsigned) and size report
         if: ${{ env.MODE == 'verify-full' }}
         shell: bash
@@ -1859,7 +1925,7 @@ jobs:
         run: |
           set -euo pipefail
           failed=0
-          for name in LEXCORE_STATUS UNIT_STATUS UI_STATUS SHOTS_EN_STATUS SHOTS_ZH_STATUS SHOTS_CHECK_STATUS SHOTS_PUSH_STATUS; do
+          for name in LEXCORE_STATUS UNIT_STATUS UI_STATUS IPAD_STATUS SHOTS_EN_STATUS SHOTS_ZH_STATUS SHOTS_CHECK_STATUS SHOTS_PUSH_STATUS; do
             value="${!name:-}"
             if [[ -n "$value" && "$value" != '0' ]]; then
               echo "::error::$name=$value"
