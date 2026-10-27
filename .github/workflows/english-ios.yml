@@ -24,8 +24,11 @@
 #   verify-full  verify + full content with AAC transcode + unsigned Release device build,
 #                app / IPA size report in the Job Summary (warning above 200 MB).
 #   archive      LexCore swift test, full content, Match readonly, signed archive + export,
-#                altool validate. The IPA is discarded with the runner.
-#   testflight   archive + build-number preflight + altool upload to TestFlight.
+#                final-IPA entitlement assertions (T-066: aps-environment production, iCloud container + CloudKit, App Group,
+#                get-task-allow absent or false; app and widgets extension), altool validate, dSYM zip pushed to the orphan
+#                branch dsyms/<version>-<build> of the PRIVATE repo readori/english (best effort; a failed push is a warning
+#                only). The IPA is discarded with the runner.
+#   testflight   archive + build-number preflight + altool upload to TestFlight (no upload if an assertion fails).
 #   screenshots  (T-060) App Store screenshots: full content (as verify-full), a 6.9" simulator (1320x2868 or the job
 #                fails), status bar 9:41 / full signal / full battery, then StoreScreenshotTests twice (-testLanguage en
 #                -testRegion US, then zh-Hans / CN). The PNGs go to an orphan branch store-screenshots/run-<run_id> of the
@@ -33,6 +36,8 @@
 #                with TARGET_REPO_PAT, which therefore needs Contents: write on readori/english in this mode only.
 #                Nothing is uploaded as an artifact; the public log carries file names, sizes and counts, never an image.
 #                No LexCore tests, no signing.
+# (archive / testflight now also write to readori/english: the dSYM branch needs the same Contents: write on TARGET_REPO_PAT
+#  as screenshots mode. Without write access the dSYM push only warns; nothing else in those modes needs it.)
 # Every mode also builds the 5 focus soundscapes and transcodes them to AAC (m4a, ~9 MB in total) into
 # App/Resources/Generated/Soundscapes; they are not cached (see step 4b). Source: the ElevenLabs clips committed in
 # tools/sfx-gen/eleven/clips (assembled into 3:00 loops, T-048); without them the synthesised loops of tools/sfx-gen are used.
@@ -44,7 +49,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'verify = sample content + simulator tests (no signing, ~20 min); verify-full = full content + audio transcode + size report; archive = signed IPA + altool validate (IPA is not kept); testflight = archive + upload to TestFlight; screenshots = App Store screenshots on a 6.9-inch simulator, pushed to a private branch (needs a write-enabled TARGET_REPO_PAT)'
+        description: 'verify = sample content + simulator tests (no signing, ~20 min); verify-full = full content + audio transcode + size report; archive = signed IPA + final entitlement assertions + altool validate + dSYMs pushed to a private branch (IPA is not kept); testflight = archive + upload to TestFlight; screenshots = App Store screenshots on a 6.9-inch simulator, pushed to a private branch (needs a write-enabled TARGET_REPO_PAT)'
         required: true
         default: 'verify'
         type: choice
@@ -86,6 +91,7 @@ env:
   EXPECTED_BUNDLE_ID: com.readori.english
   EXPECTED_WIDGETS_BUNDLE_ID: com.readori.english.widgets
   EXPECTED_APP_GROUP: group.com.readori.english
+  EXPECTED_ICLOUD_CONTAINER: iCloud.com.readori.english
   EXPECTED_MIN_IOS: '17.0'
   XCODE_MAJOR_WANTED: '26'
   XCODE_MIN_VERSION: '26.4'
@@ -497,6 +503,93 @@ jobs:
           SH
           chmod +x "$HELPERS/check_bundle.sh"
           bash -n "$HELPERS/check_bundle.sh"
+
+          # ---- check_entitlements.sh <extracted-ipa-dir>: FINAL signed entitlements of the exported IPA (T-066) ----
+          # Reads the entitlements with codesign (what the device and App Store really see), never the profile or any
+          # certificate. Prints key names with expected / actual values only. Exit 65 if any assertion fails.
+          #   app      aps-environment == production; iCloud container list has $EXPECTED_ICLOUD_CONTAINER;
+          #            icloud-services has CloudKit; App Group list has $EXPECTED_APP_GROUP; get-task-allow absent or false.
+          #   widgets  App Group list has $EXPECTED_APP_GROUP; get-task-allow absent or false.
+          cat > "$HELPERS/check_entitlements.sh" <<'SH'
+          #!/bin/bash
+          set -uo pipefail
+          ROOT="$1"
+          fails=0
+          fatal() { echo "::error title=IPA entitlements::$1"; fails=1; }
+
+          APP="$(find "$ROOT/Payload" -maxdepth 1 -type d -name '*.app' -print -quit 2>/dev/null || true)"
+          [[ -n "$APP" ]] || { echo '::error title=IPA entitlements::Exported IPA has no .app payload.'; exit 65; }
+
+          WORK="$(mktemp -d)"
+          trap 'rm -rf "$WORK"' EXIT
+
+          APPEX=''
+          shopt -s nullglob
+          for ext in "$APP"/PlugIns/*.appex; do
+            id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$ext/Info.plist" 2>/dev/null || true)"
+            [[ "$id" == "$EXPECTED_WIDGETS_BUNDLE_ID" ]] && APPEX="$ext"
+          done
+          shopt -u nullglob
+          [[ -n "$APPEX" ]] || fatal "Widgets extension $EXPECTED_WIDGETS_BUNDLE_ID is not in the exported IPA's PlugIns/."
+
+          # check <bundle path> <label> <app|widgets>
+          check() {
+            local bin="$1" label="$2" kind="$3" out="$WORK/$3.plist"
+            # stderr (the Executable= line) is dropped; stdout is the entitlements plist only.
+            if ! codesign -d --entitlements :- "$bin" 2>/dev/null > "$out" || [[ ! -s "$out" ]]; then
+              fatal "$label: codesign could not read the signed entitlements."
+              return
+            fi
+            python3 -I - "$out" "$label" "$kind" "$EXPECTED_APP_GROUP" "$EXPECTED_ICLOUD_CONTAINER" <<'PY' || fails=1
+          import plistlib, sys
+          path, label, kind, group, container = sys.argv[1:6]
+          try:
+              with open(path, "rb") as fh:
+                  ent = plistlib.loads(fh.read())
+          except Exception:
+              print(f"::error title=IPA entitlements::{label}: the signed entitlements are not a readable plist.")
+              sys.exit(1)
+
+          MISSING = "<absent>"
+          bad = 0
+
+          def as_list(v):
+              if isinstance(v, str):
+                  return [v]
+              return [str(x) for x in v] if isinstance(v, (list, tuple)) else []
+
+          def show(v):
+              return MISSING if v is None else (", ".join(as_list(v)) if isinstance(v, (list, tuple)) else str(v))
+
+          def check(key, ok, expected):
+              global bad
+              actual = show(ent.get(key))
+              print(f"{label}: {key}: {'PASS' if ok else 'FAIL'} (expected {expected}; actual {actual})")
+              if not ok:
+                  bad = 1
+                  print(f"::error title=IPA entitlements::{label}: {key} expected {expected}, actual {actual}")
+
+          if kind == "app":
+              check("aps-environment", ent.get("aps-environment") == "production", "production")
+              check("com.apple.developer.icloud-container-identifiers",
+                    container in as_list(ent.get("com.apple.developer.icloud-container-identifiers")), f"contains {container}")
+              check("com.apple.developer.icloud-services",
+                    "CloudKit" in as_list(ent.get("com.apple.developer.icloud-services")), "contains CloudKit")
+          check("com.apple.security.application-groups",
+                group in as_list(ent.get("com.apple.security.application-groups")), f"contains {group}")
+          check("get-task-allow", ent.get("get-task-allow") in (None, False), "false or absent")
+          sys.exit(bad)
+          PY
+          }
+
+          check "$APP" "App ($(basename "$APP"))" app
+          [[ -z "$APPEX" ]] || check "$APPEX" "Widgets ($(basename "$APPEX"))" widgets
+
+          (( fails == 0 )) || { echo '::error title=IPA entitlements::Final signed entitlement assertions FAILED (see the lines above).'; exit 65; }
+          echo 'Final IPA entitlement assertions: PASS'
+          SH
+          chmod +x "$HELPERS/check_entitlements.sh"
+          bash -n "$HELPERS/check_entitlements.sh"
 
           python3 -m py_compile "$HELPERS/test_summary.py" "$HELPERS/size_report.py"
           echo 'CI helpers written.'
@@ -1805,7 +1898,8 @@ jobs:
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
             CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM="$ASC_TEAM_ID" \
-            CODE_SIGN_IDENTITY='Apple Distribution'
+            CODE_SIGN_IDENTITY='Apple Distribution' \
+            DEBUG_INFORMATION_FORMAT=dwarf-with-dsym
 
           ARCHIVED_APP="$(find "$ARCHIVE_PATH/Products/Applications" -maxdepth 1 -type d -name '*.app' -print -quit 2>/dev/null || true)"
           [[ -n "$ARCHIVED_APP" && -d "$ARCHIVED_APP" ]] || { echo '::error::Signed xcarchive was not produced.'; exit 65; }
@@ -1857,6 +1951,9 @@ jobs:
           test -f "$SIGNED_APP/embedded.mobileprovision" || { echo '::error::Signed IPA is missing embedded.mobileprovision.'; exit 65; }
           codesign --verify --deep --strict "$SIGNED_APP"
           bash "$CI_HELPERS/check_bundle.sh" "$SIGNED_APP" strict signed
+          # T-066: final signed entitlements of the exported IPA (app + widgets). set -e: a failure stops this step,
+          # so SIGNED_IPA is never written and neither altool validate nor the TestFlight upload runs.
+          bash "$CI_HELPERS/check_entitlements.sh" "$VERIFY_DIR"
 
           MIN_OS="$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$SIGNED_APP/Info.plist" 2>/dev/null || true)"
           if [[ "$MIN_OS" != "$EXPECTED_MIN_IOS" ]]; then
@@ -1904,6 +2001,80 @@ jobs:
             echo "::error title=altool validate failed::${MSG:-altool exited with status $altool_status}"
             exit 1
           fi
+
+      # T-066: keep the debug symbols. The .xcarchive/dSYMs folder is zipped and pushed to an orphan branch
+      # dsyms/<marketing-version>-<build> of the PRIVATE repository (same token and push style as the screenshots
+      # step). Best effort: any failure is a warning and the step still succeeds. Nothing is uploaded as an artifact;
+      # the public log shows the branch name, dSYM bundle names, counts and the zip size only.
+      - name: Push dSYMs to a private branch (best effort)
+        if: ${{ env.MODE == 'archive' || env.MODE == 'testflight' }}
+        shell: bash
+        timeout-minutes: 15
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          set +e -uo pipefail
+
+          warn() { echo "::warning title=dSYM push::$1 The dSYMs were NOT saved (the archive result is unaffected)."; exit 0; }
+
+          ARCHIVE_PATH="$RUNNER_TEMP/English.xcarchive"
+          DSYM_DIR="$ARCHIVE_PATH/dSYMs"
+          [[ -d "$DSYM_DIR" ]] || warn 'The archive has no dSYMs folder.'
+          COUNT="$(find "$DSYM_DIR" -maxdepth 1 -type d -name '*.dSYM' | wc -l | tr -d ' ')"
+          [[ "$COUNT" -gt 0 ]] || warn 'The archive dSYMs folder contains no .dSYM bundles.'
+
+          [[ "${APP_VERSION:-}" =~ ^[0-9]+(\.[0-9]+){1,2}$ && "${BUILD_NUMBER:-}" =~ ^[1-9][0-9]*$ ]] || warn 'Version or build number is not set, so no branch name can be built.'
+          BRANCH="dsyms/${APP_VERSION}-${BUILD_NUMBER}"
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || warn 'The TARGET_REPO_PAT secret is empty.'
+
+          STAGE="$RUNNER_TEMP/dsym-repo"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          ZIP="$STAGE/dSYMs-${APP_VERSION}-${BUILD_NUMBER}.zip"
+          ( cd "$ARCHIVE_PATH" && zip -qry -X "$ZIP" dSYMs ) || warn 'Zipping the dSYMs failed.'
+          ZIP_BYTES="$(stat -f%z "$ZIP" 2>/dev/null || echo 0)"
+          [[ "$ZIP_BYTES" -gt 0 ]] || warn 'The dSYM zip is empty.'
+          # GitHub rejects files above 100 MB.
+          [[ "$ZIP_BYTES" -lt 95000000 ]] || warn "The dSYM zip is $ZIP_BYTES bytes, above the 95 MB push limit."
+
+          echo "dSYM bundles: $COUNT"
+          find "$DSYM_DIR" -maxdepth 1 -type d -name '*.dSYM' -exec basename {} \; | sort
+          echo "dSYM zip: $(basename "$ZIP") ($ZIP_BYTES bytes)"
+          printf '{\n  "version": "%s",\n  "build": "%s",\n  "run_id": "%s",\n  "source_commit": "%s",\n  "dsym_bundles": %s,\n  "zip_bytes": %s,\n  "zip_sha256": "%s"\n}\n' \
+            "$APP_VERSION" "$BUILD_NUMBER" "$GITHUB_RUN_ID" "${SOURCE_COMMIT:-}" "$COUNT" "$ZIP_BYTES" "$(shasum -a 256 "$ZIP" | awk '{print $1}')" > "$STAGE/manifest.json"
+
+          AUTH="$(printf 'x-access-token:%s' "$TARGET_REPO_PAT" | base64 | tr -d '\n')"
+          echo "::add-mask::$AUTH"
+
+          cd "$STAGE" || warn 'The staging folder is missing.'
+          export GIT_TERMINAL_PROMPT=0
+          git init -q -b "$BRANCH" || warn 'git init failed.'
+          git remote add origin "https://github.com/${PRIVATE_SOURCE_REPOSITORY}.git"
+          git add "$(basename "$ZIP")" manifest.json || warn 'git add failed.'
+          git -c user.name='english-ci' -c user.email='english-ci@users.noreply.github.com' \
+            commit -q -m "dSYMs ${APP_VERSION} (${BUILD_NUMBER}) from CI run ${GITHUB_RUN_ID}" || warn 'git commit failed.'
+
+          # --force: re-running the same build number (e.g. after a failed upload) replaces the earlier branch.
+          PUSH_LOG="$RUNNER_TEMP/dsym-push.log"
+          git -c credential.helper= \
+              -c http.postBuffer=524288000 \
+              -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH" \
+              push --quiet --force origin "HEAD:refs/heads/$BRANCH" > "$PUSH_LOG" 2>&1
+          push_status=$?
+          if [[ "$push_status" -ne 0 ]]; then
+            echo '--- git push output (token masked) ---'
+            sed "s#${AUTH}#***#g" "$PUSH_LOG" | tail -n 8
+            if grep -qiE '403|denied|permission|not permitted|forbidden' "$PUSH_LOG"; then
+              warn "git push to ${PRIVATE_SOURCE_REPOSITORY} was refused (exit $push_status). TARGET_REPO_PAT needs Contents: Read and write on ${PRIVATE_SOURCE_REPOSITORY} for this."
+            else
+              warn "git push to ${PRIVATE_SOURCE_REPOSITORY} failed (exit $push_status)."
+            fi
+          fi
+          rm -f "$PUSH_LOG"
+
+          echo "Pushed dSYMs to branch $BRANCH of ${PRIVATE_SOURCE_REPOSITORY}"
+          echo "- dSYMs: pushed to branch \`$BRANCH\` of the private repository ($COUNT bundles, $ZIP_BYTES bytes)." >> "$GITHUB_STEP_SUMMARY"
+          exit 0
 
       - name: Upload English to TestFlight (altool)
         if: ${{ env.MODE == 'testflight' }}
@@ -1959,8 +2130,8 @@ jobs:
               echo "- Simulator: ${SIMULATOR_DESC}"
             fi
             case "$MODE" in
-              archive) echo '- Signed IPA: Apple validation passed if this job succeeded (the IPA is not uploaded anywhere; the runner is discarded).' ;;
-              testflight) echo '- TestFlight: Apple validation and binary upload succeeded if this job succeeded.' ;;
+              archive) echo '- Signed IPA: final entitlement assertions and Apple validation passed if this job succeeded (the IPA is not uploaded anywhere; the runner is discarded). dSYMs: see the dSYM push step.' ;;
+              testflight) echo '- TestFlight: final entitlement assertions, Apple validation and binary upload succeeded if this job succeeded. dSYMs: see the dSYM push step.' ;;
               screenshots) echo "- Screenshots: pushed to branch \`store-screenshots/run-${GITHUB_RUN_ID}\` of the private repository if this job succeeded (file names and counts are in the step log; nothing is uploaded as an artifact)." ;;
             esac
             if [[ -f "${CONTENT_STAGE:-/nonexistent}/report.md" ]]; then
@@ -2009,4 +2180,5 @@ jobs:
           fi
 
           rm -rf "$RUNNER_TEMP/english-asc" "$RUNNER_TEMP/english-profile-scan" "$RUNNER_TEMP/English-Signed-Verify" \
-            "$RUNNER_TEMP/English.xcarchive" "$RUNNER_TEMP/English-AppStore-Export" >/dev/null 2>&1 || true
+            "$RUNNER_TEMP/English.xcarchive" "$RUNNER_TEMP/English-AppStore-Export" \
+            "$RUNNER_TEMP/dsym-repo" "$RUNNER_TEMP/dsym-push.log" >/dev/null 2>&1 || true
