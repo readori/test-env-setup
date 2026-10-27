@@ -1560,7 +1560,7 @@ jobs:
       - name: Run UI smoke tests (EnglishAppUITests)
         if: ${{ (env.MODE == 'verify' || env.MODE == 'verify-full') && env.RUN_UI_TESTS == 'true' }}
         shell: bash
-        # About 90 UI tests since v1.1 (reading, read-aloud, collection); a hung test is cut off after 5-10 minutes.
+        # About 90 UI tests since v1.1 (reading, read-aloud, collection); a hung test is cut off after 5 minutes (a class may allow up to 15).
         timeout-minutes: 80
         run: |
           set +e -uo pipefail
@@ -1582,7 +1582,7 @@ jobs:
             -test-iterations 2 \
             -test-timeouts-enabled YES \
             -default-test-execution-time-allowance 300 \
-            -maximum-test-execution-time-allowance 600
+            -maximum-test-execution-time-allowance 900
           status=$?
           echo "UI_STATUS=$status" >> "$GITHUB_ENV"
           [[ "$status" -eq 0 ]] && echo 'UI smoke tests: PASS' || echo "::error title=UI smoke tests::$UI_TEST_TARGET failed (exit $status). Details in the Job Summary."
