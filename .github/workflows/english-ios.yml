@@ -128,8 +128,8 @@ jobs:
   ios:
     name: Build English iOS
     runs-on: macos-26
-    # verify ~20 min; verify-full / archive on a cold content cache include the AAC transcode.
-    timeout-minutes: 200
+    # verify ~20 min plus UI tests (~90 min for 130+ tests); verify-full / archive on a cold content cache include the AAC transcode.
+    timeout-minutes: 300
 
     env:
       MODE: ${{ inputs.mode || 'verify' }}
@@ -1564,8 +1564,8 @@ jobs:
       - name: Run UI smoke tests (EnglishAppUITests)
         if: ${{ (env.MODE == 'verify' || env.MODE == 'verify-full') && env.RUN_UI_TESTS == 'true' }}
         shell: bash
-        # About 90 UI tests since v1.1 (reading, read-aloud, collection); a hung test is cut off after 5 minutes (a class may allow up to 15).
-        timeout-minutes: 80
+        # About 130 UI tests in 1.1.0 (~80 min on iPhone; iPad adds more); a hung test is cut off after 5 minutes (a class may allow up to 15).
+        timeout-minutes: 150
         run: |
           set +e -uo pipefail
           UI_XCRESULT="$RUNNER_TEMP/English-UI.xcresult"
