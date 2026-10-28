@@ -31,8 +31,11 @@
 #   testflight   archive + build-number preflight + altool upload to TestFlight (no upload if an assertion fails).
 #   screenshots  (T-060) App Store screenshots: full content (as verify-full), a 6.9" simulator (1320x2868 or the job
 #                fails), status bar 9:41 / full signal / full battery, then StoreScreenshotTests twice (-testLanguage en
-#                -testRegion US, then zh-Hans / CN). The PNGs go to an orphan branch store-screenshots/run-<run_id> of the
-#                PRIVATE repo readori/english (screenshots/<lang>/*.png + manifest.json with sizes and sha256), pushed
+#                -testRegion US, then zh-Hans / CN). T-104: after the iPhone passes the same two passes run on the newest 13-inch
+#                iPad Pro simulator (2064x2752 or 2048x2732; none found = status 69, never a silent skip), files in ipad/<lang>/.
+#                The PNGs go to an orphan branch store-screenshots/run-<run_id> of the
+#                PRIVATE repo readori/english (screenshots/<lang>/*.png for iPhone, screenshots/ipad/<lang>/*.png for iPad,
+#                + manifest.json with a device field, sizes and sha256), pushed
 #                with TARGET_REPO_PAT, which therefore needs Contents: write on readori/english in this mode only.
 #                Nothing is uploaded as an artifact; the public log carries file names, sizes and counts, never an image.
 #                No LexCore tests, no signing.
@@ -361,6 +364,8 @@ jobs:
           xcresult("IPadSmokeTests (iPad)", "IPAD_XCRESULT", "IPAD_STATUS")
           xcresult("StoreScreenshotTests (en)", "SHOTS_EN_XCRESULT", "SHOTS_EN_STATUS")
           xcresult("StoreScreenshotTests (zh-Hans)", "SHOTS_ZH_XCRESULT", "SHOTS_ZH_STATUS")
+          xcresult("StoreScreenshotTests (iPad, en)", "SHOTS_IPAD_EN_XCRESULT", "SHOTS_IPAD_EN_STATUS")
+          xcresult("StoreScreenshotTests (iPad, zh-Hans)", "SHOTS_IPAD_ZH_XCRESULT", "SHOTS_IPAD_ZH_STATUS")
 
           bft = status_of("BUILD_FOR_TESTING_STATUS")
           out = ["## Test results", ""]
@@ -1708,7 +1713,7 @@ jobs:
       - name: Take the App Store screenshots (en, then zh-Hans)
         if: ${{ env.MODE == 'screenshots' && env.RUN_UI_TESTS == 'true' }}
         shell: bash
-        timeout-minutes: 60
+        timeout-minutes: 120
         run: |
           set +e -uo pipefail
 
@@ -1719,28 +1724,32 @@ jobs:
 
           xcrun simctl bootstatus "$SIMULATOR_UDID" -b >/dev/null
 
-          # take <key EN|ZH> <language> <region>: one pass of StoreScreenshotTests. The test is skipped unless
-          # STORE_SCREENSHOT_DIR is set; xcodebuild hands TEST_RUNNER_* variables to the test runner without the prefix.
+          # take <key> <language> <region> <simulator udid> <device iphone|ipad>: one pass of StoreScreenshotTests.
+          # The test is skipped unless STORE_SCREENSHOT_DIR is set; xcodebuild hands TEST_RUNNER_* variables to the test
+          # runner without the prefix. Key EN / ZH = iPhone, IPAD_EN / IPAD_ZH = iPad (T-104: files go to ipad/<lang>/).
           take() {
-            local key="$1" lang="$2" region="$3"
-            local xcresult="$RUNNER_TEMP/English-Shots-$lang.xcresult"
+            local key="$1" lang="$2" region="$3" udid="$4" device="$5"
+            local label="$lang"
+            [[ "$device" == 'ipad' ]] && label="iPad $lang"
+            local xcresult="$RUNNER_TEMP/English-Shots-${device}-${lang}.xcresult"
             rm -rf "$xcresult"
             echo "SHOTS_${key}_XCRESULT=$xcresult" >> "$GITHUB_ENV"
 
             # 9:41, full signal, full battery (re-applied before each pass; an override lasts until the simulator reboots).
-            xcrun simctl status_bar "$SIMULATOR_UDID" override \
+            xcrun simctl status_bar "$udid" override \
               --time 9:41 \
               --dataNetwork wifi --wifiMode active --wifiBars 3 \
               --cellularMode active --cellularBars 4 \
               --batteryState charged --batteryLevel 100
 
-            echo "Screenshots: $lang ($region)"
+            echo "Screenshots: $label ($region)"
             TEST_RUNNER_STORE_SCREENSHOT_DIR="$SHOTS_ROOT" \
             TEST_RUNNER_STORE_SCREENSHOT_LANG="$lang" \
+            TEST_RUNNER_STORE_SCREENSHOT_DEVICE="$device" \
             xcodebuild test-without-building \
               -quiet \
               -xctestrun "$XCTESTRUN" \
-              -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
+              -destination "platform=iOS Simulator,id=$udid" \
               -resultBundlePath "$xcresult" \
               -only-testing:"$UI_TEST_TARGET/StoreScreenshotTests" \
               -parallel-testing-enabled NO \
@@ -1751,14 +1760,83 @@ jobs:
             local status=$?
             echo "SHOTS_${key}_STATUS=$status" >> "$GITHUB_ENV"
             if [[ "$status" -eq 0 ]]; then
-              echo "StoreScreenshotTests ($lang): PASS"
+              echo "StoreScreenshotTests ($label): PASS"
             else
-              echo "::error title=Screenshots ($lang)::StoreScreenshotTests failed (exit $status). Details in the Job Summary."
+              echo "::error title=Screenshots ($label)::StoreScreenshotTests failed (exit $status). Details in the Job Summary."
             fi
           }
 
-          take EN en US
-          take ZH zh-Hans CN
+          take EN en US "$SIMULATOR_UDID" iphone
+          take ZH zh-Hans CN "$SIMULATOR_UDID" iphone
+
+          # ---- T-104: the same two passes on a 13-inch iPad simulator (App Store Connect wants 13-inch iPad screenshots).
+          # Same pick as the iPad smoke step, but only 13-inch iPads qualify; none found is an error, not a silent skip.
+          ipad_fail() {
+            echo "::error title=iPad screenshots::$2"
+            echo "SHOTS_IPAD_EN_STATUS=$1" >> "$GITHUB_ENV"
+            echo "SHOTS_IPAD_ZH_STATUS=$1" >> "$GITHUB_ENV"
+            exit 0
+          }
+
+          IPAD_PICK="$(xcrun simctl list devices available -j | /usr/bin/python3 -c '
+          import json, re, sys
+          payload = json.load(sys.stdin)
+          best = None
+          for runtime, devices in payload.get("devices", {}).items():
+              m = re.search(r"SimRuntime\.iOS-(\d+)-(\d+)", runtime)
+              if not m or int(m.group(1)) < 17:
+                  continue
+              ver = (int(m.group(1)), int(m.group(2)))
+              for d in devices:
+                  name = d.get("name", "")
+                  if not (d.get("isAvailable") and name.startswith("iPad") and "13-inch" in name):
+                      continue
+                  pref = 1 if "Pro" in name else 0
+                  key = (ver, pref)
+                  if best is None or key > best[0]:
+                      best = (key, d["udid"], name, "%d.%d" % ver)
+          print("" if best is None else "%s %s|%s" % (best[1], best[3], best[2]))
+          ')"
+          if [[ -z "$IPAD_PICK" ]]; then
+            xcrun simctl list devices available | grep -E 'iPad' || true
+            ipad_fail 69 'No available 13-inch iPad Simulator with iOS 17 or later was found; the iPad screenshots need one.'
+          fi
+          IPAD_DESC="${IPAD_PICK#* }"
+          IPAD_UDID="${IPAD_PICK%% *}"
+          echo "IPAD_UDID=$IPAD_UDID" >> "$GITHUB_ENV"
+          echo "IPAD_SIMULATOR_DESC=iOS ${IPAD_DESC%%|*} · ${IPAD_DESC#*|}" >> "$GITHUB_ENV"
+          echo "iPad simulator: iOS ${IPAD_DESC%%|*} · ${IPAD_DESC#*|} ($IPAD_UDID)"
+
+          # Free the iPhone simulator's memory first; the iPad gets the runner to itself.
+          xcrun simctl shutdown "$SIMULATOR_UDID" >/dev/null 2>&1 || true
+          xcrun simctl boot "$IPAD_UDID" >/dev/null 2>&1 || true
+          xcrun simctl bootstatus "$IPAD_UDID" -b >/dev/null 2>&1 || ipad_fail 70 'The iPad simulator did not finish booting.'
+
+          # The real pixel size of the iPad screen from a probe screenshot (deleted straight away, never printed or kept).
+          # 13-inch iPad Pro (M4 and later) is 2064x2752, the 13-inch iPad Air is 2048x2732; both are accepted, either way round.
+          PROBE="$RUNNER_TEMP/sim-probe.png"
+          rm -f "$PROBE"
+          xcrun simctl io "$IPAD_UDID" screenshot --type=png "$PROBE" >/dev/null 2>&1 || ipad_fail 70 'Could not take a probe screenshot to check the iPad simulator resolution.'
+          IPAD_SIZE="$(python3 - "$PROBE" <<'PY'
+          import struct, sys
+          head = open(sys.argv[1], "rb").read(32)
+          if head[:8] != b"\x89PNG\r\n\x1a\n":
+              print("not-a-png")
+          else:
+              w, h = struct.unpack(">II", head[16:24])
+              print("%dx%d" % (min(w, h), max(w, h)))
+          PY
+          )"
+          rm -f "$PROBE"
+          echo "iPad simulator screen: $IPAD_SIZE"
+          if [[ "$IPAD_SIZE" != '2064x2752' && "$IPAD_SIZE" != '2048x2732' ]]; then
+            ipad_fail 70 "The iPad simulator screen is $IPAD_SIZE, but the App Store 13-inch iPad screenshots must be 2064x2752 or 2048x2732. Failing instead of taking wrong-sized screenshots."
+          fi
+
+          take IPAD_EN en US "$IPAD_UDID" ipad
+          take IPAD_ZH zh-Hans CN "$IPAD_UDID" ipad
+          xcrun simctl status_bar "$IPAD_UDID" clear >/dev/null 2>&1 || true
+          xcrun simctl shutdown "$IPAD_UDID" >/dev/null 2>&1 || true
           exit 0
 
       - name: Check the screenshots and push them to a private branch
@@ -1776,17 +1854,24 @@ jobs:
           rm -rf "$STAGE" "$SUMMARY"
           mkdir -p "$STAGE/screenshots"
 
-          # 1) Check: every language has the eight main screenshots (01..08), all 1320x2868 PNG files. The check copies the
-          #    files into the branch folder and writes manifest.json (sizes, pixel sizes, sha256). It prints file names,
-          #    sizes and counts only; it never reads or prints an image.
+          # 1) Check, per device and language. iPhone (<root>/<lang>/): the eight main screenshots 01..08, all 1320x2868.
+          #    iPad (<root>/ipad/<lang>/, T-104): at least the main screenshots 01..05, all 2064x2752 or 2048x2732 (13-inch).
+          #    The check copies the files into the branch folder (screenshots/<lang>/ and screenshots/ipad/<lang>/) and
+          #    writes manifest.json (device, sizes, pixel sizes, sha256). It prints file names, sizes and counts only; it never
+          #    reads or prints an image.
           python3 - "$SHOTS_ROOT" "$STAGE" "$SUMMARY" <<'PY'
           import hashlib, json, os, re, shutil, struct, sys
 
           root, stage, summary = sys.argv[1], sys.argv[2], sys.argv[3]
           LANGS = ["en", "zh-Hans"]
-          WANT = (1320, 2868)
-          NAME = re.compile(r"^(0[1-8])-[a-z0-9]+(-[a-z0-9]+)*\.png$")
-          errors, files, lines = [], [], []
+          # (device id, label, subfolder of root and of screenshots/ ("" = none), allowed pixel sizes, main screens required 01..N)
+          DEVICES = [
+              ("iphone", "iPhone", "", [(1320, 2868)], 8),
+              ("ipad", "iPad", "ipad", [(2064, 2752), (2048, 2732)], 5),
+          ]
+          # 01..08 are the store screens; 09 is the word card editor (T-091), kept for choosing, never required.
+          NAME = re.compile(r"^(0[1-9])-[a-z0-9]+(-[a-z0-9]+)*\.png$")
+          errors, files, lines, totals = [], [], [], []
 
           def png_size(path):
               with open(path, "rb") as fh:
@@ -1795,55 +1880,66 @@ jobs:
                   return None
               return struct.unpack(">II", head[16:24])
 
-          for lang in LANGS:
-              folder = os.path.join(root, lang)
-              names = sorted(n for n in os.listdir(folder) if n.endswith(".png")) if os.path.isdir(folder) else []
-              mains = set()
-              for name in names:
-                  m = NAME.match(name)
-                  path = os.path.join(folder, name)
-                  size = png_size(path)
-                  if not m:
-                      errors.append(f"{lang}/{name}: unexpected file name (expected <nn>-<name>.png with nn 01..08).")
-                      continue
-                  if size is None:
-                      errors.append(f"{lang}/{name}: not a PNG file.")
-                      continue
-                  if size != WANT:
-                      errors.append(f"{lang}/{name}: {size[0]}x{size[1]} pixels, expected {WANT[0]}x{WANT[1]}.")
-                      continue
-                  if not name.endswith("-alt.png"):
-                      mains.add(m.group(1))
-                  data = open(path, "rb").read()
-                  dest_dir = os.path.join(stage, "screenshots", lang)
-                  os.makedirs(dest_dir, exist_ok=True)
-                  shutil.copyfile(path, os.path.join(dest_dir, name))
-                  files.append({
-                      "path": f"screenshots/{lang}/{name}",
-                      "width": size[0], "height": size[1],
-                      "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
-                  })
-                  lines.append((lang, name, size, len(data)))
-              missing = [f"{n:02d}" for n in range(1, 9) if f"{n:02d}" not in mains]
-              if missing:
-                  errors.append(f"{lang}: main screenshot(s) {', '.join(missing)} missing or invalid.")
-              count = sum(1 for f in files if f["path"].startswith(f"screenshots/{lang}/"))
-              print(f"{lang}: {count} valid PNG files, {len(mains)} of 8 main screens")
+          for dev, label, sub, wants, need in DEVICES:
+              want_text = " or ".join("%dx%d" % w for w in wants)
+              for lang in LANGS:
+                  shown = (sub + "/" + lang) if sub else lang
+                  folder = os.path.join(root, sub, lang) if sub else os.path.join(root, lang)
+                  rel = "screenshots/" + shown
+                  names = sorted(n for n in os.listdir(folder) if n.endswith(".png")) if os.path.isdir(folder) else []
+                  mains, seen, count = set(), set(), 0
+                  for name in names:
+                      m = NAME.match(name)
+                      path = os.path.join(folder, name)
+                      size = png_size(path)
+                      if not m:
+                          errors.append(f"{label} {shown}/{name}: unexpected file name (expected <nn>-<name>.png with nn 01..09).")
+                          continue
+                      if size is None:
+                          errors.append(f"{label} {shown}/{name}: not a PNG file.")
+                          continue
+                      if size not in wants:
+                          errors.append(f"{label} {shown}/{name}: {size[0]}x{size[1]} pixels, expected {want_text}.")
+                          continue
+                      if not name.endswith("-alt.png"):
+                          mains.add(m.group(1))
+                      data = open(path, "rb").read()
+                      dest_dir = os.path.join(stage, *rel.split("/"))
+                      os.makedirs(dest_dir, exist_ok=True)
+                      shutil.copyfile(path, os.path.join(dest_dir, name))
+                      files.append({
+                          "device": dev, "language": lang,
+                          "path": f"{rel}/{name}",
+                          "width": size[0], "height": size[1],
+                          "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                      })
+                      lines.append((label, lang, name, size, len(data)))
+                      seen.add(size)
+                      count += 1
+                  missing = [f"{n:02d}" for n in range(1, need + 1) if f"{n:02d}" not in mains]
+                  if missing:
+                      errors.append(f"{label} {shown}: main screenshot(s) {', '.join(missing)} missing or invalid.")
+                  pixels = ", ".join("%dx%d" % s for s in sorted(seen)) or "-"
+                  totals.append((label, lang, f"{len(mains)} (need 01..{need:02d})", count, pixels))
+                  print(f"{label} {shown}: {count} valid PNG files, {len(mains)} main screens (need 01..{need:02d}), pixels {pixels}")
 
           manifest = {
               "run_id": os.environ.get("GITHUB_RUN_ID", ""),
               "source_commit": os.environ.get("SOURCE_COMMIT", ""),
               "simulator": os.environ.get("SIMULATOR_DESC", ""),
+              "ipad_simulator": os.environ.get("IPAD_SIMULATOR_DESC", ""),
               "files": files,
           }
           with open(os.path.join(stage, "manifest.json"), "w", encoding="utf-8") as fh:
               json.dump(manifest, fh, indent=2)
               fh.write("\n")
 
-          for lang, name, size, nbytes in lines:
-              print(f"  {lang}/{name}  {size[0]}x{size[1]}  {nbytes:,} bytes")
-          out = ["## Store screenshots", "", "| Language | File | Pixels | Size |", "|---|---|---|---:|"]
-          out += [f"| {l} | `{n}` | {s[0]}x{s[1]} | {b / 1_000_000:.2f} MB |" for l, n, s, b in lines]
+          for label, lang, name, size, nbytes in lines:
+              print(f"  {label} {lang}/{name}  {size[0]}x{size[1]}  {nbytes:,} bytes")
+          out = ["## Store screenshots", "", "| Device | Language | Main screens | PNG files | Pixels |", "|---|---|---|---:|---|"]
+          out += [f"| {d} | {l} | {mn} | {c} | {px} |" for d, l, mn, c, px in totals]
+          out += ["", "| Device | Language | File | Pixels | Size |", "|---|---|---|---|---:|"]
+          out += [f"| {d} | {l} | `{n}` | {s[0]}x{s[1]} | {b / 1_000_000:.2f} MB |" for d, l, n, s, b in lines]
           if errors:
               out += ["", "### Problems", ""] + [f"- {e}" for e in errors]
           with open(summary, "w", encoding="utf-8") as fh:
@@ -1925,7 +2021,7 @@ jobs:
         run: |
           set -euo pipefail
           failed=0
-          for name in LEXCORE_STATUS UNIT_STATUS UI_STATUS IPAD_STATUS SHOTS_EN_STATUS SHOTS_ZH_STATUS SHOTS_CHECK_STATUS SHOTS_PUSH_STATUS; do
+          for name in LEXCORE_STATUS UNIT_STATUS UI_STATUS IPAD_STATUS SHOTS_EN_STATUS SHOTS_ZH_STATUS SHOTS_IPAD_EN_STATUS SHOTS_IPAD_ZH_STATUS SHOTS_CHECK_STATUS SHOTS_PUSH_STATUS; do
             value="${!name:-}"
             if [[ -n "$value" && "$value" != '0' ]]; then
               echo "::error::$name=$value"
@@ -2490,7 +2586,7 @@ jobs:
             case "$MODE" in
               archive) echo '- Signed IPA: final entitlement assertions and Apple validation passed if this job succeeded (the IPA is not uploaded anywhere; the runner is discarded). dSYMs: see the dSYM push step.' ;;
               testflight) echo '- TestFlight: final entitlement assertions, Apple validation and binary upload succeeded if this job succeeded. dSYMs: see the dSYM push step.' ;;
-              screenshots) echo "- Screenshots: pushed to branch \`store-screenshots/run-${GITHUB_RUN_ID}\` of the private repository if this job succeeded (file names and counts are in the step log; nothing is uploaded as an artifact)." ;;
+              screenshots) echo "- Screenshots: iPhone and 13-inch iPad, pushed to branch \`store-screenshots/run-${GITHUB_RUN_ID}\` of the private repository if this job succeeded (file names and counts are in the step log; nothing is uploaded as an artifact)." ;;
             esac
             if [[ -f "${CONTENT_STAGE:-/nonexistent}/report.md" ]]; then
               echo
