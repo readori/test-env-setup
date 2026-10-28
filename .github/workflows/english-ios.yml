@@ -292,7 +292,7 @@ jobs:
           import glob, json, os, subprocess, sys
           import xml.etree.ElementTree as ET
 
-          rows, failures, notes = [], [], []
+          rows, failures, notes, skips = [], [], [], []
 
           def status_of(name):
               v = os.environ.get(name, "")
@@ -386,6 +386,9 @@ jobs:
                               collect(c)
                           failures.append((label, node.get("nodeIdentifier") or "/".join(here), msgs or ["(no failure message)"]))
                           found = True
+                      if kind == "Test Case" and node.get("result") == "Skipped":
+                          why = [clip(c.get("name", ""), 200) for c in node.get("children", []) or [] if c.get("name")]
+                          skips.append((label, node.get("nodeIdentifier") or "/".join(here), why[:1]))
                       for c in node.get("children", []) or []:
                           walk(c, here)
                   for n in tree.get("testNodes", []) or []:
@@ -423,6 +426,9 @@ jobs:
                       out.append(f"  - {md(m)}")
               if len(failures) > 60:
                   out.append(f"- … and {len(failures) - 60} more (see the step log).")
+          if skips:
+              out += ["", f"### Skipped tests ({len(skips)})", ""]
+              out += [f"- {md(suite)} `{md(ident)}`" + (f" — {md(why[0])}" if why else "") for suite, ident, why in skips[:80]]
           if notes:
               out += [""] + [f"> {md(n)}" for n in notes]
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
@@ -438,6 +444,12 @@ jobs:
                   for m in msgs:
                       print(f"    {m}")
               print("::endgroup::")
+          if skips:
+              print("::group::Skipped tests (identifiers, reasons)")
+              for suite, ident, why in skips:
+                  print(f"[{suite}] {ident}" + (f"  -- {why[0]}" if why else ""))
+              print("::endgroup::")
+          if failures:
               for suite, ident, msgs in failures[:15]:
                   print(f"::error title=Test failed ({esc(suite)})::{esc(ident)}%0A{esc(chr(10).join(msgs[:3]))}")
           for n in notes:
