@@ -30,15 +30,15 @@
 #                app / IPA size report in the Job Summary (warning above 200 MB).
 #   archive      LexCore swift test, full content, Match readonly, signed archive + export,
 #                final-IPA entitlement assertions (T-066: aps-environment production, iCloud container + CloudKit, App Group,
-#                get-task-allow absent or false; app and widgets extension), altool validate, dSYM zip pushed to the orphan
-#                branch dsyms/<version>-<build> of the PRIVATE repo readori/english (best effort; a failed push is a warning
-#                only). The IPA is discarded with the runner.
+#                get-task-allow absent or false; app and widgets extension), altool validate, dSYM zip appended as folder
+#                <version>-<build>/ to the branch archive/dsyms of the PRIVATE repo readori/english (best effort; a failed
+#                push is a warning only). The IPA is discarded with the runner.
 #   testflight   archive + build-number preflight + altool upload to TestFlight (no upload if an assertion fails).
 #   screenshots  (T-060) App Store screenshots: full content (as verify-full), a 6.9" simulator (1320x2868 or the job
 #                fails), status bar 9:41 / full signal / full battery, then StoreScreenshotTests twice (-testLanguage en
 #                -testRegion US, then zh-Hans / CN). T-104: after the iPhone passes the same two passes run on the newest 13-inch
 #                iPad Pro simulator (2064x2752 or 2048x2732; none found = status 69, never a silent skip), files in ipad/<lang>/.
-#                The PNGs go to an orphan branch store-screenshots/run-<run_id> of the
+#                The PNGs replace the previous set on the branch archive/store-screenshots (git history keeps older sets) of the
 #                PRIVATE repo readori/english (screenshots/<lang>/*.png for iPhone, screenshots/ipad/<lang>/*.png for iPad,
 #                + manifest.json with a device field, sizes and sha256), pushed
 #                with TARGET_REPO_PAT, which therefore needs Contents: write on readori/english in this mode only.
@@ -2003,7 +2003,7 @@ jobs:
         run: |
           set +e -uo pipefail
 
-          BRANCH="store-screenshots/run-${GITHUB_RUN_ID}"
+          BRANCH="archive/store-screenshots"
           STAGE="$RUNNER_TEMP/store-shots-repo"
           SUMMARY="$RUNNER_TEMP/store-shots-summary.md"
           rm -rf "$STAGE" "$SUMMARY"
@@ -2106,7 +2106,8 @@ jobs:
           check=$?
           echo "SHOTS_CHECK_STATUS=$check" >> "$GITHUB_ENV"
 
-          # 2) Push what is valid (even a partial set, for inspection) to an orphan branch of the PRIVATE repository.
+          # 2) Push what is valid (even a partial set, for inspection) to the archive branch of the PRIVATE repository. Each run
+          #    replaces the previous set in one new commit (the latest screenshots only; older sets stay in the branch history).
           push_failed() {
             echo "SHOTS_PUSH_STATUS=1" >> "$GITHUB_ENV"
             echo "::error title=Screenshot push::$1"
@@ -2124,18 +2125,22 @@ jobs:
 
           cd "$STAGE" || push_failed 'The staging folder is missing.'
           export GIT_TERMINAL_PROMPT=0
+          GITA=(git -c credential.helper= -c http.postBuffer=524288000 -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH")
           git init -q -b "$BRANCH" || push_failed 'git init failed.'
           git remote add origin "https://github.com/${PRIVATE_SOURCE_REPOSITORY}.git"
-          git add screenshots manifest.json || push_failed 'git add failed.'
+          # Build on the branch tip when the branch exists (index = its tree, working tree = the new set), else start it.
+          HEADS="$("${GITA[@]}" ls-remote --heads origin "refs/heads/$BRANCH" 2>/dev/null)" || push_failed "git ls-remote on ${PRIVATE_SOURCE_REPOSITORY} failed; TARGET_REPO_PAT cannot read it."
+          if [[ -n "$HEADS" ]]; then
+            "${GITA[@]}" fetch -q --depth 1 origin "refs/heads/$BRANCH" > /dev/null 2>&1 || push_failed "git fetch of $BRANCH failed."
+            git reset -q FETCH_HEAD || push_failed 'git reset to the branch tip failed.'
+          fi
+          git add -A . || push_failed 'git add failed.'
           git -c user.name='english-ci' -c user.email='english-ci@users.noreply.github.com' \
-            commit -q -m "Store screenshots from CI run ${GITHUB_RUN_ID}" || push_failed 'git commit failed.'
+            commit -q --allow-empty -m "Store screenshots from CI run ${GITHUB_RUN_ID}" || push_failed 'git commit failed.'
           PUSHED_SHA="$(git rev-parse --short=8 HEAD)"
 
           PUSH_LOG="$RUNNER_TEMP/store-shots-push.log"
-          git -c credential.helper= \
-              -c http.postBuffer=524288000 \
-              -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH" \
-              push --quiet origin "HEAD:refs/heads/$BRANCH" > "$PUSH_LOG" 2>&1
+          "${GITA[@]}" push --quiet origin "HEAD:refs/heads/$BRANCH" > "$PUSH_LOG" 2>&1
           push_status=$?
           if [[ "$push_status" -ne 0 ]]; then
             echo '--- git push output (token masked) ---'
@@ -2611,9 +2616,9 @@ jobs:
             exit 1
           fi
 
-      # T-066: keep the debug symbols. The .xcarchive/dSYMs folder is zipped and pushed to an orphan branch
-      # dsyms/<marketing-version>-<build> of the PRIVATE repository (same token and push style as the screenshots
-      # step). Best effort: any failure is a warning and the step still succeeds. Nothing is uploaded as an artifact;
+      # T-066: keep the debug symbols. The .xcarchive/dSYMs folder is zipped and appended as folder
+      # <marketing-version>-<build>/ (zip + manifest.json) to the branch archive/dsyms of the PRIVATE repository (same token
+      # and push style as the screenshots step; earlier builds stay in the branch, a re-run of a build replaces its folder). Best effort: any failure is a warning and the step still succeeds. Nothing is uploaded as an artifact;
       # the public log shows the branch name, dSYM bundle names, counts and the zip size only.
       - name: Push dSYMs to a private branch (best effort)
         if: ${{ env.MODE == 'archive' || env.MODE == 'testflight' }}
@@ -2633,13 +2638,14 @@ jobs:
           [[ "$COUNT" -gt 0 ]] || warn 'The archive dSYMs folder contains no .dSYM bundles.'
 
           [[ "${APP_VERSION:-}" =~ ^[0-9]+(\.[0-9]+){1,2}$ && "${BUILD_NUMBER:-}" =~ ^[1-9][0-9]*$ ]] || warn 'Version or build number is not set, so no branch name can be built.'
-          BRANCH="dsyms/${APP_VERSION}-${BUILD_NUMBER}"
+          BRANCH="archive/dsyms"
+          DIR="${APP_VERSION}-${BUILD_NUMBER}"
           [[ -n "${TARGET_REPO_PAT:-}" ]] || warn 'The TARGET_REPO_PAT secret is empty.'
 
           STAGE="$RUNNER_TEMP/dsym-repo"
           rm -rf "$STAGE"
-          mkdir -p "$STAGE"
-          ZIP="$STAGE/dSYMs-${APP_VERSION}-${BUILD_NUMBER}.zip"
+          mkdir -p "$STAGE/$DIR"
+          ZIP="$STAGE/$DIR/dSYMs-${APP_VERSION}-${BUILD_NUMBER}.zip"
           ( cd "$ARCHIVE_PATH" && zip -qry -X "$ZIP" dSYMs ) || warn 'Zipping the dSYMs failed.'
           ZIP_BYTES="$(stat -f%z "$ZIP" 2>/dev/null || echo 0)"
           [[ "$ZIP_BYTES" -gt 0 ]] || warn 'The dSYM zip is empty.'
@@ -2650,25 +2656,29 @@ jobs:
           find "$DSYM_DIR" -maxdepth 1 -type d -name '*.dSYM' -exec basename {} \; | sort
           echo "dSYM zip: $(basename "$ZIP") ($ZIP_BYTES bytes)"
           printf '{\n  "version": "%s",\n  "build": "%s",\n  "run_id": "%s",\n  "source_commit": "%s",\n  "dsym_bundles": %s,\n  "zip_bytes": %s,\n  "zip_sha256": "%s"\n}\n' \
-            "$APP_VERSION" "$BUILD_NUMBER" "$GITHUB_RUN_ID" "${SOURCE_COMMIT:-}" "$COUNT" "$ZIP_BYTES" "$(shasum -a 256 "$ZIP" | awk '{print $1}')" > "$STAGE/manifest.json"
+            "$APP_VERSION" "$BUILD_NUMBER" "$GITHUB_RUN_ID" "${SOURCE_COMMIT:-}" "$COUNT" "$ZIP_BYTES" "$(shasum -a 256 "$ZIP" | awk '{print $1}')" > "$STAGE/$DIR/manifest.json"
 
           AUTH="$(printf 'x-access-token:%s' "$TARGET_REPO_PAT" | base64 | tr -d '\n')"
           echo "::add-mask::$AUTH"
 
           cd "$STAGE" || warn 'The staging folder is missing.'
           export GIT_TERMINAL_PROMPT=0
+          GITA=(git -c credential.helper= -c http.postBuffer=524288000 -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH")
           git init -q -b "$BRANCH" || warn 'git init failed.'
           git remote add origin "https://github.com/${PRIVATE_SOURCE_REPOSITORY}.git"
-          git add "$(basename "$ZIP")" manifest.json || warn 'git add failed.'
+          # Build on the branch tip when the branch exists (index = its tree, so the other builds' folders are kept).
+          HEADS="$("${GITA[@]}" ls-remote --heads origin "refs/heads/$BRANCH" 2>/dev/null)" || warn "git ls-remote on ${PRIVATE_SOURCE_REPOSITORY} failed; TARGET_REPO_PAT cannot read it."
+          if [[ -n "$HEADS" ]]; then
+            "${GITA[@]}" fetch -q --depth 1 origin "refs/heads/$BRANCH" > /dev/null 2>&1 || warn "git fetch of $BRANCH failed."
+            git reset -q FETCH_HEAD || warn 'git reset to the branch tip failed.'
+          fi
+          git add -A "$DIR" || warn 'git add failed.'
           git -c user.name='english-ci' -c user.email='english-ci@users.noreply.github.com' \
             commit -q -m "dSYMs ${APP_VERSION} (${BUILD_NUMBER}) from CI run ${GITHUB_RUN_ID}" || warn 'git commit failed.'
 
-          # --force: re-running the same build number (e.g. after a failed upload) replaces the earlier branch.
+          # No --force: the commit builds on the branch tip, so the push is a fast-forward.
           PUSH_LOG="$RUNNER_TEMP/dsym-push.log"
-          git -c credential.helper= \
-              -c http.postBuffer=524288000 \
-              -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH" \
-              push --quiet --force origin "HEAD:refs/heads/$BRANCH" > "$PUSH_LOG" 2>&1
+          "${GITA[@]}" push --quiet origin "HEAD:refs/heads/$BRANCH" > "$PUSH_LOG" 2>&1
           push_status=$?
           if [[ "$push_status" -ne 0 ]]; then
             echo '--- git push output (token masked) ---'
@@ -2681,8 +2691,8 @@ jobs:
           fi
           rm -f "$PUSH_LOG"
 
-          echo "Pushed dSYMs to branch $BRANCH of ${PRIVATE_SOURCE_REPOSITORY}"
-          echo "- dSYMs: pushed to branch \`$BRANCH\` of the private repository ($COUNT bundles, $ZIP_BYTES bytes)." >> "$GITHUB_STEP_SUMMARY"
+          echo "Pushed dSYMs to $BRANCH:$DIR/ of ${PRIVATE_SOURCE_REPOSITORY}"
+          echo "- dSYMs: pushed to folder \`$DIR/\` of branch \`$BRANCH\` in the private repository ($COUNT bundles, $ZIP_BYTES bytes)." >> "$GITHUB_STEP_SUMMARY"
           exit 0
 
       - name: Upload English to TestFlight (altool)
@@ -2751,7 +2761,7 @@ jobs:
             case "$MODE" in
               archive) echo '- Signed IPA: final entitlement assertions and Apple validation passed if this job succeeded (the IPA is not uploaded anywhere; the runner is discarded). dSYMs: see the dSYM push step.' ;;
               testflight) echo '- TestFlight: final entitlement assertions, Apple validation and binary upload succeeded if this job succeeded. dSYMs: see the dSYM push step.' ;;
-              screenshots) echo "- Screenshots: iPhone and 13-inch iPad, pushed to branch \`store-screenshots/run-${GITHUB_RUN_ID}\` of the private repository if this job succeeded (file names and counts are in the step log; nothing is uploaded as an artifact)." ;;
+              screenshots) echo "- Screenshots: iPhone and 13-inch iPad, pushed to branch \`archive/store-screenshots\` of the private repository if this job succeeded (file names and counts are in the step log; nothing is uploaded as an artifact)." ;;
             esac
             if [[ -f "${CONTENT_STAGE:-/nonexistent}/report.md" ]]; then
               echo
