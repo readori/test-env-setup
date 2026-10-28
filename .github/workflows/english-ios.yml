@@ -2024,8 +2024,9 @@ jobs:
               ("iphone", "iPhone", "", [(1320, 2868)], 8),
               ("ipad", "iPad", "ipad", [(2064, 2752), (2048, 2732)], 5),
           ]
-          # 01..08 are the store screens; 09 is the word card editor (T-091), kept for choosing, never required.
-          NAME = re.compile(r"^(0[1-9])-[a-z0-9]+(-[a-z0-9]+)*\.png$")
+          # 01..08 are the store screens; 09 is the word card editor (T-091) and 10..19 the 1.1 screens (books, reading,
+          # Walkman), kept for choosing (the website uses them), never required.
+          NAME = re.compile(r"^(0[1-9]|1[0-9])-[a-z0-9]+(-[a-z0-9]+)*\.png$")
           errors, files, lines, totals = [], [], [], []
 
           def png_size(path):
@@ -2048,7 +2049,7 @@ jobs:
                       path = os.path.join(folder, name)
                       size = png_size(path)
                       if not m:
-                          errors.append(f"{label} {shown}/{name}: unexpected file name (expected <nn>-<name>.png with nn 01..09).")
+                          errors.append(f"{label} {shown}/{name}: unexpected file name (expected <nn>-<name>.png with nn 01..19).")
                           continue
                       if size is None:
                           errors.append(f"{label} {shown}/{name}: not a PNG file.")
