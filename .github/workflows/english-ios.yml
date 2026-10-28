@@ -17,6 +17,11 @@
 #     and its AAC transcode; never private source, build products, or signing material. (Exception since T-016 / T-045: the cached
 #     content.sqlite and media-core.sqlite also hold the 70 extra Basic words' own text, pictures and recordings, which we authored
 #     and ship in the app anyway; accepted by the main session 2026-10-26: the same files are in every shipped build.)
+#     (Exception since T-108: the AAC conversion of the LibriVox public-domain recordings of the 7 original books, keyed by the
+#     SHA-1 of sources.json: public data downloaded from archive.org, no private content in it.)
+#     (Exception since T-109: the AAC conversion of the Lingua Libre word recordings from Wikimedia Commons (CC0 / CC BY / CC BY-SA),
+#     keyed by the hashes of human-audio/manifest.json and its scripts: public data, no private content in it. The generated content
+#     cache of a build with human audio carries them too, under its own key suffix "-human".)
 #
 # Modes:
 #   verify       LexCore swift test; content pipeline --sample 300 (no transcode); xcodegen;
@@ -46,6 +51,24 @@
 #                Runs only: input validation, private checkout, Node, Xcode selection. No content, soundscapes, XcodeGen, build,
 #                tests, signing, screenshots or upload; no artifact. Secrets: TARGET_REPO_PAT, ASC_TEAM_ID,
 #                CLOUDKIT_MANAGEMENT_TOKEN. The log carries record type names and field counts, never the token, source or schema text.
+#   audiobook-check  (T-108) Only the audiobooks: downloads the 7 LibriVox recordings from archive.org, checks their SHA-1 and length,
+#                converts them to AAC m4a with afconvert, builds the manifest and checks every On-Demand Resources tag (< 512 MB), and
+#                fills the converted-audio cache that archive / testflight reuse. A separate job: no content, XcodeGen, build, tests,
+#                signing or upload. Secrets: TARGET_REPO_PAT only.
+#   Input `audiobooks` (default true; the owner approved the download on 2026-10-28, and it happens in CI only, never on a developer
+#                machine): archive, testflight and audiobook-check add the real-voice readings of the original books as Apple
+#                On-Demand Resources (App/Resources/BookAudio/<book id>/, one tag book-audio.<book id> per book, project.yml) plus
+#                Generated/book-audio.json. verify, verify-full, screenshots and cloudkit-schema NEVER download audio, whatever the
+#                input says; switched off, the build has no manifest and the app offers the system voice only.
+#   Input `human_word_audio` (T-109, default true; approved by the owner on 2026-10-28, CI only): archive, testflight and verify-full replace
+#                the synthetic uk / us word recordings of the words whose accent is known with Lingua Libre recordings from Wikimedia
+#                Commons (tools/content-pipeline/human-audio/: manifest.json, fetch-wavs.mjs, ci-human-audio.sh). About 2,300 files,
+#                about 210 MB of WAV downloaded from upload.wikimedia.org (sha1 + size checked, polite rate, User-Agent with contact),
+#                trimmed and levelled, converted with the ADTS settings of convert-audio-macos.sh, cached; build-packs.mjs overlays them
+#                on the word-atlas audio (same keys) and writes HUMAN-AUDIO-CREDITS.json (bundled in Generated/, shown in About).
+#                Recordings of unknown accent and speakers excluded in speaker-accents.json are never used. verify, screenshots,
+#                cloudkit-schema and audiobook-check NEVER download them, whatever the input says; switched off, the words keep the
+#                synthetic voices and the build has no credits file.
 # (archive / testflight now also write to readori/english: the dSYM branch needs the same Contents: write on TARGET_REPO_PAT
 #  as screenshots mode. Without write access the dSYM push only warns; nothing else in those modes needs it.)
 # Every mode except cloudkit-schema also builds the 5 focus soundscapes and transcodes them to AAC (m4a, ~9 MB in total) into
@@ -59,7 +82,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'verify = sample content + simulator tests (no signing, ~20 min); verify-full = full content + audio transcode + size report; archive = signed IPA + final entitlement assertions + altool validate + dSYMs pushed to a private branch (IPA is not kept); testflight = archive + upload to TestFlight; screenshots = App Store screenshots on a 6.9-inch simulator, pushed to a private branch (needs a write-enabled TARGET_REPO_PAT); cloudkit-schema = import tools/cloudkit/progress.ckdb into the CloudKit DEVELOPMENT environment with cktool (needs secret CLOUDKIT_MANAGEMENT_TOKEN; deploy to Production afterwards in the CloudKit Console; nothing is built)'
+        description: 'verify = sample content + simulator tests (no signing, ~20 min); verify-full = full content + audio transcode + size report; archive = signed IPA + final entitlement assertions + altool validate + dSYMs pushed to a private branch (IPA is not kept); testflight = archive + upload to TestFlight; screenshots = App Store screenshots on a 6.9-inch simulator, pushed to a private branch (needs a write-enabled TARGET_REPO_PAT); cloudkit-schema = import tools/cloudkit/progress.ckdb into the CloudKit DEVELOPMENT environment with cktool (needs secret CLOUDKIT_MANAGEMENT_TOKEN; deploy to Production afterwards in the CloudKit Console; nothing is built); audiobook-check = download, check and convert the LibriVox recordings of the original books only (fills the cache for archive / testflight; nothing is built)'
         required: true
         default: 'verify'
         type: choice
@@ -70,6 +93,7 @@ on:
           - testflight
           - screenshots
           - cloudkit-schema
+          - audiobook-check
       ref:
         description: 'Private readori/english branch, tag, or SHA'
         required: true
@@ -80,6 +104,16 @@ on:
         required: false
         default: ''
         type: string
+      audiobooks:
+        description: 'Real-voice readings of the original books (T-108; the owner approved the download on 2026-10-28): download the 7 LibriVox recordings from archive.org (about 1.1 GB, SHA-1 checked), convert them to AAC (about 580 MB) and add them as Apple On-Demand Resources, one tag per book. Used by archive, testflight and audiobook-check; verify, verify-full, screenshots and cloudkit-schema never download. Switch it off to build without the audio (the app then offers the system voice only).'
+        required: false
+        default: true
+        type: boolean
+      human_word_audio:
+        description: 'Real-voice word pronunciations (T-109; the owner approved the download on 2026-10-28): replace the synthetic UK / US recordings of about 2,300 words (accent known) with Lingua Libre recordings from Wikimedia Commons (about 210 MB of WAV downloaded, sha1 checked, converted to about 10 MB of AAC) and add HUMAN-AUDIO-CREDITS.json to the app. Used by archive, testflight and verify-full; verify, screenshots, cloudkit-schema and audiobook-check never download. Switch it off to keep the synthetic voices only.'
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -130,6 +164,7 @@ env:
 jobs:
   ios:
     name: Build English iOS
+    if: ${{ inputs.mode != 'audiobook-check' }}
     runs-on: macos-26
     # verify ~20 min plus UI tests (~90 min for 130+ tests); verify-full / archive on a cold content cache include the AAC transcode.
     timeout-minutes: 300
@@ -140,6 +175,10 @@ jobs:
       BUILD_NUMBER_INPUT: ${{ inputs.build_number || '' }}
       # verify uses the sample; every other mode needs the full catalog with AAC audio.
       CONTENT_MODE: ${{ (inputs.mode == 'verify' || inputs.mode == '') && 'sample300' || 'full-m4a' }}
+      # T-108: audio is downloaded only by the release-type modes (archive, testflight), and only when the input is on.
+      AUDIOBOOKS: ${{ inputs.audiobooks && (inputs.mode == 'archive' || inputs.mode == 'testflight') && 'true' || 'false' }}
+      # T-109: human word audio is downloaded only by archive, testflight and verify-full (they build the full content with AAC audio), and only when the input is on.
+      HUMAN_WORD_AUDIO: ${{ inputs.human_word_audio && (inputs.mode == 'archive' || inputs.mode == 'testflight' || inputs.mode == 'verify-full') && 'true' || 'false' }}
 
     steps:
       # ---------------------------------------------------------------------
@@ -455,10 +494,10 @@ jobs:
           out += [f"| `{rel}` | {mb(size)} |" for size, rel in files[:25]]
           if a.content_dir and os.path.isdir(a.content_dir):
               out += ["", "### Generated content (word-atlas pipeline)", "", "| File | Size | In app |", "|---|---:|---|"]
-              for n in ("content.sqlite", "media-core.sqlite", "ATTRIBUTION.md", "packs.json", "report.md"):
+              for n in ("content.sqlite", "media-core.sqlite", "ATTRIBUTION.md", "HUMAN-AUDIO-CREDITS.json", "packs.json", "report.md"):
                   p = os.path.join(a.content_dir, n)
                   if os.path.isfile(p):
-                      inapp = "yes" if n in ("content.sqlite", "media-core.sqlite", "ATTRIBUTION.md") else "no"
+                      inapp = "yes" if n in ("content.sqlite", "media-core.sqlite", "ATTRIBUTION.md", "HUMAN-AUDIO-CREDITS.json") else "no"
                       out.append(f"| `{n}` | {mb(os.path.getsize(p))} | {inapp} |")
               tsv = os.path.join(a.content_dir, "packs-sizes.tsv")
               if os.path.isfile(tsv):
@@ -509,6 +548,10 @@ jobs:
           for f in content.sqlite media-core.sqlite ATTRIBUTION.md; do
             [[ -n "$(find "$APP" -type f -name "$f" -print -quit)" ]] || problem "$f is not in the app bundle (project.yml must reference $GENERATED_RESOURCES_DIR)."
           done
+          # T-109: the credits of the real-voice word recordings must ship whenever the content holds any (CC BY-SA asks for the credit).
+          if [[ "${HUMAN_AUDIO_USED:-false}" == 'true' ]]; then
+            [[ -n "$(find "$APP" -type f -name HUMAN-AUDIO-CREDITS.json -print -quit)" ]] || problem "HUMAN-AUDIO-CREDITS.json is not in the app bundle although the content has human word recordings."
+          fi
           # The 5 focus soundscapes (AAC in m4a), generated by tools/sfx-gen in the "Generate soundscapes" step.
           for kind in campfire harbor stargazing rain stream; do
             [[ -n "$(find "$APP" -type f -name "ambient_${kind}.m4a" -print -quit)" ]] || problem "ambient_${kind}.m4a is not in the app bundle (the Generate soundscapes step installs it into $GENERATED_RESOURCES_DIR/Soundscapes)."
@@ -656,6 +699,7 @@ jobs:
             if [[ "$CONTENT_MODE" == 'full-m4a' ]]; then
               required+=(tools/content-pipeline/convert-audio-macos.sh)
             fi
+            # T-109: refs from before the human audio step simply build without it (the step warns and skips), so these are not required.
           fi
           for f in "${required[@]}"; do
             [[ -f "$SOURCE_ABS/$f" ]] || {
@@ -877,6 +921,7 @@ jobs:
           REQUIRED='CD_StudyCard,CD_StudyLog,CD_DailyStat,CD_Bookmark,CD_StreakState,CD_UserSettings'
           # v1.1 adds the practice records (ProgressSchemaV2); a 1.0 source does not have them.
           if grep -q 'CD_PracticeRecord' "$CKDB"; then REQUIRED+=',CD_PracticeRecord'; fi
+          if grep -q 'CD_Note' "$CKDB"; then REQUIRED+=',CD_Note'; fi
           CK_ARGS=(--team-id "$TEAM_ID" --container-id "$CONTAINER")
 
           WORK="$(mktemp -d "$RUNNER_TEMP/cloudkit-schema.XXXXXX")"
@@ -1101,7 +1146,8 @@ jobs:
 
       # ---------------------------------------------------------------------
       # 4. Content: word-atlas (pinned) -> tools/content-pipeline -> App/Resources/Generated
-      #    Cached by (word-atlas SHA + content-pipeline hash + content mode).
+      #    Cached by (word-atlas SHA + content-pipeline hash + content mode); a build with human word audio (T-109) adds the suffix -human
+      #    (the content then holds the Lingua Libre recordings, so it must never be mixed with a build without them).
       # ---------------------------------------------------------------------
       - name: Restore generated content cache
         id: content_cache
@@ -1109,7 +1155,7 @@ jobs:
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/english-content
-          key: english-content-${{ env.CONTENT_CACHE_VERSION }}-${{ env.CONTENT_MODE }}-${{ env.WORD_ATLAS_SHA }}-${{ hashFiles('source/tools/content-pipeline/**') }}
+          key: english-content-${{ env.CONTENT_CACHE_VERSION }}-${{ env.CONTENT_MODE }}${{ env.HUMAN_WORD_AUDIO == 'true' && '-human' || '' }}-${{ env.WORD_ATLAS_SHA }}-${{ hashFiles('source/tools/content-pipeline/**') }}
 
       - name: Fetch word-atlas (pinned commit; data/ and public/atlas/ only)
         if: ${{ env.MODE != 'cloudkit-schema' && steps.content_cache.outputs.cache-hit != 'true' }}
@@ -1212,6 +1258,39 @@ jobs:
           echo "Merged $COUNT extra-word recordings into the AAC directory"
           rm -rf "$EXTRA_AAC"
 
+      # Real-voice word recordings (T-109), archive / testflight / verify-full only (env HUMAN_WORD_AUDIO), and only when the generated
+      # content has to be rebuilt. Lingua Libre recordings from Wikimedia Commons: download (sha1 + size checked), trim + level, afconvert
+      # to ADTS AAC in $RUNNER_TEMP/human-aac/{uk,us}/<slug>.aac. They are kept apart from word-atlas-m4a (and from its cache): the content
+      # pipeline overlays them with --human-audio, the human recording winning per slot. The converted files are public data, cached by
+      # the hashes of the manifest, the speaker rules and the scripts, so unchanged inputs download nothing.
+      - name: Restore human word audio cache (AAC)
+        id: human_cache
+        if: ${{ env.MODE != 'cloudkit-schema' && steps.content_cache.outputs.cache-hit != 'true' && env.HUMAN_WORD_AUDIO == 'true' }}
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/human-aac
+          key: english-humanaudio-${{ env.CONTENT_CACHE_VERSION }}-${{ hashFiles('source/tools/content-pipeline/human-audio/manifest.json', 'source/tools/content-pipeline/human-audio/speaker-accents.json', 'source/tools/content-pipeline/human-audio/fetch-wavs.mjs', 'source/tools/content-pipeline/human-audio/wav.mjs', 'source/tools/content-pipeline/human-audio/overlay.mjs', 'source/tools/content-pipeline/human-audio/lib.mjs', 'source/tools/content-pipeline/convert-human-audio-macos.sh') }}
+
+      - name: Human word audio - download, prepare and convert (Lingua Libre)
+        if: ${{ env.MODE != 'cloudkit-schema' && steps.content_cache.outputs.cache-hit != 'true' && env.HUMAN_WORD_AUDIO == 'true' && steps.human_cache.outputs.cache-hit != 'true' }}
+        shell: bash
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          SCRIPT="$SOURCE_ABS/tools/content-pipeline/human-audio/ci-human-audio.sh"
+          if [[ ! -f "$SCRIPT" ]]; then
+            echo "::warning::This ref has no human word audio script: building with the synthetic word recordings only."
+            exit 0
+          fi
+          bash "$SCRIPT" "$SOURCE_ABS" "$RUNNER_TEMP/human-aac"
+
+      - name: Save human word audio cache (AAC)
+        if: ${{ env.MODE != 'cloudkit-schema' && steps.content_cache.outputs.cache-hit != 'true' && env.HUMAN_WORD_AUDIO == 'true' && steps.human_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/human-aac
+          key: ${{ steps.human_cache.outputs.cache-primary-key }}
+
       - name: Run content pipeline
         if: ${{ env.MODE != 'cloudkit-schema' && steps.content_cache.outputs.cache-hit != 'true' }}
         shell: bash
@@ -1237,6 +1316,15 @@ jobs:
             if grep -q -- '--strict-books' "$SOURCE_ABS/tools/content-pipeline/run-all.mjs"; then
               ARGS+=(--strict-books)
             fi
+            # Real-voice word recordings (T-109): present only when the human audio step ran (the input is on and this ref has the scripts).
+            HUMAN_AAC="$RUNNER_TEMP/human-aac"
+            if [[ "$HUMAN_WORD_AUDIO" == 'true' && -n "$(find "$HUMAN_AAC" -type f -name '*.aac' -print -quit 2>/dev/null)" ]]; then
+              if grep -q -- '--human-audio' "$SOURCE_ABS/tools/content-pipeline/run-all.mjs"; then
+                ARGS+=(--human-audio "$HUMAN_AAC")
+              else
+                echo '::warning::This ref cannot overlay human word audio; building with the synthetic recordings only.'
+              fi
+            fi
           fi
 
           START=$SECONDS
@@ -1248,6 +1336,18 @@ jobs:
             cp "$OUT_DIR/$f" "$STAGE/$f"
           done
           [[ -d "$OUT_DIR/packs" ]] || { echo '::error::Content pipeline did not produce packs/.'; exit 65; }
+          # T-109: with human word audio the pipeline also wrote the credits of the recordings it used; they are cached and bundled with the content.
+          if [[ -s "$OUT_DIR/HUMAN-AUDIO-CREDITS.json" ]]; then
+            cp "$OUT_DIR/HUMAN-AUDIO-CREDITS.json" "$STAGE/HUMAN-AUDIO-CREDITS.json"
+            python3 - "$OUT_DIR/packs.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys
+          h = json.load(open(sys.argv[1])).get("human_audio") or {}
+          print("### Human word audio in the content (T-109)\n")
+          print("| | UK | US |\n|---|---:|---:|")
+          print(f"| Recordings replaced | {h.get('uk', 0)} | {h.get('us', 0)} |\n")
+          print(f"{h.get('speakers', 0)} speakers credited in HUMAN-AUDIO-CREDITS.json.\n")
+          PY
+          fi
           # Pack files themselves are not cached or bundled (CDN upload is a later step); keep their sizes.
           python3 - "$OUT_DIR/packs" > "$STAGE/packs-sizes.tsv" <<'PY'
           import os, sys
@@ -1261,7 +1361,7 @@ jobs:
           ls -l "$STAGE"
 
           # Free disk for the Xcode build.
-          rm -rf "$ATLAS_DIR" "$OUT_DIR" "$RUNNER_TEMP/word-atlas-m4a"
+          rm -rf "$ATLAS_DIR" "$OUT_DIR" "$RUNNER_TEMP/word-atlas-m4a" "$RUNNER_TEMP/human-aac"
 
       - name: Save generated content cache
         if: ${{ env.MODE != 'cloudkit-schema' && steps.content_cache.outputs.cache-hit != 'true' }}
@@ -1287,6 +1387,13 @@ jobs:
           for f in content.sqlite media-core.sqlite ATTRIBUTION.md; do
             cp "$STAGE/$f" "$DEST/$f"
           done
+          # T-109: the credits of the real-voice word recordings travel with the content; present only when the content was built with them.
+          if [[ -s "$STAGE/HUMAN-AUDIO-CREDITS.json" ]]; then
+            cp "$STAGE/HUMAN-AUDIO-CREDITS.json" "$DEST/HUMAN-AUDIO-CREDITS.json"
+            echo 'HUMAN_AUDIO_USED=true' >> "$GITHUB_ENV"
+          elif [[ "$HUMAN_WORD_AUDIO" == 'true' ]]; then
+            echo '::warning::Human word audio was requested but the content has no HUMAN-AUDIO-CREDITS.json: this build uses the synthetic word recordings only.'
+          fi
           echo "CONTENT_STAGE=$STAGE" >> "$GITHUB_ENV"
           echo "Content ($CONTENT_MODE, cache hit: ${{ steps.content_cache.outputs.cache-hit == 'true' }}):"
           ls -l "$DEST"
@@ -1335,6 +1442,42 @@ jobs:
 
           # Free runner disk for the Xcode build (the WAV masters are ~80 MB).
           rm -rf "$WAV_DIR"
+
+      # ---------------------------------------------------------------------
+      # 4c. Real-voice readings of the original books (T-108), archive / testflight only (env AUDIOBOOKS)
+      #     tools/content-pipeline/books/audio/ci-audiobooks.sh: sources.json check, download from archive.org (SHA-1 and length
+      #     checked), afconvert to AAC m4a, manifest, per-tag size check (< 512 MB), then the files go to
+      #     App/Resources/BookAudio/<book id>/ (On-Demand Resources tags in project.yml) and the manifest to Generated/book-audio.json.
+      #     The converted files are public-domain audio keyed by the SHA-1 of sources.json: cached (see the header). Must run
+      #     before XcodeGen: project.yml adds the book folders that exist.
+      # ---------------------------------------------------------------------
+      - name: Restore converted audiobooks cache
+        id: bookaudio_cache
+        if: ${{ env.AUDIOBOOKS == 'true' }}
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/book-audio-m4a
+          key: english-bookaudio-${{ env.CONTENT_CACHE_VERSION }}-${{ hashFiles('source/tools/content-pipeline/books/audio/sources.json', 'source/tools/content-pipeline/books/audio/fetch-and-convert.mjs') }}
+
+      - name: Audiobooks - download, check, convert and add as On-Demand Resources
+        if: ${{ env.AUDIOBOOKS == 'true' }}
+        shell: bash
+        timeout-minutes: 120
+        run: |
+          set -euo pipefail
+          SCRIPT="$SOURCE_ABS/tools/content-pipeline/books/audio/ci-audiobooks.sh"
+          if [[ ! -f "$SCRIPT" ]]; then
+            echo "::warning::This ref has no audiobook script: building without real-voice readings."
+            exit 0
+          fi
+          bash "$SCRIPT" "$SOURCE_ABS" "$RUNNER_TEMP/book-audio-m4a" install
+
+      - name: Save converted audiobooks cache
+        if: ${{ env.AUDIOBOOKS == 'true' && steps.bookaudio_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/book-audio-m4a
+          key: ${{ steps.bookaudio_cache.outputs.cache-primary-key }}
 
       # ---------------------------------------------------------------------
       # 5. XcodeGen (pinned + checksum) -> EnglishApp.xcodeproj; resolve settings
@@ -2583,6 +2726,16 @@ jobs:
             if [[ -n "${SIMULATOR_DESC:-}" ]]; then
               echo "- Simulator: ${SIMULATOR_DESC}"
             fi
+            if [[ "${HUMAN_AUDIO_USED:-false}" == 'true' ]]; then
+              echo '- Human word audio (T-109): Lingua Libre recordings replace the synthetic UK / US voice of the words whose accent is known (counts in the content step summary; credits in HUMAN-AUDIO-CREDITS.json).'
+            else
+              echo '- Human word audio (T-109): none in this run (synthetic word recordings only).'
+            fi
+            if [[ "${AUDIOBOOKS:-false}" == 'true' ]]; then
+              echo '- Audiobooks (T-108): LibriVox recordings added as On-Demand Resources (tags book-audio.<book id>; sizes per tag in the audiobook step summary).'
+            else
+              echo '- Audiobooks (T-108): none in this run (the app offers the system voice only).'
+            fi
             case "$MODE" in
               archive) echo '- Signed IPA: final entitlement assertions and Apple validation passed if this job succeeded (the IPA is not uploaded anywhere; the runner is discarded). dSYMs: see the dSYM push step.' ;;
               testflight) echo '- TestFlight: final entitlement assertions, Apple validation and binary upload succeeded if this job succeeded. dSYMs: see the dSYM push step.' ;;
@@ -2636,3 +2789,93 @@ jobs:
           rm -rf "$RUNNER_TEMP/english-asc" "$RUNNER_TEMP/english-profile-scan" "$RUNNER_TEMP/English-Signed-Verify" \
             "$RUNNER_TEMP/English.xcarchive" "$RUNNER_TEMP/English-AppStore-Export" \
             "$RUNNER_TEMP/dsym-repo" "$RUNNER_TEMP/dsym-push.log" >/dev/null 2>&1 || true
+
+  # ---------------------------------------------------------------------
+  # audiobook-check (T-108): the audiobooks alone, on a macOS runner (afconvert). No content, XcodeGen, build, signing or upload.
+  # Fills the converted-audio cache (same key as the ios job) so a following archive / testflight run does not download again.
+  # ---------------------------------------------------------------------
+  audiobook-check:
+    name: Check English audiobooks
+    if: ${{ inputs.mode == 'audiobook-check' }}
+    runs-on: macos-26
+    timeout-minutes: 150
+    env:
+      MODE: audiobook-check
+      SOURCE_REF: ${{ inputs.ref || 'main' }}
+      AUDIOBOOKS: ${{ inputs.audiobooks && 'true' || 'false' }}
+
+    steps:
+      - name: Validate request and required secret
+        shell: bash
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          set -euo pipefail
+          [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || {
+            echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only).'
+            exit 64
+          }
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || {
+            echo '::error::Missing public-repo secret TARGET_REPO_PAT (Contents read access to readori/english).'
+            exit 78
+          }
+          [[ "$AUDIOBOOKS" == 'true' ]] || {
+            echo '::error::audiobook-check with the audiobooks input switched off has nothing to do.'
+            exit 64
+          }
+          echo "Mode: $MODE"
+          echo "Private source ref: $SOURCE_REF"
+
+      - name: Checkout private English source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/english
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+          persist-credentials: false
+          lfs: false
+          clean: true
+
+      - name: Verify private source layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_ABS="$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH"
+          for f in tools/content-pipeline/books/audio/ci-audiobooks.sh tools/content-pipeline/books/audio/sources.json \
+            tools/content-pipeline/books/audio/fetch-and-convert.mjs tools/content-pipeline/books/audio/build-manifest.mjs \
+            tools/content-pipeline/books/audio/build-sources.mjs; do
+            [[ -f "$SOURCE_ABS/$f" ]] || {
+              echo "::error::Private source is missing $f."
+              exit 66
+            }
+          done
+          echo "SOURCE_ABS=$SOURCE_ABS" >> "$GITHUB_ENV"
+          echo 'Layout check: PASS'
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Restore converted audiobooks cache
+        id: bookaudio_cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/book-audio-m4a
+          key: english-bookaudio-${{ env.CONTENT_CACHE_VERSION }}-${{ hashFiles('source/tools/content-pipeline/books/audio/sources.json', 'source/tools/content-pipeline/books/audio/fetch-and-convert.mjs') }}
+
+      - name: Audiobooks - download, check and convert
+        shell: bash
+        timeout-minutes: 120
+        run: |
+          set -euo pipefail
+          bash "$SOURCE_ABS/tools/content-pipeline/books/audio/ci-audiobooks.sh" "$SOURCE_ABS" "$RUNNER_TEMP/book-audio-m4a" check
+
+      - name: Save converted audiobooks cache
+        if: ${{ steps.bookaudio_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/book-audio-m4a
+          key: ${{ steps.bookaudio_cache.outputs.cache-primary-key }}
