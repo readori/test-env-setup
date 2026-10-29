@@ -76,7 +76,7 @@
 # tools/sfx-gen/eleven/clips (assembled into 3:00 loops, T-048); without them the synthesised loops of tools/sfx-gen are used.
 name: English iOS CI
 
-run-name: English iOS · ${{ inputs.mode || 'verify' }} · ${{ inputs.ref || 'main' }}${{ inputs.build_number && format(' · build {0}', inputs.build_number) || '' }}
+run-name: English iOS · ${{ inputs.mode || 'verify' }} · ${{ inputs.ref || 'main' }}${{ inputs.version && format(' · {0}', inputs.version) || '' }}${{ inputs.build_number && format(' · build {0}', inputs.build_number) || '' }}
 
 on:
   workflow_dispatch:
@@ -98,6 +98,11 @@ on:
         description: 'Private readori/english branch, tag, or SHA'
         required: true
         default: 'main'
+        type: string
+      version:
+        description: 'App version (CFBundleShortVersionString), e.g. 1.1.1. Required for archive / testflight: the owner types it, there is no built-in default. verify modes: leave empty (the never-shipped placeholder in project.yml is used).'
+        required: false
+        default: ''
         type: string
       build_number:
         description: 'Build number (CFBundleVersion). Required for archive / testflight: a whole number higher than the last build uploaded to App Store Connect. verify modes: leave empty (uses the run number).'
@@ -173,6 +178,7 @@ jobs:
       MODE: ${{ inputs.mode || 'verify' }}
       SOURCE_REF: ${{ inputs.ref || 'main' }}
       BUILD_NUMBER_INPUT: ${{ inputs.build_number || '' }}
+      APP_VERSION_INPUT: ${{ inputs.version || '' }}
       # verify uses the sample; every other mode needs the full catalog with AAC audio.
       CONTENT_MODE: ${{ (inputs.mode == 'verify' || inputs.mode == '') && 'sample300' || 'full-m4a' }}
       # T-108: audio is downloaded only by the release-type modes (archive, testflight), and only when the input is on.
@@ -261,6 +267,16 @@ jobs:
             echo "::add-mask::$CLOUDKIT_MANAGEMENT_TOKEN"
           fi
 
+          # The version and the build number of a build for Apple are both typed by the owner; nothing is filled in by default.
+          if [[ -n "$APP_VERSION_INPUT" ]]; then
+            [[ "$APP_VERSION_INPUT" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]] || {
+              echo '::error::version must look like 1.1 or 1.1.1 (digits and dots only).'
+              exit 64
+            }
+          elif [[ "$MODE" == 'archive' || "$MODE" == 'testflight' ]]; then
+            echo "::error::version is required for $MODE mode: enter the app version, e.g. 1.1.1."
+            exit 64
+          fi
           if [[ -n "$BUILD_NUMBER_INPUT" ]]; then
             [[ "$BUILD_NUMBER_INPUT" =~ ^[1-9][0-9]{0,8}$ ]] || {
               echo '::error::build_number must be a whole number (1-999999999) with no leading zeros, spaces, or dots.'
@@ -274,6 +290,7 @@ jobs:
           echo "Mode: $MODE"
           echo "Content mode: $CONTENT_MODE"
           echo "Private source ref: $SOURCE_REF"
+          echo "Version input: ${APP_VERSION_INPUT:-<empty, verify modes use the project.yml placeholder>}"
           echo "Build number input: ${BUILD_NUMBER_INPUT:-<empty, verify modes use the run number>}"
 
       - name: Write CI helper scripts (public, part of this workflow)
@@ -1600,9 +1617,11 @@ jobs:
           app = check_target(env["APP_TARGET"], env["EXPECTED_BUNDLE_ID"], "APP")
           check_target(env["WIDGETS_TARGET"], env["EXPECTED_WIDGETS_BUNDLE_ID"], "WIDGETS")
           if app:
-              ver = app.get("MARKETING_VERSION", "")
+              # The version typed at dispatch wins and is passed to every xcodebuild as MARKETING_VERSION. archive / testflight
+              # cannot start without it (checked earlier); verify modes fall back to the project.yml placeholder, never shipped.
+              ver = env.get("APP_VERSION_INPUT", "") or app.get("MARKETING_VERSION", "")
               if not re.fullmatch(r"[0-9]+(\.[0-9]+){1,2}", ver):
-                  errors.append(f"MARKETING_VERSION must look like 1.0 or 1.0.0; got '{ver or '<empty>'}'.")
+                  errors.append(f"The app version must look like 1.0 or 1.0.0; got '{ver or '<empty>'}'.")
               out["APP_VERSION"] = ver
               out["DEPLOYMENT_TARGET"] = app.get("IPHONEOS_DEPLOYMENT_TARGET", "")
           out["HAS_UI_TESTS"] = "true" if env["UI_TEST_TARGET"] in targets else "false"
@@ -1650,6 +1669,7 @@ jobs:
             ONLY_ACTIVE_ARCH=YES \
             COMPILER_INDEX_STORE_ENABLE=NO \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            MARKETING_VERSION="$APP_VERSION" \
             CODE_SIGN_IDENTITY=- \
             CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM= \
@@ -1837,6 +1857,7 @@ jobs:
             -derivedDataPath "$SIZE_DERIVED" \
             COMPILER_INDEX_STORE_ENABLE=NO \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            MARKETING_VERSION="$APP_VERSION" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY= \
@@ -2511,6 +2532,7 @@ jobs:
             -archivePath "$ARCHIVE_PATH" \
             COMPILER_INDEX_STORE_ENABLE=NO \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            MARKETING_VERSION="$APP_VERSION" \
             CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM="$ASC_TEAM_ID" \
             CODE_SIGN_IDENTITY='Apple Distribution' \
