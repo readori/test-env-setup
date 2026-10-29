@@ -523,10 +523,10 @@ jobs:
           out += [f"| `{rel}` | {mb(size)} |" for size, rel in files[:25]]
           if a.content_dir and os.path.isdir(a.content_dir):
               out += ["", "### Generated content (word-atlas pipeline)", "", "| File | Size | In app |", "|---|---:|---|"]
-              for n in ("content.sqlite", "media-core.sqlite", "ATTRIBUTION.md", "HUMAN-AUDIO-CREDITS.json", "packs.json", "report.md"):
+              for n in ("content.sqlite", "media-core.sqlite", "media-advanced.sqlite", "ATTRIBUTION.md", "HUMAN-AUDIO-CREDITS.json", "packs.json", "report.md"):
                   p = os.path.join(a.content_dir, n)
                   if os.path.isfile(p):
-                      inapp = "yes" if n in ("content.sqlite", "media-core.sqlite", "ATTRIBUTION.md", "HUMAN-AUDIO-CREDITS.json") else "no"
+                      inapp = "yes" if n in ("content.sqlite", "media-core.sqlite", "ATTRIBUTION.md", "HUMAN-AUDIO-CREDITS.json") else "On-Demand Resources (prefetched, not in the install size)" if n == "media-advanced.sqlite" else "no"
                       out.append(f"| `{n}` | {mb(os.path.getsize(p))} | {inapp} |")
               tsv = os.path.join(a.content_dir, "packs-sizes.tsv")
               if os.path.isfile(tsv):
@@ -585,8 +585,26 @@ jobs:
           for kind in campfire harbor stargazing rain stream; do
             [[ -n "$(find "$APP" -type f -name "ambient_${kind}.m4a" -print -quit)" ]] || problem "ambient_${kind}.m4a is not in the app bundle (the Generate soundscapes step installs it into $GENERATED_RESOURCES_DIR/Soundscapes)."
           done
-          STRAY="$(find "$APP" -type f \( -name 'media-*.sqlite' ! -name 'media-core.sqlite' -o -name 'packs.json' \) -print -quit)"
+          STRAY="$(find "$APP" -type f \( -name 'media-*.sqlite' ! -name 'media-core.sqlite' ! -name 'media-advanced.sqlite' -o -name 'packs.json' \) -print -quit)"
           [[ -z "$STRAY" ]] || fatal "Download pack file $(basename "$STRAY") is inside the app bundle; packs/ must stay out of the app."
+          # T-111: media-advanced.sqlite may only be in an On-Demand Resources asset pack (embedded in Debug / simulator builds, beside
+          # the app in Release). As a plain resource it would put the C1 / C2 media back into the install size.
+          PLAIN_ODR="$(find "$APP" -type f -name 'media-advanced.sqlite' ! -path '*.assetpack/*' -print -quit)"
+          [[ -z "$PLAIN_ODR" ]] || fatal "media-advanced.sqlite is a plain resource of the app (${PLAIN_ODR#"$APP"/}); project.yml must give it the On-Demand Resources tag word-media.advanced."
+          if [[ "${ADVANCED_MEDIA_USED:-false}" == 'true' ]]; then
+            ODR_HITS="$(grep -l -r --include='*.plist' 'word-media.advanced' "$APP" 2>/dev/null | sed "s#^$APP/##" | tr '\n' ' ')"
+            [[ -n "$ODR_HITS" ]] || problem "The app's On-Demand Resources plists do not mention the tag word-media.advanced (C1 / C2 word media, T-111)."
+            echo "On-Demand Resources tag word-media.advanced listed in: ${ODR_HITS:-<none>}"
+            if [[ -f "$APP/OnDemandResources.plist" ]]; then
+              plutil -convert json -o - "$APP/OnDemandResources.plist" 2>/dev/null | python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)
+          for k, v in d.items():
+              if "prefetch" in k.lower() or "initial" in k.lower():
+                  print(f"  {k}: {json.dumps(v)[:300]}")
+          ' || true
+            fi
+          fi
 
           if [[ "$SIGNED" == signed && -n "$APPEX" ]]; then
             test -f "$APPEX/embedded.mobileprovision" || fatal 'Widgets extension is missing embedded.mobileprovision.'
@@ -1365,6 +1383,11 @@ jobs:
             cp "$OUT_DIR/$f" "$STAGE/$f"
           done
           [[ -d "$OUT_DIR/packs" ]] || { echo '::error::Content pipeline did not produce packs/.'; exit 65; }
+          # T-111: thumbnails and UK / US recordings of C1 / C2 words off the Basic 850 list, for the On-Demand Resources tag
+          # word-media.advanced (absent only when the content has no such word, e.g. a small sample).
+          if [[ -s "$OUT_DIR/media-advanced.sqlite" ]]; then
+            cp "$OUT_DIR/media-advanced.sqlite" "$STAGE/media-advanced.sqlite"
+          fi
           # T-109: with human word audio the pipeline also wrote the credits of the recordings it used; they are cached and bundled with the content.
           if [[ -s "$OUT_DIR/HUMAN-AUDIO-CREDITS.json" ]]; then
             cp "$OUT_DIR/HUMAN-AUDIO-CREDITS.json" "$STAGE/HUMAN-AUDIO-CREDITS.json"
@@ -1416,6 +1439,19 @@ jobs:
           for f in content.sqlite media-core.sqlite ATTRIBUTION.md; do
             cp "$STAGE/$f" "$DEST/$f"
           done
+          # T-111: C1 / C2 word media is one On-Demand Resources tag (word-media.advanced, prefetched after install; project.yml),
+          # so it goes into its own tagged folder, not into the Generated folder reference.
+          ODR_DEST="$SOURCE_ABS/App/Resources/WordMedia"
+          rm -rf "$ODR_DEST"
+          if [[ -s "$STAGE/media-advanced.sqlite" ]]; then
+            mkdir -p "$ODR_DEST"
+            cp "$STAGE/media-advanced.sqlite" "$ODR_DEST/media-advanced.sqlite"
+            echo 'ADVANCED_MEDIA_USED=true' >> "$GITHUB_ENV"
+            echo "On-Demand Resources word-media.advanced: $(du -h "$ODR_DEST/media-advanced.sqlite" | cut -f1)"
+          elif grep -q 'media-advanced.sqlite' "$STAGE/packs.json"; then
+            echo '::error::packs.json lists media-advanced.sqlite but the cached content does not have it; bump CONTENT_CACHE_VERSION and rerun.'
+            exit 65
+          fi
           # T-109: the credits of the real-voice word recordings travel with the content; present only when the content was built with them.
           if [[ -s "$STAGE/HUMAN-AUDIO-CREDITS.json" ]]; then
             cp "$STAGE/HUMAN-AUDIO-CREDITS.json" "$DEST/HUMAN-AUDIO-CREDITS.json"
