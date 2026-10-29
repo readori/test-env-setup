@@ -514,12 +514,14 @@ jobs:
           out = [f"## {a.title}", "",
                  f"- {a.ipa_label}: **{mb(ipa)}** (zip of Payload/; App Store thinning usually makes the download a little smaller)",
                  f"- App bundle on disk (uncompressed): **{mb(app_total)}**", ""]
-          # The IPA also carries the On-Demand Resources asset packs (book recordings, C1 / C2 word media, T-111), which Apple
-          # hosts apart from the app; what users download first is close to the app bundle (build 13: bundle 216.4 MB, App Store
-          # Connect 214.9 MB). So the budget is checked against the app bundle.
-          over = app_total > a.warn_mb * MB
+          # What users download first is the app without its On-Demand Resources (book recordings, C1 / C2 word media, T-111).
+          # The signed IPA carries those packs, so there the app bundle is the measure (build 13: bundle 216.4 MB, App Store
+          # Connect 214.9 MB); the unsigned verify-full build has an unstripped binary (45 MB instead of 11), so there the
+          # compressed estimate is closer. The smaller of the two is checked.
+          first_download = min(app_total, ipa)
+          over = first_download > a.warn_mb * MB
           if over:
-              out += [f"> ⚠️ The app bundle ({mb(app_total)}, without On-Demand Resources) is above the {a.warn_mb:.0f} MB budget.", ""]
+              out += [f"> ⚠️ The first download (about {mb(first_download)}, without On-Demand Resources) is above the {a.warn_mb:.0f} MB budget.", ""]
           out += ["### Bundle by top-level item", "", "| Item | Size |", "|---|---:|"]
           out += [f"| `{k}` | {mb(v)} |" for k, v in sorted(groups.items(), key=lambda kv: -kv[1])[:20]]
           out += ["", "### Largest files in the app bundle", "", "| File | Size |", "|---|---:|"]
@@ -543,7 +545,7 @@ jobs:
           for size, rel in files[:15]:
               print(f"  {mb(size):>12}  {rel}")
           if over:
-              print(f"::warning title=App size::App bundle {mb(app_total)} (without On-Demand Resources) exceeds the {a.warn_mb:.0f} MB budget (see the Job Summary).")
+              print(f"::warning title=App size::First download about {mb(first_download)} (without On-Demand Resources) exceeds the {a.warn_mb:.0f} MB budget (see the Job Summary).")
           PY
 
           # ---- check_bundle.sh <app> <warn|strict> [signed]: built-product contract checks ----
