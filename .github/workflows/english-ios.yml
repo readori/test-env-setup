@@ -1310,6 +1310,31 @@ jobs:
           echo "Merged $COUNT extra-word recordings into the AAC directory"
           rm -rf "$EXTRA_AAC"
 
+      # Recordings of the 1.0.2 IELTS listening words (tools/content-pipeline/ielts-media/audio, committed as MP3, T-114 / T-115): same treatment as the
+      # extra words above (slugs are unique across word-atlas, the extras and these words, so the merge cannot overwrite anything). The pictures
+      # need no step: build-packs.mjs reads them from ielts-media/ directly.
+      - name: Transcode ielts-word recordings (AAC)
+        if: ${{ env.MODE != 'cloudkit-schema' && steps.content_cache.outputs.cache-hit != 'true' && env.CONTENT_MODE == 'full-m4a' }}
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          IELTS_AUDIO="$SOURCE_ABS/tools/content-pipeline/ielts-media/audio"
+          M4A_DIR="$RUNNER_TEMP/word-atlas-m4a"
+          if [[ ! -d "$IELTS_AUDIO" || -z "$(find "$IELTS_AUDIO" -type f -name '*.mp3' -print -quit)" ]]; then
+            echo 'No ielts-word recordings committed; those words keep no audio in this build.'
+            exit 0
+          fi
+          IELTS_AAC="$RUNNER_TEMP/ielts-aac"
+          rm -rf "$IELTS_AAC"
+          mkdir -p "$IELTS_AAC"
+          bash "$SOURCE_ABS/tools/content-pipeline/convert-audio-macos.sh" "$IELTS_AUDIO" "$IELTS_AAC"
+          cp -R "$IELTS_AAC"/. "$M4A_DIR"/
+          COUNT="$(find "$IELTS_AAC" -type f -name '*.aac' | wc -l | tr -d ' ')"
+          (( COUNT > 0 )) || { echo '::error::Ielts-word transcode produced no .aac files.'; exit 65; }
+          echo "Merged $COUNT ielts-word recordings into the AAC directory"
+          rm -rf "$IELTS_AAC"
+
       # Real-voice word recordings (T-109), archive / testflight / verify-full only (env HUMAN_WORD_AUDIO), and only when the generated
       # content has to be rebuilt. Lingua Libre recordings from Wikimedia Commons: download (sha1 + size checked), trim + level, afconvert
       # to ADTS AAC in $RUNNER_TEMP/human-aac/{uk,us}/<slug>.aac. They are kept apart from word-atlas-m4a (and from its cache): the content
