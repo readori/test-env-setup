@@ -14,7 +14,7 @@
 #     lifecycle scripts (npm ci / prebuild / pod install) have run.
 name: Paobuwan iOS CI
 
-run-name: Paobuwan iOS · ${{ inputs.mode || 'verify' }} · ${{ inputs.ref || 'main' }}${{ inputs.build_number && format(' · build {0}', inputs.build_number) || '' }}
+run-name: Paobuwan iOS · ${{ inputs.mode || 'verify' }} · ${{ inputs.ref || 'main' }}${{ inputs.version && format(' · v{0}', inputs.version) || '' }}${{ inputs.build_number && format(' · build {0}', inputs.build_number) || '' }}
 
 on:
   workflow_dispatch:
@@ -32,6 +32,11 @@ on:
         description: 'Private readori/paobuwan branch, tag, or SHA'
         required: true
         default: 'main'
+        type: string
+      version:
+        description: 'Version (CFBundleShortVersionString), e.g. 1.0.1. Leave empty to use the version in the private repo app.json.'
+        required: false
+        default: ''
         type: string
       build_number:
         description: 'Build number (CFBundleVersion), entered by the product owner. Required for archive / testflight: a whole number higher than the last build uploaded to App Store Connect. verify: leave empty (uses the run number).'
@@ -80,6 +85,7 @@ jobs:
     env:
       MODE: ${{ inputs.mode || 'verify' }}
       SOURCE_REF: ${{ inputs.ref || 'main' }}
+      VERSION_INPUT: ${{ inputs.version || '' }}
       BUILD_NUMBER_INPUT: ${{ inputs.build_number || '' }}
 
     steps:
@@ -141,6 +147,14 @@ jobs:
             fi
           fi
 
+          # Version: optional, entered by hand (product owner request 2026-10-30); empty = app.json.
+          if [[ -n "$VERSION_INPUT" ]]; then
+            [[ "$VERSION_INPUT" =~ ^(0|[1-9][0-9]{0,3})([.](0|[1-9][0-9]{0,3})){1,2}$ ]] || {
+              echo '::error::version must look like 1.0.1 or 1.1 (two or three numbers, no leading zeros, no spaces or letters).'
+              exit 64
+            }
+          fi
+
           # Build number: entered by hand on each run (product owner decision 2026-10-12).
           if [[ -n "$BUILD_NUMBER_INPUT" ]]; then
             [[ "$BUILD_NUMBER_INPUT" =~ ^[1-9][0-9]{0,8}$ ]] || {
@@ -154,6 +168,7 @@ jobs:
 
           echo "Mode: $MODE"
           echo "Private source ref: $SOURCE_REF"
+          echo "Version input: ${VERSION_INPUT:-<empty, uses app.json>}"
           echo "Build number input: ${BUILD_NUMBER_INPUT:-<empty, verify uses run number>}"
 
       # ---------------------------------------------------------------------
@@ -325,6 +340,10 @@ jobs:
             echo "::error::MARKETING_VERSION must look like 0.1 or 0.1.0; got: ${APP_VERSION:-<empty>}"
             exit 64
           }
+          SOURCE_APP_VERSION="$APP_VERSION"
+          if [[ -n "$VERSION_INPUT" ]]; then
+            APP_VERSION="$VERSION_INPUT"
+          fi
 
           # Build number: the build_number input (validated in step 0; required for archive / testflight).
           # verify without an input falls back to the run number (simulator only, never uploaded).
@@ -343,6 +362,18 @@ jobs:
             exit 66
           }
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$INFOPLIST_PATH"
+
+          # Version: expo prebuild also writes app.json "version" as a literal into the app Info.plist
+          # and into the Live Activity extension Info.plist, so MARKETING_VERSION alone is not enough.
+          # Write the requested version into both (xcodebuild also gets MARKETING_VERSION below).
+          if [[ "$APP_VERSION" != "$SOURCE_APP_VERSION" ]]; then
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$INFOPLIST_PATH"
+            LA_INFOPLIST="$IOS_DIR/LiveActivityExtension/Info.plist"
+            if [[ -f "$LA_INFOPLIST" ]]; then
+              /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$LA_INFOPLIST"
+            fi
+            echo "Version overridden by input: $SOURCE_APP_VERSION -> $APP_VERSION"
+          fi
 
           # Source commit (8-char short SHA) for the in-app diagnostics page (T-077 reads PBWSourceCommit).
           # Not a secret: the same short SHA is printed in this workflow's summary.
@@ -437,6 +468,7 @@ jobs:
             ARCHS="$(uname -m)" \
             ONLY_ACTIVE_ARCH=YES \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            MARKETING_VERSION="$APP_VERSION" \
             CODE_SIGN_IDENTITY=- \
             CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM= \
@@ -462,6 +494,12 @@ jobs:
           BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist")"
           [[ "$BUNDLE_ID" == "$EXPECTED_BUNDLE_ID" ]] || {
             echo "::error::Unexpected bundle identifier in built app: $BUNDLE_ID"
+            exit 65
+          }
+
+          BUILT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Info.plist")"
+          [[ "$BUILT_VERSION" == "$APP_VERSION" ]] || {
+            echo "::error::Built app CFBundleShortVersionString is '$BUILT_VERSION', expected $APP_VERSION."
             exit 65
           }
 
@@ -1119,6 +1157,7 @@ jobs:
               -destination 'generic/platform=iOS' \
               -archivePath "$ARCHIVE_PATH" \
               CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+              MARKETING_VERSION="$APP_VERSION" \
               CODE_SIGN_STYLE=Manual \
               DEVELOPMENT_TEAM="$ASC_TEAM_ID" \
               CODE_SIGN_IDENTITY='Apple Distribution'
@@ -1131,6 +1170,7 @@ jobs:
               -destination 'generic/platform=iOS' \
               -archivePath "$ARCHIVE_PATH" \
               CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+              MARKETING_VERSION="$APP_VERSION" \
               CODE_SIGN_STYLE=Manual \
               DEVELOPMENT_TEAM="$ASC_TEAM_ID" \
               CODE_SIGN_IDENTITY='Apple Distribution' \
@@ -1205,6 +1245,12 @@ jobs:
           SIGNED_BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$SIGNED_APP/Info.plist")"
           [[ "$SIGNED_BUILD_NUMBER" == "$BUILD_NUMBER" ]] || {
             echo "::error::Signed IPA CFBundleVersion is '$SIGNED_BUILD_NUMBER', expected $BUILD_NUMBER."
+            exit 65
+          }
+
+          SIGNED_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$SIGNED_APP/Info.plist")"
+          [[ "$SIGNED_VERSION" == "$APP_VERSION" ]] || {
+            echo "::error::Signed IPA CFBundleShortVersionString is '$SIGNED_VERSION', expected $APP_VERSION."
             exit 65
           }
 
