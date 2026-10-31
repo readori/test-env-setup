@@ -1393,6 +1393,10 @@ jobs:
             if grep -q -- '--strict-books' "$SOURCE_ABS/tools/content-pipeline/run-all.mjs"; then
               ARGS+=(--strict-books)
             fi
+            # Full content holds the complete hand written chunk set, not the sample (T-119; sources before 1.0.1 have no chunks).
+            if grep -q -- '--strict-chunks' "$SOURCE_ABS/tools/content-pipeline/run-all.mjs"; then
+              ARGS+=(--strict-chunks)
+            fi
             # Real-voice word recordings (T-109): present only when the human audio step ran (the input is on and this ref has the scripts).
             HUMAN_AAC="$RUNNER_TEMP/human-aac"
             if [[ "$HUMAN_WORD_AUDIO" == 'true' && -n "$(find "$HUMAN_AAC" -type f -name '*.aac' -print -quit 2>/dev/null)" ]]; then
