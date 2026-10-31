@@ -528,10 +528,10 @@ jobs:
           out += [f"| `{rel}` | {mb(size)} |" for size, rel in files[:25]]
           if a.content_dir and os.path.isdir(a.content_dir):
               out += ["", "### Generated content (word-atlas pipeline)", "", "| File | Size | In app |", "|---|---:|---|"]
-              for n in ("content.sqlite", "media-core.sqlite", "media-advanced.sqlite", "ATTRIBUTION.md", "HUMAN-AUDIO-CREDITS.json", "packs.json", "report.md"):
+              for n in ("content.sqlite", "media-core.sqlite", "media-advanced.sqlite", "media-chunks.sqlite", "ATTRIBUTION.md", "HUMAN-AUDIO-CREDITS.json", "packs.json", "report.md"):
                   p = os.path.join(a.content_dir, n)
                   if os.path.isfile(p):
-                      inapp = "yes" if n in ("content.sqlite", "media-core.sqlite", "ATTRIBUTION.md", "HUMAN-AUDIO-CREDITS.json") else "On-Demand Resources (prefetched, not in the install size)" if n == "media-advanced.sqlite" else "no"
+                      inapp = "yes" if n in ("content.sqlite", "media-core.sqlite", "ATTRIBUTION.md", "HUMAN-AUDIO-CREDITS.json") else "On-Demand Resources (prefetched, not in the install size)" if n in ("media-advanced.sqlite", "media-chunks.sqlite") else "no"
                       out.append(f"| `{n}` | {mb(os.path.getsize(p))} | {inapp} |")
               tsv = os.path.join(a.content_dir, "packs-sizes.tsv")
               if os.path.isfile(tsv):
@@ -590,7 +590,7 @@ jobs:
           for kind in campfire harbor stargazing rain stream; do
             [[ -n "$(find "$APP" -type f -name "ambient_${kind}.m4a" -print -quit)" ]] || problem "ambient_${kind}.m4a is not in the app bundle (the Generate soundscapes step installs it into $GENERATED_RESOURCES_DIR/Soundscapes)."
           done
-          STRAY="$(find "$APP" -type f \( -name 'media-*.sqlite' ! -name 'media-core.sqlite' ! -name 'media-advanced.sqlite' -o -name 'packs.json' \) -print -quit)"
+          STRAY="$(find "$APP" -type f \( -name 'media-*.sqlite' ! -name 'media-core.sqlite' ! -name 'media-advanced.sqlite' ! -name 'media-chunks.sqlite' -o -name 'packs.json' \) -print -quit)"
           [[ -z "$STRAY" ]] || fatal "Download pack file $(basename "$STRAY") is inside the app bundle; packs/ must stay out of the app."
           # T-111: media-advanced.sqlite may only be in an On-Demand Resources asset pack (embedded in Debug / simulator builds, beside
           # the app in Release). As a plain resource it would put the C1 / C2 media back into the install size.
@@ -609,6 +609,14 @@ jobs:
                   print(f"  {k}: {json.dumps(v)[:300]}")
           ' || true
             fi
+          fi
+          # T-123: the chunk recordings (media-chunks.sqlite) are one more On-Demand Resources tag, same rules as media-advanced.sqlite above.
+          PLAIN_CHUNKS="$(find "$APP" -type f -name 'media-chunks.sqlite' ! -path '*.assetpack/*' -print -quit)"
+          [[ -z "$PLAIN_CHUNKS" ]] || fatal "media-chunks.sqlite is a plain resource of the app (${PLAIN_CHUNKS#"$APP"/}); project.yml must give it the On-Demand Resources tag word-media.chunks."
+          if [[ "${CHUNK_MEDIA_USED:-false}" == 'true' ]]; then
+            CHUNK_HITS="$(grep -l -r --include='*.plist' 'word-media.chunks' "$APP" 2>/dev/null | sed "s#^$APP/##" | tr '\n' ' ')"
+            [[ -n "$CHUNK_HITS" ]] || problem "The app's On-Demand Resources plists do not mention the tag word-media.chunks (chunk recordings, T-123)."
+            echo "On-Demand Resources tag word-media.chunks listed in: ${CHUNK_HITS:-<none>}"
           fi
 
           if [[ "$SIGNED" == signed && -n "$APPEX" ]]; then
@@ -1335,6 +1343,33 @@ jobs:
           echo "Merged $COUNT ielts-word recordings into the AAC directory"
           rm -rf "$IELTS_AAC"
 
+      # Recordings of the 840 chunks and of the 850 Basic short examples (tools/content-pipeline/chunk-media/audio and basic-example-media/audio, committed as MP3,
+      # T-123): transcoded into their OWN directory, never merged into the word AAC directory above. A chunk id can equal a word slug, and a short example has the
+      # same file name as the word's own example recording (ex/<slug>), so a merge would overwrite word audio. build-packs.mjs reads them with --phrase-audio-dir
+      # (<dir>/chunks/{uk,us,ex,ex2}/<id>.aac, <dir>/basic-examples/{ex,ex2}/<slug>.aac). A change to either media directory invalidates the generated-content
+      # cache through hashFiles('source/tools/content-pipeline/**').
+      - name: Transcode chunk and Basic example recordings (AAC)
+        if: ${{ env.MODE != 'cloudkit-schema' && steps.content_cache.outputs.cache-hit != 'true' && env.CONTENT_MODE == 'full-m4a' }}
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          PHRASE_AAC="$RUNNER_TEMP/phrase-aac"
+          rm -rf "$PHRASE_AAC"
+          for pair in "chunks:chunk-media" "basic-examples:basic-example-media"; do
+            DEST_NAME="${pair%%:*}"
+            SRC_AUDIO="$SOURCE_ABS/tools/content-pipeline/${pair##*:}/audio"
+            if [[ ! -d "$SRC_AUDIO" || -z "$(find "$SRC_AUDIO" -type f -name '*.mp3' -print -quit)" ]]; then
+              echo "No $DEST_NAME recordings committed; they fall back to the system voice in this build."
+              continue
+            fi
+            mkdir -p "$PHRASE_AAC/$DEST_NAME"
+            bash "$SOURCE_ABS/tools/content-pipeline/convert-audio-macos.sh" "$SRC_AUDIO" "$PHRASE_AAC/$DEST_NAME"
+            COUNT="$(find "$PHRASE_AAC/$DEST_NAME" -type f -name '*.aac' | wc -l | tr -d ' ')"
+            (( COUNT > 0 )) || { echo "::error::The $DEST_NAME transcode produced no .aac files."; exit 65; }
+            echo "Transcoded $COUNT $DEST_NAME recordings into $PHRASE_AAC/$DEST_NAME"
+          done
+
       # Real-voice word recordings (T-109), archive / testflight / verify-full only (env HUMAN_WORD_AUDIO), and only when the generated
       # content has to be rebuilt. Lingua Libre recordings from Wikimedia Commons: download (sha1 + size checked), trim + level, afconvert
       # to ADTS AAC in $RUNNER_TEMP/human-aac/{uk,us}/<slug>.aac. They are kept apart from word-atlas-m4a (and from its cache): the content
@@ -1383,8 +1418,18 @@ jobs:
           ARGS=(--source "$ATLAS_DIR" --out "$OUT_DIR")
           if [[ "$CONTENT_MODE" == 'sample300' ]]; then
             ARGS+=(--sample "$CONTENT_SAMPLE_SIZE")
+            # T-123: the recordings of all 840 chunks would make this small build's media-chunks pack about 80 MB of MP3; the sample build leaves them out.
+            if grep -q -- '--chunk-media' "$SOURCE_ABS/tools/content-pipeline/run-all.mjs"; then
+              NO_PHRASE_MEDIA="$RUNNER_TEMP/no-phrase-media"
+              mkdir -p "$NO_PHRASE_MEDIA"
+              ARGS+=(--chunk-media "$NO_PHRASE_MEDIA" --basic-example-media "$NO_PHRASE_MEDIA")
+            fi
           else
             ARGS+=(--audio-dir "$RUNNER_TEMP/word-atlas-m4a")
+            # T-123: the chunk and Basic short example recordings, transcoded in their own directory (see the transcode step above).
+            if grep -q -- '--phrase-audio-dir' "$SOURCE_ABS/tools/content-pipeline/run-all.mjs" && [[ -n "$(find "$RUNNER_TEMP/phrase-aac" -type f -name '*.aac' -print -quit 2>/dev/null)" ]]; then
+              ARGS+=(--phrase-audio-dir "$RUNNER_TEMP/phrase-aac")
+            fi
             # Full content: the reading passages must cover every word (T-082; sources before v1.1 have no readings).
             if grep -q -- '--strict-readings' "$SOURCE_ABS/tools/content-pipeline/run-all.mjs"; then
               ARGS+=(--strict-readings)
@@ -1422,6 +1467,10 @@ jobs:
           if [[ -s "$OUT_DIR/media-advanced.sqlite" ]]; then
             cp "$OUT_DIR/media-advanced.sqlite" "$STAGE/media-advanced.sqlite"
           fi
+          # T-123: the chunk recordings, for the On-Demand Resources tag word-media.chunks (absent when no chunk has a recording, e.g. a small sample).
+          if [[ -s "$OUT_DIR/media-chunks.sqlite" ]]; then
+            cp "$OUT_DIR/media-chunks.sqlite" "$STAGE/media-chunks.sqlite"
+          fi
           # T-109: with human word audio the pipeline also wrote the credits of the recordings it used; they are cached and bundled with the content.
           if [[ -s "$OUT_DIR/HUMAN-AUDIO-CREDITS.json" ]]; then
             cp "$OUT_DIR/HUMAN-AUDIO-CREDITS.json" "$STAGE/HUMAN-AUDIO-CREDITS.json"
@@ -1447,7 +1496,7 @@ jobs:
           ls -l "$STAGE"
 
           # Free disk for the Xcode build.
-          rm -rf "$ATLAS_DIR" "$OUT_DIR" "$RUNNER_TEMP/word-atlas-m4a" "$RUNNER_TEMP/human-aac"
+          rm -rf "$ATLAS_DIR" "$OUT_DIR" "$RUNNER_TEMP/word-atlas-m4a" "$RUNNER_TEMP/human-aac" "$RUNNER_TEMP/phrase-aac" "$RUNNER_TEMP/no-phrase-media"
 
       - name: Save generated content cache
         if: ${{ env.MODE != 'cloudkit-schema' && steps.content_cache.outputs.cache-hit != 'true' }}
@@ -1484,6 +1533,18 @@ jobs:
             echo "On-Demand Resources word-media.advanced: $(du -h "$ODR_DEST/media-advanced.sqlite" | cut -f1)"
           elif grep -q 'media-advanced.sqlite' "$STAGE/packs.json"; then
             echo '::error::packs.json lists media-advanced.sqlite but the cached content does not have it; bump CONTENT_CACHE_VERSION and rerun.'
+            exit 65
+          fi
+          # T-123: the chunk recordings are one more On-Demand Resources tag (word-media.chunks, prefetched after install; project.yml), same handling.
+          CHUNK_DEST="$SOURCE_ABS/App/Resources/ChunkMedia"
+          rm -rf "$CHUNK_DEST"
+          if [[ -s "$STAGE/media-chunks.sqlite" ]]; then
+            mkdir -p "$CHUNK_DEST"
+            cp "$STAGE/media-chunks.sqlite" "$CHUNK_DEST/media-chunks.sqlite"
+            echo 'CHUNK_MEDIA_USED=true' >> "$GITHUB_ENV"
+            echo "On-Demand Resources word-media.chunks: $(du -h "$CHUNK_DEST/media-chunks.sqlite" | cut -f1)"
+          elif grep -q 'media-chunks.sqlite' "$STAGE/packs.json"; then
+            echo '::error::packs.json lists media-chunks.sqlite but the cached content does not have it; bump CONTENT_CACHE_VERSION and rerun.'
             exit 65
           fi
           # T-109: the credits of the real-voice word recordings travel with the content; present only when the content was built with them.
