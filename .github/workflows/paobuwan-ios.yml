@@ -363,6 +363,14 @@ jobs:
           }
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$INFOPLIST_PATH"
 
+          # expo prebuild writes app.json "version" into the app Info.plist as a literal and leaves the
+          # project's MARKETING_VERSION at the template's 1.0, so the Info.plist value is the real version.
+          PLIST_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFOPLIST_PATH" 2>/dev/null || true)"
+          if [[ "$PLIST_VERSION" =~ ^[0-9]+([.][0-9]+){1,2}$ ]]; then
+            SOURCE_APP_VERSION="$PLIST_VERSION"
+            [[ -n "$VERSION_INPUT" ]] || APP_VERSION="$PLIST_VERSION"
+          fi
+
           # Version: expo prebuild also writes app.json "version" as a literal into the app Info.plist
           # and into the Live Activity extension Info.plist, so MARKETING_VERSION alone is not enough.
           # Write the requested version into both (xcodebuild also gets MARKETING_VERSION below).
