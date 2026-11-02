@@ -169,14 +169,23 @@ env:
 
 jobs:
   ios:
-    name: Build English iOS
+    name: Build English iOS${{ matrix.shard != 'all' && format(' ({0})', matrix.shard) || '' }}
     if: ${{ inputs.mode != 'audiobook-check' }}
     runs-on: macos-26
+    # verify and verify-full split the iPhone UI tests over two runners: AccessibilityAuditTests (about 110 tests) on one, every other
+    # class on the other. Run serially on one runner they reached 196 min (41371020915) and then the 220 min step limit (41391169790);
+    # two workers on one 3-core runner only made each test slower (41417995398). The audits shard skips LexCore, unit, iPad and release
+    # device steps; every other mode is a single job ("all").
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(((inputs.mode || 'verify') == 'verify' || inputs.mode == 'verify-full') && '["audits", "flows"]' || '["all"]') }}
     # verify ~40 min plus UI tests (~150 min for 190+ tests); verify-full / archive on a cold content cache include the AAC transcode. GitHub caps a job at 360.
     timeout-minutes: 340
 
     env:
       MODE: ${{ inputs.mode || 'verify' }}
+      UI_SHARD: ${{ matrix.shard }}
       SOURCE_REF: ${{ inputs.ref || 'main' }}
       BUILD_NUMBER_INPUT: ${{ inputs.build_number || '' }}
       APP_VERSION_INPUT: ${{ inputs.version || '' }}
@@ -1178,7 +1187,7 @@ jobs:
       #    enforced by the "Enforce test results" step (so app tests still run).
       # ---------------------------------------------------------------------
       - name: LexCore swift test
-        if: ${{ env.MODE != 'screenshots' && env.MODE != 'cloudkit-schema' }}
+        if: ${{ env.MODE != 'screenshots' && env.MODE != 'cloudkit-schema' && env.UI_SHARD != 'audits' }}
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
         shell: bash
         timeout-minutes: 20
@@ -1858,7 +1867,7 @@ jobs:
           bash "$CI_HELPERS/check_bundle.sh" "$APP_PATH" "$( [[ "$MODE" == 'verify' ]] && echo warn || echo strict )"
 
       - name: Run unit tests (EnglishAppTests)
-        if: ${{ env.MODE == 'verify' || env.MODE == 'verify-full' }}
+        if: ${{ (env.MODE == 'verify' || env.MODE == 'verify-full') && env.UI_SHARD != 'audits' }}
         shell: bash
         timeout-minutes: 20
         run: |
@@ -1884,13 +1893,20 @@ jobs:
         if: ${{ (env.MODE == 'verify' || env.MODE == 'verify-full') && env.RUN_UI_TESTS == 'true' }}
         shell: bash
         # About 195 UI tests in 1.1.0 (125 min in run 40651927503, over 150 in 40671575637); a hung test is cut off after 5 minutes (a class may allow up to 15).
-        # Serial runs reached 196 min (41371020915) and then the 220 min limit (41391169790), so the classes run on two clones of the simulator.
+        # About 285 in 1.0.1: each shard (see the job's matrix) runs its half serially.
         timeout-minutes: 220
         run: |
           set +e -uo pipefail
           UI_XCRESULT="$RUNNER_TEMP/English-UI.xcresult"
           rm -rf "$UI_XCRESULT"
           echo "UI_XCRESULT=$UI_XCRESULT" >> "$GITHUB_ENV"
+
+          case "$UI_SHARD" in
+            audits) SELECT=(-only-testing:"$UI_TEST_TARGET/AccessibilityAuditTests") ;;
+            flows)  SELECT=(-only-testing:"$UI_TEST_TARGET" -skip-testing:"$UI_TEST_TARGET/AccessibilityAuditTests") ;;
+            *)      SELECT=(-only-testing:"$UI_TEST_TARGET") ;;
+          esac
+          echo "UI shard: ${UI_SHARD:-all} (${SELECT[*]})"
 
           xcrun simctl bootstatus "$SIMULATOR_UDID" -b >/dev/null
           # One retry per failing UI test absorbs hosted-runner simulator hiccups; a test that
@@ -1900,9 +1916,8 @@ jobs:
             -xctestrun "$XCTESTRUN" \
             -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
             -resultBundlePath "$UI_XCRESULT" \
-            -only-testing:"$UI_TEST_TARGET" \
-            -parallel-testing-enabled YES \
-            -parallel-testing-worker-count 2 \
+            "${SELECT[@]}" \
+            -parallel-testing-enabled NO \
             -retry-tests-on-failure \
             -test-iterations 2 \
             -test-timeouts-enabled YES \
@@ -1914,7 +1929,7 @@ jobs:
           exit 0
 
       - name: Run iPad smoke tests (IPadSmokeTests, 13-inch iPad Simulator)
-        if: ${{ (env.MODE == 'verify' || env.MODE == 'verify-full') && env.RUN_UI_TESTS == 'true' }}
+        if: ${{ (env.MODE == 'verify' || env.MODE == 'verify-full') && env.RUN_UI_TESTS == 'true' && env.UI_SHARD != 'audits' }}
         shell: bash
         # T-090: a few UI tests on an iPad (launch, rotation, session, word card, reading, settings, share sheet).
         # The same simulator build runs here; every other UI test class skips itself or is not selected.
@@ -1979,7 +1994,7 @@ jobs:
           exit 0
 
       - name: verify-full — Release device build (unsigned) and size report
-        if: ${{ env.MODE == 'verify-full' }}
+        if: ${{ env.MODE == 'verify-full' && env.UI_SHARD != 'audits' }}
         shell: bash
         timeout-minutes: 30
         run: |
