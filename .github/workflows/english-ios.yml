@@ -1884,6 +1884,7 @@ jobs:
         if: ${{ (env.MODE == 'verify' || env.MODE == 'verify-full') && env.RUN_UI_TESTS == 'true' }}
         shell: bash
         # About 195 UI tests in 1.1.0 (125 min in run 40651927503, over 150 in 40671575637); a hung test is cut off after 5 minutes (a class may allow up to 15).
+        # Serial runs reached 196 min (41371020915) and then the 220 min limit (41391169790), so the classes run on two clones of the simulator.
         timeout-minutes: 220
         run: |
           set +e -uo pipefail
@@ -1900,7 +1901,8 @@ jobs:
             -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
             -resultBundlePath "$UI_XCRESULT" \
             -only-testing:"$UI_TEST_TARGET" \
-            -parallel-testing-enabled NO \
+            -parallel-testing-enabled YES \
+            -parallel-testing-worker-count 2 \
             -retry-tests-on-failure \
             -test-iterations 2 \
             -test-timeouts-enabled YES \
