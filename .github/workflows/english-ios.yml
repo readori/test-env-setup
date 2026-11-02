@@ -1219,13 +1219,25 @@ jobs:
       #    Cached by (word-atlas SHA + content-pipeline hash + content mode); a build with human word audio (T-109) adds the suffix -human
       #    (the content then holds the Lingua Libre recordings, so it must never be mixed with a build without them).
       # ---------------------------------------------------------------------
+      # hashFiles over tools/content-pipeline (about 12,400 files) ran past its 120 s limit on a slow runner (41453390803); git's blob ids of
+      # the same tracked files give the same "any file changed" key without reading them.
+      - name: Hash the content pipeline sources
+        if: ${{ env.MODE != 'cloudkit-schema' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONTENT_PIPELINE_HASH="$(git -C "$PRIVATE_SOURCE_PATH" ls-files -s -- tools/content-pipeline | shasum -a 256 | cut -c1-64)"
+          [[ "$CONTENT_PIPELINE_HASH" =~ ^[0-9a-f]{64}$ ]] || { echo '::error::Could not hash tools/content-pipeline.'; exit 1; }
+          echo "CONTENT_PIPELINE_HASH=$CONTENT_PIPELINE_HASH" >> "$GITHUB_ENV"
+          echo "tools/content-pipeline: $(git -C "$PRIVATE_SOURCE_PATH" ls-files -- tools/content-pipeline | wc -l | tr -d ' ') files, hash $CONTENT_PIPELINE_HASH"
+
       - name: Restore generated content cache
         id: content_cache
         if: ${{ env.MODE != 'cloudkit-schema' }}
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/english-content
-          key: english-content-${{ env.CONTENT_CACHE_VERSION }}-${{ env.CONTENT_MODE }}${{ env.HUMAN_WORD_AUDIO == 'true' && '-human' || '' }}-${{ env.WORD_ATLAS_SHA }}-${{ hashFiles('source/tools/content-pipeline/**') }}
+          key: english-content-${{ env.CONTENT_CACHE_VERSION }}-${{ env.CONTENT_MODE }}${{ env.HUMAN_WORD_AUDIO == 'true' && '-human' || '' }}-${{ env.WORD_ATLAS_SHA }}-${{ env.CONTENT_PIPELINE_HASH }}
 
       - name: Fetch word-atlas (pinned commit; data/ and public/atlas/ only)
         if: ${{ env.MODE != 'cloudkit-schema' && steps.content_cache.outputs.cache-hit != 'true' }}
@@ -1305,7 +1317,7 @@ jobs:
       # Recordings of the 70 extra Basic 850 words (tools/content-pipeline/extra-media/audio, committed as MP3 by the owner, T-045):
       # transcode them into a separate directory (the ratio check of the script is per run) and merge into the AAC directory. This happens
       # after the cache save above, so the cached directory only ever holds word-atlas audio; a change to extra-media/ invalidates the
-      # generated-content cache through hashFiles('source/tools/content-pipeline/**').
+      # generated-content cache through CONTENT_PIPELINE_HASH (every tracked file under tools/content-pipeline).
       - name: Transcode extra-word recordings (AAC)
         if: ${{ env.MODE != 'cloudkit-schema' && steps.content_cache.outputs.cache-hit != 'true' && env.CONTENT_MODE == 'full-m4a' }}
         shell: bash
@@ -1357,7 +1369,7 @@ jobs:
       # T-123): transcoded into their OWN directory, never merged into the word AAC directory above. A chunk id can equal a word slug, and a short example has the
       # same file name as the word's own example recording (ex/<slug>), so a merge would overwrite word audio. build-packs.mjs reads them with --phrase-audio-dir
       # (<dir>/chunks/{uk,us,ex,ex2}/<id>.aac, <dir>/basic-examples/{ex,ex2}/<slug>.aac). A change to either media directory invalidates the generated-content
-      # cache through hashFiles('source/tools/content-pipeline/**').
+      # cache through CONTENT_PIPELINE_HASH (every tracked file under tools/content-pipeline).
       - name: Transcode chunk and Basic example recordings (AAC)
         if: ${{ env.MODE != 'cloudkit-schema' && steps.content_cache.outputs.cache-hit != 'true' && env.CONTENT_MODE == 'full-m4a' }}
         shell: bash
