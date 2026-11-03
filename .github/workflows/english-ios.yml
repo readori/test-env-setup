@@ -316,7 +316,7 @@ jobs:
           # ---- test_summary.py: LexCore xUnit + xcresult bundles -> Job Summary + log -------
           # Prints counts, failing test identifiers, failure messages and file:line only.
           cat > "$HELPERS/test_summary.py" <<'PY'
-          import glob, json, os, subprocess, sys
+          import glob, hashlib, json, os, re, subprocess, sys, tempfile
           import xml.etree.ElementTree as ET
 
           rows, failures, notes, skips = [], [], [], []
@@ -521,6 +521,166 @@ jobs:
                   print(f"  ... {len(lines) - ACTIVITY_CAP} more lines cut (cap {ACTIVITY_CAP})")
               print("::endgroup::")
 
+          # ---- Main thread of the app in hang spindumps (log only; best effort, never affects the exit status)
+          # A UI test that hits its execution time allowance (or a hang detected by XCTest) gets a
+          # "...-Spindump.txt" attachment. `xcresulttool export attachments --test-id <id>` (Xcode 16+) writes the
+          # files under UUID-like names plus a manifest.json (a list of {"testIdentifier", "attachments":
+          # [{"exportedFileName", "suggestedHumanReadableName", ...}]}), so files are matched on both names.
+          # The spindump text report lists "Process: <name> [pid]" sections with indented "Thread 0x... " call trees.
+          SPIN_CAP = 500        # total printed lines
+          SPIN_HEAD = 60        # first lines of the main thread call tree (the root side)
+          SPIN_TAIL = 20        # last lines (the leaf side, where the thread is actually stuck)
+          SPIN_APP_MAX = 120    # app-symbol lines kept in full in between
+          SPIN_FILES_PER_TEST = 4
+          SPIN_APP_NAMES = ("EnglishApp", "Vocabry")
+          SPIN_APP_MARKERS = ("EnglishApp", "Vocabry", "com.readori.english")
+
+          def spin_find_files(root):
+              # Returns [(file path, human readable name)] of attachments whose name mentions "spindump".
+              names = {}
+              manifest = os.path.join(root, "manifest.json")
+              if os.path.isfile(manifest):
+                  try:
+                      def walk(n):
+                          if isinstance(n, dict):
+                              if isinstance(n.get("exportedFileName"), str):
+                                  names[n["exportedFileName"]] = str(n.get("suggestedHumanReadableName") or "")
+                              for v in n.values():
+                                  walk(v)
+                          elif isinstance(n, list):
+                              for v in n:
+                                  walk(v)
+                      with open(manifest, encoding="utf-8") as fh:
+                          walk(json.load(fh))
+                  except Exception:
+                      pass
+              found = []
+              for dirpath, _, files in os.walk(root):
+                  for f in sorted(files):
+                      if f == "manifest.json":
+                          continue
+                      human = names.get(f, "")
+                      if "spindump" in (f + " " + human).lower():
+                          found.append((os.path.join(dirpath, f), human or f))
+              return found, sorted(names.values() or [f"(no manifest) {len(os.listdir(root))} files"])
+
+          def spin_pick(lines, idx):
+              # Lines of one Process section: header (up to the first thread) and the picked main thread block.
+              starts = [i for i, l in enumerate(lines) if re.match(r"^Process:\s", l)]
+              best = None
+              for n, i in enumerate(starts):
+                  end = starts[n + 1] if n + 1 < len(starts) else len(lines)
+                  name = re.sub(r"\s*\[\d+\]\s*$", "", lines[i].split(":", 1)[1].strip())
+                  head = lines[i:min(end, i + 30)]
+                  by_id = any(re.match(r"^Identifier:\s+com\.readori\.english\s*$", l) for l in head)
+                  if name in SPIN_APP_NAMES or by_id:
+                      best = (i, end, name)
+                      break
+              if best is None:
+                  return None
+              i, end, name = best
+              threads = [j for j in range(i, end) if re.match(r"^\s+Thread 0x[0-9a-fA-F]+", lines[j])]
+              if not threads:
+                  return {"proc": i, "name": name, "thread": None}
+              main = next((j for j in threads if "com.apple.main-thread" in lines[j]), threads[0])
+              stop = end
+              for j in range(main + 1, end):
+                  l = lines[j]
+                  if re.match(r"^\s+Thread 0x[0-9a-fA-F]+", l) or (l.strip() and not l[0].isspace()):
+                      stop = j
+                      break
+              block = lines[main:stop]
+              while block and not block[-1].strip():
+                  block.pop()
+              return {"proc": i, "name": name, "thread": block, "is_main": "com.apple.main-thread" in lines[main],
+                      "header": lines[i:min(end, i + 30)]}
+
+          def spin_select(block):
+              # Keep the first SPIN_HEAD lines, the last SPIN_TAIL lines and every app-symbol line; clip the rest.
+              keep = set(range(min(len(block), SPIN_HEAD))) | set(range(max(0, len(block) - SPIN_TAIL), len(block)))
+              app = [k for k, l in enumerate(block) if any(m in l for m in SPIN_APP_MARKERS)]
+              keep |= set(app[:SPIN_APP_MAX])
+              out, prev = [], -1
+              for k in sorted(keep):
+                  if k > prev + 1:
+                      out.append(f"      ... {k - prev - 1} frames skipped")
+                  line = block[k].rstrip()
+                  if not any(m in line for m in SPIN_APP_MARKERS):
+                      line = line[:220] + (" ..." if len(line) > 220 else "")
+                  out.append("    " + line)
+                  prev = k
+              return out
+
+          def spin_report(path, human):
+              out = [f"  {human}  ({os.path.basename(path)})"]
+              with open(path, encoding="utf-8", errors="replace") as fh:
+                  text = fh.read(60_000_000)
+              lines = text.splitlines()
+              picked = spin_pick(lines, 0)
+              if picked and picked.get("thread"):
+                  out.append(f"  process {picked['name']}, " + ("main thread" if picked["is_main"] else "first thread (no com.apple.main-thread queue found)")
+                             + f", {len(picked['thread'])} lines in its call tree")
+                  out += spin_select(picked["thread"])
+                  return out
+              # Not the format we expected: show the surroundings of the process header so the parser can be adapted.
+              if picked:
+                  at, why = picked["proc"], f"process {picked['name']} found but no 'Thread 0x...' lines"
+              else:
+                  at = next((i for i, l in enumerate(lines) if re.match(r"^Process:\s", l)), 0)
+                  why = "no app process section (EnglishApp / Vocabry / com.readori.english)"
+              out.append(f"  {why}; {len(lines)} lines in the file; first 80 lines from line {max(0, at - 5) + 1}:")
+              out += ["    " + l[:220] for l in lines[max(0, at - 5):max(0, at - 5) + 80]]
+              return out
+
+          def spindump_main_threads():
+              if not ui_failed:
+                  return
+              lines = []
+              seen = set()
+              for label, path, ident in ui_failed:
+                  if (path, ident) in seen:
+                      continue
+                  seen.add((path, ident))
+                  try:
+                      with tempfile.TemporaryDirectory(prefix="spin-") as tmp:
+                          last_err = ""
+                          ok = False
+                          for cand in activity_candidates(ident):
+                              p = subprocess.run(["xcrun", "xcresulttool", "export", "attachments", "--path", path,
+                                                  "--output-path", tmp, "--test-id", cand],
+                                                 capture_output=True, text=True, timeout=600)
+                              if p.returncode == 0:
+                                  ok = True
+                                  break
+                              last_err = clip(p.stderr, 200)
+                          if not ok:
+                              lines.append(f"[{label}] {ident}: attachments not exported ({last_err or 'xcresulttool failed'})")
+                              continue
+                          files, all_names = spin_find_files(tmp)
+                          if not files:
+                              lines.append(f"[{label}] {ident}: no Spindump attachment; attachment names: "
+                                           + clip(", ".join(all_names[:30]), 300))
+                              continue
+                          lines.append(f"[{label}] {ident}: {len(files)} Spindump attachment(s)")
+                          done = set()
+                          for fp, human in files[:SPIN_FILES_PER_TEST]:
+                              with open(fp, "rb") as fh:
+                                  digest = hashlib.sha1(fh.read(2_000_000)).hexdigest()
+                              if digest in done:
+                                  continue
+                              done.add(digest)
+                              lines += spin_report(fp, human)
+                  except Exception as exc:
+                      lines.append(f"[{label}] {ident}: spindump unavailable ({clip(exc, 200)})")
+              if not lines:
+                  return
+              print("::group::Main thread of the app in hang spindumps")
+              for ln in lines[:SPIN_CAP]:
+                  print(ln)
+              if len(lines) > SPIN_CAP:
+                  print(f"  ... {len(lines) - SPIN_CAP} more lines cut (cap {SPIN_CAP})")
+              print("::endgroup::")
+
           lexcore()
           xcresult("EnglishAppTests (unit)", "UNIT_XCRESULT", "UNIT_STATUS")
           xcresult("EnglishAppUITests (smoke)", "UI_XCRESULT", "UI_STATUS")
@@ -574,6 +734,10 @@ jobs:
               activity_logs()
           except Exception as exc:
               print(f"Activity log of failing UI tests skipped: {clip(exc, 200)}")
+          try:
+              spindump_main_threads()
+          except Exception as exc:
+              print(f"Spindump main thread skipped: {clip(exc, 200)}")
           if failures:
               for suite, ident, msgs in failures[:15]:
                   print(f"::error title=Test failed ({esc(suite)})::{esc(ident)}%0A{esc(chr(10).join(msgs[:3]))}")
