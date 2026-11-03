@@ -1,0 +1,413 @@
+name: Readori Voice Packs
+
+run-name: Voice packs ${{ inputs.mode }} @ ${{ inputs.source_ref }}${{ inputs.mode == 'build' && format(' · {0}', inputs.packs) || '' }}${{ inputs.publish && ' · publish' || '' }}
+
+# CI for the public repository readori/readori-voice-packs (offline sherpa-onnx voice packs).
+# That repository holds no workflows; every check and build runs here.
+#
+#   mode=check  lint + unit tests + registry / license gate. Downloads no models.
+#   mode=build  check, then fetch -> build -> validate -> smoke -> (audit) -> pack each selected
+#               pack; with publish=true (source_ref main only) upload GitHub Releases to
+#               readori/readori-voice-packs and commit catalog/v1/index.json back to its main.
+#
+# Every job checks out the same commit (resolved once in `check`). Only the two publishing steps
+# receive TARGET_REPO_PAT; everything else uses read-only tokens. No Apple / App Store Connect
+# secrets are used: Apple asset packs are built as artifacts and uploaded separately by hand.
+# Official actions are pinned to commit SHAs (checkout v7.0.1, setup-python v7.1.0,
+# upload-artifact v7.0.2, download-artifact v8.0.2).
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "check = 代码检查与测试；build = 检查后制作语音包"
+        required: true
+        default: check
+        type: choice
+        options:
+          - check
+          - build
+      source_ref:
+        description: "readori-voice-packs 的分支、标签或提交 SHA（发布只允许 main）"
+        required: true
+        default: main
+        type: string
+      packs:
+        description: "build：逗号分隔的语音包 id，或 all-approved"
+        required: true
+        default: all-approved
+        type: string
+      audit:
+        description: "build：逐音色声学审计（仅多音色包）"
+        required: true
+        default: true
+        type: boolean
+      publish:
+        description: "build：发布 GitHub Releases 并更新 catalog/v1/index.json"
+        required: true
+        default: false
+        type: boolean
+      allow_unpinned:
+        description: "build：允许 registry 中未固定 sha256 / bytes 的模型（不可与 publish 同用）"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: readori-voice-packs
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: readori/readori-voice-packs
+
+jobs:
+  check:
+    name: Lint, tests and license gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      sha: ${{ steps.rev.outputs.sha }}
+    defaults:
+      run:
+        working-directory: voice-packs
+    steps:
+      - name: Validate inputs
+        working-directory: .
+        env:
+          MODE: ${{ inputs.mode }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          PUBLISH: ${{ inputs.publish }}
+          ALLOW_UNPINNED: ${{ inputs.allow_unpinned }}
+        run: |
+          set -euo pipefail
+          if [ "$PUBLISH" = "true" ]; then
+            [ "$MODE" = "build" ] || { echo "::error::publish=true requires mode=build"; exit 1; }
+            [ "$SOURCE_REF" = "main" ] || { echo "::error::publish=true requires source_ref=main"; exit 1; }
+            [ "$ALLOW_UNPINNED" != "true" ] || { echo "::error::publish=true cannot be combined with allow_unpinned"; exit 1; }
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ inputs.source_ref }}
+          path: voice-packs
+          persist-credentials: false
+
+      - name: Resolve source commit
+        id: rev
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Source: \`$SOURCE_REPOSITORY@$sha\` (ref \`${{ inputs.source_ref }}\`)" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Unit tests
+        run: python -m pytest
+
+      - name: Registry schema and license gate
+        run: python -m readori_voicepack registry-check
+
+  plan:
+    name: Build plan
+    needs: check
+    if: ${{ inputs.mode == 'build' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      has_packs: ${{ steps.plan.outputs.has_packs }}
+    defaults:
+      run:
+        working-directory: voice-packs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ needs.check.outputs.sha }}
+          path: voice-packs
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: python -m pip install -e .
+
+      - name: Publishing token can write the target repository
+        if: ${{ inputs.publish }}
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          set -euo pipefail
+          [ -n "$GH_TOKEN" ] || { echo "::error::TARGET_REPO_PAT is not set"; exit 1; }
+          push="$(gh api "repos/$SOURCE_REPOSITORY" --jq '.permissions.push' 2>/dev/null || echo error)"
+          if [ "$push" != "true" ]; then
+            echo "::error::TARGET_REPO_PAT cannot push to $SOURCE_REPOSITORY (got: $push); grant it Contents read/write there"
+            exit 1
+          fi
+
+      - name: License gate and build matrix
+        id: plan
+        env:
+          PACKS: ${{ inputs.packs }}
+          ALLOW_UNPINNED: ${{ inputs.allow_unpinned }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          args=(--select "$PACKS" --matrix)
+          if [ "$ALLOW_UNPINNED" != "true" ]; then args+=(--require-pinned); fi
+          if [ "$PUBLISH" = "true" ]; then args+=(--for-publish); fi
+          python -m readori_voicepack registry-check "${args[@]}" > matrix.json
+          echo "matrix=$(cat matrix.json)" >> "$GITHUB_OUTPUT"
+          if [ "$(jq '.include | length' matrix.json)" -gt 0 ]; then has=true; else has=false; fi
+          echo "has_packs=$has" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Build plan"
+            echo
+            echo '```json'
+            cat matrix.json
+            echo
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build ${{ matrix.id }}
+    needs: [check, plan]
+    if: ${{ needs.plan.outputs.has_packs == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    defaults:
+      run:
+        working-directory: voice-packs
+    env:
+      PACK_ID: ${{ matrix.id }}
+      UNPINNED_FLAG: ${{ inputs.allow_unpinned && '--allow-unpinned' || '' }}
+      SOURCE_SHA: ${{ needs.check.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ needs.check.outputs.sha }}
+          path: voice-packs
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install (sherpa-onnx is pinned by the audio extra)
+        run: python -m pip install -e ".[audio]"
+
+      - name: Fetch upstream archive (bytes / sha256 checked)
+        run: python -m readori_voicepack fetch "$PACK_ID" $UNPINNED_FLAG
+
+      - name: Build pack directory
+        run: python -m readori_voicepack build "$PACK_ID" $UNPINNED_FLAG
+
+      - name: Validate (app importer rules)
+        run: python -m readori_voicepack validate "build/packs/$PACK_ID"
+
+      - name: Smoke synthesis
+        run: python -m readori_voicepack smoke "build/packs/$PACK_ID"
+
+      - name: Audit speakers
+        if: ${{ inputs.audit }}
+        run: python -m readori_voicepack audit "build/packs/$PACK_ID" --min-speakers 2
+
+      - name: Validate again after audit
+        if: ${{ inputs.audit }}
+        run: python -m readori_voicepack validate "build/packs/$PACK_ID"
+
+      - name: Pack (deterministic ZIP)
+        run: |
+          python -m readori_voicepack pack "build/packs/$PACK_ID" --out dist
+          python -m readori_voicepack validate dist/*.zip
+          {
+            echo "### $PACK_ID"
+            echo
+            echo '```json'
+            cat dist/*.zip.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload pack artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pack-${{ matrix.id }}
+          path: voice-packs/dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload sidecar (used by the index job)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sidecar-${{ matrix.id }}
+          path: voice-packs/dist/*.zip.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release to readori-voice-packs
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          set -euo pipefail
+          VER="$(jq -r '.packVersion' dist/*.zip.json)"
+          SPDX="$(jq -r '.license.spdx // "see readori-attribution.txt"' dist/*.zip.json)"
+          SHA="$(jq -r '.sha256' dist/*.zip.json)"
+          TAG="pack/${PACK_ID}/v${VER}"
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          NOTES="Readori offline voice pack ${PACK_ID} v${VER}. Model license: ${SPDX}. ZIP SHA-256: ${SHA}. Built from ${SOURCE_REPOSITORY}@${SOURCE_SHA} by ${RUN_URL}."
+          if gh release view "$TAG" --repo "$SOURCE_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.zip dist/*.zip.json --clobber --repo "$SOURCE_REPOSITORY"
+          else
+            gh release create "$TAG" dist/*.zip dist/*.zip.json \
+              --repo "$SOURCE_REPOSITORY" \
+              --title "${PACK_ID} v${VER}" \
+              --notes "$NOTES" \
+              --target "$SOURCE_SHA"
+          fi
+
+  apple-asset-pack:
+    # Draft Apple-hosted Background Assets packs. Needs Xcode 26 (`xcrun ba-package`); otherwise it
+    # explains why it was skipped. continue-on-error: this job never fails the workflow.
+    name: Apple asset packs (draft)
+    needs: [check, build]
+    if: ${{ always() && needs.build.result == 'success' }}
+    runs-on: macos-latest
+    continue-on-error: true
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: voice-packs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ needs.check.outputs.sha }}
+          path: voice-packs
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: python -m pip install -e .
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: pack-*
+          path: voice-packs/dist
+          merge-multiple: true
+
+      - name: Detect xcrun ba-package
+        id: detect
+        run: |
+          if xcrun --find ba-package > /dev/null 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            xcodebuild -version | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Apple asset packs skipped"
+              echo
+              echo "\`xcrun ba-package\` is not available on this runner (it ships with Xcode 26)."
+              echo "The GitHub Release ZIPs are unaffected."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Build draft asset packs
+        if: ${{ steps.detect.outputs.available == 'true' }}
+        run: |
+          set -euo pipefail
+          mkdir -p ba-out work
+          # Reference template from the installed tool: compare it with our generated manifests.
+          xcrun ba-package template > ba-out/ba-package-template.json
+          for zip in dist/*.zip; do
+            id="$(basename "$zip" .zip)"
+            rm -rf "work/$id"
+            mkdir -p "work/$id"
+            unzip -q "$zip" -d "work/$id"
+            python -m readori_voicepack ba-manifest "work/$id" --out ba-out
+          done
+          for manifest in ba-out/*.manifest.json; do
+            name="$(basename "$manifest" .manifest.json)"
+            xcrun ba-package "$manifest" -o "ba-out/${name}.aar"
+          done
+          ls -l ba-out | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload draft asset packs
+        if: ${{ steps.detect.outputs.available == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: apple-asset-packs
+          path: voice-packs/ba-out/*
+          if-no-files-found: error
+          retention-days: 14
+
+  index:
+    name: Update catalog index
+    needs: [check, build]
+    if: ${{ inputs.publish && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: voice-packs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: main
+          path: voice-packs
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          persist-credentials: true # needed to push the index commit
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: python -m pip install -e .
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: sidecar-*
+          path: voice-packs/sidecars
+          merge-multiple: true
+
+      - name: Update catalog/v1/index.json
+        run: python -m readori_voicepack index --sidecars sidecars --repo "$SOURCE_REPOSITORY"
+
+      - name: Commit index
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- catalog/v1/index.json; then
+            echo "index.json unchanged"
+          else
+            git add catalog/v1/index.json
+            git commit -m "catalog: update index.json (readori/test-env-setup run ${GITHUB_RUN_ID})"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
