@@ -33,7 +33,7 @@ on:
         default: main
         type: string
       packs:
-        description: "build：逗号分隔的语音包 id，或 all-approved"
+        description: "build：逗号分隔的语音包 id，或 all-approved（官方包）/ all-community（社区包，仅 GitHub Releases）"
         required: true
         default: all-approved
         type: string
@@ -275,7 +275,13 @@ jobs:
           SHA="$(jq -r '.sha256' dist/*.zip.json)"
           TAG="pack/${PACK_ID}/v${VER}"
           RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          NOTES="Readori offline voice pack ${PACK_ID} v${VER}. Model license: ${SPDX}. ZIP SHA-256: ${SHA}. Built from ${SOURCE_REPOSITORY}@${SOURCE_SHA} by ${RUN_URL}."
+          TIER="$(jq -r '.tier // "official"' dist/*.zip.json)"
+          if [ "$TIER" = "community" ]; then
+            LICENSE_LINE="Community tier: collected from the community, not recommended by Readori; add at your own discretion. Licence not verified. 社区收集，Readori 不推荐，由用户自行添加使用，许可证未经核实。"
+          else
+            LICENSE_LINE="Model license: ${SPDX}."
+          fi
+          NOTES="Readori offline voice pack ${PACK_ID} v${VER}. ${LICENSE_LINE} ZIP SHA-256: ${SHA}. Built from ${SOURCE_REPOSITORY}@${SOURCE_SHA} by ${RUN_URL}."
           if gh release view "$TAG" --repo "$SOURCE_REPOSITORY" > /dev/null 2>&1; then
             gh release upload "$TAG" dist/*.zip dist/*.zip.json --clobber --repo "$SOURCE_REPOSITORY"
           else
@@ -352,6 +358,11 @@ jobs:
           out_dir="$PWD/ba-out"
           for zip in dist/*.zip; do
             id="$(basename "$zip" .zip)"
+            # Community-tier packs are GitHub Releases only: never package them for Apple.
+            if [ "$(jq -r '.tier // "official"' "dist/${id}.zip.json" 2>/dev/null || echo official)" = "community" ]; then
+              echo "skipped $id: community tier (GitHub Releases only, not an Apple asset pack)"
+              continue
+            fi
             rm -rf "work/$id"
             mkdir -p "work/$id"
             unzip -q "$zip" -d "work/$id"
