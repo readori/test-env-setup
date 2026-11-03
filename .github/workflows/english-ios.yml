@@ -320,6 +320,8 @@ jobs:
           import xml.etree.ElementTree as ET
 
           rows, failures, notes, skips = [], [], [], []
+          ui_failed = []  # (label, xcresult path, test identifier) of failed UI tests, for the activity log
+          UI_ACTIVITY_LABELS = ("EnglishAppUITests (smoke)", "IPadSmokeTests (iPad)")
 
           def status_of(name):
               v = os.environ.get(name, "")
@@ -412,6 +414,8 @@ jobs:
                           for c in node.get("children", []) or []:
                               collect(c)
                           failures.append((label, node.get("nodeIdentifier") or "/".join(here), msgs or ["(no failure message)"]))
+                          if label in UI_ACTIVITY_LABELS:
+                              ui_failed.append((label, path, node.get("nodeIdentifier") or "/".join(here[1:])))
                           found = True
                       if kind == "Test Case" and node.get("result") == "Skipped":
                           why = [clip(c.get("name", ""), 200) for c in node.get("children", []) or [] if c.get("name")]
@@ -424,8 +428,98 @@ jobs:
                   notes.append(f"{label}: could not read the test tree ({exc}); using the summary list.")
               if not found:
                   for f in s.get("testFailures", []) or []:
-                      failures.append((label, f.get("testIdentifierString") or f"{f.get('targetName', '')}/{f.get('testName', '')}",
-                                       [clip(f.get("failureText", ""), 600)]))
+                      ident = f.get("testIdentifierString") or f"{f.get('targetName', '')}/{f.get('testName', '')}"
+                      failures.append((label, ident, [clip(f.get("failureText", ""), 600)]))
+                      if label in UI_ACTIVITY_LABELS:
+                          ui_failed.append((label, path, ident))
+
+          # ---- Activity log of failing UI tests (log only; best effort, never affects the exit status)
+          # `xcresulttool get test-results activities --test-id <id>` (Xcode 16+) returns
+          # {"testRuns": [{"activities": [{"title", "startTime", "attachments", "childActivities"}]}]},
+          # one run per retry attempt. Only titles and start offsets are printed, attachments are skipped.
+          ACTIVITY_LAST = 60
+          ACTIVITY_CAP = 400
+
+          def activity_candidates(ident):
+              # The "tests" output gives "Class/testName()"; the summary fallback may be prefixed by the target.
+              c = [ident]
+              parts = ident.split("/")
+              if len(parts) > 2:
+                  c.append("/".join(parts[-2:]))
+                  c.append("/".join(parts[1:]))
+              return list(dict.fromkeys(c))
+
+          def find_attempts(node, found):
+              # Every dict that carries an "activities" list is one run attempt (robust against schema nesting).
+              if isinstance(node, dict):
+                  if isinstance(node.get("activities"), list):
+                      found.append(node)
+                  else:
+                      for v in node.values():
+                          find_attempts(v, found)
+              elif isinstance(node, list):
+                  for v in node:
+                      find_attempts(v, found)
+              return found
+
+          def flatten_activities(acts, depth, out):
+              for a in acts or []:
+                  if not isinstance(a, dict):
+                      continue
+                  t = a.get("startTime")
+                  out.append((depth, " ".join(str(a.get("title", "")).split()),
+                              float(t) if isinstance(t, (int, float)) and not isinstance(t, bool) else None))
+                  flatten_activities(a.get("childActivities"), depth + 1, out)
+              return out
+
+          def activity_logs():
+              if not ui_failed:
+                  return
+              lines = []
+              seen = set()
+              for label, path, ident in ui_failed:
+                  if (path, ident) in seen:
+                      continue
+                  seen.add((path, ident))
+                  try:
+                      data = None
+                      last_err = ""
+                      for cand in activity_candidates(ident):
+                          p = subprocess.run(["xcrun", "xcresulttool", "get", "test-results", "activities",
+                                              "--test-id", cand, "--path", path, "--compact"],
+                                             capture_output=True, text=True, timeout=120)
+                          if p.returncode == 0:
+                              data = json.loads(p.stdout)
+                              break
+                          last_err = clip(p.stderr, 200)
+                      if data is None:
+                          lines.append(f"[{label}] {ident}: no activity log ({last_err or 'xcresulttool failed'})")
+                          continue
+                      attempts = find_attempts(data, [])
+                      lines.append(f"[{label}] {ident}  ({len(attempts)} run attempt(s))")
+                      for i, run in enumerate(attempts, 1):
+                          flat = flatten_activities(run.get("activities"), 0, [])
+                          times = [t for _, _, t in flat if t is not None]
+                          t0 = min(times) if times else None
+                          dev = run.get("device") if isinstance(run.get("device"), dict) else {}
+                          dev_name = clip(dev.get("deviceName") or dev.get("name") or "", 60)
+                          omitted = max(0, len(flat) - ACTIVITY_LAST)
+                          lines.append(f"  attempt {i}/{len(attempts)}" + (f" on {dev_name}" if dev_name else "")
+                                       + f": {len(flat)} activities" + (f", showing the last {ACTIVITY_LAST}" if omitted else ""))
+                          # Indentation keeps the original tree depth; the cut only drops the earliest entries.
+                          for depth, title, t in flat[omitted:]:
+                              off = f"+{t - t0:7.2f}s " if t is not None and t0 is not None else "          "
+                              lines.append("    " + "  " * depth + off + clip(title, 200))
+                  except Exception as exc:
+                      lines.append(f"[{label}] {ident}: activity log unavailable ({clip(exc, 200)})")
+              if not lines:
+                  return
+              print("::group::Activity log of failing UI tests")
+              for ln in lines[:ACTIVITY_CAP]:
+                  print(ln)
+              if len(lines) > ACTIVITY_CAP:
+                  print(f"  ... {len(lines) - ACTIVITY_CAP} more lines cut (cap {ACTIVITY_CAP})")
+              print("::endgroup::")
 
           lexcore()
           xcresult("EnglishAppTests (unit)", "UNIT_XCRESULT", "UNIT_STATUS")
@@ -476,6 +570,10 @@ jobs:
               for suite, ident, why in skips:
                   print(f"[{suite}] {ident}" + (f"  -- {why[0]}" if why else ""))
               print("::endgroup::")
+          try:
+              activity_logs()
+          except Exception as exc:
+              print(f"Activity log of failing UI tests skipped: {clip(exc, 200)}")
           if failures:
               for suite, ident, msgs in failures[:15]:
                   print(f"::error title=Test failed ({esc(suite)})::{esc(ident)}%0A{esc(chr(10).join(msgs[:3]))}")
