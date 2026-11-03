@@ -342,16 +342,26 @@ jobs:
           mkdir -p ba-out work
           # Reference template from the installed tool: compare it with our generated manifests.
           xcrun ba-package template > ba-out/ba-package-template.json
+          {
+            echo "### \`xcrun ba-package template\`"
+            echo
+            echo '```json'
+            cat ba-out/ba-package-template.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          out_dir="$PWD/ba-out"
           for zip in dist/*.zip; do
             id="$(basename "$zip" .zip)"
             rm -rf "work/$id"
             mkdir -p "work/$id"
             unzip -q "$zip" -d "work/$id"
-            python -m readori_voicepack ba-manifest "work/$id" --out ba-out
-          done
-          for manifest in ba-out/*.manifest.json; do
+            log="$(python -m readori_voicepack ba-manifest "work/$id" --out ba-out)"
+            echo "$log"
+            manifest="$(printf '%s\n' "$log" | sed -n 's/^wrote \(.*\.manifest\.json\).*/\1/p' | head -n 1)"
+            [ -n "$manifest" ] || { echo "::error::no manifest written for $id"; exit 1; }
             name="$(basename "$manifest" .manifest.json)"
-            xcrun ba-package "$manifest" -o "ba-out/${name}.aar"
+            # Manifest file paths are relative to the pack root, so package from inside it.
+            (cd "work/$id" && xcrun ba-package "$out_dir/${name}.manifest.json" -o "$out_dir/${name}.aar")
           done
           ls -l ba-out | tee -a "$GITHUB_STEP_SUMMARY"
 
