@@ -1895,7 +1895,10 @@ jobs:
             -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
             -resultBundlePath "$UNIT_XCRESULT" \
             -only-testing:"$UNIT_TEST_TARGET" \
-            -parallel-testing-enabled NO
+            -parallel-testing-enabled NO \
+            -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300
           status=$?
           echo "UNIT_STATUS=$status" >> "$GITHUB_ENV"
           [[ "$status" -eq 0 ]] && echo 'Unit tests: PASS' || echo "::error title=Unit tests::$UNIT_TEST_TARGET failed (exit $status). Details in the Job Summary."
