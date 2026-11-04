@@ -2393,6 +2393,12 @@ jobs:
 
           xcrun simctl bootstatus "$SIMULATOR_UDID" -b >/dev/null
 
+          # SketchbookReviewShots (T-158) only exists on branches with the Sketchbook theme; other branches leave it out.
+          REVIEW_SELECT=()
+          if [[ -f "$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH/UITests/SketchbookReviewShots.swift" ]]; then
+            REVIEW_SELECT=(-only-testing:"$UI_TEST_TARGET/SketchbookReviewShots")
+          fi
+
           # take <key> <language> <region> <simulator udid> <device iphone|ipad>: one pass of StoreScreenshotTests.
           # The test is skipped unless STORE_SCREENSHOT_DIR is set; xcodebuild hands TEST_RUNNER_* variables to the test
           # runner without the prefix. Key EN / ZH = iPhone, IPAD_EN / IPAD_ZH = iPad (T-104: files go to ipad/<lang>/).
@@ -2411,6 +2417,7 @@ jobs:
               --cellularMode active --cellularBars 4 \
               --batteryState charged --batteryLevel 100
 
+            # SketchbookReviewShots (T-158) writes review/<lang>-<name>.png on the iPhone passes and skips itself on the iPad.
             echo "Screenshots: $label ($region)"
             TEST_RUNNER_STORE_SCREENSHOT_DIR="$SHOTS_ROOT" \
             TEST_RUNNER_STORE_SCREENSHOT_LANG="$lang" \
@@ -2421,6 +2428,7 @@ jobs:
               -destination "platform=iOS Simulator,id=$udid" \
               -resultBundlePath "$xcresult" \
               -only-testing:"$UI_TEST_TARGET/StoreScreenshotTests" \
+              ${REVIEW_SELECT[@]+"${REVIEW_SELECT[@]}"} \
               -parallel-testing-enabled NO \
               -retry-tests-on-failure \
               -test-iterations 2 \
@@ -2528,6 +2536,8 @@ jobs:
           #    The check copies the files into the branch folder (screenshots/<lang>/ and screenshots/ipad/<lang>/) and
           #    writes manifest.json (device, sizes, pixel sizes, sha256). It prints file names, sizes and counts only; it never
           #    reads or prints an image.
+          #    Review screenshots (T-158): any PNG directly in <root>/review/ (any file name) is left out of all the checks
+          #    above (count, size, name) and copied as-is to screenshots/review/; they are listed under "review" in manifest.json.
           python3 - "$SHOTS_ROOT" "$STAGE" "$SUMMARY" <<'PY'
           import hashlib, json, os, re, shutil, struct, sys
 
@@ -2593,12 +2603,38 @@ jobs:
                   totals.append((label, lang, f"{len(mains)} (need 01..{need:02d})", count, pixels))
                   print(f"{label} {shown}: {count} valid PNG files, {len(mains)} main screens (need 01..{need:02d}), pixels {pixels}")
 
+          # Review screenshots: not store screenshots, so no name, size or count rules; only a PNG signature check (a file that
+          # is not a PNG is skipped with a warning). Copied byte for byte.
+          review, review_lines = [], []
+          review_dir = os.path.join(root, "review")
+          review_names = sorted(n for n in os.listdir(review_dir) if n.lower().endswith(".png")) if os.path.isdir(review_dir) else []
+          for name in review_names:
+              path = os.path.join(review_dir, name)
+              size = png_size(path)
+              if size is None:
+                  print(f"::warning title=Review screenshots::review/{name} is not a PNG file and was skipped.")
+                  continue
+              data = open(path, "rb").read()
+              dest_dir = os.path.join(stage, "screenshots", "review")
+              os.makedirs(dest_dir, exist_ok=True)
+              shutil.copyfile(path, os.path.join(dest_dir, name))
+              review.append({
+                  "path": f"screenshots/review/{name}",
+                  "width": size[0], "height": size[1],
+                  "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+              })
+              review_lines.append((name, size, len(data)))
+          print(f"Review screenshots: {len(review)} PNG files (not checked against the store rules)")
+          for name, size, nbytes in review_lines:
+              print(f"  review/{name}  {size[0]}x{size[1]}  {nbytes:,} bytes")
+
           manifest = {
               "run_id": os.environ.get("GITHUB_RUN_ID", ""),
               "source_commit": os.environ.get("SOURCE_COMMIT", ""),
               "simulator": os.environ.get("SIMULATOR_DESC", ""),
               "ipad_simulator": os.environ.get("IPAD_SIMULATOR_DESC", ""),
               "files": files,
+              "review": review,
           }
           with open(os.path.join(stage, "manifest.json"), "w", encoding="utf-8") as fh:
               json.dump(manifest, fh, indent=2)
@@ -2610,6 +2646,9 @@ jobs:
           out += [f"| {d} | {l} | {mn} | {c} | {px} |" for d, l, mn, c, px in totals]
           out += ["", "| Device | Language | File | Pixels | Size |", "|---|---|---|---|---:|"]
           out += [f"| {d} | {l} | `{n}` | {s[0]}x{s[1]} | {b / 1_000_000:.2f} MB |" for d, l, n, s, b in lines]
+          if review_lines:
+              out += ["", "### Review screenshots", "", "| File | Pixels | Size |", "|---|---|---:|"]
+              out += [f"| `{n}` | {s[0]}x{s[1]} | {b / 1_000_000:.2f} MB |" for n, s, b in review_lines]
           if errors:
               out += ["", "### Problems", ""] + [f"- {e}" for e in errors]
           with open(summary, "w", encoding="utf-8") as fh:
