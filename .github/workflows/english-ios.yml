@@ -2393,11 +2393,14 @@ jobs:
 
           xcrun simctl bootstatus "$SIMULATOR_UDID" -b >/dev/null
 
-          # SketchbookReviewShots (T-158) only exists on branches with the Sketchbook theme; other branches leave it out.
+          # The Sketchbook review shots (SketchbookReviewShots, T-158/T-159; SketchbookThemeShots, T-160) only exist on branches with the
+          # Sketchbook theme; other branches leave them out.
           REVIEW_SELECT=()
-          if [[ -f "$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH/UITests/SketchbookReviewShots.swift" ]]; then
-            REVIEW_SELECT=(-only-testing:"$UI_TEST_TARGET/SketchbookReviewShots")
-          fi
+          for cls in SketchbookReviewShots SketchbookThemeShots; do
+            if [[ -f "$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH/UITests/$cls.swift" ]]; then
+              REVIEW_SELECT+=(-only-testing:"$UI_TEST_TARGET/$cls")
+            fi
+          done
 
           # take <key> <language> <region> <simulator udid> <device iphone|ipad>: one pass of StoreScreenshotTests.
           # The test is skipped unless STORE_SCREENSHOT_DIR is set; xcodebuild hands TEST_RUNNER_* variables to the test
