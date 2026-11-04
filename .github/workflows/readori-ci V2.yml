@@ -1286,8 +1286,8 @@ jobs:
           GENERATE_INFOPLIST_FILE=NO \
           INFOPLIST_FILE="$INFO_PLIST" \
           INFOPLIST_KEY_UILaunchStoryboardName=LaunchScreen \
-          CURRENT_PROJECT_VERSION="${{ env.BUILD_NUMBER }}" \
-          MARKETING_VERSION="${{ env.APP_VERSION }}" \
+          CURRENT_PROJECT_VERSION="${BUILD_NUMBER}" \
+          MARKETING_VERSION="${APP_VERSION}" \
           READORI_SOCIAL_WORKER_ENDPOINT="$READORI_SOCIAL_WORKER_ENDPOINT" \
           PRO_LEASE_PUBLIC_KEY="$PRO_LEASE_PUBLIC_KEY" \
           ASSETCATALOG_COMPILER_APPICON_NAME=AppIcon \
@@ -1339,8 +1339,8 @@ jobs:
           # Patch Info.plist for app bundle
           /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $SCHEME" "$APP_PATH/Info.plist" || true
           /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.readori.app" "$APP_PATH/Info.plist" || true
-          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ env.BUILD_NUMBER }}" "$APP_PATH/Info.plist" || true
-          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ env.APP_VERSION }}" "$APP_PATH/Info.plist" || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUMBER}" "$APP_PATH/Info.plist" || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${APP_VERSION}" "$APP_PATH/Info.plist" || true
           if [[ -n "$READORI_SOCIAL_WORKER_ENDPOINT" ]]; then
             /usr/bin/plutil -replace READORI_SOCIAL_WORKER_ENDPOINT -string "$READORI_SOCIAL_WORKER_ENDPOINT" "$APP_PATH/Info.plist" || true
           fi
@@ -1514,8 +1514,8 @@ jobs:
 
         APP_CFBV="$($PB_EXT -c 'Print :CFBundleVersion' "$APP_PATH/Info.plist" 2>/dev/null || true)"
         APP_CFSV="$($PB_EXT -c 'Print :CFBundleShortVersionString' "$APP_PATH/Info.plist" 2>/dev/null || true)"
-        [[ -n "$APP_CFBV" && "$APP_CFBV" != *'$('* ]] || APP_CFBV="${{ env.BUILD_NUMBER }}"
-        [[ -n "$APP_CFSV" && "$APP_CFSV" != *'$('* ]] || APP_CFSV="${{ env.APP_VERSION }}"
+        [[ -n "$APP_CFBV" && "$APP_CFBV" != *'$('* ]] || APP_CFBV="${BUILD_NUMBER}"
+        [[ -n "$APP_CFSV" && "$APP_CFSV" != *'$('* ]] || APP_CFSV="${APP_VERSION}"
 
         EXT_DEST="$APP_PATH/Extensions/$EXT_NAME.appex"
         rm -rf "$EXT_DEST"
