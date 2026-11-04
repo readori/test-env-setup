@@ -776,6 +776,11 @@ jobs:
         set -euo pipefail
 
         APP_BUNDLE_ID="com.readori.app"
+        # R202 P3-B: ExtensionKit extension (Background Assets downloader) shipped
+        # inside the app. It has its own App ID + App Store profile, both of which
+        # must include the App Group shared with the main app.
+        EXT_BUNDLE_ID="com.readori.app.VoicePackDownloader"
+        APP_GROUP_ID="group.com.readori.app"
         MATCH_GIT_URL="https://github.com/readori/readori-certificates.git"
         KEYCHAIN_NAME="readori-ci.keychain-db"
         KEYCHAIN_PATH="$HOME/Library/Keychains/$KEYCHAIN_NAME"
@@ -822,9 +827,11 @@ jobs:
         # CI is deliberately readonly: the certificates repository is the
         # signing source of truth. This installs the encrypted Distribution
         # certificate/private key and AppStore_com.readori.app.mobileprovision.
+        # R202: the same readonly call also installs the extension's profile
+        # (AppStore_com.readori.app.VoicePackDownloader.mobileprovision).
         MATCH_PASSWORD="$MATCH_PASSWORD" \
         fastlane match appstore \
-          --app_identifier "$APP_BUNDLE_ID" \
+          --app_identifier "$APP_BUNDLE_ID,$EXT_BUNDLE_ID" \
           --git_url "$MATCH_GIT_URL" \
           --git_branch main \
           --git_basic_authorization "$MATCH_AUTH" \
@@ -928,10 +935,202 @@ jobs:
           exit 1
         fi
 
+        # ── R202 P3-B: VoicePackDownloader extension profile + App Group checks ──
+        # Resolve the exact App Store profile for the extension (never a development
+        # profile), normalize it to <UUID>.mobileprovision like the app profile and
+        # require the shared App Group in BOTH profiles before anything is built.
+        EXT_PROFILE_UUID=""
+        EXT_PROFILE_NAME=""
+        EXT_SELECTED_PROFILE=""
+
+        while IFS= read -r profile; do
+          [[ -f "$profile" ]] || continue
+          if ! security cms -D -i "$profile" > "$PROFILE_PLIST" 2>/dev/null; then
+            continue
+          fi
+
+          EXT_APP_IDENTIFIER="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$PROFILE_PLIST" 2>/dev/null || true)"
+          [[ "$EXT_APP_IDENTIFIER" == "${ASC_TEAM_ID}.${EXT_BUNDLE_ID}" ]] || continue
+
+          EXT_UUID="$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PROFILE_PLIST" 2>/dev/null || true)"
+          EXT_NAME="$(/usr/libexec/PlistBuddy -c 'Print :Name' "$PROFILE_PLIST" 2>/dev/null || true)"
+          EXT_GET_TASK_ALLOW="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$PROFILE_PLIST" 2>/dev/null || true)"
+
+          [[ -n "$EXT_UUID" ]] || continue
+          if [[ "$EXT_GET_TASK_ALLOW" == "true" ]]; then
+            echo "::warning::Ignoring development profile for $EXT_BUNDLE_ID: ${EXT_NAME:-unknown}"
+            continue
+          fi
+
+          EXT_SELECTED_PROFILE="$profile"
+          EXT_PROFILE_UUID="$EXT_UUID"
+          EXT_PROFILE_NAME="$EXT_NAME"
+          break
+        done < <(
+          find \
+            "$HOME/Library/MobileDevice/Provisioning Profiles" \
+            "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles" \
+            -type f -name '*.mobileprovision' -print 2>/dev/null || true
+        )
+
+        rm -f "$PROFILE_PLIST"
+
+        if [[ -z "$EXT_SELECTED_PROFILE" || -z "$EXT_PROFILE_UUID" ]]; then
+          echo "::error::Match did not install an App Store provisioning profile for ${ASC_TEAM_ID}.${EXT_BUNDLE_ID}."
+          echo "::error::Expected Match asset: profiles/appstore/AppStore_com.readori.app.VoicePackDownloader.mobileprovision"
+          exit 1
+        fi
+
+        EXT_TARGET_PROFILE="$PROFILE_DIR/${EXT_PROFILE_UUID}.mobileprovision"
+        if [[ "$EXT_SELECTED_PROFILE" != "$EXT_TARGET_PROFILE" ]]; then
+          cp "$EXT_SELECTED_PROFILE" "$EXT_TARGET_PROFILE"
+        fi
+        chmod 600 "$EXT_TARGET_PROFILE" || true
+
+        # App Group authorization: extension profile and app profile must both list it.
+        for GROUP_CHECK in "app:$TARGET_PROFILE" "extension:$EXT_TARGET_PROFILE"; do
+          GROUP_LABEL="${GROUP_CHECK%%:*}"
+          GROUP_PROFILE="${GROUP_CHECK#*:}"
+          security cms -D -i "$GROUP_PROFILE" > "$PROFILE_PLIST"
+          GROUP_LIST="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.security.application-groups' "$PROFILE_PLIST" 2>/dev/null || true)"
+          rm -f "$PROFILE_PLIST"
+          if ! grep -Fq "$APP_GROUP_ID" <<<"$GROUP_LIST"; then
+            echo "::error::The App Store provisioning profile for the $GROUP_LABEL does not include App Group $APP_GROUP_ID."
+            echo "::error::Enable App Groups for the App ID in the portal and regenerate the Match profiles (certificates-repo refresh_readori_profile)."
+            exit 1
+          fi
+          echo "App Group profile authorization ($GROUP_LABEL): PASS ($APP_GROUP_ID)"
+        done
+
+        echo "EXT_PROFILE_UUID=$EXT_PROFILE_UUID" >> "$GITHUB_ENV"
+        echo "Extension provisioning profile: ${EXT_PROFILE_NAME:-unknown} ($EXT_PROFILE_UUID)"
+
         echo "PROFILE_UUID=$PROFILE_UUID" >> "$GITHUB_ENV"
         echo "Signing identity installed by Match: yes"
         echo "Provisioning profile: ${PROFILE_NAME:-unknown} ($PROFILE_UUID)"
         [[ -n "$PROFILE_EXPIRATION" ]] && echo "Profile expiration: $PROFILE_EXPIRATION"
+
+    # ==============================================
+    # 10.5 BUILD — VoicePackDownloader extension (R202 P3-B)
+    # ==============================================
+    # ExtensionKit extension (Background Assets / StoreDownloaderExtension) for
+    # Apple-hosted offline voice packs on iOS 26+. It is a separate Xcode target
+    # generated by XcodeGen from core_project/Extensions/VoicePackDownloader and
+    # built unsigned with the iOS 26 SDK. The unsigned and testflight paths embed
+    # the .appex into Readori.app/Extensions/ (NOT PlugIns/); testflight signs it
+    # first, then the app. screenshots mode builds a hand-wrapped Simulator .app
+    # (step 14) and intentionally does not ship the extension: it has no UI and
+    # the screenshots never exercise Apple-hosted downloads.
+    - name: Build VoicePackDownloader extension (ExtensionKit, iOS 26 SDK)
+      if: ${{ env.MODE != 'screenshots' }}
+      run: |
+        set -euo pipefail
+
+        EXT_NAME="VoicePackDownloader"
+        EXT_BUNDLE_ID="com.readori.app.VoicePackDownloader"
+        EXT_POINT_ID="com.apple.background-asset-downloader-extension"
+        EXT_SRC="$GITHUB_WORKSPACE/core_project/Extensions/$EXT_NAME"
+        EXT_BUILD="$GITHUB_WORKSPACE/ext_build"
+        EXT_DERIVED="$EXT_BUILD/DerivedData"
+        EXT_OUT="$EXT_BUILD/out"
+        PB="/usr/libexec/PlistBuddy"
+
+        [[ -f "$EXT_SRC/project.yml" ]] || {
+          echo "::error::Missing $EXT_SRC/project.yml (Extensions/VoicePackDownloader is not in this checkout)."
+          exit 1
+        }
+
+        # The extension point (StoreDownloaderExtension) only exists in the iOS 26 SDK.
+        XCODE_VERSION_OUTPUT="$(xcodebuild -version 2>&1)"
+        XCODE_VERSION_LINE="${XCODE_VERSION_OUTPUT%%$'\n'*}"
+        XCODE_VERSION_RAW="${XCODE_VERSION_LINE#Xcode }"
+        XCODE_MAJOR="${XCODE_VERSION_RAW%%.*}"
+        SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version)"
+        SDK_MAJOR="${SDK_VERSION%%.*}"
+        if ! [[ "$XCODE_MAJOR" =~ ^[0-9]+$ ]] || (( XCODE_MAJOR < 26 )); then
+          echo "::error::VoicePackDownloader extension requires Xcode 26+ (iOS 26 SDK); selected ${XCODE_VERSION_RAW:-unknown}."
+          exit 1
+        fi
+        if ! [[ "$SDK_MAJOR" =~ ^[0-9]+$ ]] || (( SDK_MAJOR < 26 )); then
+          echo "::error::VoicePackDownloader extension requires the iOS 26+ SDK; found iphoneos${SDK_VERSION:-unknown}."
+          exit 1
+        fi
+        echo "Xcode: $XCODE_VERSION_RAW  iOS SDK: $SDK_VERSION"
+
+        rm -rf "$EXT_BUILD"
+        mkdir -p "$EXT_BUILD" "$EXT_OUT"
+
+        # XcodeGen: reuse the runner copy when present, otherwise install via Homebrew.
+        if ! command -v xcodegen >/dev/null 2>&1; then
+          HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_ENV_HINTS=1 \
+            brew install xcodegen || {
+            echo "brew install xcodegen failed with a stale formula index; updating Homebrew and retrying once"
+            brew update
+            HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_ENV_HINTS=1 brew install xcodegen
+          }
+        fi
+        echo "xcodegen: $(command -v xcodegen)"
+        xcodegen --version
+
+        # Generate the project outside the source tree (keeps core_project clean).
+        xcodegen generate --spec "$EXT_SRC/project.yml" --project "$EXT_BUILD"
+        [[ -d "$EXT_BUILD/$EXT_NAME.xcodeproj" ]] || {
+          echo "::error::xcodegen did not produce $EXT_BUILD/$EXT_NAME.xcodeproj"
+          ls -la "$EXT_BUILD" || true
+          exit 1
+        }
+
+        set +e
+        xcodebuild build \
+          -project "$EXT_BUILD/$EXT_NAME.xcodeproj" \
+          -scheme "$EXT_NAME" \
+          -configuration Release \
+          -sdk iphoneos \
+          -destination 'generic/platform=iOS' \
+          -derivedDataPath "$EXT_DERIVED" \
+          CODE_SIGNING_ALLOWED=NO \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGN_IDENTITY="" \
+          MARKETING_VERSION="${APP_VERSION:-1.0.0}" \
+          CURRENT_PROJECT_VERSION="${BUILD_NUMBER:-1}" \
+          COMPILER_INDEX_STORE_ENABLE=NO \
+          2>&1 | tee "$EXT_BUILD/xcodebuild.log"
+        EXT_BUILD_RC="${PIPESTATUS[0]}"
+        set -e
+
+        if (( EXT_BUILD_RC != 0 )); then
+          echo "::error::VoicePackDownloader extension build failed (exit $EXT_BUILD_RC)"
+          grep -n " error: " "$EXT_BUILD/xcodebuild.log" || true
+          tail -n 80 "$EXT_BUILD/xcodebuild.log" || true
+          exit "$EXT_BUILD_RC"
+        fi
+
+        EXT_APPEX="$EXT_DERIVED/Build/Products/Release-iphoneos/$EXT_NAME.appex"
+        if [[ ! -d "$EXT_APPEX" ]]; then
+          echo "::error::Extension build reported success but $EXT_APPEX is missing."
+          find "$EXT_DERIVED/Build/Products" -maxdepth 2 || true
+          exit 1
+        fi
+        rm -rf "$EXT_OUT/$EXT_NAME.appex"
+        cp -R "$EXT_APPEX" "$EXT_OUT/$EXT_NAME.appex"
+        EXT_APPEX="$EXT_OUT/$EXT_NAME.appex"
+
+        # Validate the Info.plist contract: bundle id, XPC! package type, ExtensionKit
+        # extension point and a real executable.
+        EXT_PLIST="$EXT_APPEX/Info.plist"
+        GOT_ID="$($PB -c 'Print :CFBundleIdentifier' "$EXT_PLIST" 2>/dev/null || true)"
+        GOT_TYPE="$($PB -c 'Print :CFBundlePackageType' "$EXT_PLIST" 2>/dev/null || true)"
+        GOT_POINT="$($PB -c 'Print :EXAppExtensionAttributes:EXExtensionPointIdentifier' "$EXT_PLIST" 2>/dev/null || true)"
+        GOT_EXEC="$($PB -c 'Print :CFBundleExecutable' "$EXT_PLIST" 2>/dev/null || true)"
+        GOT_MIN="$($PB -c 'Print :MinimumOSVersion' "$EXT_PLIST" 2>/dev/null || true)"
+        echo "Extension Info.plist: id=$GOT_ID type=$GOT_TYPE point=$GOT_POINT exec=$GOT_EXEC minOS=$GOT_MIN"
+        [[ "$GOT_ID" == "$EXT_BUNDLE_ID" ]] || { echo "::error::Unexpected extension CFBundleIdentifier: ${GOT_ID:-missing}"; exit 1; }
+        [[ "$GOT_TYPE" == "XPC!" ]] || { echo "::error::Unexpected extension CFBundlePackageType: ${GOT_TYPE:-missing} (expected XPC!)"; exit 1; }
+        [[ "$GOT_POINT" == "$EXT_POINT_ID" ]] || { echo "::error::Missing/incorrect EXExtensionPointIdentifier: ${GOT_POINT:-missing}"; exit 1; }
+        [[ -n "$GOT_EXEC" && -f "$EXT_APPEX/$GOT_EXEC" ]] || { echo "::error::Extension executable missing: ${GOT_EXEC:-<none>}"; exit 1; }
+
+        echo "READORI_EXT_APPEX=$EXT_APPEX" >> "$GITHUB_ENV"
+        echo "** VoicePackDownloader EXTENSION BUILD SUCCEEDED ** ($EXT_APPEX)"
 
     # ==============================================
     # 11a. BUILD — unsigned (sideload)
@@ -947,6 +1146,62 @@ jobs:
         cd core_project
         chmod +x scripts/build_unsigned_ipa.sh
         ./scripts/build_unsigned_ipa.sh "$SCHEME" "${GITHUB_WORKSPACE}/build"
+
+    # ==============================================
+    # 11a.5 EMBED — VoicePackDownloader extension into the unsigned IPA (R202 P3-B)
+    # ==============================================
+    # build_unsigned_ipa.sh (private repo) leaves the finished bundle in
+    # build/Payload/<App>.app and zips it. Embed the unsigned .appex into
+    # <App>.app/Extensions/ and re-zip so the sideload IPA matches the App Store build.
+    - name: Embed VoicePackDownloader extension into unsigned IPA
+      if: ${{ env.MODE == 'unsigned' }}
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+
+        BUILD_ROOT="$GITHUB_WORKSPACE/build"
+        PB="/usr/libexec/PlistBuddy"
+        EXT_NAME="VoicePackDownloader"
+        EXT_POINT_ID="com.apple.background-asset-downloader-extension"
+
+        APPS=("$BUILD_ROOT"/Payload/*.app)
+        IPAS=("$BUILD_ROOT"/*-unsigned.ipa)
+        (( ${#APPS[@]} == 1 )) || { echo "::error::Expected exactly one Payload/*.app, found ${#APPS[@]}"; ls -la "$BUILD_ROOT" "$BUILD_ROOT/Payload" || true; exit 1; }
+        (( ${#IPAS[@]} == 1 )) || { echo "::error::Expected exactly one *-unsigned.ipa, found ${#IPAS[@]}"; ls -la "$BUILD_ROOT" || true; exit 1; }
+        APP_PATH="${APPS[0]}"
+        IPA_PATH="${IPAS[0]}"
+        EXT_APPEX_SRC="${READORI_EXT_APPEX:-}"
+        [[ -d "$EXT_APPEX_SRC" ]] || { echo "::error::Built extension not found (READORI_EXT_APPEX=${EXT_APPEX_SRC:-unset})"; exit 1; }
+
+        # Same CFBundleVersion / CFBundleShortVersionString as the app.
+        APP_CFBV="$($PB -c 'Print :CFBundleVersion' "$APP_PATH/Info.plist" 2>/dev/null || true)"
+        APP_CFSV="$($PB -c 'Print :CFBundleShortVersionString' "$APP_PATH/Info.plist" 2>/dev/null || true)"
+        [[ -n "$APP_CFBV" && "$APP_CFBV" != *'$('* ]] || APP_CFBV="${BUILD_NUMBER:-1}"
+        [[ -n "$APP_CFSV" && "$APP_CFSV" != *'$('* ]] || APP_CFSV="${APP_VERSION:-1.0.0}"
+
+        EXT_DEST="$APP_PATH/Extensions/$EXT_NAME.appex"
+        rm -rf "$EXT_DEST"
+        mkdir -p "$APP_PATH/Extensions"
+        cp -R "$EXT_APPEX_SRC" "$EXT_DEST"
+        $PB -c "Set :CFBundleVersion $APP_CFBV" "$EXT_DEST/Info.plist"
+        $PB -c "Set :CFBundleShortVersionString $APP_CFSV" "$EXT_DEST/Info.plist"
+
+        GOT_POINT="$($PB -c 'Print :EXAppExtensionAttributes:EXExtensionPointIdentifier' "$EXT_DEST/Info.plist" 2>/dev/null || true)"
+        [[ "$GOT_POINT" == "$EXT_POINT_ID" ]] || { echo "::error::Embedded extension has wrong EXExtensionPointIdentifier: ${GOT_POINT:-missing}"; exit 1; }
+        echo "Embedded $EXT_NAME.appex ($APP_CFSV / $APP_CFBV) into $APP_PATH/Extensions"
+
+        rm -f "$IPA_PATH"
+        (cd "$BUILD_ROOT" && /usr/bin/zip -qry "$(basename "$IPA_PATH")" Payload)
+
+        IPA_LIST="$(mktemp)"
+        unzip -Z1 "$IPA_PATH" > "$IPA_LIST"
+        if ! grep -Fxq "Payload/$(basename "$APP_PATH")/Extensions/$EXT_NAME.appex/Info.plist" "$IPA_LIST"; then
+          echo "::error::Re-zipped IPA does not contain Extensions/$EXT_NAME.appex"
+          rm -f "$IPA_LIST"
+          exit 1
+        fi
+        rm -f "$IPA_LIST"
+        echo "Unsigned IPA contains Extensions/$EXT_NAME.appex: PASS ($(du -h "$IPA_PATH" | cut -f1))"
 
     # ==============================================
     # 11b. BUILD — signed IPA for App Store (Match-installed identity/profile)
@@ -1241,6 +1496,39 @@ jobs:
           echo "WARNING: No provisioning profile found to embed"
         fi
 
+        # ── Step 3b (R202 P3-B): embed the VoicePackDownloader ExtensionKit extension ──
+        # ExtensionKit extensions live in <App>.app/Extensions/ (not PlugIns/).
+        # They must carry the app's CFBundleVersion / CFBundleShortVersionString
+        # and their own App Store provisioning profile (installed by Match).
+        echo "=== Step 3b: Embed VoicePackDownloader extension ==="
+        EXT_NAME="VoicePackDownloader"
+        EXT_BUNDLE_ID="com.readori.app.VoicePackDownloader"
+        EXT_POINT_ID="com.apple.background-asset-downloader-extension"
+        APP_GROUP_ID="group.com.readori.app"
+        PB_EXT="/usr/libexec/PlistBuddy"
+
+        EXT_APPEX_SRC="${READORI_EXT_APPEX:-}"
+        [[ -d "$EXT_APPEX_SRC" ]] || { echo "::error::Built extension not found (READORI_EXT_APPEX=${EXT_APPEX_SRC:-unset})"; exit 1; }
+        EXT_PROFILE_PATH="$HOME/Library/MobileDevice/Provisioning Profiles/${EXT_PROFILE_UUID:-missing}.mobileprovision"
+        [[ -f "$EXT_PROFILE_PATH" ]] || { echo "::error::Extension provisioning profile not found: $EXT_PROFILE_PATH"; exit 1; }
+
+        APP_CFBV="$($PB_EXT -c 'Print :CFBundleVersion' "$APP_PATH/Info.plist" 2>/dev/null || true)"
+        APP_CFSV="$($PB_EXT -c 'Print :CFBundleShortVersionString' "$APP_PATH/Info.plist" 2>/dev/null || true)"
+        [[ -n "$APP_CFBV" && "$APP_CFBV" != *'$('* ]] || APP_CFBV="${{ env.BUILD_NUMBER }}"
+        [[ -n "$APP_CFSV" && "$APP_CFSV" != *'$('* ]] || APP_CFSV="${{ env.APP_VERSION }}"
+
+        EXT_DEST="$APP_PATH/Extensions/$EXT_NAME.appex"
+        rm -rf "$EXT_DEST"
+        mkdir -p "$APP_PATH/Extensions"
+        cp -R "$EXT_APPEX_SRC" "$EXT_DEST"
+        $PB_EXT -c "Set :CFBundleVersion $APP_CFBV" "$EXT_DEST/Info.plist"
+        $PB_EXT -c "Set :CFBundleShortVersionString $APP_CFSV" "$EXT_DEST/Info.plist"
+        cp "$EXT_PROFILE_PATH" "$EXT_DEST/embedded.mobileprovision"
+
+        GOT_POINT="$($PB_EXT -c 'Print :EXAppExtensionAttributes:EXExtensionPointIdentifier' "$EXT_DEST/Info.plist" 2>/dev/null || true)"
+        [[ "$GOT_POINT" == "$EXT_POINT_ID" ]] || { echo "::error::Embedded extension has wrong EXExtensionPointIdentifier: ${GOT_POINT:-missing}"; exit 1; }
+        echo "Embedded $EXT_NAME.appex ($APP_CFSV / $APP_CFBV) with profile $EXT_PROFILE_UUID"
+
         # ── Step 4: Code sign ──
         echo "=== Step 4: Code signing ==="
 
@@ -1313,6 +1601,21 @@ jobs:
           fi
         fi
 
+        # R202 P3-B: App Group shared with the VoicePackDownloader extension
+        # (Background Assets BAAppGroupID). Same pattern as iCloud above: only
+        # claim the entitlement when the embedded profile authorizes it. The
+        # extension is always embedded, so a profile without the group is fatal.
+        PROFILE_SUPPORTS_APP_GROUP=0
+        APP_PROF_ENTS="$(security cms -D -i "$APP_PATH/embedded.mobileprovision" 2>/dev/null || true)"
+        if grep -Fq "$APP_GROUP_ID" <<<"$APP_PROF_ENTS"; then
+          PROFILE_SUPPORTS_APP_GROUP=1
+          echo "Profile supports App Group $APP_GROUP_ID, adding application-groups entitlement"
+          /usr/libexec/PlistBuddy -c "Add :com.apple.security.application-groups array" "$SIGN_ENTITLEMENTS"
+          /usr/libexec/PlistBuddy -c "Add :com.apple.security.application-groups:0 string $APP_GROUP_ID" "$SIGN_ENTITLEMENTS"
+        else
+          echo "::error::App profile does not authorize App Group $APP_GROUP_ID, but the VoicePackDownloader extension requires it."
+          exit 1
+        fi
 
         echo "=== Entitlements for signing ==="
         cat "$SIGN_ENTITLEMENTS"
@@ -1321,6 +1624,20 @@ jobs:
         find "$APP_PATH" -name "*.framework" -o -name "*.dylib" | while read -r lib; do
           codesign -f -s "$SIGN_ID" --timestamp=none "$lib" 2>&1 || true
         done
+
+        # R202 P3-B: sign the ExtensionKit extension BEFORE the app (inner code first;
+        # signing the app afterwards seals the extension's signature into its resources).
+        EXT_SIGN_ENTITLEMENTS="/tmp/sign_entitlements_ext.plist"
+        printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict/>\n</plist>\n' > "$EXT_SIGN_ENTITLEMENTS"
+        /usr/libexec/PlistBuddy -c "Add :application-identifier string ${ASC_TEAM_ID}.${EXT_BUNDLE_ID}" "$EXT_SIGN_ENTITLEMENTS"
+        /usr/libexec/PlistBuddy -c "Add :com.apple.developer.team-identifier string ${ASC_TEAM_ID}" "$EXT_SIGN_ENTITLEMENTS"
+        /usr/libexec/PlistBuddy -c "Add :com.apple.security.application-groups array" "$EXT_SIGN_ENTITLEMENTS"
+        /usr/libexec/PlistBuddy -c "Add :com.apple.security.application-groups:0 string $APP_GROUP_ID" "$EXT_SIGN_ENTITLEMENTS"
+        /usr/libexec/PlistBuddy -c "Add :get-task-allow bool false" "$EXT_SIGN_ENTITLEMENTS"
+        echo "=== Extension entitlements for signing ==="
+        cat "$EXT_SIGN_ENTITLEMENTS"
+        codesign -f -s "$SIGN_ID" --entitlements "$EXT_SIGN_ENTITLEMENTS" --timestamp=none "$EXT_DEST"
+        echo "Extension code signing succeeded"
 
         # Sign the app bundle
         codesign -f -s "$SIGN_ID" --entitlements "$SIGN_ENTITLEMENTS" --timestamp=none "$APP_PATH"
@@ -1344,6 +1661,28 @@ jobs:
           fi
         fi
 
+        # R202 P3-B: nested-signature verification (extension + app) and App Group
+        # entitlements on BOTH signed bundles. Hard failures: a missing group would
+        # silently break Apple-hosted voice pack downloads (BAAppGroupID mismatch).
+        echo "=== Verify signatures (extension, then app: --deep --strict) ==="
+        codesign --verify --deep --strict --verbose=2 "$EXT_DEST" 2>&1 || {
+          echo "::error::codesign --verify --deep --strict failed for $EXT_NAME.appex"
+          exit 1
+        }
+        # The app's own verify stays a warning (pre-R202 behaviour: SwiftPM resource
+        # bundles have tripped --strict before); the extension check above is fatal.
+        codesign --verify --deep --strict --verbose=2 "$APP_PATH" 2>&1 || \
+          echo "::warning::codesign --verify --deep --strict reported issues for the app bundle (non-fatal, see log)"
+        EXT_SIGNED_ENTITLEMENTS="$(codesign -d --entitlements :- "$EXT_DEST" 2>/dev/null || true)"
+        echo "=== Signed extension entitlements ==="
+        echo "$EXT_SIGNED_ENTITLEMENTS"
+        echo "=== Signed app entitlements ==="
+        echo "$SIGNED_ENTITLEMENTS"
+        grep -Fq "$APP_GROUP_ID" <<<"$EXT_SIGNED_ENTITLEMENTS" || { echo "::error::Signed extension is missing App Group $APP_GROUP_ID."; exit 1; }
+        grep -Fq "$APP_GROUP_ID" <<<"$SIGNED_ENTITLEMENTS" || { echo "::error::Signed app is missing App Group $APP_GROUP_ID."; exit 1; }
+        grep -Fq "${ASC_TEAM_ID}.${EXT_BUNDLE_ID}" <<<"$EXT_SIGNED_ENTITLEMENTS" || { echo "::error::Signed extension application-identifier mismatch."; exit 1; }
+        echo "Final signed App Group entitlement (app + extension): PASS"
+
         # ── Step 5: Package IPA ──
         echo "=== Step 5: Package IPA ==="
         PAYLOAD_DIR="$BUILD_ROOT/Payload"
@@ -1356,6 +1695,17 @@ jobs:
         zip -r -q "$IPA_PATH" Payload
         echo "IPA=$IPA_PATH" >> $GITHUB_ENV
         echo "Built: $IPA_PATH ($(du -h "$IPA_PATH" | cut -f1))"
+
+        # R202 P3-B: the IPA must carry the signed ExtensionKit extension.
+        IPA_LIST="$(mktemp)"
+        unzip -Z1 "$IPA_PATH" > "$IPA_LIST"
+        if ! grep -Fxq "Payload/$(basename "$APP_PATH")/Extensions/$EXT_NAME.appex/Info.plist" "$IPA_LIST"; then
+          echo "::error::Packaged IPA does not contain Extensions/$EXT_NAME.appex"
+          rm -f "$IPA_LIST"
+          exit 1
+        fi
+        rm -f "$IPA_LIST"
+        echo "IPA contains Extensions/$EXT_NAME.appex: PASS"
 
     # ==============================================
     # 12. VERSION TAG
@@ -1726,6 +2076,9 @@ jobs:
           exit 1
         fi
 
+        # R202 P3-B: the VoicePackDownloader extension is intentionally NOT built or
+        # embedded in this Simulator wrapper (no UI; screenshots never exercise
+        # Apple-hosted downloads). unsigned/testflight embed it (steps 10.5 / 11a.5 / 11b).
         # SwiftPM executable products are emitted as a bare executable in this
         # project; wrap it into a simulator .app and preserve resources.
         APP_PATH="$BUILD_DIR/${SCHEME}.app"
@@ -2026,9 +2379,12 @@ jobs:
         rm -f ~/.appstoreconnect/private_keys/AuthKey_*.p8
         rm -rf /tmp/asc_keys
         rm -f /tmp/asc_api_key.json /tmp/sign_entitlements.plist \
-          /tmp/readori-match-profile.plist
+          /tmp/sign_entitlements_ext.plist /tmp/readori-match-profile.plist
         if [[ -n "${PROFILE_UUID:-}" ]]; then
           rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/${PROFILE_UUID}.mobileprovision"
+        fi
+        if [[ -n "${EXT_PROFILE_UUID:-}" ]]; then
+          rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/${EXT_PROFILE_UUID}.mobileprovision"
         fi
         if [[ -n "${READORI_KEYCHAIN_PATH:-}" && -f "$READORI_KEYCHAIN_PATH" ]]; then
           security delete-keychain "$READORI_KEYCHAIN_PATH" >/dev/null 2>&1 || true

@@ -9,10 +9,13 @@ run-name: Voice packs ${{ inputs.mode }} @ ${{ inputs.source_ref }}${{ inputs.mo
 #   mode=build  check, then fetch -> build -> validate -> smoke -> (audit) -> pack each selected
 #               pack; with publish=true (source_ref main only) upload GitHub Releases to
 #               readori/readori-voice-packs and commit catalog/v1/index.json back to its main.
+#   mode=asset-packs  check, then package the already published packs (asset_pack_ids, default all
+#               with an appleAssetPackId) into Apple asset packs (.aar artifact); builds nothing.
 #
 # Every job checks out the same commit (resolved once in `check`). Only the two publishing steps
 # receive TARGET_REPO_PAT; everything else uses read-only tokens. No Apple / App Store Connect
-# secrets are used: Apple asset packs are built as artifacts and uploaded separately by hand.
+# secrets are used: Apple asset packs (job `apple-asset-pack`, mode=asset-packs or after a publish)
+# are built as artifacts from the published Release ZIPs and uploaded separately by hand.
 # Official actions are pinned to commit SHAs (checkout v7.0.1, setup-python v7.1.0,
 # upload-artifact v7.0.2, download-artifact v8.0.2).
 
@@ -20,13 +23,14 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "check = 代码检查与测试；build = 检查后制作语音包"
+        description: "check = 代码检查与测试；build = 检查后制作语音包；asset-packs = 检查后只把已发布的包打成 Apple 资产包 .aar"
         required: true
         default: check
         type: choice
         options:
           - check
           - build
+          - asset-packs
       source_ref:
         description: "readori-voice-packs 的分支、标签或提交 SHA（发布只允许 main）"
         required: true
@@ -47,6 +51,11 @@ on:
         required: true
         default: false
         type: boolean
+      asset_pack_ids:
+        description: "asset-packs / 发布后的 Apple 资产包：逗号分隔的语音包 id；留空 = index.json 中所有带 appleAssetPackId 的包（build 模式留空 = 本次构建的包）"
+        required: false
+        default: ""
+        type: string
       allow_unpinned:
         description: "build：允许 registry 中未固定 sha256 / bytes 的模型（不可与 publish 同用）"
         required: true
@@ -293,22 +302,33 @@ jobs:
           fi
 
   apple-asset-pack:
-    # Draft Apple-hosted Background Assets packs. Needs Xcode 26 (`xcrun ba-package`); otherwise it
-    # explains why it was skipped. continue-on-error: this job never fails the workflow.
-    name: Apple asset packs (draft)
-    needs: [check, build]
-    if: ${{ always() && needs.build.result == 'success' }}
-    runs-on: macos-latest
+    # Apple-hosted Background Assets packs (.aar), built from the published GitHub Release ZIPs
+    # (the exact bytes the app's GitHub fallback downloads) and the committed catalog/v1/index.json.
+    # Runs for mode=asset-packs, and after a successful publish (build + index) for the packs of
+    # that build. Needs Xcode 26 (`xcrun ba-package`); otherwise it explains why it was skipped.
+    # continue-on-error: this job never fails the workflow. No secrets; nothing is uploaded to
+    # App Store Connect (a separate manual step). Community-tier packs are never packaged.
+    name: Apple asset packs
+    needs: [check, plan, build, index]
+    if: ${{ always() && needs.check.result == 'success' && (inputs.mode == 'asset-packs' || (inputs.publish && needs.index.result == 'success')) }}
+    runs-on: macos-26
     continue-on-error: true
-    timeout-minutes: 60
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: voice-packs
+    env:
+      RELEASE_PREFIX: https://github.com/readori/readori-voice-packs/releases/download/
+      ASSET_PACK_IDS: ${{ inputs.asset_pack_ids }}
+      BUILT_MATRIX: ${{ needs.plan.outputs.matrix }}
+      RUN_MODE: ${{ inputs.mode }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.SOURCE_REPOSITORY }}
-          ref: ${{ needs.check.outputs.sha }}
+          # After a publish the index was committed to main by the `index` job; otherwise use the
+          # commit that passed the checks.
+          ref: ${{ (inputs.mode == 'build' && inputs.publish) && 'main' || needs.check.outputs.sha }}
           path: voice-packs
           persist-credentials: false
 
@@ -319,69 +339,171 @@ jobs:
       - name: Install
         run: python -m pip install -e .
 
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: pack-*
-          path: voice-packs/dist
-          merge-multiple: true
-
-      - name: Detect xcrun ba-package
+      - name: Detect Xcode 26 and xcrun ba-package
         id: detect
         run: |
-          if xcrun --find ba-package > /dev/null 2>&1; then
+          set -uo pipefail
+          latest="$(ls -1d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [ -n "$latest" ]; then sudo xcode-select -s "$latest/Contents/Developer"; fi
+          version="$(xcodebuild -version 2>&1)"; echo "$version"
+          major="${version%%$'\n'*}"; major="${major#Xcode }"; major="${major%%.*}"
+          if [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 26 )) && xcrun --find ba-package > /dev/null 2>&1; then
             echo "available=true" >> "$GITHUB_OUTPUT"
-            xcodebuild -version | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "=========== xcrun ba-package --help";        xcrun ba-package --help || true
+            echo "=========== xcrun ba-package help package";  xcrun ba-package help package || true
+            echo "=========== xcrun ba-package help template"; xcrun ba-package help template || true
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
             {
               echo "### Apple asset packs skipped"
               echo
-              echo "\`xcrun ba-package\` is not available on this runner (it ships with Xcode 26)."
-              echo "The GitHub Release ZIPs are unaffected."
+              echo "\`xcrun ba-package\` needs Xcode 26 (selected: ${major:-unknown}). The GitHub Release ZIPs are unaffected."
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Build draft asset packs
+      - name: Select packs
+        id: select
         if: ${{ steps.detect.outputs.available == 'true' }}
         run: |
           set -euo pipefail
-          mkdir -p ba-out work
-          # Reference template from the installed tool: compare it with our generated manifests.
-          xcrun ba-package template > ba-out/ba-package-template.json
+          ids="${ASSET_PACK_IDS// /}"
+          if ! [[ "$ids" =~ ^[a-z0-9,-]*$ ]]; then
+            echo "::error::asset_pack_ids may only contain lowercase letters, digits, hyphens and commas"
+            exit 1
+          fi
+          mkdir -p work
+          # Every eligible entry of the index (appleAssetPackId set, official tier, release URL).
+          python -m readori_voicepack ba-layout --plan > work/plan-all.json
+          if [ -n "$ids" ]; then
+            # Explicit ids: ba-layout refuses unknown, community or appleAssetPackId-less ones.
+            python -m readori_voicepack ba-layout --plan --pack-ids "$ids" > work/plan.json
+          elif [ "$RUN_MODE" = "build" ]; then
+            # After a publish: only the packs of this build (community ones are not in the plan).
+            built="$(printf '%s' "${BUILT_MATRIX:-}" | jq -c '[.include[]?.id]' 2>/dev/null || echo '[]')"
+            jq --argjson built "${built:-[]}" '[.[] | select(.id as $i | $built | index($i))]' \
+              work/plan-all.json > work/plan.json
+          else
+            cp work/plan-all.json work/plan.json
+          fi
+          count="$(jq 'length' work/plan.json)"
+          if [ "$count" -eq 0 ]; then
+            if [ "$RUN_MODE" = "build" ]; then
+              echo "none of the built packs has an appleAssetPackId (community or not yet in the index): nothing to package" | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "any=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::no index entry has an appleAssetPackId: nothing to package"
+            exit 1
+          fi
+          echo "any=true" >> "$GITHUB_OUTPUT"
+          echo "ids=$(jq -r 'map(.id) | join(",")' work/plan.json)" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Asset packs to build ($count)"
+            echo
+            jq -r '.[] | "- `\(.assetPackId)` (\(.bytes) bytes)"' work/plan.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download Release ZIPs and verify sha256 / size
+        if: ${{ steps.select.outputs.any == 'true' }}
+        run: |
+          set -euo pipefail
+          mkdir -p work/zips
+          jq -c '.[]' work/plan.json | while IFS= read -r row; do
+            id="$(jq -r '.id' <<<"$row")"
+            url="$(jq -r '.url' <<<"$row")"
+            file="$(jq -r '.file' <<<"$row")"
+            sha="$(jq -r '.sha256' <<<"$row")"
+            size="$(jq -r '.bytes' <<<"$row")"
+            case "$url" in
+              "${RELEASE_PREFIX}"*) ;;
+              *) echo "::error::refusing to download from outside ${RELEASE_PREFIX}: $url"; exit 1 ;;
+            esac
+            echo "download $id"
+            curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+              --retry 3 --output "work/zips/$file" "$url"
+            actual="$(shasum -a 256 "work/zips/$file" | cut -d' ' -f1)"
+            [ "$actual" = "$sha" ] || { echo "::error::$id sha256 mismatch: $actual != $sha"; exit 1; }
+            [ "$(wc -c < "work/zips/$file" | tr -d ' ')" = "$size" ] || { echo "::error::$id size mismatch"; exit 1; }
+            echo "ok $id sha256=$sha"
+          done
+
+      - name: Print the real ba-package template
+        if: ${{ steps.select.outputs.any == 'true' }}
+        run: |
+          set -euo pipefail
+          rm -rf work/tmpl && mkdir -p work/tmpl
+          (
+            cd work/tmpl
+            xcrun ba-package template > stdout.txt
+            # The tool may print the template or write a JSON file into the working directory.
+            found="$(ls -1 ./*.json 2>/dev/null | head -n 1 || true)"
+            if [ -n "$found" ]; then cp "$found" ../ba-template.json; else cp stdout.txt ../ba-template.json; fi
+          )
+          python -c 'import json; json.load(open("work/ba-template.json", encoding="utf-8"))' \
+            || { echo "::error::the ba-package template is not valid JSON"; cat work/ba-template.json; exit 1; }
           {
             echo "### \`xcrun ba-package template\`"
             echo
             echo '```json'
-            cat ba-out/ba-package-template.json
+            cat work/ba-template.json
             echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          out_dir="$PWD/ba-out"
-          for zip in dist/*.zip; do
-            id="$(basename "$zip" .zip)"
-            # Community-tier packs are GitHub Releases only: never package them for Apple.
-            if [ "$(jq -r '.tier // "official"' "dist/${id}.zip.json" 2>/dev/null || echo official)" = "community" ]; then
-              echo "skipped $id: community tier (GitHub Releases only, not an Apple asset pack)"
-              continue
-            fi
-            rm -rf "work/$id"
-            mkdir -p "work/$id"
-            unzip -q "$zip" -d "work/$id"
-            log="$(python -m readori_voicepack ba-manifest "work/$id" --out ba-out)"
-            echo "$log"
-            manifest="$(printf '%s\n' "$log" | sed -n 's/^wrote \(.*\.manifest\.json\).*/\1/p' | head -n 1)"
-            [ -n "$manifest" ] || { echo "::error::no manifest written for $id"; exit 1; }
-            name="$(basename "$manifest" .manifest.json)"
-            # Manifest file paths are relative to the pack root, so package from inside it.
-            (cd "work/$id" && xcrun ba-package "$out_dir/${name}.manifest.json" -o "$out_dir/${name}.aar")
-          done
-          ls -l ba-out | tee -a "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload draft asset packs
-        if: ${{ steps.detect.outputs.available == 'true' }}
+      - name: Lay out asset packs and fill manifests from the template
+        if: ${{ steps.select.outputs.any == 'true' }}
+        env:
+          SELECTED_IDS: ${{ steps.select.outputs.ids }}
+        run: |
+          set -euo pipefail
+          python -m readori_voicepack ba-layout --pack-ids "$SELECTED_IDS" \
+            --zips work/zips --out work/ba --template work/ba-template.json --hardlink
+          for m in work/ba/*.manifest.json; do
+            echo "=========== $m"; cat "$m"
+          done
+
+      - name: Package .aar with ba-package
+        if: ${{ steps.select.outputs.any == 'true' }}
+        run: |
+          set -euo pipefail
+          mkdir -p work/aar
+          aar_dir="$PWD/work/aar"
+          for manifest in work/ba/*.manifest.json; do
+            asset="$(basename "$manifest" .manifest.json)"
+            manifest_abs="$PWD/$manifest"
+            echo "=========== package $asset"
+            # File selectors are relative to the asset pack root: run from inside it.
+            (
+              cd "work/ba/$asset"
+              # Subcommand form first (`ba-package package`), plain form as a fallback; the help
+              # texts printed above document which one this Xcode accepts.
+              if xcrun ba-package package "$manifest_abs" -o "$aar_dir/$asset.aar"; then
+                echo "packaged with: xcrun ba-package package <manifest> -o <aar>"
+              else
+                echo "::warning::'ba-package package' failed, trying 'ba-package <manifest> -o <aar>'"
+                rm -f "$aar_dir/$asset.aar"
+                xcrun ba-package "$manifest_abs" -o "$aar_dir/$asset.aar"
+                echo "packaged with: xcrun ba-package <manifest> -o <aar>"
+              fi
+            )
+            [ -s "$aar_dir/$asset.aar" ] || { echo "::error::no .aar produced for $asset"; exit 1; }
+          done
+          {
+            echo "### Asset packs"
+            echo
+            echo '```'
+            (cd "$aar_dir" && ls -l && shasum -a 256 ./*.aar)
+            echo '```'
+            echo
+            echo "Not uploaded anywhere. Uploading to App Store Connect is a separate manual step."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          cp work/ba/*.manifest.json work/ba-template.json work/plan.json "$aar_dir/"
+
+      - name: Upload asset packs
+        if: ${{ steps.select.outputs.any == 'true' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: apple-asset-packs
-          path: voice-packs/ba-out/*
+          path: voice-packs/work/aar/*
           if-no-files-found: error
           retention-days: 14
 
