@@ -1833,7 +1833,7 @@ jobs:
     - name: Auto-capture simulator screenshots
       if: ${{ env.MODE == 'screenshots' }}
       continue-on-error: true
-      timeout-minutes: 35
+      timeout-minutes: 60
       shell: bash
       env:
         PRO_LEASE_PUBLIC_KEY: ${{ secrets.PRO_LEASE_PUBLIC_KEY }}
@@ -1988,7 +1988,7 @@ jobs:
           run_with_timeout 15 xcrun simctl boot "$udid" || true
 
           echo "[$label] waiting for bootstatus..."
-          if run_with_timeout 90 xcrun simctl bootstatus "$udid" -b; then
+          if run_with_timeout 360 xcrun simctl bootstatus "$udid" -b; then
             echo "[$label] simulator ready: $(simulator_state "$udid")"
             return 0
           fi
@@ -1998,7 +1998,7 @@ jobs:
           sleep 2
           run_with_timeout 15 xcrun simctl boot "$udid" || true
 
-          if run_with_timeout 90 xcrun simctl bootstatus "$udid" -b; then
+          if run_with_timeout 240 xcrun simctl bootstatus "$udid" -b; then
             echo "[$label] simulator ready after reboot: $(simulator_state "$udid")"
             return 0
           fi
