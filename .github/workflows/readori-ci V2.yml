@@ -1072,8 +1072,11 @@ jobs:
         echo "xcodegen: $(command -v xcodegen)"
         xcodegen --version
 
-        # Generate the project outside the source tree (keeps core_project clean).
-        xcodegen generate --spec "$EXT_SRC/project.yml" --project "$EXT_BUILD"
+        # Generate the project outside the source tree (keeps core_project clean). XcodeGen keeps
+        # source / Info.plist / entitlements paths relative to the spec, not to --project, so copy
+        # the extension sources next to the generated project first.
+        cp -R "$EXT_SRC/." "$EXT_BUILD/"
+        xcodegen generate --spec "$EXT_BUILD/project.yml" --project "$EXT_BUILD"
         [[ -d "$EXT_BUILD/$EXT_NAME.xcodeproj" ]] || {
           echo "::error::xcodegen did not produce $EXT_BUILD/$EXT_NAME.xcodeproj"
           ls -la "$EXT_BUILD" || true
