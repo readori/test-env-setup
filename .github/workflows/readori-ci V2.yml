@@ -62,6 +62,32 @@ on:
           - "no"
           - "yes"
 
+      screenshot_skin:
+        description: "screenshots mode only: app skin forced via READORI_SKIN (default = app's own resolution)."
+        required: false
+        default: "default"
+        type: choice
+        options:
+          - "default"
+          - "classic"
+          - "paperInk"
+          - "handDrawn"
+
+      screenshot_appearance:
+        description: "screenshots mode only: simulator appearance."
+        required: false
+        default: "light"
+        type: choice
+        options:
+          - "light"
+          - "dark"
+
+      screenshot_locales:
+        description: "screenshots mode only: space-separated locales (en-US is always required by validation)."
+        required: false
+        default: "en-US"
+        type: string
+
 permissions:
   contents: read
 
@@ -80,6 +106,9 @@ jobs:
       SCHEME: ${{ github.event.inputs.app_scheme }}
       APP_VERSION_INPUT: ${{ github.event.inputs.app_version }}
       BUILD_NUMBER_INPUT: ${{ github.event.inputs.build_number }}
+      SCREENSHOT_SKIN: ${{ github.event.inputs.screenshot_skin }}
+      SCREENSHOT_APPEARANCE: ${{ github.event.inputs.screenshot_appearance }}
+      SCREENSHOT_LOCALES: ${{ github.event.inputs.screenshot_locales }}
       READORI_SOCIAL_WORKER_ENDPOINT: ${{ secrets.READORI_SOCIAL_WORKER_ENDPOINT }}
 
     steps:
@@ -1818,7 +1847,12 @@ jobs:
         BUNDLE_ID="com.readori.app"
         BUILD_DIR="/tmp/sim_build"
         BUILD_LOG="/tmp/sim_build.log"
-        LOCALES="en-US"
+        LOCALES="${SCREENSHOT_LOCALES:-en-US}"
+        case " $LOCALES " in *" en-US "*) ;; *) LOCALES="en-US $LOCALES" ;; esac
+        SKIN_ENV="${SCREENSHOT_SKIN:-default}"
+        [[ "$SKIN_ENV" == "default" ]] && SKIN_ENV=""
+        APPEARANCE="${SCREENSHOT_APPEARANCE:-light}"
+        echo "Screenshot skin=${SKIN_ENV:-<app default>} appearance=$APPEARANCE locales=$LOCALES"
 
         rm -rf "$SCREENSHOTS_DIR"
 
@@ -2168,6 +2202,9 @@ jobs:
             return 1
           fi
 
+          echo "[$display_type] appearance -> $APPEARANCE"
+          run_with_timeout 20 xcrun simctl ui "$udid" appearance "$APPEARANCE" || echo "::warning::[$display_type] could not set appearance $APPEARANCE"
+
           for LOCALE in $LOCALES; do
             local out_dir="$SCREENSHOTS_DIR/$LOCALE/$display_type"
             mkdir -p "$out_dir"
@@ -2192,6 +2229,7 @@ jobs:
               if ! run_with_timeout 30 env \
                 SIMCTL_CHILD_READORI_SCREENSHOT_MODE=1 \
                 SIMCTL_CHILD_READORI_SCREENSHOT_TAB="$tab" \
+                SIMCTL_CHILD_READORI_SKIN="$SKIN_ENV" \
                 xcrun simctl launch "$udid" "$BUNDLE_ID" \
                   -AppleLanguages "($apple_lang)" \
                   -AppleLocale "$apple_locale"; then
@@ -2201,6 +2239,7 @@ jobs:
                 if ! run_with_timeout 30 env \
                   SIMCTL_CHILD_READORI_SCREENSHOT_MODE=1 \
                   SIMCTL_CHILD_READORI_SCREENSHOT_TAB="$tab" \
+                  SIMCTL_CHILD_READORI_SKIN="$SKIN_ENV" \
                   xcrun simctl launch "$udid" "$BUNDLE_ID" \
                     -AppleLanguages "($apple_lang)" \
                     -AppleLocale "$apple_locale"; then
@@ -2248,6 +2287,12 @@ jobs:
             capture_one "settings"        "$out_dir/04_settings.png"        || failures=$((failures + 1))
             capture_one "pro"             "$out_dir/05_pro.png"             || failures=$((failures + 1))
             capture_one "personalization" "$out_dir/06_personalization.png" || failures=$((failures + 1))
+            # Review-only extras (not counted by validation): shelf after the reader shot imported a book, and the feed tab.
+            if [[ -n "$SKIN_ENV" || "$APPEARANCE" != "light" ]]; then
+              mkdir -p "$out_dir/extra"
+              capture_one "bookshelf" "$out_dir/extra/07_bookshelf_with_book.png" || true
+              capture_one "feed"      "$out_dir/extra/08_feed.png"                || true
+            fi
           done
 
           echo "[$display_type] shutting down simulator"
