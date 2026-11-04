@@ -1851,6 +1851,8 @@ jobs:
         case " $LOCALES " in *" en-US "*) ;; *) LOCALES="en-US $LOCALES" ;; esac
         SKIN_ENV="${SCREENSHOT_SKIN:-default}"
         [[ "$SKIN_ENV" == "default" ]] && SKIN_ENV=""
+        # AppSkin raw values are lowercase (classic / paperink / handdrawn).
+        SKIN_ENV="$(printf '%s' "$SKIN_ENV" | tr '[:upper:]' '[:lower:]')"
         APPEARANCE="${SCREENSHOT_APPEARANCE:-light}"
         echo "Screenshot skin=${SKIN_ENV:-<app default>} appearance=$APPEARANCE locales=$LOCALES"
 
