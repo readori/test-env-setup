@@ -1,0 +1,45 @@
+name: Readori BA template spike
+
+# Read-only probe: print Xcode's Background Assets ("Background Download") extension templates and
+# the ba-package tool help, so the Readori downloader extension can be assembled outside Xcode.
+# No secrets, no signing, no uploads.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Xcode version
+        run: xcodebuild -version && xcrun --show-sdk-version --sdk iphoneos
+      - name: Locate Background Assets templates
+        run: |
+          XC="$(xcode-select -p)/.."
+          find "$XC" -type d -iname "*Background Download*" 2>/dev/null | head -20 | tee /tmp/dirs.txt
+          find "$XC" -type d -iname "*Background Asset*" 2>/dev/null | head -20 | tee -a /tmp/dirs.txt
+      - name: Print template files
+        run: |
+          while IFS= read -r d; do
+            echo "=================== $d"
+            find "$d" -type f | while IFS= read -r f; do
+              echo "------------- $f"
+              case "$f" in
+                *.png|*.pdf|*.tiff) echo "(binary skipped)";;
+                *.plist) plutil -convert xml1 -o - "$f" 2>/dev/null || cat "$f";;
+                *) cat "$f";;
+              esac
+            done
+          done < /tmp/dirs.txt
+      - name: Extension point and SDK symbols
+        run: |
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          grep -rl "background-asset" "$SDK/System/Library" 2>/dev/null | head -20 || true
+          ls "$SDK/System/Library/Frameworks/BackgroundAssets.framework" || true
+          find "$SDK/System/Library/Frameworks/BackgroundAssets.framework" -name "*.swiftinterface" | head -3 | while read -r f; do echo "---- $f"; grep -n "StoreDownloaderExtension\|ManagedDownloaderExtension\|class AssetPackManager\|actor AssetPackManager\|func ensureLocalAvailability\|func url(for\|func remove(assetPackWithID\|var manifest\|func statusUpdates\|func assetPack" "$f" | head -60; done
+          find "$SDK/System/Library/Frameworks/StoreKit.framework" -name "*.swiftinterface" | head -1 | while read -r f; do echo "---- $f"; grep -n "StoreDownloaderExtension" "$f" | head -20; done
+      - name: ba-package help
+        run: xcrun ba-package --help || true
