@@ -44,6 +44,8 @@ jobs:
 
     env:
       READORI_BUNDLE_ID: com.readori.app
+      READORI_VOICEPACK_BUNDLE_ID: com.readori.app.VoicePackDownloader
+      READORI_APP_GROUP: group.com.readori.app
       MAIL_BUNDLE_ID: com.readori.mail
       SHIFTMILE_BUNDLE_ID: com.readori.shiftmile
       PAOBUWAN_BUNDLE_ID: com.readori.paobuwan
@@ -72,7 +74,7 @@ jobs:
                 echo '::error::refresh_readori_profile requires destructive_confirmation=WRITE.'
                 exit 64
               }
-              echo '::notice::Preserves the shared Distribution identity and other app profiles; force-regenerates only com.readori.app.'
+              echo '::notice::Preserves the shared Distribution identity and other app profiles; force-regenerates only com.readori.app and its voice-pack downloader extension com.readori.app.VoicePackDownloader.'
               ;;
             refresh_cfmail_profile)
               [[ "$DESTRUCTIVE_CONFIRMATION" == 'WRITE' ]] || {
@@ -426,16 +428,54 @@ jobs:
             exit 78
           }
 
-          echo 'Regenerating only com.readori.app App Store profile with current Apple capabilities...'
+          # One match call covers the app and its Background Assets downloader extension,
+          # so both profiles are signed by the same shared Distribution identity.
+          echo 'Regenerating com.readori.app + com.readori.app.VoicePackDownloader App Store profiles with current Apple capabilities...'
           MATCH_READONLY=false fastlane match appstore \
-            --app_identifier "$READORI_BUNDLE_ID" \
+            --app_identifier "$READORI_BUNDLE_ID,$READORI_VOICEPACK_BUNDLE_ID" \
             --readonly false \
             --force \
             --generate_apple_certs false \
             --skip_confirmation true \
             "${COMMON[@]}"
 
-          echo 'Readori App Store profile refresh: PASS'
+          # Both profiles must carry the App Group shared by the app and the extension,
+          # or the signed archive fails later. Associated Domains is checked in step 8.
+          for bundle in "$READORI_BUNDLE_ID" "$READORI_VOICEPACK_BUNDLE_ID"; do
+            PROFILE_FOUND=0
+            GROUP_OK=0
+            for root in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+              [[ -d "$root" ]] || continue
+              for p in "$root"/*.mobileprovision; do
+                [[ -f "$p" ]] || continue
+                tmp="$(mktemp)"
+                if security cms -D -i "$p" > "$tmp" 2>/dev/null; then
+                  appid="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$tmp" 2>/dev/null || true)"
+                  gettask="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$tmp" 2>/dev/null || true)"
+                  if [[ "$appid" == "$ASC_TEAM_ID.$bundle" && "$gettask" != 'true' ]]; then
+                    PROFILE_FOUND=1
+                    if /usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.security.application-groups' "$tmp" 2>/dev/null | grep -qx "[[:space:]]*$READORI_APP_GROUP"; then
+                      GROUP_OK=1
+                    fi
+                  fi
+                fi
+                rm -f "$tmp"
+              done
+            done
+            [[ "$PROFILE_FOUND" -eq 1 ]] || {
+              echo "::error::No installed App Store profile found for $bundle after refresh."
+              echo '::error::Confirm this App ID exists in the Apple Developer portal (Identifiers), then rerun refresh_readori_profile.'
+              exit 78
+            }
+            [[ "$GROUP_OK" -eq 1 ]] || {
+              echo "::error::The App Store profile for $bundle does not include the App Group $READORI_APP_GROUP."
+              echo "::error::In the Apple Developer portal: create the App Group $READORI_APP_GROUP, enable the App Groups capability on $bundle and assign that group, then rerun refresh_readori_profile."
+              exit 78
+            }
+            echo "App Store profile installed with App Group: $bundle"
+          done
+
+          echo 'Readori App Store profiles refresh (app + voice-pack downloader extension): PASS'
 
       # ============================================================
       # 7B2. REFRESH CF MAIL PROFILE ONLY
@@ -730,7 +770,7 @@ jobs:
           # The Live Activity extension comes after the four apps; English (app + widgets) is last.
           # If only the Live Activity extension fails: create its App ID, then run refresh_paobuwan_profile once.
           # If only English fails: run refresh_english_profile once (its App IDs and App Group must exist first).
-          for bundle in "$READORI_BUNDLE_ID" "$MAIL_BUNDLE_ID" "$SHIFTMILE_BUNDLE_ID" "$PAOBUWAN_BUNDLE_ID" "$PAOBUWAN_LIVEACTIVITY_BUNDLE_ID" "$ENGLISH_BUNDLE_ID" "$ENGLISH_WIDGETS_BUNDLE_ID"; do
+          for bundle in "$READORI_BUNDLE_ID" "$READORI_VOICEPACK_BUNDLE_ID" "$MAIL_BUNDLE_ID" "$SHIFTMILE_BUNDLE_ID" "$PAOBUWAN_BUNDLE_ID" "$PAOBUWAN_LIVEACTIVITY_BUNDLE_ID" "$ENGLISH_BUNDLE_ID" "$ENGLISH_WIDGETS_BUNDLE_ID"; do
             echo "=== Verify $bundle ==="
             MATCH_READONLY=true fastlane match appstore \
               --app_identifier "$bundle" \
@@ -875,7 +915,7 @@ jobs:
             echo '- Match auth: HTTPS + TARGET_REPO_PAT'
             echo '- Active App IDs: com.readori.app + com.readori.mail + com.readori.shiftmile + com.readori.paobuwan (+ extension com.readori.paobuwan.LiveActivity) + com.readori.english (+ extension com.readori.english.widgets, App Group group.com.readori.english)'
             echo '- Fresh bootstrap target: one shared Apple Distribution identity + three App Store profiles'
-            echo '- Refresh modes: reuse existing identity and regenerate only the selected App Store profile (refresh_paobuwan_profile covers the app and its Live Activity extension; refresh_english_profile covers the app and its widgets extension)'
+            echo '- Refresh modes: reuse existing identity and regenerate only the selected App Store profile (refresh_readori_profile covers the app and its voice-pack downloader extension; refresh_paobuwan_profile covers the app and its Live Activity extension; refresh_english_profile covers the app and its widgets extension)'
             echo '- APNs keys / ASC API keys / Identifiers are never deleted by this workflow'
             echo '- Apple Developer certificate/profile revocation is intentionally manual'
             echo '- Scope: certificates and provisioning profiles only; this workflow builds no IPA'
