@@ -681,6 +681,64 @@ jobs:
                   print(f"  ... {len(lines) - SPIN_CAP} more lines cut (cap {SPIN_CAP})")
               print("::endgroup::")
 
+          def crash_reports():
+              # Crash reports of the app written on this runner (simulator crashes land in the host's DiagnosticReports):
+              # exception, termination reason, the app-specific message (Swift fatal errors, Objective-C exception reasons)
+              # and the top frames of the crashed thread. Newest first, at most CRASH_FILES distinct signatures.
+              if not ui_failed:
+                  return
+              CRASH_FILES, CRASH_FRAMES = 3, 30
+              paths = glob.glob(os.path.expanduser("~/Library/Logs/DiagnosticReports/EnglishApp*.ips"))
+              paths += glob.glob(os.path.expanduser("~/Library/Logs/DiagnosticReports/Retired/EnglishApp*.ips"))
+              paths.sort(key=os.path.getmtime, reverse=True)
+              if not paths:
+                  return
+              lines, seen = [f"{len(paths)} EnglishApp crash report(s) on this runner"], set()
+              for path in paths:
+                  if len(seen) >= CRASH_FILES:
+                      break
+                  try:
+                      with open(path, encoding="utf-8", errors="replace") as fh:
+                          text = fh.read()
+                      body = json.loads(text[text.index("
+") + 1:])
+                      images = body.get("usedImages") or []
+                      threads = body.get("threads") or []
+                      ti = body.get("faultingThread", 0)
+                      frames = threads[ti].get("frames", []) if 0 <= ti < len(threads) else []
+                      def frame(f):
+                          ii = f.get("imageIndex", -1)
+                          img = images[ii].get("name", "?") if 0 <= ii < len(images) else "?"
+                          sym = f.get("symbol") or f"+{f.get('imageOffset', 0)}"
+                          loc = f" ({f['sourceFile']}:{f.get('sourceLine', 0)})" if f.get("sourceFile") else ""
+                          return f"{img}  {sym}{loc}"
+                      shown = [frame(f) for f in frames[:CRASH_FRAMES]]
+                      sig = "|".join(shown[:8])
+                      if sig in seen:
+                          continue
+                      seen.add(sig)
+                      exc = body.get("exception") or {}
+                      term = body.get("termination") or {}
+                      lines.append(f"--- {os.path.basename(path)}")
+                      lines.append(f"  exception: {exc.get('type', '?')} {exc.get('signal', '')} {clip(exc.get('subtype', ''), 200)}")
+                      if term:
+                          lines.append(f"  termination: {clip(term.get('indicator', '') or term.get('reasons', ''), 300)}")
+                      asi = body.get("asi") or {}
+                      for k, v in asi.items():
+                          lines.append(f"  message ({k}): {clip(' | '.join(v) if isinstance(v, list) else v, 1200)}")
+                      ler = body.get("lastExceptionBacktrace") or []
+                      if ler:
+                          lines.append("  last exception backtrace:")
+                          lines += ["    " + frame(f) for f in ler[:CRASH_FRAMES]]
+                      lines.append(f"  crashed thread {ti}:")
+                      lines += ["    " + x for x in shown]
+                  except Exception as exc:
+                      lines.append(f"--- {os.path.basename(path)}: unreadable ({clip(exc, 200)})")
+              print("::group::Crash reports of the app")
+              for ln in lines[:SPIN_CAP]:
+                  print(ln)
+              print("::endgroup::")
+
           lexcore()
           xcresult("EnglishAppTests (unit)", "UNIT_XCRESULT", "UNIT_STATUS")
           xcresult("EnglishAppUITests (smoke)", "UI_XCRESULT", "UI_STATUS")
@@ -738,6 +796,10 @@ jobs:
               spindump_main_threads()
           except Exception as exc:
               print(f"Spindump main thread skipped: {clip(exc, 200)}")
+          try:
+              crash_reports()
+          except Exception as exc:
+              print(f"Crash reports skipped: {clip(exc, 200)}")
           if failures:
               for suite, ident, msgs in failures[:15]:
                   print(f"::error title=Test failed ({esc(suite)})::{esc(ident)}%0A{esc(chr(10).join(msgs[:3]))}")
