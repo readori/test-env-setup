@@ -700,8 +700,7 @@ jobs:
                   try:
                       with open(path, encoding="utf-8", errors="replace") as fh:
                           text = fh.read()
-                      body = json.loads(text[text.index("
-") + 1:])
+                      body = json.loads(text[text.index(chr(10)) + 1:])
                       images = body.get("usedImages") or []
                       threads = body.get("threads") or []
                       ti = body.get("faultingThread", 0)
