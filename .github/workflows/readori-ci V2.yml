@@ -1854,6 +1854,8 @@ jobs:
         # AppSkin raw values are lowercase (classic / paperink / handdrawn).
         SKIN_ENV="$(printf '%s' "$SKIN_ENV" | tr '[:upper:]' '[:lower:]')"
         APPEARANCE="${SCREENSHOT_APPEARANCE:-light}"
+        # The app reads AppAppearanceMode from UserDefaults; a launch argument sets it in the
+        # argument domain for this launch only (simctl ui appearance can time out on a busy simulator).
         echo "Screenshot skin=${SKIN_ENV:-<app default>} appearance=$APPEARANCE locales=$LOCALES"
 
         rm -rf "$SCREENSHOTS_DIR"
@@ -2234,7 +2236,8 @@ jobs:
                 SIMCTL_CHILD_READORI_SKIN="$SKIN_ENV" \
                 xcrun simctl launch "$udid" "$BUNDLE_ID" \
                   -AppleLanguages "($apple_lang)" \
-                  -AppleLocale "$apple_locale"; then
+                  -AppleLocale "$apple_locale" \
+                  -readori.app.appearanceMode "$APPEARANCE"; then
                 echo "::warning::[$display_type][$LOCALE][$tab] first launch failed; retrying once"
                 run_with_timeout 15 xcrun simctl terminate "$udid" "$BUNDLE_ID" || true
                 sleep 2
@@ -2244,7 +2247,8 @@ jobs:
                   SIMCTL_CHILD_READORI_SKIN="$SKIN_ENV" \
                   xcrun simctl launch "$udid" "$BUNDLE_ID" \
                     -AppleLanguages "($apple_lang)" \
-                    -AppleLocale "$apple_locale"; then
+                    -AppleLocale "$apple_locale" \
+                    -readori.app.appearanceMode "$APPEARANCE"; then
                   echo "::error::[$display_type][$LOCALE][$tab] launch failed after retry"
                   return 1
                 fi
