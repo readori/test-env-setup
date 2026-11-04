@@ -1833,7 +1833,7 @@ jobs:
     - name: Auto-capture simulator screenshots
       if: ${{ env.MODE == 'screenshots' }}
       continue-on-error: true
-      timeout-minutes: 60
+      timeout-minutes: 80
       shell: bash
       env:
         PRO_LEASE_PUBLIC_KEY: ${{ secrets.PRO_LEASE_PUBLIC_KEY }}
@@ -2017,10 +2017,10 @@ jobs:
           local label="$2"
 
           echo "[$label] removing stale app installation (if any)..."
-          run_with_timeout 15 xcrun simctl uninstall "$udid" "$BUNDLE_ID" || true
+          run_with_timeout 45 xcrun simctl uninstall "$udid" "$BUNDLE_ID" || true
 
           echo "[$label] installing app..."
-          if run_with_timeout 45 xcrun simctl install "$udid" "$APP_PATH"; then
+          if run_with_timeout 180 xcrun simctl install "$udid" "$APP_PATH"; then
             echo "[$label] app installed"
             return 0
           fi
@@ -2029,9 +2029,9 @@ jobs:
           run_with_timeout 15 xcrun simctl shutdown "$udid" || true
           sleep 2
           ensure_simulator_ready "$udid" "$label install-retry" || return 1
-          run_with_timeout 15 xcrun simctl uninstall "$udid" "$BUNDLE_ID" || true
+          run_with_timeout 45 xcrun simctl uninstall "$udid" "$BUNDLE_ID" || true
 
-          if run_with_timeout 45 xcrun simctl install "$udid" "$APP_PATH"; then
+          if run_with_timeout 180 xcrun simctl install "$udid" "$APP_PATH"; then
             echo "[$label] app installed after retry"
             return 0
           fi
@@ -2206,9 +2206,6 @@ jobs:
             return 1
           fi
 
-          echo "[$display_type] appearance -> $APPEARANCE"
-          run_with_timeout 20 xcrun simctl ui "$udid" appearance "$APPEARANCE" || echo "::warning::[$display_type] could not set appearance $APPEARANCE"
-
           for LOCALE in $LOCALES; do
             local out_dir="$SCREENSHOTS_DIR/$LOCALE/$display_type"
             mkdir -p "$out_dir"
@@ -2227,10 +2224,10 @@ jobs:
               [[ "$tab" == "reader" ]] && wait_seconds=9
 
               echo "[$display_type][$LOCALE][$tab] terminate"
-              run_with_timeout 15 xcrun simctl terminate "$udid" "$BUNDLE_ID" || true
+              run_with_timeout 40 xcrun simctl terminate "$udid" "$BUNDLE_ID" || true
 
               echo "[$display_type][$LOCALE][$tab] launch"
-              if ! run_with_timeout 30 env \
+              if ! run_with_timeout 90 env \
                 SIMCTL_CHILD_READORI_SCREENSHOT_MODE=1 \
                 SIMCTL_CHILD_READORI_SCREENSHOT_TAB="$tab" \
                 SIMCTL_CHILD_READORI_SKIN="$SKIN_ENV" \
@@ -2239,9 +2236,9 @@ jobs:
                   -AppleLocale "$apple_locale" \
                   -readori.app.appearanceMode "$APPEARANCE"; then
                 echo "::warning::[$display_type][$LOCALE][$tab] first launch failed; retrying once"
-                run_with_timeout 15 xcrun simctl terminate "$udid" "$BUNDLE_ID" || true
+                run_with_timeout 40 xcrun simctl terminate "$udid" "$BUNDLE_ID" || true
                 sleep 2
-                if ! run_with_timeout 30 env \
+                if ! run_with_timeout 90 env \
                   SIMCTL_CHILD_READORI_SCREENSHOT_MODE=1 \
                   SIMCTL_CHILD_READORI_SCREENSHOT_TAB="$tab" \
                   SIMCTL_CHILD_READORI_SKIN="$SKIN_ENV" \
@@ -2379,7 +2376,7 @@ jobs:
     # 16.6 PUBLISH SCREENSHOTS AS BUILD ARTIFACT
     # ==============================================
     - name: Publish captured screenshots as build artifact
-      if: ${{ env.MODE == 'screenshots' }}
+      if: ${{ always() && env.MODE == 'screenshots' }}
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
         name: app-store-screenshots
