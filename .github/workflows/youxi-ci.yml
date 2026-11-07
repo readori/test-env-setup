@@ -58,15 +58,6 @@ jobs:
     timeout-minutes: 25
 
     steps:
-      - name: Checkout request file (push trigger only; this public repo, no secrets)
-        if: github.event_name == 'push'
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          path: ci-request
-          sparse-checkout: ci-requests
-          fetch-depth: 1
-          persist-credentials: false
-
       - name: Validate request and credentials
         id: request
         shell: bash
@@ -75,12 +66,15 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_REF: ${{ inputs.ref }}
           INPUT_SMOKE: ${{ inputs.smoke }}
+          REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/youxi.env
         run: |
           set -euo pipefail
 
           if [[ "$EVENT_NAME" == 'push' ]]; then
-            REQ=ci-request/ci-requests/youxi.env
-            [[ -f "$REQ" ]] || { echo '::error::ci-requests/youxi.env is missing.'; exit 64; }
+            # Download only the request file of this exact commit (public repo, no credentials).
+            # This repo is not checked out: it carries an unrelated broken submodule entry.
+            REQ="$RUNNER_TEMP/youxi-ci-request.env"
+            curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/youxi.env at this commit.'; exit 64; }
             # Plain text, read line by line; never sourced or executed.
             SOURCE_REF="$(sed -n 's/^REF=//p' "$REQ" | head -n 1 | tr -d '\r')"
             SMOKE="$(sed -n 's/^SMOKE=//p' "$REQ" | head -n 1 | tr -d '\r')"
