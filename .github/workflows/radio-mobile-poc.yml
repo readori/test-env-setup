@@ -249,7 +249,7 @@ jobs:
           # The runner's default JDK can be newer than Gradle supports; AGP needs 17+.
           echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
           export JAVA_HOME="$JAVA_HOME_17_X64"
-          echo "Gradle ${GRADLE_VERSION} verified; $(java -version 2>&1 | head -1)"
+          echo "Gradle ${GRADLE_VERSION} verified; $("$JAVA_HOME/bin/java" -version 2>&1 | head -1)"
 
       - name: Build APKs
         id: build
@@ -269,7 +269,7 @@ jobs:
         shell: bash
         working-directory: source/poc/android-player
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           export PATH="$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
           export ANDROID_AVD_HOME="$HOME/.android/avd"
           mkdir -p "$ANDROID_AVD_HOME"
@@ -322,7 +322,7 @@ jobs:
         shell: bash
         working-directory: source/poc/android-player
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           export PATH="$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
           export ANDROID_AVD_HOME="$HOME/.android/avd"
           mkdir -p "$ANDROID_AVD_HOME"
@@ -334,7 +334,7 @@ jobs:
           timeout 300 adb wait-for-device || { grep -iE 'error|fatal' "$RUNNER_TEMP/auto.log" | head; exit 1; }
           timeout 600 bash -c 'until [[ "$(adb shell getprop sys.boot_completed | tr -d "\r")" == 1 ]]; do sleep 5; done'
           echo "automotive booted, sdk $(adb shell getprop ro.build.version.sdk | tr -d '\r')"
-          adb install -r app/build/outputs/apk/automotive/debug/*.apk > /dev/null
+          adb install -r app/build/outputs/apk/automotive/debug/*.apk 2>&1 | grep -oE "Success|INSTALL_[A-Z_]+" | head -1
           sleep 15
           adb shell am start -a android.car.intent.action.MEDIA_TEMPLATE \
             --es android.car.intent.extra.MEDIA_COMPONENT "$APP_ID/.PlaybackService" > /dev/null 2>&1
@@ -347,5 +347,10 @@ jobs:
           done
           focus="$(adb shell dumpsys window | grep -m1 -oE 'mCurrentFocus=Window\{[^}]*\}' | grep -oE '[a-z][a-z0-9_]*(\.[a-z0-9_]+)+' | head -1 | tr -d '\r')"
           echo "RESULT aaos focused_package=${focus:-unknown} channels_on_screen=${found:-none}" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [[ -z "$found" ]]; then
+            # Diagnostics: on-screen labels of the emulator's own system UI (no private data).
+            adb exec-out cat /sdcard/ui.xml 2>/dev/null | grep -oE 'text="[^"]{1,40}"' | sort -u | head -15
+            echo "media sessions for app: $(adb shell dumpsys media_session | grep -c "package=$APP_ID")"
+          fi
           adb emu kill > /dev/null 2>&1 || true
           [[ "$found" == 'ABC' ]]
