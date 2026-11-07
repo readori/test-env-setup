@@ -21,7 +21,7 @@
 # tools print errors/summary only; no Actions artifacts; private files are never printed.
 name: youxi CI
 
-run-name: youxi CI · ${{ github.event_name == 'push' && github.event.head_commit.message || format('verify{0} · {1}', inputs.smoke && ' + smoke' || '', inputs.ref) }}
+run-name: youxi CI · ${{ github.event_name == 'push' && 'request (ci-requests/youxi.env)' || format('verify{0} · {1}', inputs.smoke && ' + smoke' || '', inputs.ref) }}
 
 on:
   workflow_dispatch:
