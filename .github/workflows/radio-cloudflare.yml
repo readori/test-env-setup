@@ -99,7 +99,8 @@ jobs:
           set -euo pipefail
           log="$(mktemp)"
           if ! pnpm exec wrangler deploy --dry-run --outdir "$RUNNER_TEMP/bundle" --env "$TARGET_ENV" > "$log" 2>&1; then
-            grep -E 'ERROR|✘|error' "$log" | head -30
+            echo 'dry-run failed; error codes only (private source lines are never printed):'
+            { grep -oE 'TS[0-9]{4,5}|\[ERROR\]|ERR_[A-Z_]+' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
             exit 1
           fi
           echo "dry-run bundle OK ($(du -sk "$RUNNER_TEMP/bundle" | cut -f1) KiB)"

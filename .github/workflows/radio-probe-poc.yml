@@ -83,7 +83,8 @@ jobs:
           cd workers/probe-poc
           log="$(mktemp)"
           if ! { pnpm run build:node && pnpm exec wrangler deploy --dry-run --outdir "$RUNNER_TEMP/bundle" --env dev; } > "$log" 2>&1; then
-            grep -E 'error|ERROR|✘' "$log" | grep -vE 'https?://' | head -30
+            echo 'build failed; error codes only (private source lines are never printed):'
+            { grep -oE 'TS[0-9]{4,5}|\[ERROR\]|ERR_[A-Z_]+' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
             exit 1
           fi
           echo 'build OK'
@@ -188,7 +189,7 @@ jobs:
         run: |
           set -uo pipefail
           rm -f "$RUNNER_TEMP/run-token"
-          pnpm exec wrangler delete --env dev --force > /dev/null 2>&1 || true
+          pnpm exec wrangler delete --name "$WORKER_NAME" --force > /dev/null 2>&1 || true
           code="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
             "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$WORKER_NAME" 2>/dev/null || true)"
           if [[ "$code" == 404 ]]; then
