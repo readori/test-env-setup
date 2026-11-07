@@ -50,6 +50,11 @@ on:
         required: true
         default: '30'
         type: string
+      channel_order:
+        description: 'android-poc: optional try order, e.g. channel-b,channel-a,channel-c'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -277,6 +282,7 @@ jobs:
     env:
       GRADLE_VERSION: 8.14.3
       PLAY_SECONDS: ${{ inputs.play_seconds }}
+      CHANNEL_ORDER: ${{ inputs.channel_order }}
       APP_ID: dev.meridian.poc
     steps:
       - name: Validate request
@@ -285,6 +291,7 @@ jobs:
           set -euo pipefail
           [[ "$SOURCE_REF" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]] || { echo '::error::ref must be a branch, tag or SHA (no leading -)'; exit 64; }
           [[ "$PLAY_SECONDS" =~ ^[0-9]{2,4}$ ]] || { echo '::error::play_seconds must be 10-9999'; exit 64; }
+          [[ "$CHANNEL_ORDER" =~ ^[a-z,-]{0,60}$ ]] || { echo '::error::channel_order must look like channel-b,channel-a'; exit 64; }
 
       - name: Checkout private source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -363,24 +370,30 @@ jobs:
           adb shell am instrument -w -e class "$APP_ID.BrowseAndPlayTest#browseTreeListsChannels" "$runner" > "$RUNNER_TEMP/browse.txt" 2>&1
           echo '--- browse ---'
           summarize "$RUNNER_TEMP/browse.txt"
-          adb shell am instrument -w -e class "$APP_ID.BrowseAndPlayTest#playsInBackground" -e playSeconds "$PLAY_SECONDS" "$runner" > "$RUNNER_TEMP/play.txt" 2>&1 &
+          adb shell am instrument -w -e class "$APP_ID.BrowseAndPlayTest#playsInBackground" -e playSeconds "$PLAY_SECONDS" \
+            ${CHANNEL_ORDER:+-e order "$CHANNEL_ORDER"} "$runner" > "$RUNNER_TEMP/play.txt" 2>&1 &
           inst=$!
           sample() {
             # Only our session's playback state and position; never metadata or URIs.
             local state
             state="$(adb shell dumpsys media_session | awk -v app="$APP_ID" '/package=/{mine=index($0, "package=" app)>0} mine && /state=PlaybackState/{print; exit}' \
               | sed -E 's/.*state=PlaybackState \{state=([A-Z_0-9]+)[^,]*, position=(-?[0-9]+).*/state=\1 position_ms=\2/')"
-            echo "$1: ${state:-no session state} | $(adb shell dumpsys power | grep -m1 -oE 'mWakefulness=[A-Za-z]+' | tr -d '\r') | notification records: $(adb shell dumpsys notification | grep -c "pkg=$APP_ID" | tr -d '\r')"
+            echo "$1: ${state:-no session state} | $(adb shell dumpsys power | grep -m1 -oE 'mWakefulness=[A-Za-z]+' | tr -d '\r') | doze: $(adb shell dumpsys deviceidle get deep | tr -d '\r') | notification records: $(adb shell dumpsys notification | grep -c "pkg=$APP_ID" | tr -d '\r')"
           }
           sleep 30
           sample 'playing, app in background'
           adb shell input keyevent KEYCODE_HOME
           adb shell input keyevent KEYCODE_SLEEP
+          # The emulator is on AC power, so Doze never starts by itself: unplug and force deep idle.
+          adb shell dumpsys battery unplug
+          adb shell dumpsys deviceidle force-idle deep > /dev/null 2>&1 || adb shell dumpsys deviceidle force-idle > /dev/null 2>&1
           sleep 20
           sample 'screen off +20s'
           sleep $(( PLAY_SECONDS > 70 ? PLAY_SECONDS - 60 : 10 ))
           sample 'screen off, later'
           wait "$inst"
+          adb shell dumpsys deviceidle unforce > /dev/null 2>&1
+          adb shell dumpsys battery reset
           echo '--- background playback ---'
           summarize "$RUNNER_TEMP/play.txt"
           echo '--- results ---'
@@ -429,5 +442,19 @@ jobs:
             adb logcat -d -v tag '*:W' | grep -iE 'MediaBrowser|MediaLibrary|MediaSession|CarMedia|browse' \
               | sed -E 's#[a-z]+://[^ ]+#<url>#g' | cut -c1-200 | sort | uniq -c | sort -rn | head -15
           fi
+          # Play from the car UI: tap Channel B, then read our session's playback state.
+          car_state=not-tried
+          bounds="$(adb exec-out cat /sdcard/ui.xml 2>/dev/null | grep -oE 'text="Meridian Test . Channel B"[^>]*bounds="\[[0-9]+,[0-9]+\]\[[0-9]+,[0-9]+\]"' | grep -oE '[0-9]+' | tail -4 | tr '\n' ' ')"
+          if [[ -n "$bounds" ]]; then
+            read -r x1 y1 x2 y2 <<< "$bounds"
+            adb shell input tap $(( (x1 + x2) / 2 )) $(( (y1 + y2) / 2 ))
+            car_state=none
+            for _ in $(seq 1 10); do
+              sleep 3
+              car_state="$(adb shell dumpsys media_session | awk -v app="$APP_ID" '/package=/{mine=index($0, "package=" app)>0} mine && /state=PlaybackState/{print; exit}' | grep -oE 'state=[A-Z_]+\([0-9]+\)' | head -1)"
+              [[ "$car_state" == 'state=PLAYING(3)' ]] && break
+            done
+          fi
+          echo "RESULT aaos_play tapped=channel-b session_${car_state:-none}" | tee -a "$GITHUB_STEP_SUMMARY"
           adb emu kill > /dev/null 2>&1 || true
-          [[ "$found" == 'ABC' ]]
+          [[ "$found" == 'ABC' && "$car_state" == 'state=PLAYING(3)' ]]
