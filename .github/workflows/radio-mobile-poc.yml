@@ -5,6 +5,10 @@
 #   ios-core       : macos-26, iOS simulator. `xcodebuild test` of the MeridianPlayerCore Swift
 #                    package: AVPlayer on real streams (Icecast + HLS), MTAudioProcessingTap, and
 #                    ShazamKit with a custom catalog built from audio the tests generate.
+#   ios-background : macos-26, iOS simulator. XcodeGen host app (UIBackgroundModes audio) + XCUITest:
+#                    plays a fixture stream, goes to the home screen (screen lock best effort) for
+#                    bg_minutes, samples the app state each minute, then reads back how far
+#                    playback advanced while in the background. Not part of `all` (long).
 #   android-spike  : ubuntu, KVM + Android emulator readiness: boot time of a phone image and an
 #                    Android Automotive image.
 #   android-poc    : ubuntu + KVM. Builds poc/android-player (Media3 MediaLibraryService), then on a
@@ -35,11 +39,16 @@ on:
         required: true
         default: all
         type: choice
-        options: [all, ios-core, android-spike, android-poc]
+        options: [all, ios-core, ios-background, android-spike, android-poc]
       play_seconds:
         description: 'android-poc: seconds of background playback with the screen off'
         required: true
         default: '120'
+        type: string
+      bg_minutes:
+        description: 'ios-background: minutes in the background'
+        required: true
+        default: '30'
         type: string
 
 permissions:
@@ -111,6 +120,71 @@ jobs:
           grep -E "^Test Case '.*' (passed|failed)|^\*\* TEST (SUCCEEDED|FAILED) \*\*|Executed [0-9]+ tests?" "$log" | sed -E 's/ \([0-9.]+ seconds\)//' || true
           echo '--- errors (file:line only) ---'
           grep -E '^/[^ ]+:[0-9]+:([0-9]+:)? error: ' "$log" | sed -E 's#^.*/(poc/[^:]+)#\1#' | sort -u | head -40 || true
+          echo "xcodebuild exit: $status"
+          exit "$status"
+
+  ios-background:
+    name: POC-02 iOS background playback (simulator)
+    if: inputs.job == 'ios-background'
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      BG_MINUTES: ${{ inputs.bg_minutes }}
+    steps:
+      - name: Validate request
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REF" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]] || { echo '::error::ref must be a branch, tag or SHA (no leading -)'; exit 64; }
+          [[ "$BG_MINUTES" =~ ^[0-9]{1,2}$ ]] && (( BG_MINUTES >= 1 && BG_MINUTES <= 60 )) || { echo '::error::bg_minutes must be 1-60'; exit 64; }
+
+      - name: Checkout private source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/Radio
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Pick a simulator, generate the host project
+        id: sim
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -f source/poc/ios-player/BackgroundHost/project.yml ]] || { echo '::error::poc/ios-player/BackgroundHost is missing at this ref (POC-02)'; exit 66; }
+          echo "Private source commit: $(git -C source rev-parse --short=8 HEAD)"
+          echo "Xcode: $(xcodebuild -version | tr '\n' ' ')"
+          command -v xcodegen > /dev/null || brew install xcodegen > /dev/null 2>&1
+          echo "XcodeGen: $(xcodegen --version)"
+          (cd source/poc/ios-player/BackgroundHost && xcodegen generate --quiet)
+          udid="$(xcrun simctl list devices available -j | jq -r '[.devices | to_entries[] | select(.key | test("iOS")) | .value[] | select(.name | test("^iPhone"))] | last | .udid // empty')"
+          [[ -n "$udid" ]] || { echo '::error::no available iPhone simulator'; exit 1; }
+          echo "Simulator: $(xcrun simctl list devices -j | jq -r --arg u "$udid" '.devices | to_entries[] | .key as $rt | .value[] | select(.udid == $u) | "\(.name) (\($rt | sub(".*SimRuntime."; "")))"')"
+          echo "udid=$udid" >> "$GITHUB_OUTPUT"
+          xcrun simctl boot "$udid" || true
+          xcrun simctl bootstatus "$udid" -b > /dev/null
+
+      - name: Background playback XCUITest
+        shell: bash
+        working-directory: source/poc/ios-player/BackgroundHost
+        env:
+          UDID: ${{ steps.sim.outputs.udid }}
+          TEST_RUNNER_BG_MINUTES: ${{ inputs.bg_minutes }}
+        run: |
+          set -uo pipefail
+          log="$(mktemp)"
+          xcodebuild test -project MeridianBackgroundHost.xcodeproj -scheme MeridianBackgroundHost \
+            -destination "id=$UDID" CODE_SIGNING_ALLOWED=NO -skipPackagePluginValidation > "$log" 2>&1 && status=0 || status=$?
+          echo '--- results ---'
+          grep -oE 'RESULT [a-z_]+ .*' "$log" | sort -u | tee -a "$GITHUB_STEP_SUMMARY" || true
+          echo '--- tests ---'
+          grep -E "^Test Case '.*' (passed|failed)|^\*\* TEST (SUCCEEDED|FAILED) \*\*|Executed [0-9]+ tests?" "$log" || true
+          echo '--- errors (file:line only) ---'
+          grep -E '^/[^ ]+:[0-9]+:([0-9]+:)? error: ' "$log" | sed -E 's#^.*/(poc/[^:]+)#\1#' | sort -u | head -40 || true
+          grep -E '^error: |xcodebuild: error' "$log" | cut -c1-200 | sort -u | head -10 || true
           echo "xcodebuild exit: $status"
           exit "$status"
 
