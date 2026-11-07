@@ -1,0 +1,189 @@
+# DRAFT for the PUBLIC CI repository readori/test-env-setup, as .github/workflows/radio-api.yml.
+# It is not a workflow here: the private repo keeps no workflows (CLAUDE.md). The main session
+# reviews it and copies it over. Modeled on radio-cloudflare.yml (same safety rules).
+#
+#   dry-run  : install, bundle the API Worker with `wrangler deploy --dry-run` (no credentials).
+#   deploy   : provision (finds the existing D1 + snapshots bucket), deploy meridian-api-<env>,
+#              GET /health.
+#   snapshot : import the catalog from Radio Browser (no credentials; counts only in the log),
+#              upload it to R2 (shards first, manifest last), then read it back through the Worker.
+#   all      : deploy, then snapshot.
+#
+# Secrets needed: TARGET_REPO_PAT, CLOUDFLARE_API_TOKEN (must be allowed to write R2 objects in
+# the account), CLOUDFLARE_ACCOUNT_ID. No new secret.
+# The import prints only counts (no station names, no URLs, no hosts). Nothing is uploaded as an
+# Actions artifact.
+name: Radio API
+
+run-name: Radio API · ${{ inputs.mode }} · staging · ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Private readori/Radio branch, tag, or SHA'
+        required: true
+        default: 'main'
+        type: string
+      mode:
+        description: 'dry-run | deploy | snapshot (import + upload to R2) | all'
+        required: true
+        default: dry-run
+        type: choice
+        options: [dry-run, deploy, snapshot, all]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: radio-api-staging
+  cancel-in-progress: false
+
+env:
+  SOURCE_REF: ${{ inputs.ref }}
+  MODE: ${{ inputs.mode }}
+  TARGET_ENV: staging
+  WRANGLER_SEND_METRICS: 'false'
+  TURBO_TELEMETRY_DISABLED: '1'
+
+jobs:
+  api:
+    name: API Worker + catalog snapshot (${{ inputs.mode }}, staging)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Validate request
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REF" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]] || { echo '::error::ref must be a branch, tag or SHA (no leading -)'; exit 64; }
+
+      - name: Checkout private source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/Radio
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Install dependencies and build @meridian/core (no credentials in this step)
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          [[ -f workers/api/wrangler.jsonc ]] || { echo '::error::workers/api is missing at this ref'; exit 66; }
+          echo "Private source commit: $(git rev-parse --short=8 HEAD)"
+          corepack enable
+          pnpm install --frozen-lockfile --reporter=silent
+          pnpm --filter @meridian/core build
+
+      - name: Bundle (wrangler dry-run, no credentials)
+        shell: bash
+        working-directory: source/workers/api
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          if ! pnpm exec wrangler deploy --dry-run --outdir "$RUNNER_TEMP/bundle" --env "$TARGET_ENV" > "$log" 2>&1; then
+            echo 'dry-run failed; error codes only (private source lines are never printed):'
+            { grep -oE 'TS[0-9]{4,5}|\[ERROR\]|ERR_[A-Z_]+' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
+            exit 1
+          fi
+          echo "dry-run bundle OK ($(du -sk "$RUNNER_TEMP/bundle" | cut -f1) KiB)"
+          echo "- dry-run bundle (${TARGET_ENV}): OK" >> "$GITHUB_STEP_SUMMARY"
+          node scripts/provision.mjs --env "$TARGET_ENV" --plan | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Mask workers.dev subdomain
+        if: inputs.mode != 'dry-run'
+        shell: bash
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$CF_ACCOUNT"
+          sub="$(curl -sS -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/workers/subdomain" | jq -r '.result.subdomain // empty')"
+          [[ -n "$sub" ]] || { echo '::error::No workers.dev subdomain on the account'; exit 1; }
+          echo "::add-mask::$sub"
+          echo 'subdomain masked'
+
+      - name: Provision meridian-staging-* resources
+        if: inputs.mode == 'deploy' || inputs.mode == 'all'
+        shell: bash
+        working-directory: source/workers/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          node scripts/provision.mjs --env "$TARGET_ENV" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy API Worker
+        if: inputs.mode == 'deploy' || inputs.mode == 'all'
+        shell: bash
+        working-directory: source/workers/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          redact() { sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<id>/g; s/[0-9a-fA-F]{32}/<id>/g'; }
+          if ! pnpm exec wrangler deploy --config wrangler.generated.json --env "$TARGET_ENV" > "$log" 2>&1; then
+            echo 'deploy failed; error codes only:'
+            { grep -oE 'TS[0-9]{4,5}|[ERROR]|ERR_[A-Z_]+|code: [0-9]+' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
+            exit 1
+          fi
+          { grep -E 'Uploaded|Deployed|Current Version' "$log" || true; } | redact
+          echo "- deploy meridian-api-${TARGET_ENV}: OK" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Health check
+        if: inputs.mode == 'deploy' || inputs.mode == 'all'
+        shell: bash
+        working-directory: source/workers/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          node scripts/health.mjs --env "$TARGET_ENV" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Import catalog from Radio Browser (no credentials; counts only)
+        if: inputs.mode == 'snapshot' || inputs.mode == 'all'
+        shell: bash
+        working-directory: source/workers/api
+        run: |
+          set -euo pipefail
+          # Output goes to the step summary: totals, hidden counts, shard count. No station data.
+          node scripts/import-catalog.mjs --out "$RUNNER_TEMP/snapshot-out" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload snapshot to R2 (shards first, manifest last)
+        if: inputs.mode == 'snapshot' || inputs.mode == 'all'
+        shell: bash
+        working-directory: source/workers/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$CLOUDFLARE_ACCOUNT_ID"
+          node scripts/upload-snapshot.mjs --dir "$RUNNER_TEMP/snapshot-out" --bucket "meridian-${TARGET_ENV}-snapshots" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Read the snapshot back through the Worker
+        if: inputs.mode == 'snapshot' || inputs.mode == 'all'
+        shell: bash
+        working-directory: source/workers/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          node scripts/health.mjs --env "$TARGET_ENV" --snapshot | tee -a "$GITHUB_STEP_SUMMARY"
