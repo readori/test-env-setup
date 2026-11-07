@@ -1,0 +1,199 @@
+# Radio (Meridian) POC-01 — can Workers reach radio streams on 443/80/8000/8080/other ports,
+# with fetch() and with TCP connect()?
+#
+# Public CI repository -> private source readori/Radio (workers/probe-poc).
+#
+#   1. Control group: the runner probes the 50 bundled streams itself (a client, like a listener),
+#      with the same code and the same 64 KB / 5 s budget. Bytes are discarded.
+#   2. Deploy the ephemeral Worker meridian-probe-poc-dev (Cloudflare dev only, no bindings).
+#   3. Set a random per-run RUN_TOKEN secret (masked). Until it is set the Worker answers 503.
+#   4. POST /run in batches of 5 stream indexes (free plan: 50 subrequests per request). The
+#      request carries indexes into the bundled list only, never a URL.
+#   5. Print the report: stream index, port class and booleans/status codes only (the report
+#      script refuses to print if a stream host would appear).
+#   6. Always delete the Worker, then confirm through the API that it is gone.
+#
+# Safety rules (public repo, public logs): workflow_dispatch only; actions pinned to SHAs;
+# TARGET_REPO_PAT only in checkout, not persisted; Cloudflare secrets only on the steps that call
+# Cloudflare; account id, workers.dev subdomain and run token are masked; wrangler output is
+# filtered and ids redacted; no artifacts; private files and stream URLs are never printed.
+name: Radio Probe POC
+
+run-name: Radio Probe POC · ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Private readori/Radio branch, tag, or SHA'
+        required: true
+        default: 'main'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: radio-probe-poc
+  cancel-in-progress: false
+
+env:
+  SOURCE_REF: ${{ inputs.ref }}
+  WORKER_NAME: meridian-probe-poc-dev
+  WRANGLER_SEND_METRICS: 'false'
+  TURBO_TELEMETRY_DISABLED: '1'
+
+jobs:
+  probe:
+    name: POC-01 stream probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Validate request
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REF" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]] || { echo '::error::ref must be a branch, tag or SHA (no leading -)'; exit 64; }
+
+      - name: Checkout private source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/Radio
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Install and build (no credentials in this step)
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          [[ -f workers/probe-poc/wrangler.jsonc ]] || { echo '::error::workers/probe-poc is missing at this ref (POC-01)'; exit 66; }
+          echo "Private source commit: $(git rev-parse --short=8 HEAD)"
+          corepack enable
+          pnpm install --frozen-lockfile --reporter=silent
+          cd workers/probe-poc
+          log="$(mktemp)"
+          if ! { pnpm run build:node && pnpm exec wrangler deploy --dry-run --outdir "$RUNNER_TEMP/bundle" --env dev; } > "$log" 2>&1; then
+            grep -E 'error|ERROR|✘' "$log" | grep -vE 'https?://' | head -30
+            exit 1
+          fi
+          echo 'build OK'
+
+      - name: Control group (runner probes the streams directly)
+        shell: bash
+        working-directory: source/workers/probe-poc
+        run: |
+          set -euo pipefail
+          node scripts/control.mjs "$RUNNER_TEMP/control.json"
+
+      - name: Mask account and workers.dev subdomain
+        shell: bash
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$CF_ACCOUNT"
+          sub="$(curl -sS -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/workers/subdomain" | jq -r '.result.subdomain // empty')"
+          [[ -n "$sub" ]] || { echo '::error::No workers.dev subdomain on the account'; exit 1; }
+          echo "::add-mask::$sub"
+          umask 077
+          printf '%s' "$sub" > "$RUNNER_TEMP/subdomain"
+          echo 'masked'
+
+      - name: Deploy ephemeral probe Worker
+        id: deploy
+        shell: bash
+        working-directory: source/workers/probe-poc
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          redact() { sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<id>/g; s/[0-9a-fA-F]{32}/<id>/g; s#https?://[^ ]+#<url>#g'; }
+          log="$(mktemp)"
+          echo 'attempted=true' >> "$GITHUB_OUTPUT"
+          if ! pnpm exec wrangler deploy --env dev > "$log" 2>&1; then
+            grep -E 'ERROR|✘|error|Error' "$log" | redact | head -30
+            exit 1
+          fi
+          { grep -E 'Uploaded|Deployed|Current Version' "$log" || true; } | redact
+          umask 077
+          token="$(openssl rand -hex 32)"
+          echo "::add-mask::$token"
+          printf '%s' "$token" > "$RUNNER_TEMP/run-token"
+          if ! printf '%s' "$token" | pnpm exec wrangler secret put RUN_TOKEN --env dev > "$log" 2>&1; then
+            grep -E 'ERROR|✘|error|Error' "$log" | redact | head -30
+            exit 1
+          fi
+          echo 'RUN_TOKEN set'
+
+      - name: Run probe batches
+        shell: bash
+        run: |
+          set -euo pipefail
+          sub="$(cat "$RUNNER_TEMP/subdomain")"
+          token="$(cat "$RUNNER_TEMP/run-token")"
+          url="https://${WORKER_NAME}.${sub}.workers.dev/run"
+          dir="$RUNNER_TEMP/batches"
+          mkdir -p "$dir"
+          # Ready once the secret is live: unauthenticated POST answers 403 (503 while closed).
+          ready=false
+          for i in $(seq 1 24); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -X POST "$url" 2>/dev/null || true)"
+            if [[ "$code" == 403 ]]; then ready=true; break; fi
+            echo "waiting for Worker (attempt $i, HTTP ${code:-none})"
+            sleep 5
+          done
+          [[ "$ready" == true ]] || { echo '::error::probe Worker never became ready'; exit 1; }
+          total=50
+          for from in $(seq 0 5 $((total - 1))); do
+            count=5
+            base="$dir/batch-$from-$count"
+            for attempt in 1 2; do
+              code="$(curl -s -o "$base.json" -w '%{http_code}' --max-time 120 -X POST "$url" \
+                -H "authorization: Bearer $token" -H 'content-type: application/json' \
+                --data "{\"from\":$from,\"count\":$count}" 2>/dev/null || true)"
+              [[ "$code" == 200 ]] && break
+              sleep 5
+            done
+            printf '%s' "${code:-0}" > "$base.code"
+            echo "batch $from-$((from + count - 1)): HTTP ${code:-none}"
+          done
+
+      - name: Report
+        shell: bash
+        working-directory: source/workers/probe-poc
+        run: |
+          set -euo pipefail
+          node scripts/report.mjs "$RUNNER_TEMP/control.json" "$RUNNER_TEMP/batches" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Delete probe Worker
+        if: always() && steps.deploy.outputs.attempted == 'true'
+        shell: bash
+        working-directory: source/workers/probe-poc
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -uo pipefail
+          rm -f "$RUNNER_TEMP/run-token"
+          pnpm exec wrangler delete --env dev --force > /dev/null 2>&1 || true
+          code="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$WORKER_NAME" 2>/dev/null || true)"
+          if [[ "$code" == 404 ]]; then
+            echo 'probe Worker deleted: true' | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::probe Worker deleted: false (HTTP ${code:-none})"
+            exit 1
+          fi
