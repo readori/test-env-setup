@@ -1,0 +1,157 @@
+# Radio (Meridian) capability check — read-only.
+#
+# Answers three questions before the Radio Cloudflare / iOS / Android workflows are written
+# (private repo BACKLOG OPS-05, POC-01, POC-02, POC-03):
+#
+#   cloudflare : what the shared CLOUDFLARE_API_TOKEN can read (Workers, D1, KV, R2, Queues,
+#                Workflows, workers.dev subdomain) and whether Meridian resources already exist.
+#   macos      : Xcode versions and iOS simulator runtimes on the macos-26 runner.
+#   android    : KVM, Android SDK, emulator / Automotive system images and the DHU package
+#                on ubuntu-latest.
+#
+# Nothing is created, changed or deployed. No private source is checked out.
+# Safety rules (public repo, public logs): workflow_dispatch only; the Cloudflare secrets are
+# passed only to the one step that calls the Cloudflare API; that step prints booleans, HTTP
+# status, error codes and counts only. It never prints account names, emails, subdomains, or
+# resource names (the account is shared with other projects). No Actions artifacts.
+name: Radio capability check
+
+run-name: Radio capability check · ${{ inputs.target }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Which checks to run'
+        required: true
+        default: all
+        type: choice
+        options: [all, cloudflare, macos, android]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: radio-capability-check
+  cancel-in-progress: false
+
+jobs:
+  cloudflare:
+    name: Cloudflare token capabilities
+    if: inputs.target == 'all' || inputs.target == 'cloudflare'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Probe Cloudflare API (read-only)
+        shell: bash
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          [[ -n "${CF_TOKEN:-}" ]] || { echo '::error::CLOUDFLARE_API_TOKEN is not set'; exit 78; }
+          [[ -n "${CF_ACCOUNT:-}" ]] || { echo '::error::CLOUDFLARE_ACCOUNT_ID is not set'; exit 78; }
+          echo "::add-mask::$CF_ACCOUNT"
+          api='https://api.cloudflare.com/client/v4'
+          body="$(mktemp)"
+          summary() { echo "$1" | tee -a "$GITHUB_STEP_SUMMARY"; }
+
+          # call <label> <path> [jq expression printing extra non-sensitive facts]
+          call() {
+            local label="$1" path="$2" extra="${3:-}"
+            local status success codes facts=''
+            status="$(curl -sS -o "$body" -w '%{http_code}' -H "Authorization: Bearer $CF_TOKEN" "$api$path" || echo 000)"
+            success="$(jq -r '.success // false' "$body" 2>/dev/null || echo false)"
+            codes="$(jq -r '[.errors[]?.code] | map(tostring) | join(",")' "$body" 2>/dev/null || true)"
+            if [[ "$success" == true && -n "$extra" ]]; then
+              facts="$(jq -r "$extra" "$body" 2>/dev/null || echo '?')"
+            fi
+            summary "| $label | $status | $success | ${codes:-—} | ${facts:-—} |"
+          }
+
+          summary '### Cloudflare (read-only)'
+          summary ''
+          summary '| Check | HTTP | success | error codes | facts |'
+          summary '|---|---|---|---|---|'
+          call 'Token verify (user token)' '/user/tokens/verify' '"status=" + (.result.status // "?")'
+          call 'Token verify (account token)' "/accounts/$CF_ACCOUNT/tokens/verify" '"status=" + (.result.status // "?")'
+          call 'Workers scripts' "/accounts/$CF_ACCOUNT/workers/scripts" \
+            '"total=" + (.result | length | tostring) + " meridian=" + ([.result[]? | select((.id // "") | startswith("meridian-"))] | length | tostring)'
+          call 'workers.dev subdomain' "/accounts/$CF_ACCOUNT/workers/subdomain" \
+            '"exists=" + (((.result.subdomain // "") | length > 0) | tostring)'
+          call 'D1 databases' "/accounts/$CF_ACCOUNT/d1/database?per_page=100" \
+            '"total=" + ((.result_info.total_count // (.result | length)) | tostring) + " meridian=" + ([.result[]? | select((.name // "") | startswith("meridian-"))] | length | tostring)'
+          call 'KV namespaces' "/accounts/$CF_ACCOUNT/storage/kv/namespaces?per_page=100" \
+            '"total=" + ((.result_info.total_count // (.result | length)) | tostring) + " meridian=" + ([.result[]? | select((.title // "") | startswith("meridian-"))] | length | tostring)'
+          call 'R2 buckets' "/accounts/$CF_ACCOUNT/r2/buckets" \
+            '"total=" + ((.result.buckets // []) | length | tostring) + " meridian=" + ([.result.buckets[]? | select((.name // "") | startswith("meridian-"))] | length | tostring)'
+          call 'Queues' "/accounts/$CF_ACCOUNT/queues" \
+            '"total=" + ((.result // []) | length | tostring) + " meridian=" + ([.result[]? | select((.queue_name // "") | startswith("meridian-"))] | length | tostring)'
+          call 'Workflows' "/accounts/$CF_ACCOUNT/workflows" '"total=" + ((.result // []) | length | tostring)'
+          call 'Subscriptions (plan)' "/accounts/$CF_ACCOUNT/subscriptions" \
+            '"workers_paid=" + ([.result[]? | ((.rate_plan.id // "") + " " + (.rate_plan.public_name // "") + " " + (.product.name // "")) | ascii_downcase | select(test("workers") and test("paid|bundled|standard"))] | length > 0 | tostring)'
+          rm -f "$body"
+          summary ''
+          summary 'Read access only. Write permissions (deploy, create) are not tested here.'
+
+  macos:
+    name: macOS runner toolchain
+    if: inputs.target == 'all' || inputs.target == 'macos'
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - name: Xcode and simulators
+        shell: bash
+        run: |
+          set -euo pipefail
+          summary() { echo "$1" | tee -a "$GITHUB_STEP_SUMMARY"; }
+          summary '### macOS (macos-26)'
+          summary ''
+          summary "- macOS $(sw_vers -productVersion), arch $(uname -m), CPUs $(sysctl -n hw.ncpu), free disk $(df -g / | awk 'NR==2{print $4}') GB"
+          summary "- Selected Xcode: $(xcodebuild -version | tr '\n' ' ')"
+          for app in /Applications/Xcode*.app; do
+            v="$(defaults read "$app/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || echo '?')"
+            summary "- Installed: $(basename "$app") → $v"
+          done
+          summary "- iOS simulator runtimes:"
+          xcrun simctl list runtimes -j | jq -r '.runtimes[] | select(.platform == "iOS") | "  - \(.name) available=\(.isAvailable)"' | tee -a "$GITHUB_STEP_SUMMARY"
+          summary "- iPhone device types: $(xcrun simctl list devicetypes -j | jq '[.devicetypes[] | select(.productFamily == "iPhone")] | length')"
+          for tool in xcodegen tuist swiftlint xcbeautify maestro; do
+            summary "- $tool: $(command -v "$tool" >/dev/null && echo present || echo absent)"
+          done
+          summary "- brew: $(brew --version | head -1)"
+
+  android:
+    name: Android emulator readiness
+    if: inputs.target == 'all' || inputs.target == 'android'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: KVM, SDK and system images
+        shell: bash
+        run: |
+          set -euo pipefail
+          summary() { echo "$1" | tee -a "$GITHUB_STEP_SUMMARY"; }
+          summary '### Android (ubuntu-latest)'
+          summary ''
+          summary "- CPUs $(nproc), memory $(free -g | awk '/Mem:/{print $2}') GB, free disk $(df -BG / | awk 'NR==2{print $4}')"
+          summary "- /dev/kvm exists: $([[ -e /dev/kvm ]] && echo yes || echo no); writable by runner before udev rule: $([[ -w /dev/kvm ]] && echo yes || echo no)"
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm || true
+          summary "- /dev/kvm writable after udev rule: $([[ -w /dev/kvm ]] && echo yes || echo no)"
+          summary "- Java: $(java -version 2>&1 | head -1)"
+          summary "- ANDROID_HOME set: $([[ -n "${ANDROID_HOME:-}" ]] && echo yes || echo no)"
+          sdkm="${ANDROID_HOME:-}/cmdline-tools/latest/bin/sdkmanager"
+          if [[ -x "$sdkm" ]]; then
+            list="$(mktemp)"
+            "$sdkm" --list > "$list" 2>/dev/null || true
+            summary "- Installed platforms: $(awk '/Installed packages/{f=1} /Available Packages/{f=0} f' "$list" | grep -oE 'platforms;android-[0-9]+' | sort -u | tr '\n' ' ')"
+            summary "- Installed build-tools (latest 3): $(awk '/Installed packages/{f=1} /Available Packages/{f=0} f' "$list" | grep -oE 'build-tools;[0-9.]+' | sort -uV | tail -3 | tr '\n' ' ')"
+            summary "- Emulator installed: $(grep -qE '^ *emulator ' "$list" && echo yes || echo no)"
+            summary "- Available google_apis x86_64 images (latest 3): $(grep -oE 'system-images;android-[0-9]+;google_apis;x86_64' "$list" | sort -uV | tail -3 | tr '\n' ' ')"
+            summary "- Available Automotive images: $(grep -oE 'system-images;android-[0-9]+[^ ;]*;android-automotive[^ ;]*;x86_64' "$list" | sort -uV | tr '\n' ' ')"
+            summary "- DHU package (extras;google;auto) available: $(grep -q 'extras;google;auto' "$list" && echo yes || echo no)"
+            rm -f "$list"
+          else
+            summary '- sdkmanager not found'
+          fi
