@@ -61,13 +61,10 @@ jobs:
     steps:
       - name: Validate request
         shell: bash
-        env:
-          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
         run: |
           set -euo pipefail
-          [[ "$SOURCE_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo '::error::ref must be a branch, tag or SHA'; exit 64; }
+          [[ "$SOURCE_REF" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]] || { echo '::error::ref must be a branch, tag or SHA (no leading -)'; exit 64; }
           [[ "$TARGET_ENV" == dev || "$TARGET_ENV" == staging ]] || { echo '::error::only dev or staging'; exit 64; }
-          [[ -n "${TARGET_REPO_PAT:-}" ]] || { echo '::error::Missing TARGET_REPO_PAT'; exit 78; }
 
       - name: Checkout private source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -149,7 +146,7 @@ jobs:
             grep -E 'ERROR|✘|error|Error' "$log" | redact | head -30
             exit 1
           fi
-          grep -E 'Uploaded|Deployed|Current Version' "$log" | redact
+          { grep -E 'Uploaded|Deployed|Current Version' "$log" || true; } | redact
           echo "- deploy meridian-hello-${TARGET_ENV}: OK" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Health check
