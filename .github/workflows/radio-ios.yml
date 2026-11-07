@@ -1,0 +1,1031 @@
+# Radio (Meridian, working name) iOS CI: simulator verify, signed archive, TestFlight upload.
+#
+# Public CI repository -> private source readori/Radio (pnpm workspaces + Turborepo monorepo).
+# Expo app: apps/mobile (package @meridian/mobile); local native module: modules/meridian-player.
+# Modeled on paobuwan-ios.yml, with the monorepo steps of radio-ci.yml:
+#   pnpm install -> turbo build of @meridian/mobile and its workspace deps -> expo prebuild
+#   -> pod install -> Xcode build/archive of apps/mobile/ios/*.xcworkspace.
+#
+#   verify     : Release build for the iOS Simulator with the JS bundle embedded (no signing, no secrets
+#                besides TARGET_REPO_PAT for the checkout).
+#   archive    : + readonly Match signing, App Store archive, IPA export, altool validate (IPA is not kept).
+#   testflight : archive + build-number check against TestFlight + altool upload.
+#
+# Version: only app.json "version" (no workflow input). Build number: build_number input, else the
+# run number; testflight checks it is higher than the latest TestFlight build of that version.
+# Signing profile: created once by certificates-repo.yml (signing_mode=refresh_radio_profile).
+#
+# Safety rules (public repo, public logs):
+#   - workflow_dispatch only; third-party actions pinned to commit SHAs.
+#   - each secret is passed only to the step that uses it; the validation step sees presence
+#     booleans only. TARGET_REPO_PAT is used by the checkout and the Match step only.
+#   - install / prebuild / pod / xcodebuild / Match / altool output goes to files under RUNNER_TEMP;
+#     on failure only error lines are printed (paths made relative). Raw logs can contain Metro code
+#     frames and other private source lines, so they are never printed.
+#   - no Actions artifact, no GitHub Release: the signed IPA never leaves the runner.
+#   - signing material exists only in signed modes, after every private-source lifecycle script
+#     (pnpm install / turbo build / prebuild / pod install) has run, and is removed at the end.
+name: Radio iOS
+
+run-name: Radio iOS · ${{ inputs.mode || 'verify' }} · ${{ inputs.ref || 'main' }}${{ inputs.build_number && format(' · build {0}', inputs.build_number) || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'verify = simulator Release build (no signing); archive = signed IPA + altool validate (IPA is not kept); testflight = archive + upload to TestFlight'
+        required: true
+        default: 'verify'
+        type: choice
+        options:
+          - verify
+          - archive
+          - testflight
+      ref:
+        description: 'Private readori/Radio branch, tag, or SHA'
+        required: true
+        default: 'main'
+        type: string
+      build_number:
+        description: 'Optional build number (CFBundleVersion). Empty = this run number. testflight checks it is higher than the latest TestFlight build.'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: radio-ios-${{ inputs.ref || 'main' }}-${{ inputs.mode || 'verify' }}
+  cancel-in-progress: false
+
+env:
+  PRIVATE_SOURCE_REPOSITORY: readori/Radio
+  PRIVATE_SOURCE_PATH: source
+  MOBILE_APP_DIR: apps/mobile
+  MOBILE_PACKAGE: '@meridian/mobile'
+  EXPECTED_BUNDLE_ID: com.readori.radio
+  XCODE_MAJOR_WANTED: '26'
+  XCODE_MIN_VERSION: '26.4'
+  MATCH_GIT_URL: https://github.com/readori/readori-certificates.git
+  MATCH_GIT_BRANCH: main
+  # Pinned like paobuwan-ios.yml / certificates-repo.yml. Upload itself uses Apple's altool.
+  FASTLANE_VERSION: '2.238.0'
+  FASTLANE_DISABLE_COLORS: '1'
+  FASTLANE_SKIP_UPDATE_CHECK: '1'
+  EXPO_NO_TELEMETRY: '1'
+  EXPO_NO_GIT_STATUS: '1'
+  TURBO_TELEMETRY_DISABLED: '1'
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+  CI: '1'
+  LANG: en_US.UTF-8
+
+jobs:
+  ios:
+    name: Build Radio iOS
+    runs-on: macos-26
+    timeout-minutes: 75
+
+    env:
+      MODE: ${{ inputs.mode || 'verify' }}
+      SOURCE_REF: ${{ inputs.ref || 'main' }}
+      BUILD_NUMBER_INPUT: ${{ inputs.build_number || '' }}
+
+    steps:
+      # ---------------------------------------------------------------------
+      # 0. Request validation BEFORE any private-source checkout.
+      #    Secrets are checked for presence only; their values are not passed here
+      #    (RADIO_ASC_APP_ID is not a credential and is format-checked here).
+      # ---------------------------------------------------------------------
+      - name: Validate request and required secrets
+        shell: bash
+        env:
+          HAS_TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT != '' }}
+          HAS_MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD != '' }}
+          HAS_ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID != '' }}
+          HAS_ASC_KEY_ID: ${{ secrets.ASC_KEY_ID != '' }}
+          HAS_ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY != '' }}
+          HAS_ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID != '' }}
+          RADIO_ASC_APP_ID: ${{ inputs.mode == 'testflight' && secrets.RADIO_ASC_APP_ID || '' }}
+        run: |
+          set -euo pipefail
+
+          case "$MODE" in
+            verify|archive|testflight) ;;
+            *)
+              echo "::error::Unsupported mode: $MODE"
+              exit 64
+              ;;
+          esac
+
+          # The ref is used as a git ref only; keep it to a conservative character set.
+          [[ "$SOURCE_REF" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]] || {
+            echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only; no leading -).'
+            exit 64
+          }
+
+          [[ "$HAS_TARGET_REPO_PAT" == 'true' ]] || {
+            echo '::error::Missing public-repo secret TARGET_REPO_PAT.'
+            echo '::error::It needs Contents read access to readori/Radio (and to readori/readori-certificates for signed modes).'
+            exit 78
+          }
+
+          if [[ "$MODE" == 'archive' || "$MODE" == 'testflight' ]]; then
+            missing=0
+            for name in MATCH_PASSWORD ASC_ISSUER_ID ASC_KEY_ID ASC_PRIVATE_KEY ASC_TEAM_ID; do
+              flag="HAS_$name"
+              if [[ "${!flag}" != 'true' ]]; then
+                echo "::error::Missing public-repo secret required for $MODE mode: $name"
+                missing=1
+              fi
+            done
+            (( missing == 0 )) || exit 78
+          fi
+
+          # Only testflight needs the App Store Connect app record; verify and archive never read it.
+          if [[ "$MODE" == 'testflight' ]]; then
+            [[ -n "$RADIO_ASC_APP_ID" ]] || {
+              echo '::error::Missing public-repo secret required for testflight mode: RADIO_ASC_APP_ID (numeric App Store Connect Apple ID of the Radio app).'
+              exit 78
+            }
+            [[ "$RADIO_ASC_APP_ID" =~ ^[0-9]+$ ]] || {
+              echo '::error::RADIO_ASC_APP_ID must be the numeric App Store Connect Apple ID.'
+              exit 78
+            }
+          fi
+
+          if [[ -n "$BUILD_NUMBER_INPUT" ]]; then
+            [[ "$BUILD_NUMBER_INPUT" =~ ^[1-9][0-9]{0,8}$ ]] || {
+              echo '::error::build_number must be a whole number (1-999999999) with no leading zeros, spaces, or dots.'
+              exit 64
+            }
+          fi
+
+          echo "Mode: $MODE"
+          echo "Private source ref: $SOURCE_REF"
+          echo "Build number input: ${BUILD_NUMBER_INPUT:-<empty, uses run number $GITHUB_RUN_NUMBER>}"
+
+      # Prints only error lines of a captured log (private absolute paths made relative),
+      # plus one annotation (annotations are readable through the public API without signing in).
+      - name: Prepare error-summary helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          HELPER="$RUNNER_TEMP/radio-error-summary.sh"
+          cat > "$HELPER" <<'SH'
+          #!/usr/bin/env bash
+          # usage: radio-error-summary.sh <log file> <title>
+          set -uo pipefail
+          log="$1"
+          title="$2"
+          src="$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH/"
+          # xcodebuild/clang/swiftc "file:line: error:", Metro/Expo/Node "...Error:", tsc "error TS",
+          # CocoaPods "[!]", turbo "ERROR run failed" / "Failed:", altool "ERROR ITMS-" / "*** Error".
+          lines="$(grep -E '(^|: )(fatal )?error: |(^|: )[A-Za-z]*Error: |error TS[0-9]+:|^\*\* [A-Z ]+ FAILED \*\*|^\[!\] |ERROR +run failed|^ *Failed: |ERROR ITMS-|^[[:space:]]*\*\*\* Error' "$log" 2>/dev/null \
+            | sed -e "s#${src}##g" -e "s#${GITHUB_WORKSPACE}/##g" -e "s#${HOME}/#~/#g" \
+            | cut -c1-300 | awk '!seen[$0]++' | head -40)"
+          echo "--- $title: error lines only ---"
+          if [[ -n "$lines" ]]; then
+            printf '%s\n' "$lines"
+          else
+            echo '(no error lines found in the captured log)'
+          fi
+          msg="$(printf '%s\n' "${lines:-no error lines found}" | head -20 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+          echo "::error title=$title::$msg"
+          SH
+          chmod +x "$HELPER"
+          echo "ERROR_SUMMARY=$HELPER" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------------
+      # 1. PUBLIC CI repository -> PRIVATE source repository
+      # ---------------------------------------------------------------------
+      - name: Checkout private Radio source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/Radio
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Verify private source layout
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE_ABS="$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH"
+          for f in package.json pnpm-lock.yaml pnpm-workspace.yaml turbo.json .nvmrc \
+                   "$MOBILE_APP_DIR/package.json" "$MOBILE_APP_DIR/app.json"; do
+            [[ -f "$SOURCE_ABS/$f" ]] || {
+              echo "::error::Private source is missing $f."
+              exit 66
+            }
+          done
+
+          SOURCE_COMMIT="$(git -C "$SOURCE_ABS" rev-parse HEAD)"
+          echo "SOURCE_COMMIT=$SOURCE_COMMIT" >> "$GITHUB_ENV"
+          echo "SOURCE_SHORT_SHA=${SOURCE_COMMIT:0:8}" >> "$GITHUB_ENV"
+
+          # Print only comparison results, never the file contents.
+          PACKAGE_MANAGER="$(node -p "require(process.argv[1]).packageManager || ''" "$SOURCE_ABS/package.json")"
+          [[ "$PACKAGE_MANAGER" =~ ^pnpm@[0-9]+\.[0-9]+\.[0-9]+ ]] || {
+            echo '::error::Root package.json must pin "packageManager": "pnpm@<x.y.z>".'
+            exit 66
+          }
+          PACKAGE_NAME="$(node -p "require(process.argv[1]).name || ''" "$SOURCE_ABS/$MOBILE_APP_DIR/package.json")"
+          [[ "$PACKAGE_NAME" == "$MOBILE_PACKAGE" ]] || {
+            echo "::error::$MOBILE_APP_DIR/package.json name must be $MOBILE_PACKAGE (got: ${PACKAGE_NAME:-<empty>})."
+            exit 66
+          }
+
+          CONFIGURED_BUNDLE_ID="$(node -e 'const c=require(process.argv[1]).expo||{}; process.stdout.write(String((c.ios||{}).bundleIdentifier||""))' "$SOURCE_ABS/$MOBILE_APP_DIR/app.json")"
+          [[ "$CONFIGURED_BUNDLE_ID" =~ ^[A-Za-z0-9.-]+$ ]] || {
+            echo "::error::$MOBILE_APP_DIR/app.json expo.ios.bundleIdentifier is missing or invalid."
+            exit 65
+          }
+          # Signed modes require the production bundle ID. verify only warns, so the simulator
+          # build can be exercised before app.json is switched; later checks then compare
+          # against the configured ID (consistency only).
+          if [[ "$CONFIGURED_BUNDLE_ID" != "$EXPECTED_BUNDLE_ID" ]]; then
+            if [[ "$MODE" == 'verify' ]]; then
+              echo "::warning::app.json ios.bundleIdentifier is $CONFIGURED_BUNDLE_ID, expected $EXPECTED_BUNDLE_ID. verify continues; archive/testflight will fail until app.json is changed."
+            else
+              echo "::error::app.json ios.bundleIdentifier must be $EXPECTED_BUNDLE_ID for $MODE (got: $CONFIGURED_BUNDLE_ID)."
+              exit 65
+            fi
+          fi
+          echo "CONFIGURED_BUNDLE_ID=$CONFIGURED_BUNDLE_ID" >> "$GITHUB_ENV"
+
+          echo "Private source: $PRIVATE_SOURCE_REPOSITORY@$SOURCE_REF (${SOURCE_COMMIT:0:8})"
+          echo "Package manager: $PACKAGE_MANAGER"
+          echo "Bundle ID: $CONFIGURED_BUNDLE_ID"
+
+      # ---------------------------------------------------------------------
+      # 2. Toolchain: Node from .nvmrc (24, same as radio-ci.yml) + Xcode 26.4+
+      # ---------------------------------------------------------------------
+      - name: Set up Node.js (.nvmrc)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: ${{ env.PRIVATE_SOURCE_PATH }}/.nvmrc
+
+      - name: Select Xcode 26.4+
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Pick the newest non-beta Xcode of the wanted major by its real
+          # CFBundleShortVersionString (file names do not sort reliably).
+          XCODE_APP=''
+          BEST_VERSION=''
+          for app in /Applications/Xcode*.app; do
+            [[ -d "$app/Contents/Developer" ]] || continue
+            case "$app" in *[Bb]eta*) continue ;; esac
+            version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || true)"
+            [[ "${version%%.*}" == "$XCODE_MAJOR_WANTED" ]] || continue
+            if [[ -z "$BEST_VERSION" ]] || [[ "$(printf '%s\n%s\n' "$BEST_VERSION" "$version" | sort -V | tail -1)" == "$version" ]]; then
+              BEST_VERSION="$version"
+              XCODE_APP="$app"
+            fi
+          done
+
+          if [[ -z "$XCODE_APP" ]]; then
+            echo "::error::No Xcode ${XCODE_MAJOR_WANTED}.x installation was found on this runner."
+            ls -1 /Applications | grep '^Xcode' || true
+            exit 69
+          fi
+          if [[ "$(printf '%s\n%s\n' "$XCODE_MIN_VERSION" "$BEST_VERSION" | sort -V | head -1)" != "$XCODE_MIN_VERSION" ]]; then
+            echo "::error::Radio iOS requires Xcode $XCODE_MIN_VERSION or later on the 26.x track; newest found: $BEST_VERSION"
+            exit 69
+          fi
+
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          echo "Selected Xcode: $XCODE_APP ($BEST_VERSION)"
+          xcodebuild -version
+          echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "Runner architecture: $(uname -m)"
+
+      # ---------------------------------------------------------------------
+      # 3. JS dependencies, workspace builds, native project generation, CocoaPods
+      #    (all private-source lifecycle scripts run here, BEFORE any signing
+      #    material or App Store Connect key exists on the runner)
+      # ---------------------------------------------------------------------
+      - name: Install dependencies (pnpm, frozen lockfile)
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Uses the pnpm version pinned in package.json "packageManager".
+          corepack enable
+          echo "node $(node --version), pnpm $(pnpm --version)"
+          LOG="$RUNNER_TEMP/radio-pnpm-install.log"
+          if ! pnpm install --frozen-lockfile --reporter=append-only > "$LOG" 2>&1; then
+            # pnpm errors name packages and lockfile problems, not source contents.
+            grep -E 'ERR_PNPM|ERROR|Error' "$LOG" | cut -c1-300 | head -30 || true
+            echo '::error title=pnpm install::pnpm install --frozen-lockfile failed (error lines above).'
+            exit 1
+          fi
+          echo 'pnpm install: PASS'
+
+      - name: Build workspace packages for the mobile app (turbo)
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # @meridian/core and @meridian/ui-tokens export from dist/, which Metro needs when Xcode
+          # bundles the JS. The trailing ... also runs the mobile package's own build (expo export),
+          # an early JS-bundle check before the long Xcode build. Output is captured: a failing
+          # Metro bundle prints code frames (private source lines).
+          LOG="$RUNNER_TEMP/radio-turbo-build.log"
+          set +e
+          pnpm exec turbo run build --filter="${MOBILE_PACKAGE}..." --output-logs=errors-only > "$LOG" 2>&1
+          status=$?
+          set -e
+          if (( status != 0 )); then
+            "$ERROR_SUMMARY" "$LOG" 'turbo build'
+            exit "$status"
+          fi
+          echo 'turbo build: PASS'
+
+      - name: Generate native iOS project (expo prebuild)
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}/${{ env.MOBILE_APP_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ios/ is generated, never committed. --no-install: CocoaPods runs as its own step.
+          LOG="$RUNNER_TEMP/radio-prebuild.log"
+          set +e
+          pnpm exec expo prebuild --platform ios --no-install > "$LOG" 2>&1
+          status=$?
+          set -e
+          if (( status != 0 )); then
+            "$ERROR_SUMMARY" "$LOG" 'expo prebuild'
+            exit "$status"
+          fi
+          test -d ios || {
+            echo '::error::expo prebuild did not create ios/.'
+            exit 66
+          }
+          echo 'expo prebuild: PASS'
+
+      - name: Install CocoaPods dependencies
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}/${{ env.MOBILE_APP_DIR }}/ios
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "CocoaPods $(pod --version)"
+          LOG="$RUNNER_TEMP/radio-pod-install.log"
+          set +e
+          pod install --silent > "$LOG" 2>&1
+          status=$?
+          set -e
+          if (( status != 0 )); then
+            "$ERROR_SUMMARY" "$LOG" 'pod install'
+            exit "$status"
+          fi
+          echo 'pod install: PASS'
+
+      - name: Resolve workspace, scheme, version and build number
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IOS_DIR="$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH/$MOBILE_APP_DIR/ios"
+
+          WORKSPACE_PATH=''
+          COUNT=0
+          for ws in "$IOS_DIR"/*.xcworkspace; do
+            [[ -d "$ws" ]] || continue
+            WORKSPACE_PATH="$ws"
+            COUNT=$((COUNT + 1))
+          done
+          (( COUNT == 1 )) || {
+            echo "::error::Expected exactly one .xcworkspace in $MOBILE_APP_DIR/ios after pod install; found $COUNT."
+            exit 66
+          }
+
+          # Expo names the Xcode scheme after the generated project (= workspace basename,
+          # from app.json "name"). app.json "scheme" is the deep-link URL scheme, not this.
+          SCHEME="$(basename "$WORKSPACE_PATH" .xcworkspace)"
+          xcodebuild -list -workspace "$WORKSPACE_PATH" -json > "$RUNNER_TEMP/radio-xcode-list.json" 2>/dev/null
+          python3 - "$RUNNER_TEMP/radio-xcode-list.json" "$SCHEME" <<'PY'
+          import json, sys
+          schemes = json.load(open(sys.argv[1])).get("workspace", {}).get("schemes", [])
+          if sys.argv[2] not in schemes:
+              print("::error::Scheme '%s' was not found in the generated workspace." % sys.argv[2])
+              print("Available schemes (%d): %s" % (len(schemes), ", ".join(schemes[:40])))
+              raise SystemExit(66)
+          PY
+          rm -f "$RUNNER_TEMP/radio-xcode-list.json"
+
+          # Product bundle ID as Xcode sees it (the settings file is never printed).
+          SETTINGS_FILE="$RUNNER_TEMP/radio-build-settings.txt"
+          xcodebuild -showBuildSettings -workspace "$WORKSPACE_PATH" -scheme "$SCHEME" -configuration Release 2>/dev/null > "$SETTINGS_FILE"
+
+          BUNDLE_ID="$(awk -F ' = ' '/^ *PRODUCT_BUNDLE_IDENTIFIER = / {print $2; exit}' "$SETTINGS_FILE")"
+          [[ "$BUNDLE_ID" == "$CONFIGURED_BUNDLE_ID" ]] || {
+            echo "::error::PRODUCT_BUNDLE_IDENTIFIER is '${BUNDLE_ID:-<empty>}', expected $CONFIGURED_BUNDLE_ID (app.json)."
+            exit 65
+          }
+
+          INFOPLIST_REL="$(awk -F ' = ' '/^ *INFOPLIST_FILE = / {print $2; exit}' "$SETTINGS_FILE")"
+          DEPLOYMENT_TARGET="$(awk -F ' = ' '/^ *IPHONEOS_DEPLOYMENT_TARGET = / {print $2; exit}' "$SETTINGS_FILE")"
+          rm -f "$SETTINGS_FILE"
+
+          INFOPLIST_PATH="$IOS_DIR/$INFOPLIST_REL"
+          [[ -n "$INFOPLIST_REL" && -f "$INFOPLIST_PATH" ]] || {
+            echo "::error::App Info.plist not found (INFOPLIST_FILE=${INFOPLIST_REL:-<empty>})."
+            exit 66
+          }
+
+          # Version lives only in app.json. expo prebuild writes app.json "version" into the app
+          # Info.plist as a literal and leaves MARKETING_VERSION at the template's 1.0, so read it there.
+          APP_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFOPLIST_PATH" 2>/dev/null || true)"
+          [[ "$APP_VERSION" =~ ^[0-9]+([.][0-9]+){1,2}$ ]] || {
+            echo "::error::Generated Info.plist CFBundleShortVersionString must look like 0.1 or 0.1.0 (from app.json \"version\"); got: ${APP_VERSION:-<empty>}"
+            exit 64
+          }
+
+          # Build number: the build_number input, else this run number (strictly increasing per workflow).
+          BUILD_NUMBER="${BUILD_NUMBER_INPUT:-${GITHUB_RUN_NUMBER}}"
+          [[ "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::Build number is not a positive integer: $BUILD_NUMBER"
+            exit 64
+          }
+          # expo prebuild also writes a literal CFBundleVersion (app.json ios.buildNumber, default "1"),
+          # so CURRENT_PROJECT_VERSION alone does not change the uploaded build number. Write it there.
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$INFOPLIST_PATH"
+
+          echo "WORKSPACE_PATH=$WORKSPACE_PATH" >> "$GITHUB_ENV"
+          echo "SCHEME=$SCHEME" >> "$GITHUB_ENV"
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+
+          echo "Scheme: $SCHEME"
+          echo "Version: $APP_VERSION ($BUILD_NUMBER)"
+          echo "Deployment target: ${DEPLOYMENT_TARGET:-unknown}"
+
+      # ---------------------------------------------------------------------
+      # 4. VERIFY mode: Simulator Release build, JS bundle embedded (no signing, no secrets)
+      # ---------------------------------------------------------------------
+      - name: Build app for iOS Simulator (Release, embedded JS bundle)
+        if: ${{ env.MODE == 'verify' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERIFY_DERIVED="$RUNNER_TEMP/DerivedData-Radio-Verify"
+          LOG="$RUNNER_TEMP/radio-xcodebuild-simulator.log"
+          rm -rf "$VERIFY_DERIVED"
+
+          # Release (not Debug) so the JS bundle is embedded and the app runs without Metro.
+          # Generic destination: nothing here needs a booted simulator.
+          # Ad-hoc signature ("Sign to Run Locally") so Keychain-backed APIs work when run later.
+          set +e
+          xcodebuild build \
+            -quiet \
+            -workspace "$WORKSPACE_PATH" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$VERIFY_DERIVED" \
+            ARCHS="$(uname -m)" \
+            ONLY_ACTIVE_ARCH=NO \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            MARKETING_VERSION="$APP_VERSION" \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM= \
+            PROVISIONING_PROFILE_SPECIFIER= \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGNING_REQUIRED=NO > "$LOG" 2>&1
+          status=$?
+          set -e
+          if (( status != 0 )); then
+            "$ERROR_SUMMARY" "$LOG" 'Simulator build'
+            exit "$status"
+          fi
+
+          APP_PATH="$(find "$VERIFY_DERIVED/Build/Products/Release-iphonesimulator" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          [[ -n "$APP_PATH" && -d "$APP_PATH" ]] || {
+            echo '::error::Simulator .app was not produced.'
+            exit 65
+          }
+
+          # Proof that the JS bundle is embedded (Release "Bundle React Native code and images" phase).
+          [[ -s "$APP_PATH/main.jsbundle" ]] || {
+            echo '::error::main.jsbundle is missing from the Release simulator app; the JS bundle was not embedded.'
+            exit 65
+          }
+
+          BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist")"
+          [[ "$BUNDLE_ID" == "$CONFIGURED_BUNDLE_ID" ]] || {
+            echo "::error::Unexpected bundle identifier in built app: $BUNDLE_ID (expected $CONFIGURED_BUNDLE_ID)."
+            exit 65
+          }
+          BUILT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Info.plist")"
+          BUILT_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP_PATH/Info.plist")"
+          [[ "$BUILT_VERSION" == "$APP_VERSION" && "$BUILT_BUILD" == "$BUILD_NUMBER" ]] || {
+            echo "::error::Built app is $BUILT_VERSION ($BUILT_BUILD), expected $APP_VERSION ($BUILD_NUMBER)."
+            exit 65
+          }
+
+          echo "JS bundle: embedded ($(du -k "$APP_PATH/main.jsbundle" | awk '{print $1}') KiB)"
+          echo 'Simulator build: PASS'
+          rm -rf "$VERIFY_DERIVED"
+
+      # ---------------------------------------------------------------------
+      # 5. ARCHIVE / TESTFLIGHT: Match signing (readonly), archive, export, altool
+      # ---------------------------------------------------------------------
+      - name: Install pinned fastlane for Match only
+        if: ${{ env.MODE == 'archive' || env.MODE == 'testflight' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FASTLANE_GEM_HOME="$RUNNER_TEMP/fastlane-gems"
+          rm -rf "$FASTLANE_GEM_HOME"
+          mkdir -p "$FASTLANE_GEM_HOME"
+
+          export GEM_HOME="$FASTLANE_GEM_HOME"
+          export GEM_PATH="$FASTLANE_GEM_HOME"
+          export PATH="$FASTLANE_GEM_HOME/bin:$PATH"
+
+          gem install --no-document --silent fastlane -v "$FASTLANE_VERSION"
+          fastlane --version
+
+          echo "GEM_HOME=$FASTLANE_GEM_HOME" >> "$GITHUB_ENV"
+          echo "GEM_PATH=$FASTLANE_GEM_HOME" >> "$GITHUB_ENV"
+          echo "$FASTLANE_GEM_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Create ephemeral keychain, write ASC key, install signing assets with Match
+        if: ${{ env.MODE == 'archive' || env.MODE == 'testflight' }}
+        shell: bash
+        env:
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          # --- ephemeral keychain (password never leaves this step) ---------
+          KEYCHAIN_NAME="radio-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.keychain-db"
+          KEYCHAIN_PATH="$HOME/Library/Keychains/$KEYCHAIN_NAME"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_NAME"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+
+          LOGIN_KEYCHAIN="$(security default-keychain -d user | tr -d '"' | xargs)"
+          echo "ORIGINAL_DEFAULT_KEYCHAIN=$LOGIN_KEYCHAIN" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_NAME=$KEYCHAIN_NAME" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          security default-keychain -d user -s "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" "$LOGIN_KEYCHAIN"
+
+          # --- App Store Connect API key (Match + latest build check + altool) ---
+          ASC_DIR="$RUNNER_TEMP/radio-asc"
+          mkdir -p "$ASC_DIR" "$HOME/.appstoreconnect/private_keys"
+          P8_PATH="$ASC_DIR/AuthKey_${ASC_KEY_ID}.p8"
+          API_KEY_JSON="$ASC_DIR/api-key.json"
+
+          printf '%s\n' "$ASC_PRIVATE_KEY" > "$P8_PATH"
+          chmod 600 "$P8_PATH"
+          grep -q 'BEGIN PRIVATE KEY' "$P8_PATH" || {
+            echo '::error::ASC_PRIVATE_KEY does not look like an App Store Connect .p8 private key.'
+            exit 78
+          }
+          cp "$P8_PATH" "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          chmod 600 "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+
+          export P8_PATH_FOR_PY="$P8_PATH"
+          python3 - "$API_KEY_JSON" <<'PY'
+          import json, os, sys
+          from pathlib import Path
+
+          p8 = Path(os.environ["P8_PATH_FOR_PY"]).read_text(encoding="utf-8")
+          payload = {
+              "key_id": os.environ["ASC_KEY_ID"],
+              "issuer_id": os.environ["ASC_ISSUER_ID"],
+              "key": p8,
+              "in_house": False,
+          }
+          Path(sys.argv[1]).write_text(json.dumps(payload), encoding="utf-8")
+          PY
+          chmod 600 "$API_KEY_JSON"
+
+          echo "ASC_P8_PATH=$P8_PATH" >> "$GITHUB_ENV"
+          echo "ASC_API_KEY_JSON=$API_KEY_JSON" >> "$GITHUB_ENV"
+          echo "ASC_KEY_ID=$ASC_KEY_ID" >> "$GITHUB_ENV"
+
+          # --- Match repository authentication (readonly) -------------------
+          MATCH_AUTH="$(printf '%s:%s' 'readori' "$TARGET_REPO_PAT" | base64 | tr -d '\n')"
+          echo "::add-mask::$MATCH_AUTH"
+
+          MATCH_BRANCH_SHA="$(
+            git -c http.extraheader="AUTHORIZATION: basic $MATCH_AUTH" \
+              ls-remote --heads "$MATCH_GIT_URL" "refs/heads/$MATCH_GIT_BRANCH" 2>/dev/null \
+            | awk 'NR==1 {print $1}'
+          )"
+          [[ -n "$MATCH_BRANCH_SHA" ]] || {
+            echo "::error::Match branch '$MATCH_GIT_BRANCH' is not readable in readori/readori-certificates (TARGET_REPO_PAT scope?)."
+            exit 66
+          }
+          echo "Match branch: $MATCH_GIT_BRANCH (${MATCH_BRANCH_SHA:0:8})"
+
+          # --- Match: shared Apple Distribution identity + Radio App Store profile
+          # Readonly by design: this workflow never writes to the shared certificates repository.
+          # The profile is created once by certificates-repo.yml (signing_mode=refresh_radio_profile).
+          MATCH_LOG="$RUNNER_TEMP/radio-match.log"
+          set +e
+          MATCH_READONLY=true fastlane match appstore \
+            --app_identifier "$EXPECTED_BUNDLE_ID" \
+            --git_url "$MATCH_GIT_URL" \
+            --git_branch "$MATCH_GIT_BRANCH" \
+            --git_basic_authorization "$MATCH_AUTH" \
+            --team_id "$ASC_TEAM_ID" \
+            --api_key_path "$API_KEY_JSON" \
+            --keychain_name "$KEYCHAIN_NAME" \
+            --keychain_password "$KEYCHAIN_PASSWORD" \
+            --shallow_clone true \
+            --clone_branch_directly true \
+            --readonly true > "$MATCH_LOG" 2>&1
+          match_status=$?
+          set -e
+          if (( match_status != 0 )); then
+            grep -iE 'error|\[!\]|could not|couldn.t|no matching|not found|expired|revoked|denied|unauthori|forbidden' "$MATCH_LOG" \
+              | cut -c1-300 | awk '!seen[$0]++' | head -30 || true
+            rm -f "$MATCH_LOG"
+            echo "::error::Readonly Match could not install signing assets for $EXPECTED_BUNDLE_ID."
+            echo '::error::First run? Run certificates-repo.yml with signing_mode=refresh_radio_profile and destructive_confirmation=WRITE, then retry.'
+            exit 65
+          fi
+          rm -f "$MATCH_LOG"
+          echo "Match readonly install: PASS ($EXPECTED_BUNDLE_ID)"
+
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH" >/dev/null
+
+      - name: Locate and validate installed App Store profile
+        if: ${{ env.MODE == 'archive' || env.MODE == 'testflight' }}
+        shell: bash
+        env:
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          PROFILE_SCAN_DIR="$RUNNER_TEMP/radio-profile-scan"
+          rm -rf "$PROFILE_SCAN_DIR"
+          mkdir -p "$PROFILE_SCAN_DIR"
+
+          shopt -s nullglob
+          candidates=(
+            "$HOME/Library/MobileDevice/Provisioning Profiles/"*.mobileprovision
+            "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/"*.mobileprovision
+          )
+          shopt -u nullglob
+
+          PROFILE_NAME=''
+          PROFILE_TEAM=''
+          PROFILE_GET_TASK=''
+          for profile in "${candidates[@]}"; do
+            [[ -f "$profile" ]] || continue
+            plist="$PROFILE_SCAN_DIR/$(basename "$profile").plist"
+            /usr/bin/security cms -D -i "$profile" > "$plist" 2>/dev/null || continue
+            app_id="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$plist" 2>/dev/null || true)"
+            [[ "$app_id" == *".$EXPECTED_BUNDLE_ID" ]] || continue
+            PROFILE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :Name' "$plist")"
+            PROFILE_TEAM="$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$plist")"
+            PROFILE_GET_TASK="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$plist" 2>/dev/null || echo false)"
+            break
+          done
+          rm -rf "$PROFILE_SCAN_DIR"
+
+          [[ -n "$PROFILE_NAME" ]] || {
+            echo "::error::No App Store provisioning profile for $EXPECTED_BUNDLE_ID was installed by Match."
+            exit 65
+          }
+          [[ "$PROFILE_TEAM" == "$ASC_TEAM_ID" ]] || {
+            echo "::error::Provisioning profile team for $EXPECTED_BUNDLE_ID does not match ASC_TEAM_ID."
+            exit 65
+          }
+          [[ "$PROFILE_GET_TASK" != 'true' ]] || {
+            echo "::error::Installed profile for $EXPECTED_BUNDLE_ID has get-task-allow=true and is not an App Store distribution profile."
+            exit 65
+          }
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -q 'Apple Distribution' || {
+            echo '::error::No Apple Distribution signing identity was installed into the ephemeral keychain.'
+            exit 65
+          }
+
+          echo "APPSTORE_PROFILE_NAME=$PROFILE_NAME" >> "$GITHUB_ENV"
+          echo "Provisioning profile: $PROFILE_NAME"
+
+      - name: Check build number is higher than the latest TestFlight build
+        if: ${{ env.MODE == 'testflight' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Fails in minutes instead of after the archive when the build number was already uploaded.
+          # Read-only App Store Connect query with the same API key used by Match and altool.
+          set +e
+          LATEST_OUTPUT="$(
+            fastlane run latest_testflight_build_number \
+              api_key_path:"$ASC_API_KEY_JSON" \
+              app_identifier:"$EXPECTED_BUNDLE_ID" \
+              version:"$APP_VERSION" \
+              initial_build_number:0 2>&1
+          )"
+          query_status=$?
+          set -e
+          LATEST="$(printf '%s\n' "$LATEST_OUTPUT" | sed -n 's/.*Result: \([0-9][0-9]*\).*/\1/p' | tail -1)"
+
+          if [[ "$query_status" -ne 0 || -z "$LATEST" ]]; then
+            echo '::warning title=Build number check skipped::Could not read the latest TestFlight build number; continuing to archive.'
+            exit 0
+          fi
+
+          echo "Latest TestFlight build for $APP_VERSION: $LATEST; this run: $BUILD_NUMBER"
+          if (( BUILD_NUMBER <= LATEST )); then
+            echo "::error title=Build number already used::Build number $BUILD_NUMBER is not higher than the latest TestFlight build $LATEST for version $APP_VERSION. Re-run with build_number $((LATEST + 1)) or higher."
+            exit 1
+          fi
+
+      - name: Build signed App Store archive and IPA
+        if: ${{ env.MODE == 'archive' || env.MODE == 'testflight' }}
+        shell: bash
+        env:
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          ARCHIVE_PATH="$RUNNER_TEMP/Radio.xcarchive"
+          EXPORT_DIR="$RUNNER_TEMP/Radio-AppStore-Export"
+          EXPORT_OPTIONS="$RUNNER_TEMP/Radio-ExportOptions.plist"
+          ARCHIVE_LOG="$RUNNER_TEMP/radio-xcodebuild-archive.log"
+          EXPORT_LOG="$RUNNER_TEMP/radio-xcodebuild-export.log"
+
+          rm -rf "$ARCHIVE_PATH" "$EXPORT_DIR" "$EXPORT_OPTIONS"
+          mkdir -p "$EXPORT_DIR"
+          # Paths for the cleanup step, recorded before anything is produced.
+          echo "SIGNED_ARCHIVE_PATH=$ARCHIVE_PATH" >> "$GITHUB_ENV"
+          echo "SIGNED_EXPORT_DIR=$EXPORT_DIR" >> "$GITHUB_ENV"
+          echo "SIGNED_EXPORT_OPTIONS=$EXPORT_OPTIONS" >> "$GITHUB_ENV"
+
+          set +e
+          xcodebuild archive \
+            -quiet \
+            -workspace "$WORKSPACE_PATH" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$ARCHIVE_PATH" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            MARKETING_VERSION="$APP_VERSION" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="$ASC_TEAM_ID" \
+            CODE_SIGN_IDENTITY='Apple Distribution' \
+            PROVISIONING_PROFILE_SPECIFIER="$APPSTORE_PROFILE_NAME" > "$ARCHIVE_LOG" 2>&1
+          status=$?
+          set -e
+          if (( status != 0 )); then
+            "$ERROR_SUMMARY" "$ARCHIVE_LOG" 'App Store archive'
+            exit "$status"
+          fi
+
+          ARCHIVED_APP="$(find "$ARCHIVE_PATH/Products/Applications" -maxdepth 1 -type d -name '*.app' -print -quit 2>/dev/null || true)"
+          [[ -n "$ARCHIVED_APP" && -d "$ARCHIVED_APP" ]] || {
+            echo '::error::Signed xcarchive was not produced.'
+            exit 65
+          }
+
+          export BUNDLE_ID_FOR_PLIST="$EXPECTED_BUNDLE_ID"
+          export PROFILE_NAME_FOR_PLIST="$APPSTORE_PROFILE_NAME"
+          export TEAM_ID_FOR_PLIST="$ASC_TEAM_ID"
+          python3 - "$EXPORT_OPTIONS" <<'PY'
+          import os, plistlib, sys
+
+          payload = {
+              "method": "app-store-connect",
+              "destination": "export",
+              "signingStyle": "manual",
+              "signingCertificate": "Apple Distribution",
+              "teamID": os.environ["TEAM_ID_FOR_PLIST"],
+              "provisioningProfiles": {os.environ["BUNDLE_ID_FOR_PLIST"]: os.environ["PROFILE_NAME_FOR_PLIST"]},
+              "manageAppVersionAndBuildNumber": False,
+              "stripSwiftSymbols": True,
+              "uploadSymbols": True,
+          }
+          with open(sys.argv[1], "wb") as fh:
+              plistlib.dump(payload, fh)
+          PY
+
+          set +e
+          xcodebuild -exportArchive \
+            -quiet \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportPath "$EXPORT_DIR" \
+            -exportOptionsPlist "$EXPORT_OPTIONS" > "$EXPORT_LOG" 2>&1
+          status=$?
+          set -e
+          if (( status != 0 )); then
+            "$ERROR_SUMMARY" "$EXPORT_LOG" 'IPA export'
+            exit "$status"
+          fi
+
+          SIGNED_IPA="$(find "$EXPORT_DIR" -maxdepth 1 -type f -name '*.ipa' -print -quit)"
+          [[ -n "$SIGNED_IPA" && -f "$SIGNED_IPA" ]] || {
+            echo '::error::Signed App Store IPA was not exported.'
+            exit 65
+          }
+
+          # Verify the exported IPA without printing its contents.
+          VERIFY_DIR="$RUNNER_TEMP/Radio-Signed-Verify"
+          echo "SIGNED_VERIFY_DIR=$VERIFY_DIR" >> "$GITHUB_ENV"
+          rm -rf "$VERIFY_DIR"
+          mkdir -p "$VERIFY_DIR"
+          unzip -q "$SIGNED_IPA" -d "$VERIFY_DIR"
+          SIGNED_APP="$(find "$VERIFY_DIR/Payload" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          [[ -n "$SIGNED_APP" ]] || {
+            echo '::error::Exported IPA has no .app payload.'
+            exit 65
+          }
+          test -f "$SIGNED_APP/embedded.mobileprovision" || {
+            echo '::error::Signed IPA is missing embedded.mobileprovision.'
+            exit 65
+          }
+          codesign --verify --deep --strict "$SIGNED_APP" >/dev/null 2>&1 || {
+            echo '::error::codesign --verify --deep --strict failed for the exported app.'
+            exit 65
+          }
+          [[ -s "$SIGNED_APP/main.jsbundle" ]] || {
+            echo '::error::Signed IPA is missing main.jsbundle; the JS bundle was not embedded.'
+            exit 65
+          }
+
+          SIGNED_BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$SIGNED_APP/Info.plist")"
+          [[ "$SIGNED_BUILD_NUMBER" == "$BUILD_NUMBER" ]] || {
+            echo "::error::Signed IPA CFBundleVersion is '$SIGNED_BUILD_NUMBER', expected $BUILD_NUMBER."
+            exit 65
+          }
+          SIGNED_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$SIGNED_APP/Info.plist")"
+          [[ "$SIGNED_VERSION" == "$APP_VERSION" ]] || {
+            echo "::error::Signed IPA CFBundleShortVersionString is '$SIGNED_VERSION', expected $APP_VERSION."
+            exit 65
+          }
+          SIGNED_BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$SIGNED_APP/Info.plist")"
+          [[ "$SIGNED_BUNDLE_ID" == "$EXPECTED_BUNDLE_ID" ]] || {
+            echo "::error::Signed IPA bundle ID mismatch: $SIGNED_BUNDLE_ID"
+            exit 65
+          }
+
+          MIN_OS="$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$SIGNED_APP/Info.plist" 2>/dev/null || true)"
+          NON_EXEMPT="$(/usr/libexec/PlistBuddy -c 'Print :ITSAppUsesNonExemptEncryption' "$SIGNED_APP/Info.plist" 2>/dev/null || true)"
+          if [[ -z "$NON_EXEMPT" ]]; then
+            echo '::warning::ITSAppUsesNonExemptEncryption is not set; App Store Connect will ask the export-compliance question for every build.'
+          fi
+
+          rm -rf "$VERIFY_DIR"
+
+          echo "SIGNED_IPA=$SIGNED_IPA" >> "$GITHUB_ENV"
+          echo "Signed IPA: $(basename "$SIGNED_IPA") ($(du -k "$SIGNED_IPA" | awk '{print $1}') KiB), MinimumOSVersion ${MIN_OS:-unknown}"
+          echo "IPA sha256: $(shasum -a 256 "$SIGNED_IPA" | awk '{print $1}')"
+
+      - name: Validate App Store package with Apple (altool)
+        if: ${{ env.MODE == 'archive' || env.MODE == 'testflight' }}
+        shell: bash
+        env:
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          set -euo pipefail
+
+          ALTOOL_LOG="$RUNNER_TEMP/altool-validate.log"
+          set +e
+          xcrun altool \
+            --validate-app \
+            --file "$SIGNED_IPA" \
+            --type ios \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID" > "$ALTOOL_LOG" 2>&1
+          altool_status=$?
+          set -e
+          if [[ "$altool_status" -ne 0 ]] || grep -qiE '^[[:space:]]*[*]{3} Error|ERROR ITMS-' "$ALTOOL_LOG"; then
+            # Apple's messages as one annotation (readable without signing in); altool prints no secrets.
+            MSG="$(grep -iE 'error|ITMS-|bundle version|CFBundleVersion|message' "$ALTOOL_LOG" | head -30 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+            echo "::error title=altool validate failed::${MSG:-altool exited with status $altool_status}"
+            exit 1
+          fi
+          echo 'altool validate: PASS'
+
+      - name: Upload Radio to TestFlight (altool)
+        if: ${{ env.MODE == 'testflight' }}
+        shell: bash
+        env:
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          # Numeric App Store Connect app id. altool --upload-app resolves the app from the IPA's
+          # bundle ID; the id is checked here only to prove the owner configured the App record.
+          RADIO_ASC_APP_ID: ${{ secrets.RADIO_ASC_APP_ID }}
+        run: |
+          set -euo pipefail
+
+          [[ "$RADIO_ASC_APP_ID" =~ ^[0-9]+$ ]] || {
+            echo '::error::RADIO_ASC_APP_ID must be the numeric App Store Connect Apple ID.'
+            exit 78
+          }
+
+          ALTOOL_LOG="$RUNNER_TEMP/altool-upload.log"
+          set +e
+          xcrun altool \
+            --upload-app \
+            --file "$SIGNED_IPA" \
+            --type ios \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID" > "$ALTOOL_LOG" 2>&1
+          altool_status=$?
+          set -e
+          if [[ "$altool_status" -ne 0 ]] || grep -qiE '^[[:space:]]*[*]{3} Error|ERROR ITMS-' "$ALTOOL_LOG"; then
+            MSG="$(grep -iE 'error|ITMS-|bundle version|CFBundleVersion|message' "$ALTOOL_LOG" | head -30 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+            echo "::error title=altool upload failed::${MSG:-altool exited with status $altool_status}"
+            exit 1
+          fi
+
+          echo 'TestFlight binary upload accepted by App Store Connect.'
+
+      # ---------------------------------------------------------------------
+      # 6. Summary
+      # ---------------------------------------------------------------------
+      - name: Build summary
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          {
+            echo '## Radio iOS completed'
+            echo
+            echo "- Mode: \`${MODE}\`"
+            echo "- Version: \`${APP_VERSION}\` (${BUILD_NUMBER})"
+            echo "- Bundle ID: \`${CONFIGURED_BUNDLE_ID}\`"
+            echo "- Private source: \`${PRIVATE_SOURCE_REPOSITORY}@${SOURCE_REF}\` (\`${SOURCE_SHORT_SHA}\`)"
+            echo "- Xcode: \`$(xcodebuild -version | head -1)\`"
+            if [[ "$MODE" == 'verify' ]]; then
+              echo '- Simulator Release build: passed, JS bundle embedded'
+            fi
+            if [[ "$MODE" == 'archive' ]]; then
+              echo '- Signed IPA: Apple validation passed (not uploaded anywhere; the runner is discarded).'
+            fi
+            if [[ "$MODE" == 'testflight' ]]; then
+              echo '- TestFlight: Apple validation passed and binary upload was accepted.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------------
+      # 7. Cleanup signing material, IPA and captured logs, even after failures
+      # ---------------------------------------------------------------------
+      - name: Cleanup signing material
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          if [[ -n "${ORIGINAL_DEFAULT_KEYCHAIN:-}" ]]; then
+            security default-keychain -d user -s "$ORIGINAL_DEFAULT_KEYCHAIN" >/dev/null 2>&1 || true
+            security list-keychains -d user -s "$ORIGINAL_DEFAULT_KEYCHAIN" >/dev/null 2>&1 || true
+          fi
+          if [[ -n "${KEYCHAIN_NAME:-}" ]]; then
+            security delete-keychain "$KEYCHAIN_NAME" >/dev/null 2>&1 || true
+          fi
+
+          if [[ -n "${ASC_P8_PATH:-}" ]]; then
+            rm -f "$ASC_P8_PATH" >/dev/null 2>&1 || true
+          fi
+          if [[ -n "${ASC_API_KEY_JSON:-}" ]]; then
+            rm -f "$ASC_API_KEY_JSON" >/dev/null 2>&1 || true
+          fi
+          if [[ -n "${ASC_KEY_ID:-}" ]]; then
+            rm -f "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8" >/dev/null 2>&1 || true
+          fi
+
+          # Profiles installed by Match. Hosted macOS runners start with these directories empty.
+          rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/"*.mobileprovision >/dev/null 2>&1 || true
+          rm -f "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/"*.mobileprovision >/dev/null 2>&1 || true
+
+          # Signed archive, IPA and export options (the IPA never leaves the runner).
+          for p in "${SIGNED_ARCHIVE_PATH:-}" "${SIGNED_EXPORT_DIR:-}" "${SIGNED_EXPORT_OPTIONS:-}" "${SIGNED_VERIFY_DIR:-}"; do
+            [[ -n "$p" ]] && rm -rf "$p" >/dev/null 2>&1
+          done
+
+          rm -rf "$RUNNER_TEMP/radio-asc" "$RUNNER_TEMP/radio-profile-scan" "$RUNNER_TEMP/fastlane-gems" >/dev/null 2>&1 || true
+          rm -f "$RUNNER_TEMP"/radio-*.log "$RUNNER_TEMP"/altool-*.log >/dev/null 2>&1 || true
+          echo 'Signing material, IPA and captured logs removed.'
