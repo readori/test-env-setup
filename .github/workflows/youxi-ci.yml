@@ -1,0 +1,179 @@
+# youxi（撤离幸存者，低模 3D 网页游戏）CI.
+#
+# Public CI repository -> private source readori/youxi (TypeScript + Three.js + Vite, npm).
+#
+#   verify : npm ci -> typecheck -> unit tests (deterministic sim) -> build -> budget gate
+#            (bundle size from governance/budgets.json).
+#   smoke  : (optional, on by default) Playwright Chromium opens the single-file build, a bot plays
+#            desktop + phone viewports; fails on any page/console error.
+#            Screenshots stay on the runner: they are NOT uploaded.
+#
+# No Steam, Apple or Cloudflare credentials are used by this workflow. Desktop/iOS packaging and
+# playtest deploys are separate workflows, added later (private repo governance/roadmap.md).
+#
+# Safety rules (public repo, public logs): workflow_dispatch only, never pull_request; third-party
+# actions pinned to commit SHAs; TARGET_REPO_PAT is used only by the checkout step and not persisted;
+# tools print errors/summary only; no Actions artifacts; private files are never printed.
+name: youxi CI
+
+run-name: youxi CI · verify${{ inputs.smoke && ' + smoke' || '' }} · ${{ inputs.ref || 'main' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Private readori/youxi branch, tag, or SHA'
+        required: true
+        default: 'main'
+        type: string
+      smoke:
+        description: 'Also run the headless-browser smoke test (bot plays desktop + phone)'
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: youxi-ci-${{ inputs.ref || 'main' }}
+  cancel-in-progress: true
+
+env:
+  PRIVATE_SOURCE_REPOSITORY: readori/youxi
+  PRIVATE_SOURCE_PATH: source
+
+jobs:
+  verify:
+    name: Verify game
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      SOURCE_REF: ${{ inputs.ref || 'main' }}
+
+    steps:
+      - name: Validate request and credentials
+        shell: bash
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || {
+            echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only).'
+            exit 64
+          }
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || {
+            echo '::error::Missing public CI credential: TARGET_REPO_PAT (it must have read access to readori/youxi).'
+            exit 78
+          }
+          echo "Private source ref: $SOURCE_REF"
+
+      - name: Checkout private source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/youxi
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Detect project layout (fail fast)
+        id: layout
+        shell: bash
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        run: |
+          set -euo pipefail
+
+          SOURCE_COMMIT="$(git rev-parse HEAD)"
+          echo "Private source commit: ${SOURCE_COMMIT:0:8}"
+          {
+            echo '### youxi CI'
+            echo
+            echo "- Source: \`$PRIVATE_SOURCE_REPOSITORY@${SOURCE_COMMIT:0:8}\` (ref \`$SOURCE_REF\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ ! -f package.json ]]; then
+            echo '::notice::No package.json at this ref: the game project is not on this ref yet. Nothing to verify.'
+            echo '- Result: skipped, no package.json at this ref' >> "$GITHUB_STEP_SUMMARY"
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          for f in package-lock.json tsconfig.json governance/budgets.json data/tuning.json tools/check-budgets.cjs; do
+            [[ -f "$f" ]] || {
+              echo "::error::$f is missing; CI needs the layout described in the private CLAUDE.md."
+              exit 66
+            }
+          done
+          for s in typecheck test build build:single; do
+            node -e "process.exit((require('./package.json').scripts||{})['$s']?0:1)" || {
+              echo "::error::package.json must define the \"$s\" script."
+              exit 66
+            }
+          done
+
+          echo 'project layout: PASS'
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js 22
+        if: steps.layout.outputs.ready == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Install dependencies (no credentials in this step)
+        if: steps.layout.outputs.ready == 'true'
+        shell: bash
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund --loglevel=error
+
+      - name: Typecheck and unit tests
+        if: steps.layout.outputs.ready == 'true'
+        shell: bash
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        env:
+          CI: 'true'
+        run: |
+          set -euo pipefail
+          npm run --silent typecheck
+          npx vitest run tests --reporter=dot --silent
+          echo '- typecheck / unit tests: PASS' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build and budget gate (no deploy)
+        if: steps.layout.outputs.ready == 'true'
+        shell: bash
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        env:
+          CI: 'true'
+        run: |
+          set -euo pipefail
+          npx vite build --logLevel error
+          BUDGET_LINE="$(node tools/check-budgets.cjs)"
+          echo "$BUDGET_LINE"
+          echo "- build + budget: PASS ($BUDGET_LINE)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install Chromium for smoke test
+        if: steps.layout.outputs.ready == 'true' && inputs.smoke
+        shell: bash
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        run: |
+          set -euo pipefail
+          # Uses the Playwright version pinned in the private package-lock.json.
+          npx playwright install --with-deps chromium > /dev/null
+
+      - name: Smoke test (bot plays desktop + phone, no uploads)
+        if: steps.layout.outputs.ready == 'true' && inputs.smoke
+        shell: bash
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        env:
+          CI: 'true'
+        run: |
+          set -euo pipefail
+          SINGLE=1 npx vite build --logLevel error
+          node tools/smoke.cjs
