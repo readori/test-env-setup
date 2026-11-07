@@ -95,8 +95,7 @@ jobs:
           grep -qx 'MeridianPlayerCore-Package' <<< "$schemes" && scheme=MeridianPlayerCore-Package
           echo "scheme: $scheme"
           xcodebuild test -scheme "$scheme" -destination "id=$UDID" \
-            CODE_SIGNING_ALLOWED=NO -skipPackagePluginValidation > "$log" 2>&1
-          status=$?
+            CODE_SIGNING_ALLOWED=NO -skipPackagePluginValidation > "$log" 2>&1 && status=0 || status=$?
           echo '--- results ---'
           grep -E '^RESULT ' "$log" | tee -a "$GITHUB_STEP_SUMMARY" || true
           echo '--- tests ---'
@@ -152,9 +151,18 @@ jobs:
             local name="$1" image="$2" device="$3" start elapsed
             echo no | avdmanager create avd -n "$name" -k "$image" ${device:+-d "$device"} --force > /dev/null 2>&1 || { echo "$name: avd create failed"; return 1; }
             start=$(date +%s)
-            emulator -avd "$name" -no-window -no-snapshot -no-boot-anim -gpu swiftshader_indirect -accel on -no-audio > /dev/null 2>&1 &
-            adb wait-for-device
-            for _ in $(seq 1 180); do
+            emulator -avd "$name" -no-window -no-snapshot -no-boot-anim -gpu swiftshader_indirect -accel on \
+              -no-audio -camera-back none -camera-front none -no-metrics > "$RUNNER_TEMP/$name-emulator.log" 2>&1 &
+            local pid=$!
+            if ! timeout 300 adb wait-for-device; then
+              echo "$name: device never appeared (emulator running: $(kill -0 "$pid" 2>/dev/null && echo yes || echo no))" | tee -a "$GITHUB_STEP_SUMMARY"
+              # The emulator log holds no secrets or private source: SDK paths and device messages only.
+              grep -iE 'error|fatal|panic|fail' "$RUNNER_TEMP/$name-emulator.log" | head -20
+              tail -n 15 "$RUNNER_TEMP/$name-emulator.log"
+              kill "$pid" 2>/dev/null || true
+              return 1
+            fi
+            for _ in $(seq 1 120); do
               [[ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" == 1 ]] && break
               sleep 5
             done
@@ -167,8 +175,10 @@ jobs:
             adb emu kill > /dev/null 2>&1 || true
             sleep 10
           }
-          boot phone "$PHONE_IMAGE" pixel_7
+          ok=0
+          boot phone "$PHONE_IMAGE" pixel_7 || ok=1
           if [[ -n "$AUTO_IMAGE" ]]; then
             device="$(avdmanager list device -c 2>/dev/null | grep -m1 -E 'automotive_1024p_landscape|automotive' || true)"
-            boot automotive "$AUTO_IMAGE" "$device"
+            boot automotive "$AUTO_IMAGE" "$device" || ok=1
           fi
+          exit "$ok"
