@@ -199,6 +199,18 @@ jobs:
       # ---------------------------------------------------------------------
       # 1. PUBLIC CI repository -> PRIVATE source repository
       # ---------------------------------------------------------------------
+      - name: Mask the API base URL (EXPO_PUBLIC_MERIDIAN_API)
+        shell: bash
+        env:
+          API_BASE: ${{ secrets.RADIO_STAGING_API }}
+        run: |
+          if [ -n "$API_BASE" ]; then
+            echo "::add-mask::$API_BASE"
+            echo "API base: set (masked)"
+          else
+            echo "::warning::RADIO_STAGING_API is not set; the app will be built without an API base."
+          fi
+
       - name: Checkout private Radio source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -331,6 +343,8 @@ jobs:
       - name: Build workspace packages for the mobile app (turbo)
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
         shell: bash
+        env:
+          EXPO_PUBLIC_MERIDIAN_API: ${{ secrets.RADIO_STAGING_API }}
         run: |
           set -euo pipefail
           # @meridian/core and @meridian/ui-tokens export from dist/, which Metro needs when Xcode
@@ -356,7 +370,7 @@ jobs:
           # ios/ is generated, never committed. --no-install: CocoaPods runs as its own step.
           LOG="$RUNNER_TEMP/radio-prebuild.log"
           set +e
-          pnpm exec expo prebuild --platform ios --no-install > "$LOG" 2>&1
+          pnpm exec expo prebuild --platform ios --clean --no-install > "$LOG" 2>&1
           status=$?
           set -e
           if (( status != 0 )); then
@@ -472,6 +486,8 @@ jobs:
       - name: Build app for iOS Simulator (Release, embedded JS bundle)
         if: ${{ env.MODE == 'verify' }}
         shell: bash
+        env:
+          EXPO_PUBLIC_MERIDIAN_API: ${{ secrets.RADIO_STAGING_API }}
         run: |
           set -euo pipefail
 
@@ -767,6 +783,7 @@ jobs:
         shell: bash
         env:
           ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+          EXPO_PUBLIC_MERIDIAN_API: ${{ secrets.RADIO_STAGING_API }}
         run: |
           set -euo pipefail
 
