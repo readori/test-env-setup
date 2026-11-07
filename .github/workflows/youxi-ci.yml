@@ -11,12 +11,17 @@
 # No Steam, Apple or Cloudflare credentials are used by this workflow. Desktop/iOS packaging and
 # playtest deploys are separate workflows, added later (private repo governance/roadmap.md).
 #
-# Safety rules (public repo, public logs): workflow_dispatch only, never pull_request; third-party
+# Triggers: workflow_dispatch (a human clicks Run), or a push to main that changes
+# ci-requests/youxi.env (how the project's AI PM requests a run; the owner approved this on 2026-11-07,
+# private repo ADR-0004). Only people with push access to this repo can trigger; never pull_request.
+# The request file is parsed as plain KEY=VALUE text with strict patterns and is never executed.
+#
+# Safety rules (public repo, public logs): no pull_request triggers; third-party
 # actions pinned to commit SHAs; TARGET_REPO_PAT is used only by the checkout step and not persisted;
 # tools print errors/summary only; no Actions artifacts; private files are never printed.
 name: youxi CI
 
-run-name: youxi CI · verify${{ inputs.smoke && ' + smoke' || '' }} · ${{ inputs.ref || 'main' }}
+run-name: youxi CI · ${{ github.event_name == 'push' && github.event.head_commit.message || format('verify{0} · {1}', inputs.smoke && ' + smoke' || '', inputs.ref) }}
 
 on:
   workflow_dispatch:
@@ -31,12 +36,15 @@ on:
         required: true
         default: true
         type: boolean
+  push:
+    branches: [main]
+    paths: ['ci-requests/youxi.env']
 
 permissions:
   contents: read
 
 concurrency:
-  group: youxi-ci-${{ inputs.ref || 'main' }}
+  group: youxi-ci-${{ inputs.ref || 'request' }}
   cancel-in-progress: true
 
 env:
@@ -49,21 +57,49 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
-    env:
-      SOURCE_REF: ${{ inputs.ref || 'main' }}
-
     steps:
+      - name: Checkout request file (push trigger only; this public repo, no secrets)
+        if: github.event_name == 'push'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: ci-request
+          sparse-checkout: ci-requests
+          fetch-depth: 1
+          persist-credentials: false
+
       - name: Validate request and credentials
+        id: request
         shell: bash
         env:
           TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_SMOKE: ${{ inputs.smoke }}
         run: |
           set -euo pipefail
 
-          [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || {
-            echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only).'
+          if [[ "$EVENT_NAME" == 'push' ]]; then
+            REQ=ci-request/ci-requests/youxi.env
+            [[ -f "$REQ" ]] || { echo '::error::ci-requests/youxi.env is missing.'; exit 64; }
+            # Plain text, read line by line; never sourced or executed.
+            SOURCE_REF="$(sed -n 's/^REF=//p' "$REQ" | head -n 1 | tr -d '\r')"
+            SMOKE="$(sed -n 's/^SMOKE=//p' "$REQ" | head -n 1 | tr -d '\r')"
+          else
+            SOURCE_REF="$INPUT_REF"
+            SMOKE="$INPUT_SMOKE"
+          fi
+
+          [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && ${#SOURCE_REF} -le 200 ]] || {
+            echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only, no leading dash).'
             exit 64
           }
+          [[ "$SMOKE" == 'true' || "$SMOKE" == 'false' ]] || {
+            echo '::error::SMOKE must be true or false.'
+            exit 64
+          }
+          echo "SOURCE_REF=$SOURCE_REF" >> "$GITHUB_ENV"
+          echo "smoke=$SMOKE" >> "$GITHUB_OUTPUT"
+          echo "Trigger: $EVENT_NAME · smoke: $SMOKE"
           [[ -n "${TARGET_REPO_PAT:-}" ]] || {
             echo '::error::Missing public CI credential: TARGET_REPO_PAT (it must have read access to readori/youxi).'
             exit 78
@@ -159,7 +195,7 @@ jobs:
           echo "- build + budget: PASS ($BUDGET_LINE)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Install Chromium for smoke test
-        if: steps.layout.outputs.ready == 'true' && inputs.smoke
+        if: steps.layout.outputs.ready == 'true' && steps.request.outputs.smoke == 'true'
         shell: bash
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
         run: |
@@ -168,7 +204,7 @@ jobs:
           npx playwright install --with-deps chromium > /dev/null
 
       - name: Smoke test (bot plays desktop + phone, no uploads)
-        if: steps.layout.outputs.ready == 'true' && inputs.smoke
+        if: steps.layout.outputs.ready == 'true' && steps.request.outputs.smoke == 'true'
         shell: bash
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
         env:
