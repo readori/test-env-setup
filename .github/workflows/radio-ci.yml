@@ -1,0 +1,163 @@
+# Radio (Meridian, working name) monorepo CI.
+#
+# Public CI repository -> private source readori/Radio
+# (pnpm workspaces + Turborepo: apps/web, apps/api, apps/mobile, workers/*, packages/*).
+#
+#   verify : pnpm install (frozen lockfile) -> turbo typecheck / lint / test -> turbo build.
+#            No Cloudflare, Apple or Google credentials are used by this workflow.
+#
+# Deploy (Cloudflare Worker), iOS (TestFlight) and Android (Play) pipelines are separate workflows,
+# added later (private repo BACKLOG OPS-10b / OPS-10c) and modeled on paobuwan-worker.yml / paobuwan-ios.yml.
+#
+# Safety rules (public repo, public logs): workflow_dispatch only, never pull_request; third-party
+# actions pinned to commit SHAs; TARGET_REPO_PAT is used only by the checkout step and not persisted;
+# turbo prints error output only; no Actions artifacts; private files are never printed.
+name: Radio CI
+
+run-name: Radio CI · verify · ${{ inputs.ref || 'main' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Private readori/Radio branch, tag, or SHA'
+        required: true
+        default: 'main'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: radio-ci-${{ inputs.ref || 'main' }}
+  cancel-in-progress: true
+
+env:
+  PRIVATE_SOURCE_REPOSITORY: readori/Radio
+  PRIVATE_SOURCE_PATH: source
+
+jobs:
+  verify:
+    name: Verify monorepo
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      SOURCE_REF: ${{ inputs.ref || 'main' }}
+
+    steps:
+      - name: Validate request and credentials
+        shell: bash
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || {
+            echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only).'
+            exit 64
+          }
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || {
+            echo '::error::Missing public CI credential: TARGET_REPO_PAT (it must have read access to readori/Radio).'
+            exit 78
+          }
+          echo "Private source ref: $SOURCE_REF"
+
+      - name: Checkout private source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/Radio
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Detect monorepo layout (fail fast)
+        id: layout
+        shell: bash
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        run: |
+          set -euo pipefail
+
+          SOURCE_COMMIT="$(git rev-parse HEAD)"
+          echo "Private source commit: ${SOURCE_COMMIT:0:8}"
+          {
+            echo '### Radio CI · verify'
+            echo
+            echo "- Source: \`$PRIVATE_SOURCE_REPOSITORY@${SOURCE_COMMIT:0:8}\` (ref \`$SOURCE_REF\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ ! -f package.json ]]; then
+            echo '::notice::No package.json yet: the monorepo is not initialized (private BACKLOG OPS-01). Nothing to verify.'
+            echo '- Result: skipped, monorepo not initialized (OPS-01)' >> "$GITHUB_STEP_SUMMARY"
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          for f in pnpm-lock.yaml pnpm-workspace.yaml turbo.json; do
+            [[ -f "$f" ]] || {
+              echo "::error::$f is missing at the repository root; CI needs a pnpm + Turborepo monorepo (see private CLAUDE.md)."
+              exit 66
+            }
+          done
+
+          PACKAGE_MANAGER="$(node -p "require('./package.json').packageManager || ''")"
+          [[ "$PACKAGE_MANAGER" =~ ^pnpm@[0-9]+\.[0-9]+\.[0-9]+ ]] || {
+            echo '::error::package.json must pin "packageManager": "pnpm@<x.y.z>".'
+            exit 66
+          }
+
+          for task in typecheck lint test build; do
+            node -e "const t=require('./turbo.json').tasks||{}; process.exit(t['$task']?0:1)" || {
+              echo "::error::turbo.json must define the \"$task\" task."
+              exit 66
+            }
+          done
+
+          echo "Package manager: $PACKAGE_MANAGER"
+          echo 'monorepo layout: PASS'
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js 24
+        if: steps.layout.outputs.ready == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Install dependencies (no credentials in this step)
+        if: steps.layout.outputs.ready == 'true'
+        shell: bash
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        run: |
+          set -euo pipefail
+          # Uses the pnpm version pinned in package.json "packageManager".
+          corepack enable
+          pnpm --version
+          pnpm install --frozen-lockfile --reporter=silent
+
+      - name: Typecheck, lint, test
+        if: steps.layout.outputs.ready == 'true'
+        shell: bash
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        env:
+          TURBO_TELEMETRY_DISABLED: '1'
+          CI: 'true'
+        run: |
+          set -euo pipefail
+          pnpm exec turbo run typecheck lint test --output-logs=errors-only --continue
+          echo '- typecheck / lint / test: PASS' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build (no deploy)
+        if: steps.layout.outputs.ready == 'true'
+        shell: bash
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        env:
+          TURBO_TELEMETRY_DISABLED: '1'
+          NEXT_TELEMETRY_DISABLED: '1'
+          CI: 'true'
+        run: |
+          set -euo pipefail
+          pnpm exec turbo run build --output-logs=errors-only
+          echo '- build: PASS' >> "$GITHUB_STEP_SUMMARY"
