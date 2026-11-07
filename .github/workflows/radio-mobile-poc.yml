@@ -147,6 +147,9 @@ jobs:
         run: |
           set -uo pipefail
           export PATH="$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+          # avdmanager and the emulator must agree on where AVDs live.
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
           boot() {
             local name="$1" image="$2" device="$3" start elapsed
             echo no | avdmanager create avd -n "$name" -k "$image" ${device:+-d "$device"} --force > /dev/null 2>&1 || { echo "$name: avd create failed"; return 1; }
