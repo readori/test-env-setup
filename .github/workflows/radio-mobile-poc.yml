@@ -273,7 +273,7 @@ jobs:
     name: POC-03 Android Media3 (emulators)
     if: inputs.job == 'android-poc'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 80
     env:
       GRADLE_VERSION: 8.14.3
       PLAY_SECONDS: ${{ inputs.play_seconds }}
@@ -369,7 +369,7 @@ jobs:
             # Only our session's playback state and position; never metadata or URIs.
             local state
             state="$(adb shell dumpsys media_session | awk -v app="$APP_ID" '/package=/{mine=index($0, "package=" app)>0} mine && /state=PlaybackState/{print; exit}' \
-              | sed -E 's/.*state=PlaybackState \{state=([A-Z_0-9]+)[^,]*, position=([0-9]+).*/state=\1 position_ms=\2/')"
+              | sed -E 's/.*state=PlaybackState \{state=([A-Z_0-9]+)[^,]*, position=(-?[0-9]+).*/state=\1 position_ms=\2/')"
             echo "$1: ${state:-no session state} | $(adb shell dumpsys power | grep -m1 -oE 'mWakefulness=[A-Za-z]+' | tr -d '\r') | notification records: $(adb shell dumpsys notification | grep -c "pkg=$APP_ID" | tr -d '\r')"
           }
           sleep 30
