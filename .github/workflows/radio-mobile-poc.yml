@@ -1,0 +1,174 @@
+# Radio (Meridian) mobile POCs — POC-02 (iOS) and POC-03 (Android) on GitHub-hosted VMs.
+#
+# Public CI repository -> private source readori/Radio (poc/ios-player, poc/android-player).
+#
+#   ios-core       : macos-26, iOS simulator. `xcodebuild test` of the MeridianPlayerCore Swift
+#                    package: AVPlayer on real streams (Icecast + HLS), MTAudioProcessingTap, and
+#                    ShazamKit with a custom catalog built from audio the tests generate.
+#   android-spike  : ubuntu, KVM + Android emulator readiness: boot time of a phone image and an
+#                    Android Automotive image.
+#
+# Simulator/emulator results are not device results; device checks stay with a human.
+#
+# Safety rules (public repo, public logs): workflow_dispatch only; actions pinned to SHAs;
+# TARGET_REPO_PAT only in checkout, not persisted; no other secrets; no artifacts. Logs show only
+# `RESULT` lines (booleans, counts, stream labels — never URLs), test pass/fail lines and compiler
+# `file:line: error:` lines. Raw xcodebuild logs, simulator logs, xcresult and logcat are never printed.
+name: Radio Mobile POC
+
+run-name: Radio Mobile POC · ${{ inputs.job }} · ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Private readori/Radio branch, tag, or SHA'
+        required: true
+        default: 'main'
+        type: string
+      job:
+        description: 'Which POC job to run'
+        required: true
+        default: all
+        type: choice
+        options: [all, ios-core, android-spike]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: radio-mobile-poc-${{ inputs.job }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REF: ${{ inputs.ref }}
+
+jobs:
+  ios-core:
+    name: POC-02 iOS core (simulator)
+    if: inputs.job == 'all' || inputs.job == 'ios-core'
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - name: Validate request
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REF" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]] || { echo '::error::ref must be a branch, tag or SHA (no leading -)'; exit 64; }
+
+      - name: Checkout private source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/Radio
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Pick a simulator
+        id: sim
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -f source/poc/ios-player/MeridianPlayerCore/Package.swift ]] || { echo '::error::poc/ios-player is missing at this ref (POC-02)'; exit 66; }
+          echo "Private source commit: $(git -C source rev-parse --short=8 HEAD)"
+          echo "Xcode: $(xcodebuild -version | tr '\n' ' ')"
+          udid="$(xcrun simctl list devices available -j | jq -r '[.devices | to_entries[] | select(.key | test("iOS")) | .value[] | select(.name | test("^iPhone"))] | last | .udid // empty')"
+          [[ -n "$udid" ]] || { echo '::error::no available iPhone simulator'; exit 1; }
+          echo "Simulator: $(xcrun simctl list devices -j | jq -r --arg u "$udid" '.devices | to_entries[] | .key as $rt | .value[] | select(.udid == $u) | "\(.name) (\($rt | sub(".*SimRuntime."; "")))"')"
+          echo "udid=$udid" >> "$GITHUB_OUTPUT"
+          xcrun simctl boot "$udid" || true
+          xcrun simctl bootstatus "$udid" -b > /dev/null
+
+      - name: Test MeridianPlayerCore on the simulator
+        shell: bash
+        working-directory: source/poc/ios-player/MeridianPlayerCore
+        env:
+          UDID: ${{ steps.sim.outputs.udid }}
+        run: |
+          set -uo pipefail
+          log="$(mktemp)"
+          schemes="$(xcodebuild -list -json 2>/dev/null | jq -r '(.workspace.schemes // .project.schemes // [])[]')"
+          scheme=MeridianPlayerCore
+          grep -qx 'MeridianPlayerCore-Package' <<< "$schemes" && scheme=MeridianPlayerCore-Package
+          echo "scheme: $scheme"
+          xcodebuild test -scheme "$scheme" -destination "id=$UDID" \
+            CODE_SIGNING_ALLOWED=NO -skipPackagePluginValidation > "$log" 2>&1
+          status=$?
+          echo '--- results ---'
+          grep -E '^RESULT ' "$log" | tee -a "$GITHUB_STEP_SUMMARY" || true
+          echo '--- tests ---'
+          grep -E "^Test Case '.*' (passed|failed)|^\*\* TEST (SUCCEEDED|FAILED) \*\*|Executed [0-9]+ tests?" "$log" | sed -E 's/ \([0-9.]+ seconds\)//' || true
+          echo '--- errors (file:line only) ---'
+          grep -E '^/[^ ]+:[0-9]+:([0-9]+:)? error: ' "$log" | sed -E 's#^.*/(poc/[^:]+)#\1#' | sort -u | head -40 || true
+          echo "xcodebuild exit: $status"
+          exit "$status"
+
+  android-spike:
+    name: POC-03 Android emulator readiness
+    if: inputs.job == 'all' || inputs.job == 'android-spike'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Enable KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo chmod 666 /dev/kvm
+          echo "kvm writable: $([[ -w /dev/kvm ]] && echo yes || echo no)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Install emulator and system images
+        id: sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkm="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          list="$(mktemp)"
+          "$sdkm" --list > "$list" 2>/dev/null
+          phone='system-images;android-35;google_apis;x86_64'
+          grep -q "$phone" "$list" || phone="$(grep -oE 'system-images;android-[0-9]+;google_apis;x86_64' "$list" | sort -uV | tail -1)"
+          auto="$(grep -oE 'system-images;android-[0-9]+[^ ;]*;android-automotive[^ ;]*;x86_64' "$list" | sort -uV | tail -1)"
+          echo "phone image: $phone" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "automotive image: ${auto:-none}" | tee -a "$GITHUB_STEP_SUMMARY"
+          if ! "$sdkm" --install emulator platform-tools "$phone" ${auto:+"$auto"} > "$list.install" 2>&1; then
+            grep -iE 'licen|error|fail' "$list.install" | head -20
+            exit 1
+          fi
+          echo "phone=$phone" >> "$GITHUB_OUTPUT"
+          echo "auto=$auto" >> "$GITHUB_OUTPUT"
+          "$ANDROID_HOME/emulator/emulator" -accel-check 2>&1 | head -5
+
+      - name: Boot phone and Automotive emulators
+        shell: bash
+        env:
+          PHONE_IMAGE: ${{ steps.sdk.outputs.phone }}
+          AUTO_IMAGE: ${{ steps.sdk.outputs.auto }}
+        run: |
+          set -uo pipefail
+          export PATH="$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+          boot() {
+            local name="$1" image="$2" device="$3" start elapsed
+            echo no | avdmanager create avd -n "$name" -k "$image" ${device:+-d "$device"} --force > /dev/null 2>&1 || { echo "$name: avd create failed"; return 1; }
+            start=$(date +%s)
+            emulator -avd "$name" -no-window -no-snapshot -no-boot-anim -gpu swiftshader_indirect -accel on -no-audio > /dev/null 2>&1 &
+            adb wait-for-device
+            for _ in $(seq 1 180); do
+              [[ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" == 1 ]] && break
+              sleep 5
+            done
+            elapsed=$(( $(date +%s) - start ))
+            if [[ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" == 1 ]]; then
+              echo "$name booted: yes in ${elapsed}s, sdk $(adb shell getprop ro.build.version.sdk | tr -d '\r')" | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "$name booted: no after ${elapsed}s" | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+            adb emu kill > /dev/null 2>&1 || true
+            sleep 10
+          }
+          boot phone "$PHONE_IMAGE" pixel_7
+          if [[ -n "$AUTO_IMAGE" ]]; then
+            device="$(avdmanager list device -c 2>/dev/null | grep -m1 -E 'automotive_1024p_landscape|automotive' || true)"
+            boot automotive "$AUTO_IMAGE" "$device"
+          fi
