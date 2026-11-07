@@ -1,0 +1,164 @@
+# Radio (Meridian) Cloudflare environments — OPS-05 bootstrap.
+#
+# Public CI repository -> private source readori/Radio (workers/hello).
+#
+#   dry-run : install, then bundle the hello Worker with `wrangler deploy --dry-run` (no credentials).
+#   deploy  : find-or-create the environment's meridian-<env>-* resources (D1 catalog + app, KV,
+#             R2 snapshots, Queue) through workers/hello/scripts/provision.mjs, deploy the hello
+#             Worker, then GET /health until every binding answers.
+#
+# Only dev and staging. Production is deliberately not offered: it needs the approval-gated
+# pipeline of private BACKLOG OPS-10b (radio-worker.yml, modeled on paobuwan-worker.yml), which
+# replaces this workflow.
+#
+# Safety rules (public repo, public logs): workflow_dispatch only; actions pinned to SHAs;
+# TARGET_REPO_PAT only in checkout, not persisted; Cloudflare secrets only on the steps that call
+# Cloudflare; the workers.dev subdomain is masked; wrangler output is filtered and resource ids are
+# redacted; no artifacts; private files are never printed.
+name: Radio Cloudflare
+
+run-name: Radio Cloudflare · ${{ inputs.mode }} · ${{ inputs.environment }} · ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Private readori/Radio branch, tag, or SHA'
+        required: true
+        default: 'main'
+        type: string
+      environment:
+        description: 'Cloudflare environment'
+        required: true
+        default: dev
+        type: choice
+        options: [dev, staging]
+      mode:
+        description: 'dry-run bundles only; deploy provisions resources and deploys'
+        required: true
+        default: dry-run
+        type: choice
+        options: [dry-run, deploy]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: radio-cloudflare-${{ inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REF: ${{ inputs.ref }}
+  TARGET_ENV: ${{ inputs.environment }}
+  WRANGLER_SEND_METRICS: 'false'
+  TURBO_TELEMETRY_DISABLED: '1'
+
+jobs:
+  hello:
+    name: hello Worker (${{ inputs.mode }}, ${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Validate request
+        shell: bash
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo '::error::ref must be a branch, tag or SHA'; exit 64; }
+          [[ "$TARGET_ENV" == dev || "$TARGET_ENV" == staging ]] || { echo '::error::only dev or staging'; exit 64; }
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || { echo '::error::Missing TARGET_REPO_PAT'; exit 78; }
+
+      - name: Checkout private source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/Radio
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Install dependencies (no credentials in this step)
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          [[ -f workers/hello/wrangler.jsonc ]] || { echo '::error::workers/hello is missing at this ref (OPS-05)'; exit 66; }
+          echo "Private source commit: $(git rev-parse --short=8 HEAD)"
+          corepack enable
+          pnpm install --frozen-lockfile --reporter=silent
+
+      - name: Bundle (wrangler dry-run, no credentials)
+        shell: bash
+        working-directory: source/workers/hello
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          if ! pnpm exec wrangler deploy --dry-run --outdir "$RUNNER_TEMP/bundle" --env "$TARGET_ENV" > "$log" 2>&1; then
+            grep -E 'ERROR|✘|error' "$log" | head -30
+            exit 1
+          fi
+          echo "dry-run bundle OK ($(du -sk "$RUNNER_TEMP/bundle" | cut -f1) KiB)"
+          echo "- dry-run bundle (${TARGET_ENV}): OK" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Mask workers.dev subdomain
+        if: inputs.mode == 'deploy'
+        shell: bash
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$CF_ACCOUNT"
+          sub="$(curl -sS -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/workers/subdomain" | jq -r '.result.subdomain // empty')"
+          [[ -n "$sub" ]] || { echo '::error::No workers.dev subdomain on the account'; exit 1; }
+          echo "::add-mask::$sub"
+          echo 'subdomain masked'
+
+      - name: Provision meridian-${{ inputs.environment }}-* resources
+        if: inputs.mode == 'deploy'
+        shell: bash
+        working-directory: source/workers/hello
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          node scripts/provision.mjs --env "$TARGET_ENV" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy hello Worker
+        if: inputs.mode == 'deploy'
+        shell: bash
+        working-directory: source/workers/hello
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          redact() { sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<id>/g; s/[0-9a-fA-F]{32}/<id>/g'; }
+          if ! pnpm exec wrangler deploy --config wrangler.generated.json --env "$TARGET_ENV" > "$log" 2>&1; then
+            grep -E 'ERROR|✘|error|Error' "$log" | redact | head -30
+            exit 1
+          fi
+          grep -E 'Uploaded|Deployed|Current Version' "$log" | redact
+          echo "- deploy meridian-hello-${TARGET_ENV}: OK" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Health check
+        if: inputs.mode == 'deploy'
+        shell: bash
+        working-directory: source/workers/hello
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          node scripts/health.mjs --env "$TARGET_ENV" | tee -a "$GITHUB_STEP_SUMMARY"
