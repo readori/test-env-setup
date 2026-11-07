@@ -246,9 +246,13 @@ jobs:
           echo "$(curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip.sha256")  gradle.zip" | sha256sum -c - > /dev/null
           unzip -q gradle.zip
           echo "$RUNNER_TEMP/gradle-${GRADLE_VERSION}/bin" >> "$GITHUB_PATH"
+          # The runner's default JDK can be newer than Gradle supports; AGP needs 17+.
+          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+          export JAVA_HOME="$JAVA_HOME_17_X64"
           echo "Gradle ${GRADLE_VERSION} verified; $(java -version 2>&1 | head -1)"
 
       - name: Build APKs
+        id: build
         shell: bash
         working-directory: source/poc/android-player
         run: |
@@ -256,7 +260,7 @@ jobs:
           log="$(mktemp)"
           if ! gradle --no-daemon --console=plain -q assemblePhoneDebug assemblePhoneDebugAndroidTest assembleAutomotiveDebug > "$log" 2>&1; then
             echo 'build failed; compiler errors and Gradle failure summary only:'
-            grep -E '^e: |What went wrong|^> |Could not (resolve|find)' "$log" | sed -E 's#file://[^ ]*/(poc/[^ ]+)#\1#' | head -40
+            grep -E -A3 '^e: |What went wrong' "$log" | grep -vE 'Run with --|Get more help|^--$' | sed -E 's#file://[^ ]*/(poc/[^ ]+)#\1#' | head -40
             exit 1
           fi
           find app/build/outputs/apk -name '*.apk' -printf '%P %k KiB\n'
@@ -314,7 +318,7 @@ jobs:
           exit "$ok"
 
       - name: Automotive emulator - system media center lists the channels
-        if: always() && env.AUTO_IMAGE != ''
+        if: always() && steps.build.outcome == 'success' && env.AUTO_IMAGE != ''
         shell: bash
         working-directory: source/poc/android-player
         run: |
