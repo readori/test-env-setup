@@ -7,6 +7,10 @@
 #                    ShazamKit with a custom catalog built from audio the tests generate.
 #   android-spike  : ubuntu, KVM + Android emulator readiness: boot time of a phone image and an
 #                    Android Automotive image.
+#   android-poc    : ubuntu + KVM. Builds poc/android-player (Media3 MediaLibraryService), then on a
+#                    phone emulator browses the tree and plays in the background with the screen
+#                    off; on an Automotive emulator opens the system media center and reads the
+#                    channel labels from the on-screen accessibility tree (uiautomator dump).
 #
 # Simulator/emulator results are not device results; device checks stay with a human.
 #
@@ -31,7 +35,12 @@ on:
         required: true
         default: all
         type: choice
-        options: [all, ios-core, android-spike]
+        options: [all, ios-core, android-spike, android-poc]
+      play_seconds:
+        description: 'android-poc: seconds of background playback with the screen off'
+        required: true
+        default: '120'
+        type: string
 
 permissions:
   contents: read
@@ -185,3 +194,154 @@ jobs:
             boot automotive "$AUTO_IMAGE" "$device" || ok=1
           fi
           exit "$ok"
+
+  android-poc:
+    name: POC-03 Android Media3 (emulators)
+    if: inputs.job == 'android-poc'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GRADLE_VERSION: 8.14.3
+      PLAY_SECONDS: ${{ inputs.play_seconds }}
+      APP_ID: dev.meridian.poc
+    steps:
+      - name: Validate request
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REF" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]] || { echo '::error::ref must be a branch, tag or SHA (no leading -)'; exit 64; }
+          [[ "$PLAY_SECONDS" =~ ^[0-9]{2,4}$ ]] || { echo '::error::play_seconds must be 10-9999'; exit 64; }
+
+      - name: Checkout private source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/Radio
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Set up SDK, Gradle and KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -f source/poc/android-player/settings.gradle.kts ]] || { echo '::error::poc/android-player is missing at this ref (POC-03)'; exit 66; }
+          echo "Private source commit: $(git -C source rev-parse --short=8 HEAD)"
+          sudo chmod 666 /dev/kvm
+          sdkm="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          list="$(mktemp)"
+          "$sdkm" --list > "$list" 2>/dev/null
+          auto="$(grep -oE 'system-images;android-[0-9]+[^ ;]*;android-automotive[^ ;]*;x86_64' "$list" | sort -uV | tail -1)"
+          echo "AUTO_IMAGE=$auto" >> "$GITHUB_ENV"
+          if ! "$sdkm" --install emulator platform-tools 'platforms;android-36' 'build-tools;36.0.0' \
+              'system-images;android-35;google_apis;x86_64' "$auto" > "$list.install" 2>&1; then
+            grep -iE 'licen|error|fail' "$list.install" | head -20
+            exit 1
+          fi
+          # Gradle distribution, verified against the checksum published next to it.
+          cd "$RUNNER_TEMP"
+          curl -fsSLo gradle.zip "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
+          echo "$(curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip.sha256")  gradle.zip" | sha256sum -c - > /dev/null
+          unzip -q gradle.zip
+          echo "$RUNNER_TEMP/gradle-${GRADLE_VERSION}/bin" >> "$GITHUB_PATH"
+          echo "Gradle ${GRADLE_VERSION} verified; $(java -version 2>&1 | head -1)"
+
+      - name: Build APKs
+        shell: bash
+        working-directory: source/poc/android-player
+        run: |
+          set -uo pipefail
+          log="$(mktemp)"
+          if ! gradle --no-daemon --console=plain -q assemblePhoneDebug assemblePhoneDebugAndroidTest assembleAutomotiveDebug > "$log" 2>&1; then
+            echo 'build failed; compiler errors and Gradle failure summary only:'
+            grep -E '^e: |What went wrong|^> |Could not (resolve|find)' "$log" | sed -E 's#file://[^ ]*/(poc/[^ ]+)#\1#' | head -40
+            exit 1
+          fi
+          find app/build/outputs/apk -name '*.apk' -printf '%P %k KiB\n'
+
+      - name: Phone emulator - browse, then background playback with the screen off
+        shell: bash
+        working-directory: source/poc/android-player
+        run: |
+          set -uo pipefail
+          export PATH="$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo no | avdmanager create avd -n phone -k 'system-images;android-35;google_apis;x86_64' -d pixel_7 --force > /dev/null
+          # Audio left on: with -no-audio the emulator may not consume audio in real time.
+          emulator -avd phone -no-window -no-snapshot -no-boot-anim -gpu swiftshader_indirect -accel on \
+            -camera-back none -camera-front none -no-metrics > "$RUNNER_TEMP/phone.log" 2>&1 &
+          timeout 300 adb wait-for-device || { grep -iE 'error|fatal' "$RUNNER_TEMP/phone.log" | head; exit 1; }
+          timeout 600 bash -c 'until [[ "$(adb shell getprop sys.boot_completed | tr -d "\r")" == 1 ]]; do sleep 5; done'
+          echo "phone booted, sdk $(adb shell getprop ro.build.version.sdk | tr -d '\r')"
+          adb install -r app/build/outputs/apk/phone/debug/*.apk > /dev/null
+          adb install -r app/build/outputs/apk/androidTest/phone/debug/*.apk > /dev/null
+          adb shell pm grant "$APP_ID" android.permission.POST_NOTIFICATIONS || true
+          adb logcat -c
+          runner="$APP_ID.test/androidx.test.runner.AndroidJUnitRunner"
+          summarize() { grep -E '^OK \(|^FAILURES|^Tests run|AssertionError|INSTRUMENTATION_(FAILED|CODE: -?[0-9])' "$1" | head -10; }
+          adb shell am instrument -w -e class "$APP_ID.BrowseAndPlayTest#browseTreeListsChannels" "$runner" > "$RUNNER_TEMP/browse.txt" 2>&1
+          echo '--- browse ---'
+          summarize "$RUNNER_TEMP/browse.txt"
+          adb shell am instrument -w -e class "$APP_ID.BrowseAndPlayTest#playsInBackground" -e playSeconds "$PLAY_SECONDS" "$runner" > "$RUNNER_TEMP/play.txt" 2>&1 &
+          inst=$!
+          sample() {
+            # Only our session's playback state and position; never metadata or URIs.
+            local state
+            state="$(adb shell dumpsys media_session | awk -v app="$APP_ID" '/package=/{mine=index($0, "package=" app)>0} mine && /state=PlaybackState/{print; exit}' \
+              | sed -E 's/.*state=PlaybackState \{state=([A-Z_0-9]+)[^,]*, position=([0-9]+).*/state=\1 position_ms=\2/')"
+            echo "$1: ${state:-no session state} | $(adb shell dumpsys power | grep -m1 -oE 'mWakefulness=[A-Za-z]+' | tr -d '\r') | notification records: $(adb shell dumpsys notification | grep -c "pkg=$APP_ID" | tr -d '\r')"
+          }
+          sleep 30
+          sample 'playing, app in background'
+          adb shell input keyevent KEYCODE_HOME
+          adb shell input keyevent KEYCODE_SLEEP
+          sleep 20
+          sample 'screen off +20s'
+          sleep $(( PLAY_SECONDS > 70 ? PLAY_SECONDS - 60 : 10 ))
+          sample 'screen off, later'
+          wait "$inst"
+          echo '--- background playback ---'
+          summarize "$RUNNER_TEMP/play.txt"
+          echo '--- results ---'
+          adb logcat -d -s System.out:I | grep -oE 'RESULT .*' | tee -a "$GITHUB_STEP_SUMMARY"
+          ok=0
+          grep -qE '^OK \(' "$RUNNER_TEMP/browse.txt" || ok=1
+          grep -qE '^OK \(' "$RUNNER_TEMP/play.txt" || ok=1
+          adb emu kill > /dev/null 2>&1 || true
+          exit "$ok"
+
+      - name: Automotive emulator - system media center lists the channels
+        if: always() && env.AUTO_IMAGE != ''
+        shell: bash
+        working-directory: source/poc/android-player
+        run: |
+          set -uo pipefail
+          export PATH="$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          sleep 10
+          device="$(avdmanager list device -c 2>/dev/null | grep -m1 -E 'automotive_1024p_landscape|automotive' || true)"
+          echo no | avdmanager create avd -n auto -k "$AUTO_IMAGE" ${device:+-d "$device"} --force > /dev/null
+          emulator -avd auto -no-window -no-snapshot -no-boot-anim -gpu swiftshader_indirect -accel on -no-audio \
+            -camera-back none -camera-front none -no-metrics > "$RUNNER_TEMP/auto.log" 2>&1 &
+          timeout 300 adb wait-for-device || { grep -iE 'error|fatal' "$RUNNER_TEMP/auto.log" | head; exit 1; }
+          timeout 600 bash -c 'until [[ "$(adb shell getprop sys.boot_completed | tr -d "\r")" == 1 ]]; do sleep 5; done'
+          echo "automotive booted, sdk $(adb shell getprop ro.build.version.sdk | tr -d '\r')"
+          adb install -r app/build/outputs/apk/automotive/debug/*.apk > /dev/null
+          sleep 15
+          adb shell am start -a android.car.intent.action.MEDIA_TEMPLATE \
+            --es android.car.intent.extra.MEDIA_COMPONENT "$APP_ID/.PlaybackService" > /dev/null 2>&1
+          found=''
+          for _ in $(seq 1 12); do
+            sleep 5
+            adb shell uiautomator dump /sdcard/ui.xml > /dev/null 2>&1 || continue
+            found="$(adb exec-out cat /sdcard/ui.xml | grep -oE 'Meridian Test . Channel [A-C]' | sed -E 's/.* //' | sort -u | tr -d '\n')"
+            [[ -n "$found" ]] && break
+          done
+          focus="$(adb shell dumpsys window | grep -m1 -oE 'mCurrentFocus=Window\{[^}]*\}' | grep -oE '[a-z][a-z0-9_]*(\.[a-z0-9_]+)+' | head -1 | tr -d '\r')"
+          echo "RESULT aaos focused_package=${focus:-unknown} channels_on_screen=${found:-none}" | tee -a "$GITHUB_STEP_SUMMARY"
+          adb emu kill > /dev/null 2>&1 || true
+          [[ "$found" == 'ABC' ]]
