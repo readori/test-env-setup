@@ -199,16 +199,33 @@ jobs:
       # ---------------------------------------------------------------------
       # 1. PUBLIC CI repository -> PRIVATE source repository
       # ---------------------------------------------------------------------
-      - name: Mask the API base URL (EXPO_PUBLIC_MERIDIAN_API)
+      - name: Resolve and mask the API base URL (EXPO_PUBLIC_MERIDIAN_API)
         shell: bash
         env:
           API_BASE: ${{ secrets.RADIO_STAGING_API }}
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
         run: |
+          set -euo pipefail
+          # RADIO_STAGING_API wins when set. Otherwise derive the staging Worker URL
+          # (meridian-api-staging on the account's workers.dev subdomain, deployed by radio-api.yml).
+          if [ -z "$API_BASE" ] && [ -n "$CF_TOKEN" ] && [ -n "$CF_ACCOUNT" ]; then
+            echo "::add-mask::$CF_ACCOUNT"
+            sub="$(curl -sS -H "Authorization: Bearer $CF_TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/workers/subdomain" | jq -r '.result.subdomain // empty')"
+            if [ -n "$sub" ]; then
+              echo "::add-mask::$sub"
+              API_BASE="https://meridian-api-staging.${sub}.workers.dev"
+            fi
+          fi
           if [ -n "$API_BASE" ]; then
             echo "::add-mask::$API_BASE"
+            # Only Metro (turbo export, Xcode "Bundle React Native code") reads this; it is a
+            # public client endpoint, masked because the workers.dev subdomain identifies the account.
+            echo "EXPO_PUBLIC_MERIDIAN_API=$API_BASE" >> "$GITHUB_ENV"
             echo "API base: set (masked)"
           else
-            echo "::warning::RADIO_STAGING_API is not set; the app will be built without an API base."
+            echo "::warning::No API base (RADIO_STAGING_API unset and staging URL not derivable); the app will be built without one."
           fi
 
       - name: Checkout private Radio source
@@ -343,8 +360,6 @@ jobs:
       - name: Build workspace packages for the mobile app (turbo)
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
         shell: bash
-        env:
-          EXPO_PUBLIC_MERIDIAN_API: ${{ secrets.RADIO_STAGING_API }}
         run: |
           set -euo pipefail
           # @meridian/core and @meridian/ui-tokens export from dist/, which Metro needs when Xcode
@@ -486,8 +501,6 @@ jobs:
       - name: Build app for iOS Simulator (Release, embedded JS bundle)
         if: ${{ env.MODE == 'verify' }}
         shell: bash
-        env:
-          EXPO_PUBLIC_MERIDIAN_API: ${{ secrets.RADIO_STAGING_API }}
         run: |
           set -euo pipefail
 
@@ -783,7 +796,6 @@ jobs:
         shell: bash
         env:
           ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
-          EXPO_PUBLIC_MERIDIAN_API: ${{ secrets.RADIO_STAGING_API }}
         run: |
           set -euo pipefail
 
