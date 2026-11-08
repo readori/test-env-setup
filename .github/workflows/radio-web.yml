@@ -188,4 +188,12 @@ jobs:
           echo "api /health: HTTP $c"
           echo "- api \`/health\`: HTTP $c" >> "$GITHUB_STEP_SUMMARY"
           [[ "$c" == 200 ]] || echo "::warning::Staging API /health is not 200; the site loads but cannot list stations until radio-api.yml deploy/snapshot is run."
+          # The catalog manifest, fetched the way the page does (cross-origin from the site).
+          hdr="$(mktemp)"
+          c="$(curl -s -o /dev/null -D "$hdr" -w '%{http_code}' --max-time 20 -H "Origin: ${WEB_URL}" "${API_BASE}/snapshot/manifest.json" || echo 000)"
+          if grep -qi '^access-control-allow-origin:' "$hdr"; then cors=yes; else cors=no; fi
+          rm -f "$hdr"
+          echo "api /snapshot/manifest.json: HTTP $c, CORS for the site: $cors"
+          echo "- api \`/snapshot/manifest.json\`: HTTP $c, CORS: $cors" >> "$GITHUB_STEP_SUMMARY"
+          [[ "$c" == 200 && "$cors" == yes ]] || echo "::warning::The catalog is not readable from the site (run radio-api.yml snapshot, or check CORS_ORIGINS)."
           (( fail == 0 )) || { echo '::error::The deployed site did not answer 200 on every checked path.'; exit 1; }
