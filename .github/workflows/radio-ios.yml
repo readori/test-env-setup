@@ -11,8 +11,10 @@
 #   archive    : + readonly Match signing, App Store archive, IPA export, altool validate (IPA is not kept).
 #   testflight : archive + build-number check against TestFlight + altool upload.
 #
-# Version: only app.json "version" (no workflow input). Build number: build_number input, else the
-# run number; testflight checks it is higher than the latest TestFlight build of that version.
+# Version and build number: both required workflow inputs, typed by the person dispatching the run
+# (no defaults, no run-number fallback; app.json "version" is ignored). They are written into the
+# generated Info.plist and passed as MARKETING_VERSION / CURRENT_PROJECT_VERSION; testflight checks
+# the build number is higher than the latest TestFlight build of that version.
 # Signing profile: created once by certificates-repo.yml (signing_mode=refresh_radio_profile).
 #
 # Safety rules (public repo, public logs):
@@ -27,7 +29,7 @@
 #     (pnpm install / turbo build / prebuild / pod install) has run, and is removed at the end.
 name: Radio iOS
 
-run-name: Radio iOS · ${{ inputs.mode || 'verify' }} · ${{ inputs.ref || 'main' }}${{ inputs.build_number && format(' · build {0}', inputs.build_number) || '' }}
+run-name: Radio iOS · ${{ inputs.mode || 'verify' }} · ${{ inputs.ref || 'main' }} · ${{ inputs.version }} (${{ inputs.build_number }})
 
 on:
   workflow_dispatch:
@@ -46,10 +48,13 @@ on:
         required: true
         default: 'main'
         type: string
+      version:
+        description: 'App version (CFBundleShortVersionString), x.y.z, e.g. 1.0.0. Required, no default.'
+        required: true
+        type: string
       build_number:
-        description: 'Optional build number (CFBundleVersion). Empty = this run number. testflight checks it is higher than the latest TestFlight build.'
-        required: false
-        default: ''
+        description: 'Build number (CFBundleVersion), whole number, e.g. 1. Required, no default. testflight checks it is higher than the latest TestFlight build of this version.'
+        required: true
         type: string
 
 permissions:
@@ -89,6 +94,7 @@ jobs:
     env:
       MODE: ${{ inputs.mode || 'verify' }}
       SOURCE_REF: ${{ inputs.ref || 'main' }}
+      VERSION_INPUT: ${{ inputs.version || '' }}
       BUILD_NUMBER_INPUT: ${{ inputs.build_number || '' }}
 
     steps:
@@ -154,16 +160,19 @@ jobs:
             }
           fi
 
-          if [[ -n "$BUILD_NUMBER_INPUT" ]]; then
-            [[ "$BUILD_NUMBER_INPUT" =~ ^[1-9][0-9]{0,8}$ ]] || {
-              echo '::error::build_number must be a whole number (1-999999999) with no leading zeros, spaces, or dots.'
-              exit 64
-            }
-          fi
+          # Version and build number are always typed by the person dispatching the run.
+          [[ "$VERSION_INPUT" =~ ^(0|[1-9][0-9]{0,3})[.](0|[1-9][0-9]{0,3})[.](0|[1-9][0-9]{0,3})$ ]] || {
+            echo '::error::version is required and must be x.y.z (e.g. 1.0.0): digits only, no leading zeros or spaces.'
+            exit 64
+          }
+          [[ "$BUILD_NUMBER_INPUT" =~ ^[1-9][0-9]{0,8}$ ]] || {
+            echo '::error::build_number is required and must be a whole number (1-999999999) with no leading zeros, spaces, or dots.'
+            exit 64
+          }
 
           echo "Mode: $MODE"
           echo "Private source ref: $SOURCE_REF"
-          echo "Build number input: ${BUILD_NUMBER_INPUT:-<empty, uses run number $GITHUB_RUN_NUMBER>}"
+          echo "Version input: $VERSION_INPUT ($BUILD_NUMBER_INPUT)"
 
       # Prints only error lines of a captured log (private absolute paths made relative),
       # plus one annotation (annotations are readable through the public API without signing in).
@@ -468,22 +477,17 @@ jobs:
             exit 66
           }
 
-          # Version lives only in app.json. expo prebuild writes app.json "version" into the app
-          # Info.plist as a literal and leaves MARKETING_VERSION at the template's 1.0, so read it there.
-          APP_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFOPLIST_PATH" 2>/dev/null || true)"
-          [[ "$APP_VERSION" =~ ^[0-9]+([.][0-9]+){1,2}$ ]] || {
-            echo "::error::Generated Info.plist CFBundleShortVersionString must look like 0.1 or 0.1.0 (from app.json \"version\"); got: ${APP_VERSION:-<empty>}"
+          # Version and build number come only from the required inputs (validated in step 0).
+          # expo prebuild writes literal CFBundleShortVersionString (app.json "version") and
+          # CFBundleVersion (app.json ios.buildNumber) into the Info.plist, so MARKETING_VERSION /
+          # CURRENT_PROJECT_VERSION alone do not change them. Overwrite both there.
+          APP_VERSION="$VERSION_INPUT"
+          BUILD_NUMBER="$BUILD_NUMBER_INPUT"
+          [[ -n "$APP_VERSION" && -n "$BUILD_NUMBER" ]] || {
+            echo '::error::version and build_number inputs are required.'
             exit 64
           }
-
-          # Build number: the build_number input, else this run number (strictly increasing per workflow).
-          BUILD_NUMBER="${BUILD_NUMBER_INPUT:-${GITHUB_RUN_NUMBER}}"
-          [[ "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]] || {
-            echo "::error::Build number is not a positive integer: $BUILD_NUMBER"
-            exit 64
-          }
-          # expo prebuild also writes a literal CFBundleVersion (app.json ios.buildNumber, default "1"),
-          # so CURRENT_PROJECT_VERSION alone does not change the uploaded build number. Write it there.
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$INFOPLIST_PATH"
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$INFOPLIST_PATH"
 
           echo "WORKSPACE_PATH=$WORKSPACE_PATH" >> "$GITHUB_ENV"
