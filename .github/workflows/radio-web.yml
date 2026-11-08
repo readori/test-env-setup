@@ -1,0 +1,191 @@
+# Radio (Meridian) Web: build the Next.js static export (apps/web) and deploy it to Cloudflare
+# as the static-assets-only Worker meridian-web-staging (apps/web/wrangler.jsonc, env staging).
+#
+# Public CI repository -> private source readori/Radio.
+#
+#   dry-run : install, build the static export, bundle with `wrangler deploy --dry-run` (no
+#             Cloudflare credentials).
+#   deploy  : + resolve the staging API base, build with it, deploy meridian-web-staging,
+#             then GET the site (/, /en/, /zh/) and the API /health.
+#
+# Staging only. Production waits for the approval-gated pipeline of private BACKLOG OPS-10b.
+# The site has no Worker script: it only serves files, so it can never proxy or cache audio.
+#
+# Safety rules (public repo, public logs): workflow_dispatch only; actions pinned to SHAs;
+# TARGET_REPO_PAT only in checkout, not persisted; Cloudflare secrets only on the steps that call
+# Cloudflare; the account id and workers.dev subdomain are masked; build and wrangler output go to
+# files and only error codes are printed; no artifacts; private files are never printed.
+name: Radio Web
+
+run-name: Radio Web · ${{ inputs.mode }} · staging · ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Private readori/Radio branch, tag, or SHA'
+        required: true
+        type: string
+      mode:
+        description: 'dry-run = build + bundle (no credentials); deploy = build + deploy meridian-web-staging + checks'
+        required: true
+        default: dry-run
+        type: choice
+        options: [dry-run, deploy]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: radio-web-staging
+  cancel-in-progress: false
+
+env:
+  SOURCE_REF: ${{ inputs.ref }}
+  MODE: ${{ inputs.mode }}
+  TARGET_ENV: staging
+  WEB_WORKER: meridian-web-staging
+  API_WORKER: meridian-api-staging
+  WRANGLER_SEND_METRICS: 'false'
+  TURBO_TELEMETRY_DISABLED: '1'
+  NEXT_TELEMETRY_DISABLED: '1'
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+
+jobs:
+  web:
+    name: Web static export (${{ inputs.mode }}, staging)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Validate request
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REF" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]] || { echo '::error::ref must be a branch, tag or SHA (no leading -)'; exit 64; }
+          case "$MODE" in dry-run|deploy) ;; *) echo "::error::Unsupported mode: $MODE"; exit 64 ;; esac
+
+      - name: Checkout private source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/Radio
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Install dependencies (no credentials in this step)
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          [[ -f apps/web/wrangler.jsonc && -f apps/web/package.json ]] || { echo '::error::apps/web is missing at this ref'; exit 66; }
+          echo "Private source commit: $(git rev-parse --short=8 HEAD)"
+          corepack enable
+          log="$RUNNER_TEMP/install.log"
+          if ! pnpm install --frozen-lockfile --reporter=silent > "$log" 2>&1; then
+            echo 'pnpm install failed; error codes only:'
+            { grep -oE 'ERR_PNPM_[A-Z_]+|ERR_[A-Z_]+' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
+            exit 1
+          fi
+          echo 'pnpm install: PASS'
+
+      - name: Resolve and mask the API base URL (NEXT_PUBLIC_MERIDIAN_API)
+        if: inputs.mode == 'deploy'
+        shell: bash
+        env:
+          API_BASE: ${{ secrets.RADIO_STAGING_API }}
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$CF_ACCOUNT"
+          sub="$(curl -sS -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/workers/subdomain" | jq -r '.result.subdomain // empty')"
+          [[ -n "$sub" ]] || { echo '::error::No workers.dev subdomain on the account'; exit 1; }
+          echo "::add-mask::$sub"
+          # RADIO_STAGING_API wins when set; otherwise the staging API Worker deployed by radio-api.yml.
+          [[ -n "$API_BASE" ]] || API_BASE="https://${API_WORKER}.${sub}.workers.dev"
+          echo "::add-mask::$API_BASE"
+          {
+            echo "NEXT_PUBLIC_MERIDIAN_API=$API_BASE"
+            echo "API_BASE=$API_BASE"
+            echo "WEB_URL=https://${WEB_WORKER}.${sub}.workers.dev"
+          } >> "$GITHUB_ENV"
+          echo 'API base and site URL resolved (masked)'
+
+      - name: Build static export
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/build.log"
+          # Builds @meridian/web and its workspace dependencies. Next inlines NEXT_PUBLIC_MERIDIAN_API.
+          if ! pnpm turbo run build --filter=@meridian/web... --output-logs=errors-only > "$log" 2>&1; then
+            echo 'build failed; error codes only (private source lines are never printed):'
+            { grep -oE 'TS[0-9]{4,5}|ERR_[A-Z_]+|Type error|Module not found|Failed to compile|Error occurred prerendering' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
+            exit 1
+          fi
+          [[ -f apps/web/dist/index.html ]] || { echo '::error::apps/web/dist/index.html was not produced'; exit 1; }
+          echo "turbo build: PASS ($(find apps/web/dist -type f | wc -l) files, $(du -sk apps/web/dist | cut -f1) KiB)"
+          echo "- static export: OK" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Bundle (wrangler dry-run, no credentials)
+        shell: bash
+        working-directory: source/apps/web
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/dry-run.log"
+          if ! pnpm exec wrangler deploy --dry-run --env "$TARGET_ENV" --outdir "$RUNNER_TEMP/bundle" > "$log" 2>&1; then
+            echo 'dry-run failed; error codes only:'
+            { grep -oE '\[ERROR\]|ERR_[A-Z_]+|code: [0-9]+' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
+            exit 1
+          fi
+          echo 'wrangler dry-run: PASS'
+          echo "- wrangler dry-run (${TARGET_ENV}): OK" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy meridian-web-staging
+        if: inputs.mode == 'deploy'
+        shell: bash
+        working-directory: source/apps/web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$CLOUDFLARE_ACCOUNT_ID"
+          log="$RUNNER_TEMP/deploy.log"
+          redact() { sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<id>/g; s/[0-9a-fA-F]{32}/<id>/g; s#https://[^ ]+#<url>#g'; }
+          if ! pnpm exec wrangler deploy --env "$TARGET_ENV" > "$log" 2>&1; then
+            echo 'deploy failed; error codes only:'
+            { grep -oE '\[ERROR\]|ERR_[A-Z_]+|code: [0-9]+' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
+            exit 1
+          fi
+          { grep -E 'Uploaded|Deployed|Current Version|assets' "$log" || true; } | redact
+          echo "- deploy ${WEB_WORKER}: OK" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check the site and the API
+        if: inputs.mode == 'deploy'
+        shell: bash
+        run: |
+          set -euo pipefail
+          code() { curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$1" || echo 000; }
+          fail=0
+          for path in / /en/ /zh/; do
+            c=000
+            for i in 1 2 3 4 5 6; do c="$(code "${WEB_URL}${path}")"; [[ "$c" == 200 ]] && break; sleep 10; done
+            echo "site ${path}: HTTP $c"
+            echo "- site \`${path}\`: HTTP $c" >> "$GITHUB_STEP_SUMMARY"
+            [[ "$c" == 200 ]] || fail=1
+          done
+          c="$(code "${API_BASE}/health")"
+          echo "api /health: HTTP $c"
+          echo "- api \`/health\`: HTTP $c" >> "$GITHUB_STEP_SUMMARY"
+          [[ "$c" == 200 ]] || echo "::warning::Staging API /health is not 200; the site loads but cannot list stations until radio-api.yml deploy/snapshot is run."
+          (( fail == 0 )) || { echo '::error::The deployed site did not answer 200 on every checked path.'; exit 1; }
