@@ -265,6 +265,8 @@ jobs:
           SOURCE_COMMIT="$(git -C "$SOURCE_ABS" rev-parse HEAD)"
           echo "SOURCE_COMMIT=$SOURCE_COMMIT" >> "$GITHUB_ENV"
           echo "SOURCE_SHORT_SHA=${SOURCE_COMMIT:0:8}" >> "$GITHUB_ENV"
+          # Shown in the app's diagnostics log header (the short SHA is already public in this log).
+          echo "EXPO_PUBLIC_MERIDIAN_SOURCE_SHA=${SOURCE_COMMIT:0:8}" >> "$GITHUB_ENV"
 
           # Print only comparison results, never the file contents.
           PACKAGE_MANAGER="$(node -p "require(process.argv[1]).packageManager || ''" "$SOURCE_ABS/package.json")"

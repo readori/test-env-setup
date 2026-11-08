@@ -87,6 +87,8 @@ jobs:
           set -euo pipefail
           [[ -f apps/web/wrangler.jsonc && -f apps/web/package.json ]] || { echo '::error::apps/web is missing at this ref'; exit 66; }
           echo "Private source commit: $(git rev-parse --short=8 HEAD)"
+          # Shown in the site's diagnostics log header.
+          echo "NEXT_PUBLIC_MERIDIAN_SOURCE_SHA=$(git rev-parse --short=8 HEAD)" >> "$GITHUB_ENV"
           corepack enable
           log="$RUNNER_TEMP/install.log"
           if ! pnpm install --frozen-lockfile --reporter=silent > "$log" 2>&1; then
