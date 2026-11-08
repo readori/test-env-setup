@@ -809,6 +809,8 @@ jobs:
           # Verify the freshly written profile here (the shared validation step below is
           # skipped for this mode). application-identifier must match exactly.
           PROFILE_FOUND=0
+          RADIO_CARPLAY=no
+          RADIO_ENT_KEYS=''
           for root in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
             [[ -d "$root" ]] || continue
             for p in "$root"/*.mobileprovision; do
@@ -819,6 +821,11 @@ jobs:
                 gettask="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$tmp" 2>/dev/null || true)"
                 if [[ "$appid" == "$ASC_TEAM_ID.$RADIO_BUNDLE_ID" && "$gettask" != 'true' ]]; then
                   PROFILE_FOUND=1
+                  # CarPlay audio (OPS-02): report presence and entitlement key names only.
+                  if /usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.carplay-audio' "$tmp" >/dev/null 2>&1; then
+                    RADIO_CARPLAY=yes
+                  fi
+                  RADIO_ENT_KEYS="$(plutil -extract Entitlements xml1 -o - "$tmp" 2>/dev/null | grep -o '<key>[^<]*</key>' | sed 's#</*key>##g' | sort | paste -sd' ' - || true)"
                 fi
               fi
               rm -f "$tmp"
@@ -830,6 +837,11 @@ jobs:
             exit 78
           }
           echo "App Store profile installed: $RADIO_BUNDLE_ID"
+          echo "Radio profile entitlement keys: $RADIO_ENT_KEYS"
+          echo "CarPlay audio entitlement in profile: $RADIO_CARPLAY"
+          if [[ "$RADIO_CARPLAY" != 'yes' ]]; then
+            echo '::warning::com.apple.developer.carplay-audio is not in the new Radio profile. Enable CarPlay Audio under the App ID Additional Capabilities in the Apple Developer portal, then rerun refresh_radio_profile.'
+          fi
 
           echo 'Radio App Store profile refresh: PASS'
 
