@@ -1,0 +1,203 @@
+# youxi playtest deploy: build the game (private readori/youxi) and publish it to Cloudflare as the
+# static-assets-only Worker "youxi" on the account's workers.dev subdomain.
+#
+#   gate   : npm ci -> typecheck -> unit tests -> build -> budget gate (same as youxi-ci.yml, no smoke;
+#            the AI PM only requests a deploy for a commit whose youxi CI run, with smoke, was green).
+#   deploy : copy dist/ + noindex headers, `wrangler deploy --dry-run` (no credentials), then
+#            `wrangler deploy`, then GET the page and one asset (HTTP 200, X-Robots-Tag present).
+#
+# The site has no Worker script: it only serves the built files. Anyone with the link can play
+# (owner decision 2026-11-08, private repo ADR-0011); pages send X-Robots-Tag: noindex.
+#
+# Triggers: workflow_dispatch (a human clicks Run), or a push to main that changes
+# ci-requests/youxi-deploy.env (how the project's AI PM requests a deploy; owner approved on 2026-11-08,
+# private repo ADR-0011). Only people with push access to this repo can trigger; never pull_request.
+# The request file is parsed as plain KEY=VALUE text and is never executed. Push requests must name
+# a full 40-character commit SHA.
+#
+# Safety rules (public repo, public logs): no pull_request triggers; actions pinned to commit SHAs;
+# wrangler pinned to an exact version; TARGET_REPO_PAT only in checkout, not persisted; Cloudflare
+# secrets only on the steps that call Cloudflare; the account id and workers.dev subdomain are masked;
+# tool output goes to files and only error codes are printed; no Actions artifacts; private files are
+# never printed.
+name: youxi deploy
+
+run-name: youxi deploy · ${{ github.event_name == 'push' && 'request (ci-requests/youxi-deploy.env)' || inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Private readori/youxi branch, tag, or SHA'
+        required: true
+        type: string
+  push:
+    branches: [main]
+    paths: ['ci-requests/youxi-deploy.env']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: youxi-deploy
+  cancel-in-progress: false
+
+env:
+  PRIVATE_SOURCE_PATH: source
+  WORKER_NAME: youxi
+  WRANGLER_VERSION: 4.151.3
+  WRANGLER_SEND_METRICS: 'false'
+
+jobs:
+  deploy:
+    name: Build and deploy youxi
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Validate request and credentials
+        shell: bash
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/youxi-deploy.env
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == 'push' ]]; then
+            # Only the request file of this exact commit (public, no credentials). This repo is not
+            # checked out: it carries an unrelated broken submodule entry.
+            REQ="$RUNNER_TEMP/youxi-deploy-request.env"
+            curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/youxi-deploy.env at this commit.'; exit 64; }
+            SOURCE_REF="$(sed -n 's/^REF=//p' "$REQ" | head -n 1 | tr -d '\r')"
+            [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::REF in a deploy request must be a full 40-character commit SHA.'; exit 64; }
+          else
+            SOURCE_REF="$INPUT_REF"
+          fi
+          [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && ${#SOURCE_REF} -le 200 ]] || {
+            echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only, no leading dash).'
+            exit 64
+          }
+          echo "SOURCE_REF=$SOURCE_REF" >> "$GITHUB_ENV"
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || { echo '::error::Missing TARGET_REPO_PAT.'; exit 78; }
+          [[ -n "${CF_TOKEN:-}" && -n "${CF_ACCOUNT:-}" ]] || { echo '::error::Missing CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID.'; exit 78; }
+          echo "Trigger: $EVENT_NAME · private source ref: $SOURCE_REF"
+
+      - name: Checkout private source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/youxi
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Install dependencies (no credentials in this step)
+        shell: bash
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        run: |
+          set -euo pipefail
+          SOURCE_COMMIT="$(git rev-parse HEAD)"
+          echo "Private source commit: ${SOURCE_COMMIT:0:8}"
+          echo "SOURCE_SHORT=${SOURCE_COMMIT:0:8}" >> "$GITHUB_ENV"
+          echo '### youxi deploy' >> "$GITHUB_STEP_SUMMARY"
+          echo "- Source: \`readori/youxi@${SOURCE_COMMIT:0:8}\`" >> "$GITHUB_STEP_SUMMARY"
+          npm ci --no-audit --no-fund --loglevel=error
+
+      - name: Gate - typecheck, unit tests, build, budget
+        shell: bash
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        env:
+          CI: 'true'
+        run: |
+          set -euo pipefail
+          npm run --silent typecheck
+          npx vitest run tests --reporter=dot --silent
+          npx vite build --logLevel error
+          BUDGET_LINE="$(node tools/check-budgets.cjs)"
+          echo "$BUDGET_LINE"
+          [[ -f dist/index.html ]] || { echo '::error::dist/index.html was not produced'; exit 1; }
+          echo "- gate: PASS ($BUDGET_LINE)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prepare site (noindex) and bundle with wrangler dry-run (no credentials)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SITE="$RUNNER_TEMP/site"
+          mkdir -p "$SITE/public"
+          cp -R "$PRIVATE_SOURCE_PATH/dist/." "$SITE/public/"
+          printf '/*\n  X-Robots-Tag: noindex, nofollow\n' > "$SITE/public/_headers"
+          printf 'User-agent: *\nDisallow: /\n' > "$SITE/public/robots.txt"
+          cat > "$SITE/wrangler.jsonc" <<EOF
+          {
+            "name": "${WORKER_NAME}",
+            "compatibility_date": "2026-10-01",
+            "workers_dev": true,
+            "preview_urls": false,
+            "assets": { "directory": "./public" }
+          }
+          EOF
+          echo "SITE=$SITE" >> "$GITHUB_ENV"
+          echo "site: $(find "$SITE/public" -type f | wc -l) files, $(du -sk "$SITE/public" | cut -f1) KiB"
+          cd "$SITE"
+          log="$RUNNER_TEMP/dry-run.log"
+          if ! npx --yes "wrangler@${WRANGLER_VERSION}" deploy --dry-run > "$log" 2>&1; then
+            echo 'dry-run failed; error codes only:'
+            { grep -oE '\[ERROR\]|ERR_[A-Z_]+|code: [0-9]+' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
+            exit 1
+          fi
+          echo 'wrangler dry-run: PASS'
+          echo '- wrangler dry-run: OK' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy the youxi Worker
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$CLOUDFLARE_ACCOUNT_ID"
+          sub="$(curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain" | jq -r '.result.subdomain // empty')"
+          [[ -n "$sub" ]] || { echo '::error::No workers.dev subdomain on the account'; exit 1; }
+          echo "::add-mask::$sub"
+          echo "SITE_URL=https://${WORKER_NAME}.${sub}.workers.dev" >> "$GITHUB_ENV"
+          cd "$SITE"
+          log="$RUNNER_TEMP/deploy.log"
+          redact() { sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<id>/g; s/[0-9a-fA-F]{32}/<id>/g; s#https://[^ ]+#<url>#g'; }
+          if ! npx --yes "wrangler@${WRANGLER_VERSION}" deploy > "$log" 2>&1; then
+            echo 'deploy failed; error codes only:'
+            { grep -oE '\[ERROR\]|ERR_[A-Z_]+|code: [0-9]+' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
+            exit 1
+          fi
+          { grep -E 'Uploaded|Deployed|Current Version|assets' "$log" || true; } | redact
+          echo "- deploy ${WORKER_NAME} (source ${SOURCE_SHORT}): OK" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check the live site
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="$(cd "$SITE/public" && find assets -type f -name '*.js' | head -n 1)"
+          fail=0
+          for path in / "/$asset"; do
+            c=000
+            for i in 1 2 3 4 5 6; do c="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "${SITE_URL}${path}" || echo 000)"; [[ "$c" == 200 ]] && break; sleep 10; done
+            label="$path"; [[ "$path" == / ]] || label='first JS asset'
+            echo "site ${label}: HTTP $c"
+            echo "- site ${label}: HTTP $c" >> "$GITHUB_STEP_SUMMARY"
+            [[ "$c" == 200 ]] || fail=1
+          done
+          if curl -sI --max-time 20 "${SITE_URL}/" | grep -qi '^x-robots-tag: noindex'; then robots=yes; else robots=no; fi
+          echo "noindex header: $robots"
+          echo "- noindex header: $robots" >> "$GITHUB_STEP_SUMMARY"
+          [[ "$robots" == yes ]] || echo '::warning::X-Robots-Tag noindex header is missing on /.'
+          (( fail == 0 )) || { echo '::error::The deployed site did not answer 200.'; exit 1; }
