@@ -3,8 +3,12 @@
 # reviews it and copies it over. Modeled on radio-cloudflare.yml (same safety rules).
 #
 #   dry-run  : install, bundle the API Worker with `wrangler deploy --dry-run` (no credentials).
-#   deploy   : provision (finds the existing D1 + snapshots bucket), deploy meridian-api-<env>,
-#              GET /health.
+#   d1-check : provision, then ONLY read the D1: table names, recorded migrations and the row count
+#              of the old `entitlements` table (stops if it is not empty). Writes nothing.
+#   deploy   : provision (finds the existing D1 + snapshots bucket), the same D1 check, D1
+#              migrations (`wrangler d1 migrations apply`, tables that already exist are recorded
+#              in d1_migrations first), deploy meridian-api-<env>, GET /health, and a check that
+#              the two App Store endpoints answer 400 to an empty body.
 #   snapshot : import the catalog from Radio Browser (no credentials; counts only in the log),
 #              upload it to R2 (shards first, manifest last), then read it back through the Worker.
 #   all      : deploy, then snapshot.
@@ -26,11 +30,11 @@ on:
         default: 'main'
         type: string
       mode:
-        description: 'dry-run | deploy | snapshot (import + upload to R2) | all'
+        description: 'dry-run | d1-check (read-only) | deploy | snapshot (import + upload to R2) | all'
         required: true
         default: dry-run
         type: choice
-        options: [dry-run, deploy, snapshot, all]
+        options: [dry-run, d1-check, deploy, snapshot, all]
 
 permissions:
   contents: read
@@ -116,7 +120,7 @@ jobs:
           echo 'subdomain masked'
 
       - name: Provision meridian-staging-* resources
-        if: inputs.mode == 'deploy' || inputs.mode == 'all'
+        if: inputs.mode == 'deploy' || inputs.mode == 'all' || inputs.mode == 'd1-check'
         shell: bash
         working-directory: source/workers/api
         env:
@@ -125,6 +129,130 @@ jobs:
         run: |
           set -euo pipefail
           node scripts/provision.mjs --env "$TARGET_ENV" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Write the D1 helper (no credentials in this step)
+        if: inputs.mode == 'deploy' || inputs.mode == 'all' || inputs.mode == 'd1-check'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/d1.mjs" <<'JS'
+          // Usage: node d1.mjs check | migrate   (cwd: source/workers/api, wrangler.generated.json present)
+          // Prints table names, migration file names, counts and error codes only. The raw wrangler
+          // output is never printed (it contains ids).
+          import { execFileSync } from 'node:child_process';
+          import { readdirSync, readFileSync } from 'node:fs';
+
+          const phase = process.argv[2];
+          const env = process.env.TARGET_ENV;
+          const DB = `meridian-${env}-db`;
+          const MIGRATIONS = '../../packages/db/migrations';
+          const CODES = /ERR_[A-Z_]+|SQLITE_[A-Z_]+|code: \d+|\[ERROR\]/g;
+
+          function wrangler(args) {
+            try {
+              return execFileSync('pnpm', ['exec', 'wrangler', ...args], {
+                encoding: 'utf8',
+                stdio: ['ignore', 'pipe', 'pipe'],
+                maxBuffer: 64 * 1024 * 1024,
+              });
+            } catch (error) {
+              const text = `${error.stdout ?? ''}${error.stderr ?? ''}`;
+              const codes = [...new Set(text.match(CODES) ?? [])];
+              console.error(`::error::wrangler ${args.slice(0, 2).join(' ')} failed; codes only: ${codes.join(' ') || 'none found'}`);
+              process.exit(1);
+            }
+          }
+
+          function sql(command) {
+            const out = wrangler(['d1', 'execute', DB, '--remote', '--env', env, '--config', 'wrangler.generated.json', '--json', '--command', command]);
+            try {
+              return JSON.parse(out.slice(out.indexOf('[')))[0]?.results ?? [];
+            } catch {
+              console.error('::error::unparseable wrangler output');
+              process.exit(1);
+            }
+          }
+
+          const tableNames = () =>
+            sql("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").map((r) => r.name);
+
+          function check() {
+            const tables = tableNames();
+            console.log(`tables (${tables.length}): ${tables.join(', ')}`);
+            if (tables.includes('d1_migrations')) {
+              const names = sql('SELECT name FROM d1_migrations ORDER BY id').map((r) => r.name);
+              console.log(`d1_migrations: present, recorded: ${names.join(', ') || 'none'}`);
+            } else console.log('d1_migrations: absent');
+            if (tables.includes('entitlements')) {
+              const n = Number(sql('SELECT count(*) AS n FROM entitlements')[0]?.n);
+              console.log(`entitlements rows: ${n}`);
+              if (n !== 0) {
+                console.error('::error::entitlements is not empty (or unreadable); stopping before any change');
+                process.exit(1);
+              }
+            } else console.log('entitlements: table absent');
+            return tables;
+          }
+
+          const tables = check();
+          if (phase === 'check') process.exit(0);
+
+          const files = readdirSync(MIGRATIONS).filter((f) => f.endsWith('.sql')).sort();
+          if (!files.every((f) => /^[0-9A-Za-z_.-]+\.sql$/.test(f))) {
+            console.error('::error::unexpected migration file name');
+            process.exit(1);
+          }
+          const recorded = new Set(tables.includes('d1_migrations') ? sql('SELECT name FROM d1_migrations').map((r) => r.name) : []);
+          // A migration that is not recorded but whose tables already exist was applied by hand:
+          // record it instead of running it again ("table already exists"). 0003 only drops, so it
+          // has no CREATE TABLE and always runs; it is idempotent.
+          const baseline = files.filter((f) => !recorded.has(f)).filter((f) => {
+            const created = [...readFileSync(`${MIGRATIONS}/${f}`, 'utf8').matchAll(/CREATE TABLE `([^`]+)`/g)].map((m) => m[1]);
+            return created.some((t) => tables.includes(t));
+          });
+          if (baseline.length > 0) {
+            console.log(`already present, recorded without running: ${baseline.join(', ')}`);
+            sql('CREATE TABLE IF NOT EXISTS d1_migrations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL)');
+            for (const f of baseline) sql(`INSERT OR IGNORE INTO d1_migrations (name) VALUES ('${f}')`);
+          }
+
+          wrangler(['d1', 'migrations', 'apply', DB, '--remote', '--env', env, '--config', 'wrangler.generated.json']);
+
+          const after = sql('SELECT name FROM d1_migrations ORDER BY id').map((r) => r.name);
+          const missing = files.filter((f) => !after.includes(f));
+          console.log(`migrations recorded after apply: ${after.join(', ')}`);
+          const tables2 = tableNames();
+          console.log(`tables after apply (${tables2.length}): ${tables2.join(', ')}`);
+          const wanted = ['store_transactions', 'store_devices', 'recognize_uses'];
+          const bad = [...missing.map((f) => `not recorded: ${f}`), ...wanted.filter((t) => !tables2.includes(t)).map((t) => `missing table: ${t}`), ...(tables2.includes('entitlements') ? ['entitlements still exists'] : [])];
+          if (bad.length > 0) {
+            console.error(`::error::migration state is not what was expected: ${bad.join('; ')}`);
+            process.exit(1);
+          }
+          console.log('migration state OK');
+          JS
+
+      - name: D1 pre-check (read-only; stops if entitlements is not empty)
+        if: inputs.mode == 'deploy' || inputs.mode == 'all' || inputs.mode == 'd1-check'
+        shell: bash
+        working-directory: source/workers/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          node "$RUNNER_TEMP/d1.mjs" check | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: D1 migrations (wrangler d1 migrations apply)
+        if: inputs.mode == 'deploy' || inputs.mode == 'all'
+        shell: bash
+        working-directory: source/workers/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          node "$RUNNER_TEMP/d1.mjs" migrate | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Deploy API Worker
         if: inputs.mode == 'deploy' || inputs.mode == 'all'
@@ -155,6 +283,28 @@ jobs:
         run: |
           set -euo pipefail
           node scripts/health.mjs --env "$TARGET_ENV" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: App Store endpoints answer 400 to an empty body
+        if: inputs.mode == 'deploy' || inputs.mode == 'all'
+        shell: bash
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$CF_ACCOUNT"
+          sub="$(curl -sS -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/workers/subdomain" | jq -r '.result.subdomain // empty')"
+          [[ -n "$sub" ]] || { echo '::error::No workers.dev subdomain on the account'; exit 1; }
+          echo "::add-mask::$sub"
+          base="https://meridian-api-${TARGET_ENV}.${sub}.workers.dev"
+          failed=0
+          for path in /entitlements/verify /appstore/notifications; do
+            code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' --data '{}' "${base}${path}" || echo 000)"
+            echo "POST ${path} with an empty body -> ${code}" | tee -a "$GITHUB_STEP_SUMMARY"
+            [[ "$code" == 400 ]] || { echo "::error::expected 400 from ${path}"; failed=1; }
+          done
+          exit "$failed"
 
       - name: Import catalog from Radio Browser (no credentials; counts only)
         if: inputs.mode == 'snapshot' || inputs.mode == 'all'
