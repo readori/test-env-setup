@@ -1,5 +1,6 @@
 # youxi playtest deploy: build the game (private readori/youxi) and publish it to Cloudflare as the
-# static-assets-only Worker "youxi" on the account's workers.dev subdomain.
+# static-assets-only Worker "youxi" on the account's workers.dev subdomain and the custom domain
+# lol.readori.com (the owner attached it on 2026-11-08; kept in the generated config so a deploy never drops it).
 #
 #   gate   : npm ci -> typecheck -> unit tests -> build -> budget gate (same as youxi-ci.yml, no smoke;
 #            the AI PM only requests a deploy for a commit whose youxi CI run, with smoke, was green).
@@ -45,6 +46,7 @@ concurrency:
 env:
   PRIVATE_SOURCE_PATH: source
   WORKER_NAME: youxi
+  PUBLIC_DOMAIN: lol.readori.com
   WRANGLER_VERSION: 4.151.3
   WRANGLER_SEND_METRICS: 'false'
 
@@ -143,6 +145,7 @@ jobs:
             "compatibility_date": "2026-10-01",
             "workers_dev": true,
             "preview_urls": false,
+            "routes": [{ "pattern": "${PUBLIC_DOMAIN}", "custom_domain": true }],
             "assets": { "directory": "./public" }
           }
           EOF
@@ -196,6 +199,13 @@ jobs:
             echo "- site ${label}: HTTP $c" >> "$GITHUB_STEP_SUMMARY"
             [[ "$c" == 200 ]] || fail=1
           done
+          # The public custom domain must serve this exact build (same entry script as the deployed index.html).
+          entry="$(grep -oE 'assets/index-[A-Za-z0-9_-]+\.js' "$SITE/public/index.html" | head -n 1)"
+          d=no
+          for i in 1 2 3 4 5 6; do curl -s --max-time 20 "https://${PUBLIC_DOMAIN}/" | grep -q "$entry" && { d=yes; break; }; sleep 10; done
+          echo "https://${PUBLIC_DOMAIN}/ serves this build: $d"
+          echo "- https://${PUBLIC_DOMAIN}/ serves this build: $d" >> "$GITHUB_STEP_SUMMARY"
+          [[ "$d" == yes ]] || fail=1
           if curl -sI --max-time 20 "${SITE_URL}/" | grep -qi '^x-robots-tag: noindex'; then robots=yes; else robots=no; fi
           echo "noindex header: $robots"
           echo "- noindex header: $robots" >> "$GITHUB_STEP_SUMMARY"
