@@ -115,6 +115,15 @@ on:
         required: false
         default: true
         type: boolean
+      shots_devices:
+        description: "screenshots mode only: both = iPhone 6.9-inch then 13-inch iPad (default); iphone or ipad = only that device (about half the time; the private branch keeps the other device folder as it was)."
+        required: false
+        default: both
+        type: choice
+        options:
+          - both
+          - iphone
+          - ipad
       human_word_audio:
         description: 'Real-voice word pronunciations (T-109; the owner approved the download on 2026-10-28): replace the synthetic UK / US recordings of about 2,300 words (accent known) with Lingua Libre recordings from Wikimedia Commons (about 210 MB of WAV downloaded, sha1 checked, converted to about 10 MB of AAC) and add HUMAN-AUDIO-CREDITS.json to the app. Used by archive, testflight and verify-full; verify, screenshots, cloudkit-schema and audiobook-check never download. Switch it off to keep the synthetic voices only.'
         required: false
@@ -189,6 +198,7 @@ jobs:
       SOURCE_REF: ${{ inputs.ref || 'main' }}
       BUILD_NUMBER_INPUT: ${{ inputs.build_number || '' }}
       APP_VERSION_INPUT: ${{ inputs.version || '' }}
+      SHOTS_DEVICES: ${{ inputs.shots_devices || 'both' }}
       # verify uses the sample; every other mode needs the full catalog with AAC audio.
       CONTENT_MODE: ${{ (inputs.mode == 'verify' || inputs.mode == '') && 'sample300' || 'full-m4a' }}
       # T-108: audio is downloaded only by the release-type modes (archive, testflight), and only when the input is on.
@@ -2382,7 +2392,7 @@ jobs:
       - name: Take the App Store screenshots (en, then zh-Hans)
         if: ${{ env.MODE == 'screenshots' && env.RUN_UI_TESTS == 'true' }}
         shell: bash
-        timeout-minutes: 120
+        timeout-minutes: 200
         run: |
           set +e -uo pipefail
 
@@ -2446,8 +2456,12 @@ jobs:
             fi
           }
 
-          take EN en US "$SIMULATOR_UDID" iphone
-          take ZH zh-Hans CN "$SIMULATOR_UDID" iphone
+          echo "Devices: $SHOTS_DEVICES"
+          if [[ "$SHOTS_DEVICES" != 'ipad' ]]; then
+            take EN en US "$SIMULATOR_UDID" iphone
+            take ZH zh-Hans CN "$SIMULATOR_UDID" iphone
+          fi
+          [[ "$SHOTS_DEVICES" == 'iphone' ]] && exit 0
 
           # ---- T-104: the same two passes on a 13-inch iPad simulator (App Store Connect wants 13-inch iPad screenshots).
           # Same pick as the iPad smoke step, but only 13-inch iPads qualify; none found is an error, not a silent skip.
@@ -2551,6 +2565,10 @@ jobs:
               ("iphone", "iPhone", "", [(1320, 2868)], 8),
               ("ipad", "iPad", "ipad", [(2064, 2752), (2048, 2732)], 5),
           ]
+          # shots_devices iphone / ipad: check only that device.
+          _only = os.environ.get("SHOTS_DEVICES", "both")
+          if _only in ("iphone", "ipad"):
+              DEVICES = [d for d in DEVICES if d[0] == _only]
           # 01..08 are the store screens; 09 is the word card editor (T-091) and 10..19 the 1.1 screens (books, reading,
           # Walkman), kept for choosing (the website uses them), never required.
           NAME = re.compile(r"^(0[1-9]|1[0-9])-[a-z0-9]+(-[a-z0-9]+)*\.png$")
@@ -2691,7 +2709,15 @@ jobs:
             "${GITA[@]}" fetch -q --depth 1 origin "refs/heads/$BRANCH" > /dev/null 2>&1 || push_failed "git fetch of $BRANCH failed."
             git reset -q FETCH_HEAD || push_failed 'git reset to the branch tip failed.'
           fi
-          git add -A . || push_failed 'git add failed.'
+          # One device only: stage just that device, so the other device folder on the branch stays as it was.
+          case "$SHOTS_DEVICES" in
+            ipad) ADD_PATHS=(manifest.json screenshots/ipad) ;;
+            iphone) ADD_PATHS=(manifest.json screenshots/en screenshots/zh-Hans screenshots/review) ;;
+            *) ADD_PATHS=(.) ;;
+          esac
+          EXISTING=()
+          for p in "${ADD_PATHS[@]}"; do [[ -e "$p" ]] && EXISTING+=("$p"); done
+          git add -A -- "${EXISTING[@]}" || push_failed 'git add failed.'
           git -c user.name='english-ci' -c user.email='english-ci@users.noreply.github.com' \
             commit -q --allow-empty -m "Store screenshots from CI run ${GITHUB_RUN_ID}" || push_failed 'git commit failed.'
           PUSHED_SHA="$(git rev-parse --short=8 HEAD)"
