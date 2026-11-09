@@ -116,7 +116,7 @@ on:
         default: true
         type: boolean
       shots_devices:
-        description: "screenshots mode only: both = iPhone 6.9-inch then 13-inch iPad (default); iphone or ipad = only that device (about half the time; the private branch keeps the other device folder as it was)."
+        description: "screenshots mode only: both = iPhone 6.9-inch then 13-inch iPad (default); iphone or ipad = only that device (about half the time; the private branch keeps the other device folder as it was); ipad-en = the iPad in English only."
         required: false
         default: both
         type: choice
@@ -124,6 +124,7 @@ on:
           - both
           - iphone
           - ipad
+          - ipad-en
       human_word_audio:
         description: 'Real-voice word pronunciations (T-109; the owner approved the download on 2026-10-28): replace the synthetic UK / US recordings of about 2,300 words (accent known) with Lingua Libre recordings from Wikimedia Commons (about 210 MB of WAV downloaded, sha1 checked, converted to about 10 MB of AAC) and add HUMAN-AUDIO-CREDITS.json to the app. Used by archive, testflight and verify-full; verify, screenshots, cloudkit-schema and audiobook-check never download. Switch it off to keep the synthetic voices only.'
         required: false
@@ -2457,7 +2458,7 @@ jobs:
           }
 
           echo "Devices: $SHOTS_DEVICES"
-          if [[ "$SHOTS_DEVICES" != 'ipad' ]]; then
+          if [[ "$SHOTS_DEVICES" != ipad* ]]; then
             take EN en US "$SIMULATOR_UDID" iphone
             take ZH zh-Hans CN "$SIMULATOR_UDID" iphone
           fi
@@ -2528,7 +2529,7 @@ jobs:
           fi
 
           take IPAD_EN en US "$IPAD_UDID" ipad
-          take IPAD_ZH zh-Hans CN "$IPAD_UDID" ipad
+          [[ "$SHOTS_DEVICES" == 'ipad-en' ]] || take IPAD_ZH zh-Hans CN "$IPAD_UDID" ipad
           xcrun simctl status_bar "$IPAD_UDID" clear >/dev/null 2>&1 || true
           xcrun simctl shutdown "$IPAD_UDID" >/dev/null 2>&1 || true
           exit 0
@@ -2567,8 +2568,10 @@ jobs:
           ]
           # shots_devices iphone / ipad: check only that device.
           _only = os.environ.get("SHOTS_DEVICES", "both")
-          if _only in ("iphone", "ipad"):
-              DEVICES = [d for d in DEVICES if d[0] == _only]
+          if _only in ("iphone", "ipad", "ipad-en"):
+              DEVICES = [d for d in DEVICES if d[0] == _only.split("-")[0]]
+          if _only == "ipad-en":
+              LANGS = ["en"]
           # 01..08 are the store screens; 09 is the word card editor (T-091) and 10..19 the 1.1 screens (books, reading,
           # Walkman), kept for choosing (the website uses them), never required.
           NAME = re.compile(r"^(0[1-9]|1[0-9])-[a-z0-9]+(-[a-z0-9]+)*\.png$")
@@ -2712,6 +2715,7 @@ jobs:
           # One device only: stage just that device, so the other device folder on the branch stays as it was.
           case "$SHOTS_DEVICES" in
             ipad) ADD_PATHS=(manifest.json screenshots/ipad) ;;
+            ipad-en) ADD_PATHS=(manifest.json screenshots/ipad/en) ;;
             iphone) ADD_PATHS=(manifest.json screenshots/en screenshots/zh-Hans screenshots/review) ;;
             *) ADD_PATHS=(.) ;;
           esac
