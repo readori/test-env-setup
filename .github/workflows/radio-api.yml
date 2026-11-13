@@ -11,6 +11,9 @@
 #              the two App Store endpoints answer 400 to an empty body.
 #   snapshot : import the catalog from Radio Browser (no credentials; counts only in the log),
 #              upload it to R2 (shards first, manifest last), then read it back through the Worker.
+#              The import needs land polygons for the globe points (DATA-10): Natural Earth
+#              admin-0 map units 1:50m (public domain), fetched from a pinned commit of
+#              nvkelso/natural-earth-vector and checked against a SHA-256 before use.
 #   all      : deploy, then snapshot.
 #
 # Secrets needed: TARGET_REPO_PAT, CLOUDFLARE_API_TOKEN (must be allowed to write R2 objects in
@@ -306,6 +309,20 @@ jobs:
           done
           exit "$failed"
 
+      - name: Fetch Natural Earth land polygons (public domain; pinned commit, checksum checked)
+        if: inputs.mode == 'snapshot' || inputs.mode == 'all'
+        shell: bash
+        env:
+          NE_URL: https://raw.githubusercontent.com/nvkelso/natural-earth-vector/ca96624a56bd078437bca8184e78163e5039ad19/geojson/ne_50m_admin_0_map_units.geojson
+          NE_SHA256: b8d421aca6e9e08e8cdf09cc26af111cc3e0deba4fe915611d58ade71e8a4db0
+        run: |
+          set -euo pipefail
+          # The same file the size budget of the points index was measured with. A different file
+          # moves country-level points, so the checksum must match or nothing is imported.
+          curl -fsSL --retry 3 --max-time 120 -o "$RUNNER_TEMP/ne-land.geojson" "$NE_URL"
+          echo "$NE_SHA256  $RUNNER_TEMP/ne-land.geojson" | sha256sum -c - > /dev/null \
+            || { echo '::error::Natural Earth file does not match the pinned checksum'; exit 1; }
+
       - name: Import catalog from Radio Browser (no credentials; counts only)
         if: inputs.mode == 'snapshot' || inputs.mode == 'all'
         shell: bash
@@ -313,7 +330,7 @@ jobs:
         run: |
           set -euo pipefail
           # Output goes to the step summary: totals, hidden counts, shard count. No station data.
-          node scripts/import-catalog.mjs --out "$RUNNER_TEMP/snapshot-out" | tee -a "$GITHUB_STEP_SUMMARY"
+          node scripts/import-catalog.mjs --land "$RUNNER_TEMP/ne-land.geojson" --out "$RUNNER_TEMP/snapshot-out" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload snapshot to R2 (shards first, manifest last)
         if: inputs.mode == 'snapshot' || inputs.mode == 'all'
