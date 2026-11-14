@@ -732,8 +732,9 @@ jobs:
                   if maestro --device "$UDID" test "$OUT/rotate.yaml" > "$OUT/maestro-rotate-$round.log" 2>&1; then
                     echo "rotate round $round: Maestro flow passed"
                   else
-                    echo "rotate round $round: Maestro reported a failure"
-                    grep -E 'FAILED|Unknown|not supported' "$OUT/maestro-rotate-$round.log" | head -3 || true
+                    # A flow that did not run (e.g. setOrientation unsupported) must not pass as "rotated".
+                    fail "Rotate round $round: the Maestro flow failed, so the rotation was not exercised."
+                    grep -E 'FAILED|Unknown|not supported' "$OUT/maestro-rotate-$round.log" | cut -c1-200 | head -3 || true
                   fi
                   sleep 4
                   if alive; then
