@@ -56,6 +56,15 @@ on:
         description: 'Build number (CFBundleVersion), whole number, e.g. 1. Required, no default. testflight checks it is higher than the latest TestFlight build of this version.'
         required: true
         type: string
+      smoke:
+        description: 'verify only: none = build only; launch = also boot a simulator, start the app and check it stays up; drag = launch + Maestro swipes on the first screen'
+        required: false
+        default: 'none'
+        type: choice
+        options:
+          - none
+          - launch
+          - drag
 
 permissions:
   contents: read
@@ -96,6 +105,7 @@ jobs:
       SOURCE_REF: ${{ inputs.ref || 'main' }}
       VERSION_INPUT: ${{ inputs.version || '' }}
       BUILD_NUMBER_INPUT: ${{ inputs.build_number || '' }}
+      SMOKE: ${{ inputs.smoke || 'none' }}
 
     steps:
       # ---------------------------------------------------------------------
@@ -569,7 +579,116 @@ jobs:
 
           echo "JS bundle: embedded ($(du -k "$APP_PATH/main.jsbundle" | awk '{print $1}') KiB)"
           echo 'Simulator build: PASS'
-          rm -rf "$VERIFY_DERIVED"
+          if [[ "$SMOKE" == 'launch' || "$SMOKE" == 'drag' ]]; then
+            # Kept for the smoke step below (the runner is discarded afterwards).
+            echo "SIM_APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+            echo "SIM_BUNDLE_ID=$BUNDLE_ID" >> "$GITHUB_ENV"
+          else
+            rm -rf "$VERIFY_DERIVED"
+          fi
+
+      # ---------------------------------------------------------------------
+      # 4b. VERIFY mode, optional: run the Release app on a simulator (smoke = launch | drag)
+      #     Public log: verdict, crash signature (frames of the crashed thread) and the app's own
+      #     WARN / ERROR / [globe] diagnostics lines only. No screenshots, no artifacts.
+      # ---------------------------------------------------------------------
+      - name: Simulator smoke run
+        if: ${{ env.MODE == 'verify' && (inputs.smoke == 'launch' || inputs.smoke == 'drag') }}
+        shell: bash
+        timeout-minutes: 20
+        run: |
+          set -uo pipefail
+          OUT="$RUNNER_TEMP/radio-smoke"
+          mkdir -p "$OUT"
+          REPORTS="$HOME/Library/Logs/DiagnosticReports"
+          mkdir -p "$REPORTS"
+          APP_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$SIM_APP_PATH/Info.plist" 2>/dev/null || basename "$SIM_APP_PATH" .app)"
+
+          UDID="$(xcrun simctl list devices available -j | jq -r '
+            [.devices | to_entries[] | select(.key | test("iOS")) | .value[] | select(.name | test("^iPhone"))]
+            | (map(select(.name | test("Pro Max"))) + .) | .[0].udid // empty')"
+          [[ -n "$UDID" ]] || { echo '::error title=Simulator smoke::No iPhone simulator available on this runner.'; exit 70; }
+          echo "Simulator: $(xcrun simctl list devices available | grep -F "$UDID" | sed -E 's/ \([0-9A-F-]{36}\).*//' | xargs)"
+          xcrun simctl boot "$UDID" > /dev/null 2>&1 || true
+          xcrun simctl bootstatus "$UDID" -b > /dev/null 2>&1 || { echo '::error title=Simulator smoke::Simulator did not boot.'; exit 70; }
+          xcrun simctl install "$UDID" "$SIM_APP_PATH" || { echo '::error title=Simulator smoke::Install failed.'; exit 70; }
+          touch "$OUT/start"
+
+          alive() { xcrun simctl spawn "$UDID" launchctl list 2>/dev/null | grep -qF "UIKitApplication:$SIM_BUNDLE_ID"; }
+
+          # The app's own diagnostics log (documents/diagnostics): WARN / ERROR / [globe] lines only.
+          app_log() {
+            local data
+            data="$(xcrun simctl get_app_container "$UDID" "$SIM_BUNDLE_ID" data 2>/dev/null || true)"
+            [[ -n "$data" && -d "$data/Documents/diagnostics" ]] || { echo '(no app diagnostics files)'; return 0; }
+            cat "$data"/Documents/diagnostics/diagnostics-*.log 2>/dev/null \
+              | grep -E ' (WARN|ERROR) |\[globe\]|\[app\] ' | cut -c1-260 | tail -60
+          }
+
+          # Crash reports written since the step started: exception + frames of the crashed thread.
+          crash_summary() {
+            local found=1 f
+            while IFS= read -r f; do
+              [[ -n "$f" ]] || continue
+              found=0
+              echo "--- crash report: $(basename "$f" | sed -E 's/-[0-9]{4}-.*//') ---"
+              tail -n +2 "$f" | jq -r '
+                def img(i): (.usedImages[i].name // "?");
+                "exception: \(.exception.type // "?") \(.exception.signal // "") \(.exception.subtype // "")",
+                "termination: \(.termination.indicator // "") \((.termination.details // []) | join(" "))",
+                "asi: \((.asi // {}) | tostring | .[0:600])",
+                "crashed thread \(.faultingThread // "?"):",
+                ((.threads // [])[(.faultingThread // 0)].frames // [] | .[0:45][] | "  \(img(.imageIndex))  \(.symbol // "?") + \(.symbolLocation // 0)"),
+                (if .lastExceptionBacktrace then "last exception backtrace:", (.lastExceptionBacktrace[0:35][] | "  \(img(.imageIndex))  \(.symbol // "?") + \(.symbolLocation // 0)") else empty end)
+              ' 2>/dev/null | cut -c1-240 || echo '(crash report could not be parsed)'
+            done < <(find "$REPORTS" -maxdepth 2 -type f -name "${APP_NAME}*.ips" -newer "$OUT/start" 2>/dev/null | sort)
+            return $found
+          }
+
+          verdict=0
+          fail() { echo "::error title=Simulator smoke::$1"; verdict=1; }
+
+          # 1. Cold start (fresh install), 30 s on the first screen.
+          xcrun simctl launch "$UDID" "$SIM_BUNDLE_ID" > /dev/null 2>&1 || fail 'The app did not launch.'
+          sleep 30
+          if alive; then echo 'launch: app is up after 30 s'; else fail 'The app died within 30 s of a cold start.'; fi
+
+          # 2. Optional: swipes and taps on the first screen (Maestro), then check again.
+          if [[ "$SMOKE" == 'drag' && "$verdict" == 0 ]]; then
+            export MAESTRO_CLI_NO_ANALYTICS=1 MAESTRO_CLI_ANALYSIS_NOTIFICATION_DISABLED=true
+            if curl -fsSL 'https://get.maestro.mobile.dev' | bash > "$OUT/maestro-install.log" 2>&1; then
+              export PATH="$HOME/.maestro/bin:$PATH"
+              cat > "$OUT/drag.yaml" <<YAML
+          appId: $SIM_BUNDLE_ID
+          ---
+          - swipe: { start: "70%,35%", end: "30%,35%", duration: 600 }
+          - swipe: { start: "30%,35%", end: "75%,30%", duration: 250 }
+          - swipe: { start: "50%,25%", end: "50%,45%", duration: 500 }
+          - tapOn: { point: "50%,35%" }
+          - swipe: { start: "60%,35%", end: "35%,40%", duration: 150 }
+          - swipe: { start: "35%,40%", end: "65%,30%", duration: 900 }
+          YAML
+              sed -i '' -e 's/^          //' "$OUT/drag.yaml"
+              for round in 1 2 3; do
+                maestro --device "$UDID" test "$OUT/drag.yaml" > "$OUT/maestro-$round.log" 2>&1 \
+                  || echo "drag round $round: Maestro reported a failure (see verdict below)"
+                sleep 4
+                if alive; then echo "drag round $round: app is up"; else fail "The app died during drag round $round."; break; fi
+              done
+            else
+              fail 'Maestro could not be installed; the drag part did not run.'
+            fi
+          fi
+
+          sleep 10
+          echo '--- app diagnostics (WARN / ERROR / globe / app lines) ---'
+          app_log
+          if crash_summary; then fail 'A crash report was written for the app (signature above).'; else echo 'crash reports: none'; fi
+
+          xcrun simctl shutdown "$UDID" > /dev/null 2>&1 || true
+          rm -rf "$OUT" "$RUNNER_TEMP/DerivedData-Radio-Verify"
+          if [[ "$verdict" == 0 ]]; then echo 'Simulator smoke: PASS'; else echo 'Simulator smoke: FAIL'; fi
+          exit "$verdict"
 
       # ---------------------------------------------------------------------
       # 5. ARCHIVE / TESTFLIGHT: Match signing (readonly), archive, export, altool
