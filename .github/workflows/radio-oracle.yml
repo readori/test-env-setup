@@ -18,7 +18,7 @@ on:
         required: true
         default: probe
         type: choice
-        options: [probe]
+        options: [probe, ssh-probe]
 
 permissions:
   contents: read
@@ -28,8 +28,45 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  ssh-probe:
+    name: SSH probe (runs `true` only)
+    if: inputs.mode == 'ssh-probe'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Try one SSH login with ORACLE_API_TOKEN as the private key
+        shell: bash
+        env:
+          KEY: ${{ secrets.ORACLE_API_TOKEN }}
+          HOST: ${{ secrets.ORACLE_SSH_HOST }}
+          SSH_USER: ${{ secrets.ORACLE_SSH_USER }}
+        run: |
+          set -uo pipefail
+          umask 077
+          echo "::add-mask::$HOST"
+          d="$RUNNER_TEMP/ssh"; mkdir -p "$d"
+          printf '%s\n' "$KEY" > "$d/key"
+          head -1 "$d/key" | sed -E 's/-----BEGIN (.*)-----/key_header=\1/' | grep -E '^key_header=(RSA PRIVATE KEY|PRIVATE KEY|OPENSSH PRIVATE KEY|EC PRIVATE KEY)$' || echo 'key_header=other'
+          if ssh-keygen -y -f "$d/key" > /dev/null 2>&1; then echo 'usable_as_ssh_key=yes'; else echo 'usable_as_ssh_key=no'; fi
+          kind=other
+          if [[ "$HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then kind=ipv4; elif [[ "$HOST" == *.* ]]; then kind=hostname; fi
+          echo "host_kind=$kind resolves=$(getent hosts "$HOST" > /dev/null && echo yes || echo no)"
+          ssh -i "$d/key" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$d/known" \
+              -o ConnectTimeout=15 -o LogLevel=ERROR "$SSH_USER@$HOST" true > /dev/null 2> "$d/err"
+          rc=$?
+          if [[ $rc -eq 0 ]]; then result=ok
+          elif grep -q 'Permission denied' "$d/err"; then result=permission-denied
+          elif grep -qiE 'timed out|Connection timed' "$d/err"; then result=timeout
+          elif grep -qi 'Could not resolve' "$d/err"; then result=no-dns
+          elif grep -qi 'refused' "$d/err"; then result=refused
+          else result=other; fi
+          echo "ssh_result=$result" | tee -a "$GITHUB_STEP_SUMMARY"
+          rm -rf "$d"
+          [[ $result == ok ]]
+
   probe:
     name: OCI key probe
+    if: inputs.mode == 'probe'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
