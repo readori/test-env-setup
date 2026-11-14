@@ -1,0 +1,104 @@
+# Radio (Hourwave) Oracle batch VM — read-only probes (owner 2026-11-14: "通过 CI 处理").
+#
+#   probe : checks the shape of secrets.ORACLE_API_TOKEN (an OCI API key) and, when it carries a
+#           full OCI CLI config, one read-only authenticated call. Prints booleans and counts only.
+#
+# Safety rules (public repo, public logs): workflow_dispatch only; no checkout of private source;
+# the secret is only on the steps that need it, written to $RUNNER_TEMP with mode 600 and removed;
+# OCIDs, fingerprints, namespaces and hosts are never printed; no artifacts.
+name: Radio Oracle
+
+run-name: Radio Oracle · ${{ inputs.mode }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'probe = read-only checks of the OCI key'
+        required: true
+        default: probe
+        type: choice
+        options: [probe]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: radio-oracle
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: OCI key probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Secret shape (booleans and counts only)
+        id: shape
+        shell: bash
+        env:
+          OCI_KEY: ${{ secrets.ORACLE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          umask 077
+          f="$RUNNER_TEMP/oci-secret"
+          printf '%s\n' "$OCI_KEY" > "$f"
+          has() { grep -qE "$1" "$f" && echo yes || echo no; }
+          pem=$(has 'BEGIN (RSA |EC |ENCRYPTED )?PRIVATE KEY')
+          tenancy=$(has '^[[:space:]]*tenancy[[:space:]]*=')
+          user=$(has '^[[:space:]]*user[[:space:]]*=')
+          fp=$(has '^[[:space:]]*fingerprint[[:space:]]*=')
+          region=$(has '^[[:space:]]*region[[:space:]]*=')
+          keyfile=$(has '^[[:space:]]*key_file[[:space:]]*=')
+          ocid=$(has 'ocid1\.')
+          json=$(head -c1 "$f" | grep -q '{' && echo yes || echo no)
+          lines=$(wc -l < "$f" | tr -d ' ')
+          chars=$(wc -c < "$f" | tr -d ' ')
+          {
+            echo "pem_private_key=$pem"
+            echo "tenancy_line=$tenancy user_line=$user fingerprint_line=$fp region_line=$region key_file_line=$keyfile"
+            echo "contains_ocid=$ocid looks_json=$json lines=$lines chars=$chars"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          full=no
+          [[ $pem == yes && $tenancy == yes && $user == yes && $fp == yes && $region == yes ]] && full=yes
+          echo "full_config=$full" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+          rm -f "$f"
+
+      - name: Install OCI CLI
+        if: steps.shape.outputs.full == 'yes'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check oci-cli > /dev/null
+          echo "oci-cli $(oci --version)"
+
+      - name: Read-only authenticated call
+        if: steps.shape.outputs.full == 'yes'
+        shell: bash
+        env:
+          OCI_KEY: ${{ secrets.ORACLE_API_TOKEN }}
+          OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: 'True'
+        run: |
+          set -euo pipefail
+          umask 077
+          d="$RUNNER_TEMP/oci"; mkdir -p "$d"
+          printf '%s\n' "$OCI_KEY" > "$d/raw"
+          # The PEM block goes to its own file; the config lines (minus any key_file) to config.
+          awk '/BEGIN .*PRIVATE KEY/{p=1} p{print} /END .*PRIVATE KEY/{p=0}' "$d/raw" > "$d/key.pem"
+          { echo '[DEFAULT]'; grep -E '^[[:space:]]*(tenancy|user|fingerprint|region|pass_phrase)[[:space:]]*=' "$d/raw"; echo "key_file=$d/key.pem"; } > "$d/config"
+          for k in tenancy user fingerprint; do
+            v=$(grep -E "^[[:space:]]*$k[[:space:]]*=" "$d/raw" | head -1 | cut -d= -f2- | tr -d ' \r')
+            [[ -n "$v" ]] && echo "::add-mask::$v"
+          done
+          rm -f "$d/raw"
+          if oci --config-file "$d/config" iam region-subscription list > "$d/out" 2> "$d/err"; then
+            echo "auth=ok subscribed_regions=$(grep -c '"region-name"' "$d/out" || true)" | tee -a "$GITHUB_STEP_SUMMARY"
+            rc=0
+          else
+            code=$(grep -oE '"code": "[A-Za-z]+"|"status": [0-9]+' "$d/err" | head -2 | tr '\n' ' ')
+            echo "auth=failed ${code:-no-code}" | tee -a "$GITHUB_STEP_SUMMARY"
+            rc=1
+          fi
+          rm -rf "$d"
+          exit $rc
