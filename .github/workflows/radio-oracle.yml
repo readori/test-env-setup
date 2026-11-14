@@ -34,12 +34,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Try one SSH login with ORACLE_API_TOKEN as the private key
+      - name: Install cloudflared (official release, pinned)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/cloudflared" https://github.com/cloudflare/cloudflared/releases/download/2026.10.3/cloudflared-linux-amd64
+          chmod +x "$RUNNER_TEMP/cloudflared"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/cloudflared" --version
+
+      - name: Try one SSH login through the Hourwave tunnel (Access service token)
         shell: bash
         env:
           KEY: ${{ secrets.ORACLE_API_TOKEN }}
           HOST: ${{ secrets.ORACLE_SSH_HOST }}
           SSH_USER: ${{ secrets.ORACLE_SSH_USER }}
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.ORACLE_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.ORACLE_ACCESS_CLIENT_SECRET }}
         run: |
           set -uo pipefail
           umask 077
@@ -51,14 +62,20 @@ jobs:
           kind=other
           if [[ "$HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then kind=ipv4; elif [[ "$HOST" == *.* ]]; then kind=hostname; fi
           echo "host_kind=$kind resolves=$(getent hosts "$HOST" > /dev/null && echo yes || echo no)"
-          ssh -i "$d/key" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$d/known" \
-              -o ConnectTimeout=15 -o LogLevel=ERROR "$SSH_USER@$HOST" true > /dev/null 2> "$d/err"
+          echo "service_token_set=$([[ -n "$TUNNEL_SERVICE_TOKEN_ID" && -n "$TUNNEL_SERVICE_TOKEN_SECRET" ]] && echo yes || echo no)"
+          timeout 60 ssh -i "$d/key" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$d/known" \
+              -o ConnectTimeout=20 -o LogLevel=ERROR \
+              -o ProxyCommand="cloudflared access ssh --hostname %h" \
+              "$SSH_USER@$HOST" true > /dev/null 2> "$d/err"
           rc=$?
           if [[ $rc -eq 0 ]]; then result=ok
           elif grep -q 'Permission denied' "$d/err"; then result=permission-denied
           elif grep -qiE 'timed out|Connection timed' "$d/err"; then result=timeout
           elif grep -qi 'Could not resolve' "$d/err"; then result=no-dns
           elif grep -qi 'refused' "$d/err"; then result=refused
+          elif grep -qiE '403|forbidden|access denied' "$d/err"; then result=access-denied
+          elif grep -qiE '530|502|websocket|bad handshake|origin' "$d/err"; then result=tunnel-not-connected
+          elif [[ $rc -eq 124 ]]; then result=timeout
           else result=other; fi
           echo "ssh_result=$result" | tee -a "$GITHUB_STEP_SUMMARY"
           rm -rf "$d"
