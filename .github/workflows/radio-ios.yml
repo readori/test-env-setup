@@ -711,6 +711,40 @@ jobs:
                   break
                 fi
               done
+              # Rotation (Radio FEAT-21): portrait -> landscape -> portrait with swipes in between.
+              if [[ "$verdict" == 0 ]]; then
+                cat > "$OUT/rotate.yaml" <<YAML
+          appId: $SIM_BUNDLE_ID
+          ---
+          - setOrientation: LANDSCAPE_LEFT
+          - waitForAnimationToEnd: { timeout: 3000 }
+          - swipe: { start: "70%,40%", end: "30%,40%", duration: 600 }
+          - swipe: { start: "75%,30%", end: "75%,70%", duration: 500 }
+          - setOrientation: PORTRAIT
+          - waitForAnimationToEnd: { timeout: 3000 }
+          - setOrientation: LANDSCAPE_RIGHT
+          - waitForAnimationToEnd: { timeout: 3000 }
+          - setOrientation: PORTRAIT
+          - waitForAnimationToEnd: { timeout: 3000 }
+          YAML
+                sed -i '' -e 's/^          //' "$OUT/rotate.yaml"
+                for round in 1 2; do
+                  if maestro --device "$UDID" test "$OUT/rotate.yaml" > "$OUT/maestro-rotate-$round.log" 2>&1; then
+                    echo "rotate round $round: Maestro flow passed"
+                  else
+                    echo "rotate round $round: Maestro reported a failure"
+                    grep -E 'FAILED|Unknown|not supported' "$OUT/maestro-rotate-$round.log" | head -3 || true
+                  fi
+                  sleep 4
+                  if alive; then
+                    echo "rotate round $round: app is up (pid, status: $(app_entry))"
+                  else
+                    fail "The app died during rotate round $round."
+                    why_gone "rotate-$round"
+                    break
+                  fi
+                done
+              fi
             else
               fail 'Maestro could not be installed; the drag part did not run.'
             fi
