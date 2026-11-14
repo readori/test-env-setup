@@ -63,11 +63,11 @@ jobs:
           if [[ "$HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then kind=ipv4; elif [[ "$HOST" == *.* ]]; then kind=hostname; fi
           echo "host_kind=$kind resolves=$(getent hosts "$HOST" > /dev/null && echo yes || echo no)"
           echo "service_token_set=$([[ -n "$TUNNEL_SERVICE_TOKEN_ID" && -n "$TUNNEL_SERVICE_TOKEN_SECRET" ]] && echo yes || echo no)"
+          rc=0
           timeout 60 ssh -i "$d/key" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$d/known" \
               -o ConnectTimeout=20 -o LogLevel=ERROR \
               -o ProxyCommand="cloudflared access ssh --hostname %h" \
-              "$SSH_USER@$HOST" true > /dev/null 2> "$d/err"
-          rc=$?
+              "$SSH_USER@$HOST" true > /dev/null 2> "$d/err" || rc=$?
           if [[ $rc -eq 0 ]]; then result=ok
           elif grep -q 'Permission denied' "$d/err"; then result=permission-denied
           elif grep -qiE 'timed out|Connection timed' "$d/err"; then result=timeout
