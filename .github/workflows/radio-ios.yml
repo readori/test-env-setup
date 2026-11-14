@@ -614,7 +614,37 @@ jobs:
           xcrun simctl install "$UDID" "$SIM_APP_PATH" || { echo '::error title=Simulator smoke::Install failed.'; exit 70; }
           touch "$OUT/start"
 
-          alive() { xcrun simctl spawn "$UDID" launchctl list 2>/dev/null | grep -qF "UIKitApplication:$SIM_BUNDLE_ID"; }
+          # The app's launchd entry: "<pid or -> <last exit status>". Up means a numeric pid.
+          app_entry() {
+            xcrun simctl spawn "$UDID" launchctl list 2>/dev/null \
+              | awk -v l="UIKitApplication:$SIM_BUNDLE_ID" 'index($3, l) == 1 { print $1, $2; exit }'
+          }
+          alive() { [[ "$(app_entry)" =~ ^[0-9]+\  ]]; }
+
+          # Why the app is gone: launchd entry, any new diagnostic report (polled up to 60 s),
+          # termination lines from the system log, the app's own error lines, Maestro's last lines.
+          why_gone() {
+            local round="$1" i
+            echo "--- why the app is gone (round $round) ---"
+            echo "launchd entry (pid, last exit status): $(app_entry || true)"
+            for i in $(seq 1 12); do
+              [[ -n "$(find "$REPORTS" -maxdepth 2 -type f -newer "$OUT/start" 2>/dev/null | head -1)" ]] && break
+              sleep 5
+            done
+            echo "new diagnostic reports: $(find "$REPORTS" -maxdepth 2 -type f -newer "$OUT/start" -exec basename {} \; 2>/dev/null | sed -E 's/-[0-9]{4}-[0-9-]+.*//' | sort | uniq -c | xargs)"
+            echo '--- system log: termination lines ---'
+            xcrun simctl spawn "$UDID" log show --last 8m --style compact \
+              --predicate 'process == "runningboardd" OR process == "SpringBoard" OR process == "backboardd" OR process == "launchd" OR process == "ReportCrash"' 2>/dev/null \
+              | grep -F -e "$SIM_BUNDLE_ID" -e "$APP_NAME" \
+              | grep -iE 'termin|kill|exit|jetsam|watchdog|crash|signal|memory|limit|reason' \
+              | cut -c1-240 | tail -40 || true
+            echo '--- app process: error / fault lines ---'
+            xcrun simctl spawn "$UDID" log show --last 8m --style compact \
+              --predicate "process == \"$APP_NAME\" AND (messageType == error OR messageType == fault)" 2>/dev/null \
+              | cut -c1-200 | tail -20 || true
+            echo "--- Maestro round $round: last lines ---"
+            tail -n 20 "$OUT/maestro-$round.log" 2>/dev/null | cut -c1-200 || true
+          }
 
           # The app's own diagnostics log (documents/diagnostics): WARN / ERROR / [globe] lines only.
           app_log() {
@@ -651,7 +681,7 @@ jobs:
           # 1. Cold start (fresh install), 30 s on the first screen.
           xcrun simctl launch "$UDID" "$SIM_BUNDLE_ID" > /dev/null 2>&1 || fail 'The app did not launch.'
           sleep 30
-          if alive; then echo 'launch: app is up after 30 s'; else fail 'The app died within 30 s of a cold start.'; fi
+          if alive; then echo "launch: app is up after 30 s (pid, status: $(app_entry))"; else fail 'The app died within 30 s of a cold start.'; why_gone launch; fi
 
           # 2. Optional: swipes and taps on the first screen (Maestro), then check again.
           if [[ "$SMOKE" == 'drag' && "$verdict" == 0 ]]; then
@@ -673,7 +703,13 @@ jobs:
                 maestro --device "$UDID" test "$OUT/drag.yaml" > "$OUT/maestro-$round.log" 2>&1 \
                   || echo "drag round $round: Maestro reported a failure (see verdict below)"
                 sleep 4
-                if alive; then echo "drag round $round: app is up"; else fail "The app died during drag round $round."; break; fi
+                if alive; then
+                  echo "drag round $round: app is up (pid, status: $(app_entry))"
+                else
+                  fail "The app died during drag round $round."
+                  why_gone "$round"
+                  break
+                fi
               done
             else
               fail 'Maestro could not be installed; the drag part did not run.'
