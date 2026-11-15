@@ -156,6 +156,7 @@ jobs:
           JS
           web="$(node "$RUNNER_TEMP/names.mjs" apps/web/wrangler.jsonc "$TARGET_ENV" worker)"
           api="$(node "$RUNNER_TEMP/names.mjs" workers/api/wrangler.jsonc "$TARGET_ENV" worker)"
+          for n in "$web" "$api"; do echo "::add-mask::$n"; done
           { echo "WEB_WORKER=$web"; echo "API_WORKER=$api"; } >> "$GITHUB_ENV"
           echo 'Worker names resolved (not printed)'
 

@@ -151,6 +151,8 @@ jobs:
           api="$(node "$RUNNER_TEMP/names.mjs" workers/api/wrangler.jsonc "$TARGET_ENV" worker)"
           db="$(node "$RUNNER_TEMP/names.mjs" workers/api/wrangler.jsonc "$TARGET_ENV" db)"
           bucket="$(node "$RUNNER_TEMP/names.mjs" workers/api/wrangler.jsonc "$TARGET_ENV" bucket)"
+          # Masked so later steps (provision output, summaries) never print them either.
+          for n in "$api" "$db" "$bucket"; do echo "::add-mask::$n"; done
           { echo "API_WORKER=$api"; echo "DB_NAME=$db"; echo "BUCKET_NAME=$bucket"; } >> "$GITHUB_ENV"
           echo 'resource names resolved (not printed)'
 
