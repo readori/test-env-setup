@@ -63,11 +63,13 @@ jobs:
           if [[ "$HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then kind=ipv4; elif [[ "$HOST" == *.* ]]; then kind=hostname; fi
           echo "host_kind=$kind resolves=$(getent hosts "$HOST" > /dev/null && echo yes || echo no)"
           echo "service_token_set=$([[ -n "$TUNNEL_SERVICE_TOKEN_ID" && -n "$TUNNEL_SERVICE_TOKEN_SECRET" ]] && echo yes || echo no)"
+          # Read-only Q2 checks (plan 0.5): each prints one yes/no or one state word.
+          REMOTE='if sudo -n true >/dev/null 2>&1; then echo sudo_n=yes; else echo sudo_n=no; fi; if id -Gn | tr " " "\n" | grep -qx docker; then echo docker_group=yes; else echo docker_group=no; fi; echo "cloudflared_state=$(systemctl is-active cloudflared 2>/dev/null | head -1 | tr -cd "a-z-")"'
           rc=0
           timeout 60 ssh -i "$d/key" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$d/known" \
               -o ConnectTimeout=20 -o LogLevel=ERROR \
               -o ProxyCommand="cloudflared access ssh --hostname %h" \
-              "$SSH_USER@$HOST" true > /dev/null 2> "$d/err" || rc=$?
+              "$SSH_USER@$HOST" "$REMOTE" > "$d/out" 2> "$d/err" || rc=$?
           if [[ $rc -eq 0 ]]; then result=ok
           elif grep -q 'Permission denied' "$d/err"; then result=permission-denied
           elif grep -qiE 'timed out|Connection timed' "$d/err"; then result=timeout
@@ -78,6 +80,7 @@ jobs:
           elif [[ $rc -eq 124 ]]; then result=timeout
           else result=other; fi
           echo "ssh_result=$result" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [[ $result == ok ]]; then grep -E '^(sudo_n=(yes|no)|docker_group=(yes|no)|cloudflared_state=[a-z-]{0,20})$' "$d/out" | tee -a "$GITHUB_STEP_SUMMARY" || true; fi
           rm -rf "$d"
           [[ $result == ok ]]
 
