@@ -1,9 +1,11 @@
 # Radio (Meridian, working name) iOS CI: simulator verify, signed archive, TestFlight upload.
 #
 # Public CI repository -> private source readori/Radio (pnpm workspaces + Turborepo monorepo).
-# Expo app: apps/mobile (package @meridian/mobile); local native module: modules/meridian-player.
+# Expo app: apps/mobile (package @meridian/mobile or @hourwave/mobile); local native module under modules/.
+# Name-agnostic (OPS-12 phase 0): turbo filters are paths, the package scope is checked loosely, and both
+# EXPO_PUBLIC_MERIDIAN_* and EXPO_PUBLIC_HOURWAVE_* names are written.
 # Modeled on paobuwan-ios.yml, with the monorepo steps of radio-ci.yml:
-#   pnpm install -> turbo build of @meridian/mobile and its workspace deps -> expo prebuild
+#   pnpm install -> turbo build of apps/mobile and its workspace deps -> expo prebuild
 #   -> pod install -> Xcode build/archive of apps/mobile/ios/*.xcworkspace.
 #
 #   verify     : Release build for the iOS Simulator with the JS bundle embedded (no signing, no secrets
@@ -77,7 +79,6 @@ env:
   PRIVATE_SOURCE_REPOSITORY: readori/Radio
   PRIVATE_SOURCE_PATH: source
   MOBILE_APP_DIR: apps/mobile
-  MOBILE_PACKAGE: '@meridian/mobile'
   EXPECTED_BUNDLE_ID: com.readori.radio
   XCODE_MAJOR_WANTED: '26'
   XCODE_MIN_VERSION: '26.4'
@@ -218,35 +219,6 @@ jobs:
       # ---------------------------------------------------------------------
       # 1. PUBLIC CI repository -> PRIVATE source repository
       # ---------------------------------------------------------------------
-      - name: Resolve and mask the API base URL (EXPO_PUBLIC_MERIDIAN_API)
-        shell: bash
-        env:
-          API_BASE: ${{ secrets.RADIO_STAGING_API }}
-          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          set -euo pipefail
-          # RADIO_STAGING_API wins when set. Otherwise derive the staging Worker URL
-          # (meridian-api-staging on the account's workers.dev subdomain, deployed by radio-api.yml).
-          if [ -z "$API_BASE" ] && [ -n "$CF_TOKEN" ] && [ -n "$CF_ACCOUNT" ]; then
-            echo "::add-mask::$CF_ACCOUNT"
-            sub="$(curl -sS -H "Authorization: Bearer $CF_TOKEN" \
-              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/workers/subdomain" | jq -r '.result.subdomain // empty')"
-            if [ -n "$sub" ]; then
-              echo "::add-mask::$sub"
-              API_BASE="https://meridian-api-staging.${sub}.workers.dev"
-            fi
-          fi
-          if [ -n "$API_BASE" ]; then
-            echo "::add-mask::$API_BASE"
-            # Only Metro (turbo export, Xcode "Bundle React Native code") reads this; it is a
-            # public client endpoint, masked because the workers.dev subdomain identifies the account.
-            echo "EXPO_PUBLIC_MERIDIAN_API=$API_BASE" >> "$GITHUB_ENV"
-            echo "API base: set (masked)"
-          else
-            echo "::warning::No API base (RADIO_STAGING_API unset and staging URL not derivable); the app will be built without one."
-          fi
-
       - name: Checkout private Radio source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -257,6 +229,89 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
           clean: true
+
+      - name: Resolve and mask the API base URL (EXPO_PUBLIC_*_API)
+        shell: bash
+        env:
+          API_BASE: ${{ secrets.RADIO_STAGING_API }}
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          # RADIO_STAGING_API wins when set. Otherwise derive the staging Worker URL: the Worker
+          # name is read from workers/api/wrangler.jsonc of the checked-out ref (env staging, not
+          # printed) on the account's workers.dev subdomain, deployed by radio-api.yml.
+          if [ -z "$API_BASE" ] && [ -n "$CF_TOKEN" ] && [ -n "$CF_ACCOUNT" ]; then
+            echo "::add-mask::$CF_ACCOUNT"
+            sub="$(curl -sS -H "Authorization: Bearer $CF_TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/workers/subdomain" | jq -r '.result.subdomain // empty')"
+            if [ -n "$sub" ]; then
+              echo "::add-mask::$sub"
+              HELPER="$RUNNER_TEMP/names.mjs"
+              cat > "$HELPER" <<'JS'
+          // Usage: node names.mjs <wrangler.jsonc> <env|-> <worker|db|bucket>
+          // Prints one resource name read from the wrangler config of the checked-out ref, so the
+          // workflows work for the meridian-* and the hourwave-* code alike. Errors never echo config content.
+          import { readFileSync } from 'node:fs';
+
+          function jsonc(text) {
+            let out = '';
+            let inString = false;
+            for (let i = 0; i < text.length; i++) {
+              const c = text[i];
+              if (inString) {
+                out += c;
+                if (c === '\\') out += text[++i];
+                else if (c === '"') inString = false;
+              } else if (c === '"') {
+                inString = true;
+                out += c;
+              } else if (c === '/' && text[i + 1] === '/') {
+                while (i < text.length && text[i] !== '\n') i++;
+                out += '\n';
+              } else if (c === '/' && text[i + 1] === '*') {
+                i += 2;
+                while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
+                i++;
+              } else out += c;
+            }
+            return JSON.parse(out.replace(/,(\s*[}\]])/g, '$1'));
+          }
+
+          const [file, env, kind] = process.argv.slice(2);
+          let name;
+          try {
+            const top = jsonc(readFileSync(file, 'utf8'));
+            const sect = env === '-' ? top : (top.env ?? {})[env] ?? {};
+            if (kind === 'worker') name = sect.name ?? (env === '-' ? top.name : `${top.name}-${env}`);
+            else if (kind === 'db') name = (sect.d1_databases ?? [])[0]?.database_name;
+            else if (kind === 'bucket') name = (sect.r2_buckets ?? [])[0]?.bucket_name;
+          } catch {
+            console.error(`::error::cannot read the ${kind} name from the wrangler config`);
+            process.exit(1);
+          }
+          if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(name ?? '')) {
+            console.error(`::error::no valid ${kind} name in the wrangler config`);
+            process.exit(1);
+          }
+          process.stdout.write(name);
+          JS
+              if api_worker="$(node "$HELPER" "$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH/workers/api/wrangler.jsonc" staging worker)"; then
+                API_BASE="https://${api_worker}.${sub}.workers.dev"
+              fi
+            fi
+          fi
+          if [ -n "$API_BASE" ]; then
+            echo "::add-mask::$API_BASE"
+            # Only Metro (turbo export, Xcode "Bundle React Native code") reads these; it is a
+            # public client endpoint, masked because the workers.dev subdomain identifies the account.
+            # Both names during the OPS-12 rename: the ref's code reads one of them.
+            echo "EXPO_PUBLIC_MERIDIAN_API=$API_BASE" >> "$GITHUB_ENV"
+            echo "EXPO_PUBLIC_HOURWAVE_API=$API_BASE" >> "$GITHUB_ENV"
+            echo "API base: set (masked)"
+          else
+            echo "::warning::No API base (RADIO_STAGING_API unset and staging URL not derivable); the app will be built without one."
+          fi
 
       - name: Verify private source layout
         shell: bash
@@ -277,6 +332,7 @@ jobs:
           echo "SOURCE_SHORT_SHA=${SOURCE_COMMIT:0:8}" >> "$GITHUB_ENV"
           # Shown in the app's diagnostics log header (the short SHA is already public in this log).
           echo "EXPO_PUBLIC_MERIDIAN_SOURCE_SHA=${SOURCE_COMMIT:0:8}" >> "$GITHUB_ENV"
+          echo "EXPO_PUBLIC_HOURWAVE_SOURCE_SHA=${SOURCE_COMMIT:0:8}" >> "$GITHUB_ENV"
 
           # Print only comparison results, never the file contents.
           PACKAGE_MANAGER="$(node -p "require(process.argv[1]).packageManager || ''" "$SOURCE_ABS/package.json")"
@@ -285,8 +341,8 @@ jobs:
             exit 66
           }
           PACKAGE_NAME="$(node -p "require(process.argv[1]).name || ''" "$SOURCE_ABS/$MOBILE_APP_DIR/package.json")"
-          [[ "$PACKAGE_NAME" == "$MOBILE_PACKAGE" ]] || {
-            echo "::error::$MOBILE_APP_DIR/package.json name must be $MOBILE_PACKAGE (got: ${PACKAGE_NAME:-<empty>})."
+          [[ "$PACKAGE_NAME" =~ ^@(meridian|hourwave)/mobile$ ]] || {
+            echo "::error::$MOBILE_APP_DIR/package.json name must be @meridian/mobile or @hourwave/mobile (got: ${PACKAGE_NAME:-<empty>})."
             exit 66
           }
 
@@ -383,13 +439,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # @meridian/core and @meridian/ui-tokens export from dist/, which Metro needs when Xcode
+          # The core and ui-tokens workspace packages export from dist/, which Metro needs when Xcode
           # bundles the JS. The trailing ... also runs the mobile package's own build (expo export),
           # an early JS-bundle check before the long Xcode build. Output is captured: a failing
           # Metro bundle prints code frames (private source lines).
           LOG="$RUNNER_TEMP/radio-turbo-build.log"
           set +e
-          pnpm exec turbo run build --filter="${MOBILE_PACKAGE}..." --output-logs=errors-only > "$LOG" 2>&1
+          pnpm exec turbo run build --filter="./${MOBILE_APP_DIR}..." --output-logs=errors-only > "$LOG" 2>&1
           status=$?
           set -e
           if (( status != 0 )); then

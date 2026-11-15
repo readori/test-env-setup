@@ -1,10 +1,10 @@
-# Radio (Meridian) capability check — read-only.
+# Radio capability check — read-only.
 #
 # Answers three questions before the Radio Cloudflare / iOS / Android workflows are written
 # (private repo BACKLOG OPS-05, POC-01, POC-02, POC-03):
 #
 #   cloudflare : what the shared CLOUDFLARE_API_TOKEN can read (Workers, D1, KV, R2, Queues,
-#                Workflows, workers.dev subdomain) and whether Meridian resources already exist.
+#                Workflows, workers.dev subdomain) and whether meridian-* and hourwave-* resources already exist (counts only, never names).
 #   macos      : Xcode versions and iOS simulator runtimes on the macos-26 runner.
 #   android    : KVM, Android SDK, emulator / Automotive system images and the DHU package
 #                on ubuntu-latest.
@@ -76,17 +76,17 @@ jobs:
           call 'Token verify (user token)' '/user/tokens/verify' '"status=" + (.result.status // "?")'
           call 'Token verify (account token)' "/accounts/$CF_ACCOUNT/tokens/verify" '"status=" + (.result.status // "?")'
           call 'Workers scripts' "/accounts/$CF_ACCOUNT/workers/scripts" \
-            '"total=" + (.result | length | tostring) + " meridian=" + ([.result[]? | select((.id // "") | startswith("meridian-"))] | length | tostring)'
+            '"total=" + (.result | length | tostring) + " meridian=" + ([.result[]? | select((.id // "") | startswith("meridian-"))] | length | tostring) + " hourwave=" + ([.result[]? | select((.id // "") | startswith("hourwave-"))] | length | tostring)'
           call 'workers.dev subdomain' "/accounts/$CF_ACCOUNT/workers/subdomain" \
             '"exists=" + (((.result.subdomain // "") | length > 0) | tostring)'
           call 'D1 databases' "/accounts/$CF_ACCOUNT/d1/database?per_page=100" \
-            '"total=" + ((.result_info.total_count // (.result | length)) | tostring) + " meridian=" + ([.result[]? | select((.name // "") | startswith("meridian-"))] | length | tostring)'
+            '"total=" + ((.result_info.total_count // (.result | length)) | tostring) + " meridian=" + ([.result[]? | select((.name // "") | startswith("meridian-"))] | length | tostring) + " hourwave=" + ([.result[]? | select((.name // "") | startswith("hourwave-"))] | length | tostring)'
           call 'KV namespaces' "/accounts/$CF_ACCOUNT/storage/kv/namespaces?per_page=100" \
-            '"total=" + ((.result_info.total_count // (.result | length)) | tostring) + " meridian=" + ([.result[]? | select((.title // "") | startswith("meridian-"))] | length | tostring)'
+            '"total=" + ((.result_info.total_count // (.result | length)) | tostring) + " meridian=" + ([.result[]? | select((.title // "") | startswith("meridian-"))] | length | tostring) + " hourwave=" + ([.result[]? | select((.title // "") | startswith("hourwave-"))] | length | tostring)'
           call 'R2 buckets' "/accounts/$CF_ACCOUNT/r2/buckets" \
-            '"total=" + ((.result.buckets // []) | length | tostring) + " meridian=" + ([.result.buckets[]? | select((.name // "") | startswith("meridian-"))] | length | tostring)'
+            '"total=" + ((.result.buckets // []) | length | tostring) + " meridian=" + ([.result.buckets[]? | select((.name // "") | startswith("meridian-"))] | length | tostring) + " hourwave=" + ([.result.buckets[]? | select((.name // "") | startswith("hourwave-"))] | length | tostring)'
           call 'Queues' "/accounts/$CF_ACCOUNT/queues" \
-            '"total=" + ((.result // []) | length | tostring) + " meridian=" + ([.result[]? | select((.queue_name // "") | startswith("meridian-"))] | length | tostring)'
+            '"total=" + ((.result // []) | length | tostring) + " meridian=" + ([.result[]? | select((.queue_name // "") | startswith("meridian-"))] | length | tostring) + " hourwave=" + ([.result[]? | select((.queue_name // "") | startswith("hourwave-"))] | length | tostring)'
           call 'Workflows' "/accounts/$CF_ACCOUNT/workflows" '"total=" + ((.result // []) | length | tostring)'
           call 'Subscriptions (plan)' "/accounts/$CF_ACCOUNT/subscriptions" \
             '"workers_paid=" + ([.result[]? | ((.rate_plan.id // "") + " " + (.rate_plan.public_name // "") + " " + (.product.name // "")) | ascii_downcase | select(test("workers") and test("paid|bundled|standard"))] | length > 0 | tostring)'

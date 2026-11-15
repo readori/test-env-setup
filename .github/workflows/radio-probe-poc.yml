@@ -5,7 +5,8 @@
 #
 #   1. Control group: the runner probes the 50 bundled streams itself (a client, like a listener),
 #      with the same code and the same 64 KB / 5 s budget. Bytes are discarded.
-#   2. Deploy the ephemeral Worker meridian-probe-poc-dev (Cloudflare dev only, no bindings).
+#   2. Deploy the ephemeral probe Worker (env dev, no bindings; its name is read from
+#      workers/probe-poc/wrangler.jsonc of the checked-out ref, never printed).
 #   3. Set a random per-run RUN_TOKEN secret (masked). Until it is set the Worker answers 503.
 #   4. POST /run in batches of 5 stream indexes (free plan: 50 subrequests per request). The
 #      request carries indexes into the bundled list only, never a URL.
@@ -39,7 +40,7 @@ concurrency:
 
 env:
   SOURCE_REF: ${{ inputs.ref }}
-  WORKER_NAME: meridian-probe-poc-dev
+  # WORKER_NAME is read from the wrangler config of the checked-out ref (step below).
   WRANGLER_SEND_METRICS: 'false'
   TURBO_TELEMETRY_DISABLED: '1'
 
@@ -88,6 +89,63 @@ jobs:
             exit 1
           fi
           echo 'build OK'
+
+      - name: Resolve the probe Worker name from the wrangler config (not printed)
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/names.mjs" <<'JS'
+          // Usage: node names.mjs <wrangler.jsonc> <env|-> <worker|db|bucket>
+          // Prints one resource name read from the wrangler config of the checked-out ref, so the
+          // workflows work for the meridian-* and the hourwave-* code alike. Errors never echo config content.
+          import { readFileSync } from 'node:fs';
+
+          function jsonc(text) {
+            let out = '';
+            let inString = false;
+            for (let i = 0; i < text.length; i++) {
+              const c = text[i];
+              if (inString) {
+                out += c;
+                if (c === '\\') out += text[++i];
+                else if (c === '"') inString = false;
+              } else if (c === '"') {
+                inString = true;
+                out += c;
+              } else if (c === '/' && text[i + 1] === '/') {
+                while (i < text.length && text[i] !== '\n') i++;
+                out += '\n';
+              } else if (c === '/' && text[i + 1] === '*') {
+                i += 2;
+                while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
+                i++;
+              } else out += c;
+            }
+            return JSON.parse(out.replace(/,(\s*[}\]])/g, '$1'));
+          }
+
+          const [file, env, kind] = process.argv.slice(2);
+          let name;
+          try {
+            const top = jsonc(readFileSync(file, 'utf8'));
+            const sect = env === '-' ? top : (top.env ?? {})[env] ?? {};
+            if (kind === 'worker') name = sect.name ?? (env === '-' ? top.name : `${top.name}-${env}`);
+            else if (kind === 'db') name = (sect.d1_databases ?? [])[0]?.database_name;
+            else if (kind === 'bucket') name = (sect.r2_buckets ?? [])[0]?.bucket_name;
+          } catch {
+            console.error(`::error::cannot read the ${kind} name from the wrangler config`);
+            process.exit(1);
+          }
+          if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(name ?? '')) {
+            console.error(`::error::no valid ${kind} name in the wrangler config`);
+            process.exit(1);
+          }
+          process.stdout.write(name);
+          JS
+          name="$(node "$RUNNER_TEMP/names.mjs" workers/probe-poc/wrangler.jsonc dev worker)"
+          echo "WORKER_NAME=$name" >> "$GITHUB_ENV"
+          echo 'Worker name resolved (not printed)'
 
       - name: Control group (runner probes the streams directly)
         shell: bash

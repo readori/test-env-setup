@@ -7,7 +7,7 @@
 #              of the old `entitlements` table (stops if it is not empty). Writes nothing.
 #   deploy   : provision (finds the existing D1 + snapshots bucket), the same D1 check, D1
 #              migrations (`wrangler d1 migrations apply`, tables that already exist are recorded
-#              in d1_migrations first), deploy meridian-api-<env>, GET /health, and a check that
+#              in d1_migrations first), deploy the API Worker, GET /health, and a check that
 #              the two App Store endpoints answer 400 to an empty body.
 #   snapshot : import the catalog from Radio Browser (no credentials; counts only in the log),
 #              upload it to R2 (shards first, manifest last), then read it back through the Worker.
@@ -15,6 +15,9 @@
 #              admin-0 map units 1:50m (public domain), fetched from a pinned commit of
 #              nvkelso/natural-earth-vector and checked against a SHA-256 before use.
 #   all      : deploy, then snapshot.
+#
+# Name-agnostic (OPS-12 phase 0): the package filter is a path, and the Worker, D1 and R2 names are
+# read from workers/api/wrangler.jsonc of the checked-out ref (never printed).
 #
 # Secrets needed: TARGET_REPO_PAT, CLOUDFLARE_API_TOKEN (must be allowed to write R2 objects in
 # the account), CLOUDFLARE_ACCOUNT_ID. No new secret.
@@ -81,7 +84,7 @@ jobs:
         with:
           node-version: 24
 
-      - name: Install dependencies and build @meridian/core (no credentials in this step)
+      - name: Install dependencies and build packages/core (no credentials in this step)
         shell: bash
         working-directory: source
         run: |
@@ -90,7 +93,66 @@ jobs:
           echo "Private source commit: $(git rev-parse --short=8 HEAD)"
           corepack enable
           pnpm install --frozen-lockfile --reporter=silent
-          pnpm --filter @meridian/core build
+          pnpm --filter ./packages/core build
+
+      - name: Resolve Worker, D1 and R2 names from the wrangler config (not printed)
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/names.mjs" <<'JS'
+          // Usage: node names.mjs <wrangler.jsonc> <env|-> <worker|db|bucket>
+          // Prints one resource name read from the wrangler config of the checked-out ref, so the
+          // workflows work for the meridian-* and the hourwave-* code alike. Errors never echo config content.
+          import { readFileSync } from 'node:fs';
+
+          function jsonc(text) {
+            let out = '';
+            let inString = false;
+            for (let i = 0; i < text.length; i++) {
+              const c = text[i];
+              if (inString) {
+                out += c;
+                if (c === '\\') out += text[++i];
+                else if (c === '"') inString = false;
+              } else if (c === '"') {
+                inString = true;
+                out += c;
+              } else if (c === '/' && text[i + 1] === '/') {
+                while (i < text.length && text[i] !== '\n') i++;
+                out += '\n';
+              } else if (c === '/' && text[i + 1] === '*') {
+                i += 2;
+                while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
+                i++;
+              } else out += c;
+            }
+            return JSON.parse(out.replace(/,(\s*[}\]])/g, '$1'));
+          }
+
+          const [file, env, kind] = process.argv.slice(2);
+          let name;
+          try {
+            const top = jsonc(readFileSync(file, 'utf8'));
+            const sect = env === '-' ? top : (top.env ?? {})[env] ?? {};
+            if (kind === 'worker') name = sect.name ?? (env === '-' ? top.name : `${top.name}-${env}`);
+            else if (kind === 'db') name = (sect.d1_databases ?? [])[0]?.database_name;
+            else if (kind === 'bucket') name = (sect.r2_buckets ?? [])[0]?.bucket_name;
+          } catch {
+            console.error(`::error::cannot read the ${kind} name from the wrangler config`);
+            process.exit(1);
+          }
+          if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(name ?? '')) {
+            console.error(`::error::no valid ${kind} name in the wrangler config`);
+            process.exit(1);
+          }
+          process.stdout.write(name);
+          JS
+          api="$(node "$RUNNER_TEMP/names.mjs" workers/api/wrangler.jsonc "$TARGET_ENV" worker)"
+          db="$(node "$RUNNER_TEMP/names.mjs" workers/api/wrangler.jsonc "$TARGET_ENV" db)"
+          bucket="$(node "$RUNNER_TEMP/names.mjs" workers/api/wrangler.jsonc "$TARGET_ENV" bucket)"
+          { echo "API_WORKER=$api"; echo "DB_NAME=$db"; echo "BUCKET_NAME=$bucket"; } >> "$GITHUB_ENV"
+          echo 'resource names resolved (not printed)'
 
       - name: Bundle (wrangler dry-run, no credentials)
         shell: bash
@@ -122,7 +184,7 @@ jobs:
           echo "::add-mask::$sub"
           echo 'subdomain masked'
 
-      - name: Provision meridian-staging-* resources
+      - name: Provision the staging resources
         if: inputs.mode == 'deploy' || inputs.mode == 'all' || inputs.mode == 'd1-check'
         shell: bash
         working-directory: source/workers/api
@@ -147,7 +209,11 @@ jobs:
 
           const phase = process.argv[2];
           const env = process.env.TARGET_ENV;
-          const DB = `meridian-${env}-db`;
+          const DB = process.env.DB_NAME; // from the ref's wrangler config (step above)
+          if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(DB ?? '')) {
+            console.error('::error::DB_NAME is not set');
+            process.exit(1);
+          }
           const MIGRATIONS = '../../packages/db/migrations';
           const CODES = /ERR_[A-Z_]+|SQLITE_[A-Z_]+|code: \d+|\[ERROR\]/g;
 
@@ -274,7 +340,7 @@ jobs:
             exit 1
           fi
           { grep -E 'Uploaded|Deployed|Current Version' "$log" || true; } | redact
-          echo "- deploy meridian-api-${TARGET_ENV}: OK" >> "$GITHUB_STEP_SUMMARY"
+          echo "- deploy API Worker (${TARGET_ENV}): OK" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Health check
         if: inputs.mode == 'deploy' || inputs.mode == 'all'
@@ -300,7 +366,7 @@ jobs:
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/workers/subdomain" | jq -r '.result.subdomain // empty')"
           [[ -n "$sub" ]] || { echo '::error::No workers.dev subdomain on the account'; exit 1; }
           echo "::add-mask::$sub"
-          base="https://meridian-api-${TARGET_ENV}.${sub}.workers.dev"
+          base="https://${API_WORKER}.${sub}.workers.dev"
           failed=0
           for path in /entitlements/verify /appstore/notifications; do
             code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' --data '{}' "${base}${path}" || echo 000)"
@@ -342,7 +408,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "::add-mask::$CLOUDFLARE_ACCOUNT_ID"
-          node scripts/upload-snapshot.mjs --dir "$RUNNER_TEMP/snapshot-out" --bucket "meridian-${TARGET_ENV}-snapshots" | tee -a "$GITHUB_STEP_SUMMARY"
+          node scripts/upload-snapshot.mjs --dir "$RUNNER_TEMP/snapshot-out" --bucket "$BUCKET_NAME" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Read the snapshot back through the Worker
         if: inputs.mode == 'snapshot' || inputs.mode == 'all'

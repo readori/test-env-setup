@@ -1,11 +1,13 @@
 # Radio (Meridian) Web: build the Next.js static export (apps/web) and deploy it to Cloudflare
-# as the static-assets-only Worker meridian-web-staging (apps/web/wrangler.jsonc, env staging).
+# as the static-assets-only Worker named in apps/web/wrangler.jsonc (env staging).
+# Name-agnostic (OPS-12 phase 0): package filters are paths, Worker names come from the wrangler
+# configs of the checked-out ref, and both NEXT_PUBLIC_MERIDIAN_* and NEXT_PUBLIC_HOURWAVE_* are set.
 #
 # Public CI repository -> private source readori/Radio.
 #
 #   dry-run : install, build the static export, bundle with `wrangler deploy --dry-run` (no
 #             Cloudflare credentials).
-#   deploy  : + resolve the staging API base, build with it, deploy meridian-web-staging,
+#   deploy  : + resolve the staging API base, build with it, deploy the web Worker,
 #             then GET the site (/, /en/, /zh/) and the API /health.
 #
 # Staging only. Production waits for the approval-gated pipeline of private BACKLOG OPS-10b.
@@ -27,7 +29,7 @@ on:
         required: true
         type: string
       mode:
-        description: 'dry-run = build + bundle (no credentials); deploy = build + deploy meridian-web-staging + checks'
+        description: 'dry-run = build + bundle (no credentials); deploy = build + deploy the web Worker + checks'
         required: true
         default: dry-run
         type: choice
@@ -44,8 +46,7 @@ env:
   SOURCE_REF: ${{ inputs.ref }}
   MODE: ${{ inputs.mode }}
   TARGET_ENV: staging
-  WEB_WORKER: meridian-web-staging
-  API_WORKER: meridian-api-staging
+  # WEB_WORKER and API_WORKER are read from the wrangler configs of the checked-out ref (step below).
   WRANGLER_SEND_METRICS: 'false'
   TURBO_TELEMETRY_DISABLED: '1'
   NEXT_TELEMETRY_DISABLED: '1'
@@ -88,7 +89,9 @@ jobs:
           [[ -f apps/web/wrangler.jsonc && -f apps/web/package.json ]] || { echo '::error::apps/web is missing at this ref'; exit 66; }
           echo "Private source commit: $(git rev-parse --short=8 HEAD)"
           # Shown in the site's diagnostics log header.
+          # Both names during the OPS-12 rename: Next inlines whichever one the ref's code reads.
           echo "NEXT_PUBLIC_MERIDIAN_SOURCE_SHA=$(git rev-parse --short=8 HEAD)" >> "$GITHUB_ENV"
+          echo "NEXT_PUBLIC_HOURWAVE_SOURCE_SHA=$(git rev-parse --short=8 HEAD)" >> "$GITHUB_ENV"
           corepack enable
           log="$RUNNER_TEMP/install.log"
           if ! pnpm install --frozen-lockfile --reporter=silent > "$log" 2>&1; then
@@ -98,7 +101,65 @@ jobs:
           fi
           echo 'pnpm install: PASS'
 
-      - name: Resolve and mask the API base URL (NEXT_PUBLIC_MERIDIAN_API)
+      - name: Resolve Worker names from the wrangler configs (not printed)
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/names.mjs" <<'JS'
+          // Usage: node names.mjs <wrangler.jsonc> <env|-> <worker|db|bucket>
+          // Prints one resource name read from the wrangler config of the checked-out ref, so the
+          // workflows work for the meridian-* and the hourwave-* code alike. Errors never echo config content.
+          import { readFileSync } from 'node:fs';
+
+          function jsonc(text) {
+            let out = '';
+            let inString = false;
+            for (let i = 0; i < text.length; i++) {
+              const c = text[i];
+              if (inString) {
+                out += c;
+                if (c === '\\') out += text[++i];
+                else if (c === '"') inString = false;
+              } else if (c === '"') {
+                inString = true;
+                out += c;
+              } else if (c === '/' && text[i + 1] === '/') {
+                while (i < text.length && text[i] !== '\n') i++;
+                out += '\n';
+              } else if (c === '/' && text[i + 1] === '*') {
+                i += 2;
+                while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
+                i++;
+              } else out += c;
+            }
+            return JSON.parse(out.replace(/,(\s*[}\]])/g, '$1'));
+          }
+
+          const [file, env, kind] = process.argv.slice(2);
+          let name;
+          try {
+            const top = jsonc(readFileSync(file, 'utf8'));
+            const sect = env === '-' ? top : (top.env ?? {})[env] ?? {};
+            if (kind === 'worker') name = sect.name ?? (env === '-' ? top.name : `${top.name}-${env}`);
+            else if (kind === 'db') name = (sect.d1_databases ?? [])[0]?.database_name;
+            else if (kind === 'bucket') name = (sect.r2_buckets ?? [])[0]?.bucket_name;
+          } catch {
+            console.error(`::error::cannot read the ${kind} name from the wrangler config`);
+            process.exit(1);
+          }
+          if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(name ?? '')) {
+            console.error(`::error::no valid ${kind} name in the wrangler config`);
+            process.exit(1);
+          }
+          process.stdout.write(name);
+          JS
+          web="$(node "$RUNNER_TEMP/names.mjs" apps/web/wrangler.jsonc "$TARGET_ENV" worker)"
+          api="$(node "$RUNNER_TEMP/names.mjs" workers/api/wrangler.jsonc "$TARGET_ENV" worker)"
+          { echo "WEB_WORKER=$web"; echo "API_WORKER=$api"; } >> "$GITHUB_ENV"
+          echo 'Worker names resolved (not printed)'
+
+      - name: Resolve and mask the API base URL (NEXT_PUBLIC_*_API)
         if: inputs.mode == 'deploy'
         shell: bash
         env:
@@ -117,6 +178,7 @@ jobs:
           echo "::add-mask::$API_BASE"
           {
             echo "NEXT_PUBLIC_MERIDIAN_API=$API_BASE"
+            echo "NEXT_PUBLIC_HOURWAVE_API=$API_BASE"
             echo "API_BASE=$API_BASE"
             echo "WEB_URL=https://${WEB_WORKER}.${sub}.workers.dev"
           } >> "$GITHUB_ENV"
@@ -128,8 +190,9 @@ jobs:
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/build.log"
-          # Builds @meridian/web and its workspace dependencies. Next inlines NEXT_PUBLIC_MERIDIAN_API.
-          if ! pnpm turbo run build --filter=@meridian/web... --output-logs=errors-only > "$log" 2>&1; then
+          # Builds apps/web and its workspace dependencies (path filter: independent of the package
+          # scope). Next inlines NEXT_PUBLIC_MERIDIAN_API or NEXT_PUBLIC_HOURWAVE_API.
+          if ! pnpm turbo run build --filter=./apps/web... --output-logs=errors-only > "$log" 2>&1; then
             echo 'build failed; error codes only (private source lines are never printed):'
             { grep -oE 'TS[0-9]{4,5}|ERR_[A-Z_]+|Type error|Module not found|Failed to compile|Error occurred prerendering' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
             exit 1
@@ -152,7 +215,7 @@ jobs:
           echo 'wrangler dry-run: PASS'
           echo "- wrangler dry-run (${TARGET_ENV}): OK" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Deploy meridian-web-staging
+      - name: Deploy the web Worker
         if: inputs.mode == 'deploy'
         shell: bash
         working-directory: source/apps/web
