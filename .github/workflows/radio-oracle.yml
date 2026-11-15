@@ -46,7 +46,8 @@ jobs:
       - name: Try one SSH login through the Hourwave tunnel (Access service token)
         shell: bash
         env:
-          KEY: ${{ secrets.ORACLE_API_TOKEN }}
+          # SSH private key of the VM user; ORACLE_API_TOKEN was the old name of the same key.
+          KEY: ${{ secrets.ORACLE_SSH_KEY || secrets.ORACLE_API_TOKEN }}
           HOST: ${{ secrets.ORACLE_SSH_HOST }}
           SSH_USER: ${{ secrets.ORACLE_SSH_USER }}
           TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.ORACLE_ACCESS_CLIENT_ID }}
