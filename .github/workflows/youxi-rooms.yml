@@ -1,0 +1,183 @@
+# youxi co-op room server -> the owner's Oracle VM (arm64), private repo ADR-0015 (owner 2026-11-15:
+# 「同意用这台机器联机房间，新建一条游戏专用（授权你自己新建配置）」).
+#
+#   deploy : check out the private source at `ref`, send only the server build context to the VM over
+#            SSH (Hourwave tunnel + Access service token, same route as radio-oracle.yml), build the
+#            image there (native arm64), (re)start container `youxi-rooms` and, if it is not running,
+#            the tunnel connector `youxi-cloudflared` on the private docker network `youxi-net`.
+#            Then checks /healthz inside the VM and https://youxi-rooms.readori.com/healthz from here.
+#   status : health + resource use of the youxi-* containers only.
+#   stop   : removes the youxi-* containers (image and network stay).
+#
+# Rules on the shared VM: touch only youxi-* containers / images / the youxi-net network; CPU and memory
+# limits on every container; no global prune; no published ports (traffic only through the tunnel).
+# Public repo, public logs: workflow_dispatch only; the VM host is masked; the tunnel token goes over
+# SSH stdin into a 600 file that is deleted after `docker run`; build output is not printed (it can
+# contain private source); only key=value summary lines are printed; no artifacts.
+name: youxi rooms
+
+run-name: youxi rooms · ${{ inputs.mode }} · ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'deploy = build + (re)start; status = health only; stop = remove youxi-* containers'
+        required: true
+        default: deploy
+        type: choice
+        options: [deploy, status, stop]
+      ref:
+        description: 'Private readori/youxi branch, tag, or SHA (deploy only)'
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: youxi-rooms
+  cancel-in-progress: false
+
+jobs:
+  rooms:
+    name: Room server (${{ inputs.mode }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PRIVATE_SOURCE_PATH: source
+    steps:
+      - name: Validate input
+        shell: bash
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          [[ -n "$INPUT_REF" && "$INPUT_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && ${#INPUT_REF} -le 200 ]] || {
+            echo '::error::ref must be a branch, tag, or SHA (letters, digits, . _ / - only).'; exit 64; }
+          echo "SOURCE_REF=$INPUT_REF" >> "$GITHUB_ENV"
+
+      - name: Checkout private source
+        if: inputs.mode == 'deploy'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/youxi
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Pack server build context
+        if: inputs.mode == 'deploy'
+        shell: bash
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        run: |
+          set -euo pipefail
+          for f in server/Dockerfile server/build.mjs package.json package-lock.json tsconfig.json data/tuning.json governance/budgets.json; do
+            [[ -f "$f" ]] || { echo "::error::$f is missing at this ref (room server not on this ref?)."; exit 66; }
+          done
+          SHA="$(git rev-parse --short=12 HEAD)"
+          echo "IMAGE_TAG=$SHA" >> "$GITHUB_ENV"
+          tar czf "$RUNNER_TEMP/ctx.tgz" package.json package-lock.json tsconfig.json src/sim src/net server data governance/budgets.json
+          echo "source=${SHA} context_kb=$(( $(stat -c %s "$RUNNER_TEMP/ctx.tgz") / 1024 ))" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Install cloudflared (official release, pinned)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/cloudflared" https://github.com/cloudflare/cloudflared/releases/download/2026.10.3/cloudflared-linux-amd64
+          chmod +x "$RUNNER_TEMP/cloudflared"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Run on the VM
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+          KEY: ${{ secrets.ORACLE_SSH_KEY }}
+          HOST: ${{ secrets.ORACLE_SSH_HOST }}
+          SSH_USER: ${{ secrets.ORACLE_SSH_USER }}
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.ORACLE_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.ORACLE_ACCESS_CLIENT_SECRET }}
+          YOUXI_TUNNEL_TOKEN: ${{ secrets.YOUXI_TUNNEL_TOKEN }}
+        run: |
+          set -uo pipefail
+          umask 077
+          echo "::add-mask::$HOST"
+          d="$RUNNER_TEMP/ssh"; mkdir -p "$d"
+          printf '%s\n' "$KEY" > "$d/key"
+          sshv() {
+            timeout 900 ssh -i "$d/key" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$d/known" \
+              -o ConnectTimeout=20 -o LogLevel=ERROR -o ServerAliveInterval=15 \
+              -o ProxyCommand="cloudflared access ssh --hostname %h" "$SSH_USER@$HOST" "$@"
+          }
+          # Every remote command prints only key=value lines; anything else is dropped before logging.
+          show() { grep -E '^[a-z_]+=[A-Za-z0-9 ._%/:()+-]{0,120}$' "$1" | tee -a "$GITHUB_STEP_SUMMARY" || true; }
+
+          PRE='set -uo pipefail; D=docker; docker info >/dev/null 2>&1 || D="sudo -n docker"; $D info >/dev/null 2>&1 || { echo docker=unavailable; exit 3; }; echo "arch=$(uname -m)"'
+          STATUS='for c in youxi-rooms youxi-cloudflared; do echo "${c//-/_}=$($D inspect -f "{{.State.Status}}" "$c" 2>/dev/null || echo absent)"; done
+            if $D exec youxi-rooms node -e "fetch(\"http://127.0.0.1:8080/healthz\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1; then echo health_inside=ok; else echo health_inside=fail; fi
+            $D stats --no-stream --format "stats_{{.Name}}={{.MemUsage}} cpu {{.CPUPerc}}" youxi-rooms youxi-cloudflared 2>/dev/null | sed "s/stats_youxi-/stats_/; s/-cloudflared/_cloudflared/"'
+
+          rc=0
+          case "$MODE" in
+            status)
+              sshv "$PRE; $STATUS" > "$d/out" 2> "$d/err" || rc=$? ;;
+            stop)
+              sshv "$PRE; \$D rm -f youxi-rooms youxi-cloudflared >/dev/null 2>&1; echo stopped=youxi-rooms,youxi-cloudflared" > "$d/out" 2> "$d/err" || rc=$? ;;
+            deploy)
+              [[ -n "$YOUXI_TUNNEL_TOKEN" ]] || { echo '::error::secret YOUXI_TUNNEL_TOKEN is not set.'; exit 78; }
+              # 1) build context
+              sshv 'set -e; rm -rf ~/youxi-rooms/build; mkdir -p ~/youxi-rooms/build; tar xzf - -C ~/youxi-rooms/build; echo context=uploaded' \
+                < "$RUNNER_TEMP/ctx.tgz" > "$d/out" 2> "$d/err" || rc=$?
+              # 2) tunnel token: stdin -> 600 file, read by docker run --env-file, then deleted
+              if [[ $rc -eq 0 ]]; then
+                printf 'TUNNEL_TOKEN=%s\n' "$YOUXI_TUNNEL_TOKEN" | sshv 'umask 077; mkdir -p ~/youxi-rooms; cat > ~/youxi-rooms/tunnel.env; echo token=staged' >> "$d/out" 2>> "$d/err" || rc=$?
+              fi
+              # 3) build + run
+              if [[ $rc -eq 0 ]]; then
+                sshv "$PRE; T=$IMAGE_TAG; cd ~/youxi-rooms/build || exit 4
+                  \$D network inspect youxi-net >/dev/null 2>&1 || \$D network create youxi-net >/dev/null || { echo network=failed; exit 5; }
+                  if \$D build -q -f server/Dockerfile -t youxi-rooms:\$T . > ../build.log 2>&1; then echo build=ok; else echo build=failed; rm -f ~/youxi-rooms/tunnel.env; exit 6; fi
+                  \$D rm -f youxi-rooms >/dev/null 2>&1
+                  \$D run -d --name youxi-rooms --restart unless-stopped --read-only --tmpfs /tmp \
+                    --cpus 1 --memory 512m --pids-limit 256 --security-opt no-new-privileges \
+                    --log-opt max-size=5m --log-opt max-file=2 --network youxi-net youxi-rooms:\$T >/dev/null && echo rooms=started || { echo rooms=failed; exit 7; }
+                  if [ \"\$(\$D inspect -f '{{.State.Running}}' youxi-cloudflared 2>/dev/null)\" = true ]; then echo tunnel=kept
+                  else \$D rm -f youxi-cloudflared >/dev/null 2>&1
+                    \$D run -d --name youxi-cloudflared --restart unless-stopped --cpus 0.5 --memory 256m --pids-limit 128 \
+                      --security-opt no-new-privileges --log-opt max-size=5m --log-opt max-file=2 --network youxi-net \
+                      --env-file ~/youxi-rooms/tunnel.env cloudflare/cloudflared:2026.11.0 tunnel --no-autoupdate run >/dev/null \
+                      && echo tunnel=started || echo tunnel=failed
+                  fi
+                  rm -f ~/youxi-rooms/tunnel.env; echo token=removed
+                  \$D image ls youxi-rooms --format '{{.Tag}}' | grep -vx \"\$T\" | xargs -r -I{} \$D rmi youxi-rooms:{} >/dev/null 2>&1; echo old_images=removed
+                  sleep 8; $STATUS" >> "$d/out" 2>> "$d/err" || rc=$?
+              fi ;;
+          esac
+          show "$d/out"
+          if [[ $rc -ne 0 ]]; then
+            if grep -q 'Permission denied' "$d/err"; then why=permission-denied
+            elif grep -qiE '530|502|websocket|bad handshake' "$d/err"; then why=ssh-tunnel-not-connected
+            elif [[ $rc -eq 124 ]]; then why=timeout
+            else why="remote-exit-$rc"; fi
+            echo "result=failed ($why)" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          rm -rf "$d"
+          exit $rc
+
+      - name: Public health check through the tunnel
+        if: inputs.mode != 'stop'
+        shell: bash
+        run: |
+          set -uo pipefail
+          code=000
+          for i in $(seq 1 12); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://youxi-rooms.readori.com/healthz || true)
+            [[ "$code" == 200 ]] && break
+            sleep 5
+          done
+          echo "public_healthz=$code" | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ "$code" == 200 ]]
