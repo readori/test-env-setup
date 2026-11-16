@@ -55,7 +55,7 @@ jobs:
   verify:
     name: Verify game
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 80
 
     steps:
       - name: Validate request and credentials
