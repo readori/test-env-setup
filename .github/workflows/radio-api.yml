@@ -274,12 +274,22 @@ jobs:
             process.exit(1);
           }
           const recorded = new Set(tables.includes('d1_migrations') ? sql('SELECT name FROM d1_migrations').map((r) => r.name) : []);
-          // A migration that is not recorded but whose tables already exist was applied by hand:
-          // record it instead of running it again ("table already exists"). 0003 only drops, so it
-          // has no CREATE TABLE and always runs; it is idempotent.
+          // One-off repair: an earlier run recorded 0005_accounts.sql without running it (the rule
+          // below used to accept ANY of its tables; 0005 drops and rebuilds `favorites`, which
+          // already existed). Its own tables are missing, so unrecord it and let apply run it; its
+          // guard aborts the whole file if the old users / devices / favorites tables hold a row.
+          if (recorded.has('0005_accounts.sql') && !tables.includes('auth_accounts')) {
+            console.log('0005_accounts.sql recorded but not applied (auth_accounts missing): unrecording it');
+            sql("DELETE FROM d1_migrations WHERE name = '0005_accounts.sql'");
+            recorded.delete('0005_accounts.sql');
+          }
+          // A migration that is not recorded but ALL of whose tables already exist was applied by
+          // hand: record it instead of running it again ("table already exists"). 0003 only drops,
+          // so it has no CREATE TABLE and always runs; it is idempotent. A migration that drops and
+          // rebuilds an existing table (0005) still has new tables missing, so it runs.
           const baseline = files.filter((f) => !recorded.has(f)).filter((f) => {
             const created = [...readFileSync(`${MIGRATIONS}/${f}`, 'utf8').matchAll(/CREATE TABLE `([^`]+)`/g)].map((m) => m[1]);
-            return created.some((t) => tables.includes(t));
+            return created.length > 0 && created.every((t) => tables.includes(t));
           });
           if (baseline.length > 0) {
             console.log(`already present, recorded without running: ${baseline.join(', ')}`);
@@ -294,7 +304,7 @@ jobs:
           console.log(`migrations recorded after apply: ${after.join(', ')}`);
           const tables2 = tableNames();
           console.log(`tables after apply (${tables2.length}): ${tables2.join(', ')}`);
-          const wanted = ['store_transactions', 'store_devices', 'recognize_uses'];
+          const wanted = ['store_transactions', 'store_devices', 'recognize_uses', ...(files.includes('0005_accounts.sql') ? ['auth_accounts', 'auth_sessions'] : [])];
           const bad = [...missing.map((f) => `not recorded: ${f}`), ...wanted.filter((t) => !tables2.includes(t)).map((t) => `missing table: ${t}`), ...(tables2.includes('entitlements') ? ['entitlements still exists'] : [])];
           if (bad.length > 0) {
             console.error(`::error::migration state is not what was expected: ${bad.join('; ')}`);
@@ -338,7 +348,11 @@ jobs:
           redact() { sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<id>/g; s/[0-9a-fA-F]{32}/<id>/g'; }
           if ! pnpm exec wrangler deploy --config wrangler.generated.json --env "$TARGET_ENV" > "$log" 2>&1; then
             echo 'deploy failed; error codes only:'
-            { grep -oE 'TS[0-9]{4,5}|[ERROR]|ERR_[A-Z_]+|code: [0-9]+' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
+            { grep -oE 'TS[0-9]{4,5}|\[ERROR\]|ERR_[A-Z_]+|code: [0-9]+' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
+            # Cloudflare API messages ("... [code: N]") name the cause; ids redacted, Worker / D1
+            # names are masked earlier in this job. No source lines are printed.
+            echo 'Cloudflare API messages:'
+            { grep -E '\[code: [0-9]+\]' "$log" || true; } | redact | cut -c1-240 | sort -u | head -5
             exit 1
           fi
           { grep -E 'Uploaded|Deployed|Current Version' "$log" || true; } | redact
