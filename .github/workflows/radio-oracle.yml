@@ -228,11 +228,16 @@ jobs:
           persist-credentials: false
           clean: true
 
+      # Plain docker, not docker/setup-qemu-action: this repo allows GitHub-owned actions only
+      # (a third-party action fails the whole workflow at startup, every mode included).
       - name: QEMU for arm64 (only on an x64 runner)
         if: runner.arch == 'X64'
-        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
-        with:
-          platforms: arm64
+        shell: bash
+        run: |
+          docker run --privileged --rm tonistiigi/binfmt:qemu-v9.2.2 --install arm64 \
+            > "$RUNNER_TEMP/binfmt.log" 2>&1 \
+            || { echo '::error::could not register QEMU binfmt for arm64'; exit 1; }
+          echo 'qemu=arm64:ok'
 
       - name: Build the arm64 image (quiet; no cache export, no push)
         id: build
