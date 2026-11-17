@@ -1,0 +1,243 @@
+# Radio (Hourwave) catalog ingest Worker, staging (DATA-02 S6; plan reports/oracle-batch-plan §4/§5).
+#
+#   dry-run : bundle only (wrangler deploy --dry-run), no credentials.
+#   deploy  : cron-slot check -> provision (queue find-or-create, D1/R2 ids) -> pending D1 migrations
+#             (only 0004 may be pending; anything else stops) -> deploy -> three secrets via stdin
+#             -> status. The staging config ships INGEST_DRY_RUN=true.
+#   status  : ingest_runs counts only.
+#
+# Public-log rules: workflow_dispatch only; no `set -x`; resource names are read from the config and
+# masked; wrangler output goes to temp files and only error codes / redacted error lines are printed;
+# hostnames, ids and station data are never printed; secrets only on the steps that need them;
+# no artifacts, no cache.
+name: Radio Ingest
+run-name: Radio Ingest · ${{ inputs.mode }} · staging · ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Private readori/Radio branch, tag, or SHA'
+        required: true
+        type: string
+      mode:
+        description: 'dry-run | deploy | status'
+        required: true
+        default: dry-run
+        type: choice
+        options: [dry-run, deploy, status]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: radio-ingest-staging
+  cancel-in-progress: false
+
+env:
+  SOURCE_REF: ${{ inputs.ref }}
+  MODE: ${{ inputs.mode }}
+  TARGET_ENV: staging
+  WRANGLER_SEND_METRICS: 'false'
+  TURBO_TELEMETRY_DISABLED: '1'
+
+jobs:
+  ingest:
+    name: Ingest Worker (${{ inputs.mode }}, staging)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Validate request
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REF" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]] || { echo '::error::ref must be a branch, tag or SHA (no leading -)'; exit 64; }
+
+      - name: Checkout private source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/Radio
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Install and bundle (no credentials in this step)
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          [[ -f workers/catalog-ingest/wrangler.jsonc ]] || { echo '::error::workers/catalog-ingest is missing at this ref'; exit 66; }
+          echo "Private source commit: $(git rev-parse --short=8 HEAD)"
+          corepack enable
+          pnpm install --frozen-lockfile --reporter=silent
+          log="$(mktemp)"
+          if ! pnpm turbo run build --filter=@hourwave/catalog-ingest... --output-logs=none > "$log" 2>&1; then
+            echo 'build failed; error codes only (private source lines are never printed):'
+            { grep -oE 'TS[0-9]{4,5}|\[ERROR\]|ERR_[A-Z_]+' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
+            exit 1
+          fi
+          echo "- bundle: OK" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Resolve names from the wrangler config (masked)
+        shell: bash
+        working-directory: source/workers/catalog-ingest
+        run: |
+          set -euo pipefail
+          # The ingest config is plain JSON (no comments).
+          read -r worker db < <(node -e '
+            const c = JSON.parse(require("fs").readFileSync("wrangler.jsonc", "utf8"));
+            const e = (c.env || {})[process.argv[1]] || {};
+            const w = e.name || `${c.name}-${process.argv[1]}`;
+            const d = ((e.d1_databases || [])[0] || {}).database_name || "";
+            const ok = (s) => /^[a-z0-9][a-z0-9-]{0,62}$/.test(s);
+            if (!ok(w) || !ok(d)) { console.error("::error::no valid worker/db name in the config"); process.exit(1); }
+            console.log(w, d);' "$TARGET_ENV")
+          echo "::add-mask::$worker"; echo "::add-mask::$db"
+          { echo "INGEST_WORKER=$worker"; echo "DB_NAME=$db"; } >> "$GITHUB_ENV"
+          echo 'names resolved (not printed)'
+
+      - name: Cron Trigger slots (Workers Free allows 5 per account)
+        if: inputs.mode == 'deploy'
+        shell: bash
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$CF_ACCOUNT"
+          api="https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/workers/scripts"
+          scripts="$(curl -sS -H "Authorization: Bearer $CF_TOKEN" "$api" | jq -r 'if .success then .result[].id else empty end')"
+          [[ -n $scripts ]] || { echo '::error::could not list Worker scripts'; exit 1; }
+          used=0; mine=0
+          while read -r s; do
+            [[ $s =~ ^[A-Za-z0-9_-]{1,63}$ ]] || continue
+            n="$(curl -sS -H "Authorization: Bearer $CF_TOKEN" "$api/$s/schedules" | jq -r 'if .success then (.result.schedules // [] | length) else 0 end')"
+            [[ $n =~ ^[0-9]+$ ]] || n=0
+            if [[ $s == "$INGEST_WORKER" ]]; then mine=$n; else used=$((used + n)); fi
+          done <<< "$scripts"
+          echo "cron_triggers_other_workers=$used cron_triggers_this_worker=$mine" | tee -a "$GITHUB_STEP_SUMMARY"
+          (( used + 1 <= 5 )) || { echo '::error::no free Cron Trigger slot (5 per account on Workers Free); ask the owner'; exit 1; }
+
+      - name: Provision (queue find-or-create, D1/R2 ids)
+        if: inputs.mode == 'deploy'
+        shell: bash
+        working-directory: source/workers/catalog-ingest
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$CLOUDFLARE_ACCOUNT_ID"
+          # Prints names (masked) and created/exists only; writes wrangler.generated.json.
+          node scripts/provision.mjs --env "$TARGET_ENV" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: D1 migrations (only 0004 may be pending)
+        if: inputs.mode == 'deploy'
+        shell: bash
+        working-directory: source/workers/catalog-ingest
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          redact() { sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<id>/g; s/[0-9a-fA-F]{32}/<id>/g'; }
+          if ! pnpm exec wrangler d1 migrations list "$DB_NAME" --remote \
+               --config wrangler.generated.json --env "$TARGET_ENV" > "$log" 2>&1 < /dev/null; then
+            grep -E 'ERROR|✘|[Ee]rror' "$log" | redact | head -20; exit 1
+          fi
+          pending="$(grep -oE '[0-9]{4}_[a-z0-9_]+\.sql' "$log" | sort -u || true)"
+          if [[ -z "$pending" ]]; then echo "- D1 migrations: none pending" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; fi
+          # `migrations apply` applies EVERY pending file; 0005 (API-03 accounts) belongs to its own task.
+          unexpected="$(echo "$pending" | grep -vx '0004_catalog_ingest.sql' || true)"
+          if [[ -n "$unexpected" ]]; then
+            echo "::error::unexpected pending migrations: $(echo $unexpected | tr '\n' ' ') - apply them from their own task"
+            exit 1
+          fi
+          # 0004 aborts by itself unless stations / station_streams / stream_health are empty.
+          if ! pnpm exec wrangler d1 migrations apply "$DB_NAME" --remote \
+               --config wrangler.generated.json --env "$TARGET_ENV" > "$log" 2>&1 < /dev/null; then
+            grep -E 'ERROR|✘|[Ee]rror|CHECK' "$log" | redact | head -20; exit 1
+          fi
+          echo "- D1 migrations: applied $(echo $pending | tr '\n' ' ')" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy
+        if: inputs.mode == 'deploy'
+        shell: bash
+        working-directory: source/workers/catalog-ingest
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          redact() { sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<id>/g; s/[0-9a-fA-F]{32}/<id>/g'; }
+          # Before the secrets: `secret put` needs the Worker. Without them the cron does nothing.
+          if ! pnpm exec wrangler deploy --config wrangler.generated.json --env "$TARGET_ENV" > "$log" 2>&1 < /dev/null; then
+            grep -E 'ERROR|✘|[Ee]rror' "$log" | redact | head -30; exit 1
+          fi
+          echo "- deploy: OK" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Secrets (stdin only)
+        if: inputs.mode == 'deploy'
+        shell: bash
+        working-directory: source/workers/catalog-ingest
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+          BATCH_HOST: ${{ secrets.HOURWAVE_BATCH_HOST }}
+          BATCH_ID: ${{ secrets.HOURWAVE_BATCH_ACCESS_CLIENT_ID }}
+          BATCH_SECRET: ${{ secrets.HOURWAVE_BATCH_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          for v in BATCH_HOST BATCH_ID BATCH_SECRET; do
+            [[ -n "${!v}" ]] || { echo "::error::missing secret for $v"; exit 1; }
+          done
+          host="${BATCH_HOST#https://}"; host="${host%%/*}"
+          echo "::add-mask::$host"
+          [[ $host =~ ^[A-Za-z0-9.-]{1,253}$ ]] || { echo '::error::HOURWAVE_BATCH_HOST is not a hostname'; exit 1; }
+          put() {
+            printf '%s' "$2" | pnpm exec wrangler secret put "$1" \
+              --config wrangler.generated.json --env "$TARGET_ENV" > /dev/null 2>&1 \
+              || { echo "::error::secret put $1 failed"; exit 1; }
+            echo "- secret $1: set" | tee -a "$GITHUB_STEP_SUMMARY"
+          }
+          put BATCH_ORIGIN "https://$host"
+          put BATCH_ACCESS_CLIENT_ID "$BATCH_ID"
+          put BATCH_ACCESS_CLIENT_SECRET "$BATCH_SECRET"
+
+      - name: Status (ingest_runs counts only)
+        if: inputs.mode == 'deploy' || inputs.mode == 'status'
+        shell: bash
+        working-directory: source/workers/catalog-ingest
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -uo pipefail
+          echo "::add-mask::$CLOUDFLARE_ACCOUNT_ID"
+          [[ -f wrangler.generated.json ]] || node scripts/provision.mjs --env "$TARGET_ENV" > /dev/null 2>&1 \
+            || { echo '::error::provision (lookup) failed'; exit 1; }
+          out="$(mktemp)"
+          q="SELECT product, run_id, status, reason, json_extract(stats,'\$.chunksApplied') AS chunks,
+               json_extract(stats,'\$.rowsWritten') AS rows, json_extract(stats,'\$.wouldWrite') AS would,
+               json_extract(stats,'\$.diffMsMax') AS diff_ms_max
+             FROM ingest_runs ORDER BY run_id DESC LIMIT 6"
+          if pnpm exec wrangler d1 execute "$DB_NAME" --remote --json \
+               --config wrangler.generated.json --env "$TARGET_ENV" --command "$q" > "$out" 2> /dev/null < /dev/null; then
+            n="$(jq '.[0].results | length' "$out" 2> /dev/null || echo 0)"
+            echo "ingest_runs_rows=$n" | tee -a "$GITHUB_STEP_SUMMARY"
+            jq -r '.[0].results[] | "product=\(.product) run=\(.run_id) status=\(.status) chunks=\(.chunks // 0) rows=\(.rows // 0) would=\(.would // 0) diff_ms_max=\(.diff_ms_max // 0) reason=\((.reason // "none") | gsub("[^A-Za-z0-9:._ -]"; "_") | .[0:80])"' "$out" \
+              | grep -E '^product=(catalog|health) ' | tee -a "$GITHUB_STEP_SUMMARY" || true
+          else
+            echo 'status query failed (0004 not applied yet?)'
+          fi
+          rm -f "$out"
