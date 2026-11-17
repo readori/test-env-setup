@@ -19,6 +19,18 @@
 # the build number is higher than the latest TestFlight build of that version.
 # Signing profile: created once by certificates-repo.yml (signing_mode=refresh_radio_profile).
 #
+# Widgets (MOB-05, input `widgets`, default false): exported as HOURWAVE_WIDGETS=1 / =0 to every step,
+# so the app's widgets config plugin (apps/mobile/plugins/widgets) adds or omits the WidgetKit
+# extension target HourwaveWidgets (bundle com.readori.radio.widgets, App Group
+# group.com.readori.radio, iOS 17) at expo prebuild. Right after prebuild the generated
+# ios/*.xcodeproj is checked: widgets=true without that target, or widgets=false with it, fails.
+# With the target, archive/testflight install both App Store profiles readonly (app + widgets), set
+# manual signing per target (app target = scheme name -> app profile, HourwaveWidgets -> widgets
+# profile), export with both provisioningProfiles, and check the IPA: the appex is in PlugIns/ with
+# its own embedded.mobileprovision and the app's version/build, both carry the App Group, neither has
+# get-task-allow. Without the target every step behaves exactly as before (single profile).
+# Both profiles come from certificates-repo.yml signing_mode=refresh_radio_profile.
+#
 # Safety rules (public repo, public logs):
 #   - workflow_dispatch only; third-party actions pinned to commit SHAs.
 #   - each secret is passed only to the step that uses it; the validation step sees presence
@@ -31,7 +43,7 @@
 #     (pnpm install / turbo build / prebuild / pod install) has run, and is removed at the end.
 name: Radio iOS
 
-run-name: Radio iOS · ${{ inputs.mode || 'verify' }} · ${{ inputs.ref || 'main' }} · ${{ inputs.version }} (${{ inputs.build_number }})
+run-name: Radio iOS · ${{ inputs.mode || 'verify' }} · ${{ inputs.ref || 'main' }} · ${{ inputs.version }} (${{ inputs.build_number }})${{ inputs.widgets && ' · widgets' || '' }}
 
 on:
   workflow_dispatch:
@@ -67,6 +79,11 @@ on:
           - none
           - launch
           - drag
+      widgets:
+        description: 'Build the WidgetKit extension HourwaveWidgets (com.readori.radio.widgets): sets HOURWAVE_WIDGETS=1 for expo prebuild (unchecked = HOURWAVE_WIDGETS=0). The ref must contain the widgets config plugin; signed modes need both profiles from certificates-repo.yml refresh_radio_profile.'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -80,6 +97,10 @@ env:
   PRIVATE_SOURCE_PATH: source
   MOBILE_APP_DIR: apps/mobile
   EXPECTED_BUNDLE_ID: com.readori.radio
+  # MOB-05 widgets extension (only built with input widgets=true; see the header).
+  EXPECTED_WIDGETS_BUNDLE_ID: com.readori.radio.widgets
+  EXPECTED_APP_GROUP: group.com.readori.radio
+  WIDGETS_TARGET: HourwaveWidgets
   XCODE_MAJOR_WANTED: '26'
   XCODE_MIN_VERSION: '26.4'
   MATCH_GIT_URL: https://github.com/readori/readori-certificates.git
@@ -107,6 +128,10 @@ jobs:
       VERSION_INPUT: ${{ inputs.version || '' }}
       BUILD_NUMBER_INPUT: ${{ inputs.build_number || '' }}
       SMOKE: ${{ inputs.smoke || 'none' }}
+      # Read by the widgets config plugin at expo prebuild (explicit 0 = off whatever app.json says).
+      # Job-wide so every step that evaluates the app config sees the same value.
+      HOURWAVE_WIDGETS: ${{ inputs.widgets && '1' || '0' }}
+      WIDGETS_REQUESTED: ${{ inputs.widgets && 'true' || 'false' }}
 
     steps:
       # ---------------------------------------------------------------------
@@ -184,6 +209,7 @@ jobs:
           echo "Mode: $MODE"
           echo "Private source ref: $SOURCE_REF"
           echo "Version input: $VERSION_INPUT ($BUILD_NUMBER_INPUT)"
+          echo "Widgets: requested=$WIDGETS_REQUESTED (HOURWAVE_WIDGETS=$HOURWAVE_WIDGETS)"
 
       # Prints only error lines of a captured log (private absolute paths made relative),
       # plus one annotation (annotations are readable through the public API without signing in).
@@ -475,6 +501,42 @@ jobs:
           }
           echo 'expo prebuild: PASS'
 
+          # Widgets extension target (MOB-05): present only when the plugin ran with HOURWAVE_WIDGETS=1.
+          # Checked here, before pod install (only ios/<App>.xcodeproj exists, no Pods project yet).
+          PROJECT_PATH=''
+          COUNT=0
+          for proj in "$PWD"/ios/*.xcodeproj; do
+            [[ -d "$proj" ]] || continue
+            PROJECT_PATH="$proj"
+            COUNT=$((COUNT + 1))
+          done
+          (( COUNT == 1 )) || {
+            echo "::error::Expected exactly one .xcodeproj in $MOBILE_APP_DIR/ios after expo prebuild; found $COUNT."
+            exit 66
+          }
+          xcodebuild -list -project "$PROJECT_PATH" -json > "$RUNNER_TEMP/radio-xcodeproj-list.json" 2>/dev/null || {
+            echo '::error::xcodebuild -list could not read the generated Xcode project.'
+            exit 66
+          }
+          WIDGETS_TARGET_PRESENT="$(python3 - "$RUNNER_TEMP/radio-xcodeproj-list.json" "$WIDGETS_TARGET" <<'PY'
+          import json, sys
+          targets = json.load(open(sys.argv[1])).get("project", {}).get("targets", [])
+          print("true" if sys.argv[2] in targets else "false")
+          PY
+          )"
+          rm -f "$RUNNER_TEMP/radio-xcodeproj-list.json"
+          if [[ "$WIDGETS_REQUESTED" == 'true' && "$WIDGETS_TARGET_PRESENT" != 'true' ]]; then
+            echo "::error::widgets=true but the generated Xcode project has no $WIDGETS_TARGET target. The ref must contain the widgets config plugin (apps/mobile/plugins/widgets) registered in the app config."
+            exit 65
+          fi
+          if [[ "$WIDGETS_REQUESTED" != 'true' && "$WIDGETS_TARGET_PRESENT" == 'true' ]]; then
+            echo "::error::widgets=false (HOURWAVE_WIDGETS=0) but the generated Xcode project has a $WIDGETS_TARGET target; the plugin did not honour the off switch."
+            exit 65
+          fi
+          echo "IOS_PROJECT_PATH=$PROJECT_PATH" >> "$GITHUB_ENV"
+          echo "WIDGETS_TARGET_PRESENT=$WIDGETS_TARGET_PRESENT" >> "$GITHUB_ENV"
+          echo "Widgets extension target $WIDGETS_TARGET: $WIDGETS_TARGET_PRESENT"
+
       - name: Install CocoaPods dependencies
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}/${{ env.MOBILE_APP_DIR }}/ios
         shell: bash
@@ -529,14 +591,31 @@ jobs:
           SETTINGS_FILE="$RUNNER_TEMP/radio-build-settings.txt"
           xcodebuild -showBuildSettings -workspace "$WORKSPACE_PATH" -scheme "$SCHEME" -configuration Release 2>/dev/null > "$SETTINGS_FILE"
 
-          BUNDLE_ID="$(awk -F ' = ' '/^ *PRODUCT_BUNDLE_IDENTIFIER = / {print $2; exit}' "$SETTINGS_FILE")"
+          # One setting of the app target: the block "Build settings for action build and target
+          # <scheme>:" (Expo: app target = scheme name), else the first block (as before). With the
+          # widgets extension as a dependency, the first block may be the extension's.
+          app_setting() {
+            awk -F ' = ' -v key="$1" -v app="$SCHEME" '
+              /^Build settings for action [a-z]+ and target / {
+                t = $0; sub(/^Build settings for action [a-z]+ and target /, "", t); sub(/:$/, "", t)
+                next
+              }
+              $1 ~ "^ *" key "$" {
+                if (first == "") first = $2
+                if (t == app && mine == "") mine = $2
+              }
+              END { print (mine != "" ? mine : first) }
+            ' "$SETTINGS_FILE"
+          }
+
+          BUNDLE_ID="$(app_setting PRODUCT_BUNDLE_IDENTIFIER)"
           [[ "$BUNDLE_ID" == "$CONFIGURED_BUNDLE_ID" ]] || {
             echo "::error::PRODUCT_BUNDLE_IDENTIFIER is '${BUNDLE_ID:-<empty>}', expected $CONFIGURED_BUNDLE_ID (app.json)."
             exit 65
           }
 
-          INFOPLIST_REL="$(awk -F ' = ' '/^ *INFOPLIST_FILE = / {print $2; exit}' "$SETTINGS_FILE")"
-          DEPLOYMENT_TARGET="$(awk -F ' = ' '/^ *IPHONEOS_DEPLOYMENT_TARGET = / {print $2; exit}' "$SETTINGS_FILE")"
+          INFOPLIST_REL="$(app_setting INFOPLIST_FILE)"
+          DEPLOYMENT_TARGET="$(app_setting IPHONEOS_DEPLOYMENT_TARGET)"
           rm -f "$SETTINGS_FILE"
 
           INFOPLIST_PATH="$IOS_DIR/$INFOPLIST_REL"
@@ -557,6 +636,20 @@ jobs:
           }
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$INFOPLIST_PATH"
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$INFOPLIST_PATH"
+
+          # Widgets extension: same literal versions in its Info.plist (the plugin's "Sync version
+          # with the app" build phase copies them again from the app's Info.plist at build time).
+          # Its bundle ID is <app bundle ID>.widgets (= EXPECTED_WIDGETS_BUNDLE_ID in signed modes).
+          if [[ "$WIDGETS_TARGET_PRESENT" == 'true' ]]; then
+            EXT_INFOPLIST="$IOS_DIR/$WIDGETS_TARGET/Info.plist"
+            [[ -f "$EXT_INFOPLIST" ]] || {
+              echo "::error::$WIDGETS_TARGET/Info.plist was not generated by the widgets plugin."
+              exit 66
+            }
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$EXT_INFOPLIST"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$EXT_INFOPLIST"
+            echo "WIDGETS_BUNDLE_ID=$CONFIGURED_BUNDLE_ID.widgets" >> "$GITHUB_ENV"
+          fi
 
           echo "WORKSPACE_PATH=$WORKSPACE_PATH" >> "$GITHUB_ENV"
           echo "SCHEME=$SCHEME" >> "$GITHUB_ENV"
@@ -632,6 +725,28 @@ jobs:
             echo "::error::Built app is $BUILT_VERSION ($BUILT_BUILD), expected $APP_VERSION ($BUILD_NUMBER)."
             exit 65
           }
+
+          # Widgets (widgets=true): the extension must be embedded with the app's version/build.
+          if [[ "$WIDGETS_TARGET_PRESENT" == 'true' ]]; then
+            SIM_APPEX=''
+            shopt -s nullglob
+            for ext in "$APP_PATH"/PlugIns/*.appex; do
+              ext_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$ext/Info.plist" 2>/dev/null || true)"
+              [[ "$ext_id" == "$WIDGETS_BUNDLE_ID" ]] && SIM_APPEX="$ext"
+            done
+            shopt -u nullglob
+            [[ -n "$SIM_APPEX" ]] || {
+              echo "::error::Widgets extension $WIDGETS_BUNDLE_ID is not embedded in the simulator app's PlugIns/."
+              exit 65
+            }
+            EXT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$SIM_APPEX/Info.plist" 2>/dev/null || true)"
+            EXT_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$SIM_APPEX/Info.plist" 2>/dev/null || true)"
+            [[ "$EXT_VERSION" == "$APP_VERSION" && "$EXT_BUILD" == "$BUILD_NUMBER" ]] || {
+              echo "::error::Widgets extension is ${EXT_VERSION:-?} (${EXT_BUILD:-?}), expected $APP_VERSION ($BUILD_NUMBER)."
+              exit 65
+            }
+            echo "Widgets extension embedded: $(basename "$SIM_APPEX")"
+          fi
 
           echo "JS bundle: embedded ($(du -k "$APP_PATH/main.jsbundle" | awk '{print $1}') KiB)"
           echo 'Simulator build: PASS'
@@ -921,13 +1036,18 @@ jobs:
           }
           echo "Match branch: $MATCH_GIT_BRANCH (${MATCH_BRANCH_SHA:0:8})"
 
-          # --- Match: shared Apple Distribution identity + Radio App Store profile
+          # --- Match: shared Apple Distribution identity + Radio App Store profile(s)
           # Readonly by design: this workflow never writes to the shared certificates repository.
-          # The profile is created once by certificates-repo.yml (signing_mode=refresh_radio_profile).
+          # The profiles are created by certificates-repo.yml (signing_mode=refresh_radio_profile):
+          # the app's, plus the widgets extension's when the HourwaveWidgets target was generated.
+          MATCH_APP_IDENTIFIERS="$EXPECTED_BUNDLE_ID"
+          if [[ "$WIDGETS_TARGET_PRESENT" == 'true' ]]; then
+            MATCH_APP_IDENTIFIERS="$EXPECTED_BUNDLE_ID,$EXPECTED_WIDGETS_BUNDLE_ID"
+          fi
           MATCH_LOG="$RUNNER_TEMP/radio-match.log"
           set +e
           MATCH_READONLY=true fastlane match appstore \
-            --app_identifier "$EXPECTED_BUNDLE_ID" \
+            --app_identifier "$MATCH_APP_IDENTIFIERS" \
             --git_url "$MATCH_GIT_URL" \
             --git_branch "$MATCH_GIT_BRANCH" \
             --git_basic_authorization "$MATCH_AUTH" \
@@ -944,12 +1064,12 @@ jobs:
             grep -iE 'error|\[!\]|could not|couldn.t|no matching|not found|expired|revoked|denied|unauthori|forbidden' "$MATCH_LOG" \
               | cut -c1-300 | awk '!seen[$0]++' | head -30 || true
             rm -f "$MATCH_LOG"
-            echo "::error::Readonly Match could not install signing assets for $EXPECTED_BUNDLE_ID."
-            echo '::error::First run? Run certificates-repo.yml with signing_mode=refresh_radio_profile and destructive_confirmation=WRITE, then retry.'
+            echo "::error::Readonly Match could not install signing assets for $MATCH_APP_IDENTIFIERS."
+            echo '::error::First run (or first run with widgets)? Run certificates-repo.yml with signing_mode=refresh_radio_profile and destructive_confirmation=WRITE, then retry.'
             exit 65
           fi
           rm -f "$MATCH_LOG"
-          echo "Match readonly install: PASS ($EXPECTED_BUNDLE_ID)"
+          echo "Match readonly install: PASS ($MATCH_APP_IDENTIFIERS)"
 
           security set-key-partition-list \
             -S apple-tool:,apple:,codesign: \
@@ -957,7 +1077,7 @@ jobs:
             -k "$KEYCHAIN_PASSWORD" \
             "$KEYCHAIN_PATH" >/dev/null
 
-      - name: Locate and validate installed App Store profile
+      - name: Locate and validate installed App Store profile(s) (app [+ widgets, App Group])
         if: ${{ env.MODE == 'archive' || env.MODE == 'testflight' }}
         shell: bash
         env:
@@ -976,34 +1096,63 @@ jobs:
           )
           shopt -u nullglob
 
-          PROFILE_NAME=''
-          PROFILE_TEAM=''
-          PROFILE_GET_TASK=''
-          for profile in "${candidates[@]}"; do
-            [[ -f "$profile" ]] || continue
-            plist="$PROFILE_SCAN_DIR/$(basename "$profile").plist"
-            /usr/bin/security cms -D -i "$profile" > "$plist" 2>/dev/null || continue
-            app_id="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$plist" 2>/dev/null || true)"
-            [[ "$app_id" == *".$EXPECTED_BUNDLE_ID" ]] || continue
-            PROFILE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :Name' "$plist")"
-            PROFILE_TEAM="$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$plist")"
-            PROFILE_GET_TASK="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$plist" 2>/dev/null || echo false)"
-            break
-          done
+          # Prints the installed App Store profile name for one bundle ID, or exits 65.
+          # Matched by application-identifier suffix (the App ID prefix may differ from the team ID),
+          # then the TeamIdentifier is checked. Only names and PASS/FAIL are printed.
+          # locate_profile <bundle ID> <require App Group: true|false>
+          locate_profile() {
+            local bundle="$1" need_group="$2"
+            local found_name='' found_team='' found_get_task='' found_plist=''
+            for profile in "${candidates[@]}"; do
+              [[ -f "$profile" ]] || continue
+              plist="$PROFILE_SCAN_DIR/$(basename "$profile").plist"
+              /usr/bin/security cms -D -i "$profile" > "$plist" 2>/dev/null || continue
+              app_id="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$plist" 2>/dev/null || true)"
+              [[ "$app_id" == *".$bundle" ]] || continue
+              found_plist="$plist"
+              found_name="$(/usr/libexec/PlistBuddy -c 'Print :Name' "$plist")"
+              found_team="$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$plist")"
+              found_get_task="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$plist" 2>/dev/null || echo false)"
+              break
+            done
+
+            [[ -n "$found_name" ]] || {
+              echo "::error::No App Store provisioning profile for $bundle was installed by Match." >&2
+              exit 65
+            }
+            [[ "$found_team" == "$ASC_TEAM_ID" ]] || {
+              echo "::error::Provisioning profile team for $bundle does not match ASC_TEAM_ID." >&2
+              exit 65
+            }
+            [[ "$found_get_task" != 'true' ]] || {
+              echo "::error::Installed profile for $bundle has get-task-allow=true and is not an App Store distribution profile." >&2
+              exit 65
+            }
+            if [[ "$need_group" == 'true' ]]; then
+              python3 - "$found_plist" "$EXPECTED_APP_GROUP" "$bundle" >&2 <<'PY'
+          import plistlib, sys
+          ent = plistlib.load(open(sys.argv[1], "rb")).get("Entitlements", {})
+          groups = ent.get("com.apple.security.application-groups", [])
+          if isinstance(groups, str):
+              groups = [groups]
+          if sys.argv[2] not in groups:
+              print(f"::error::App Store profile for {sys.argv[3]} does not include App Group {sys.argv[2]}. "
+                    "Assign the group to this App ID in the Apple Developer portal, then run certificates-repo.yml "
+                    "signing_mode=refresh_radio_profile.")
+              sys.exit(65)
+          print(f"App Group in profile for {sys.argv[3]}: PASS")
+          PY
+            fi
+            printf '%s\n' "$found_name"
+          }
+
+          PROFILE_NAME="$(locate_profile "$EXPECTED_BUNDLE_ID" "$WIDGETS_TARGET_PRESENT")"
+          WIDGETS_PROFILE_NAME=''
+          if [[ "$WIDGETS_TARGET_PRESENT" == 'true' ]]; then
+            WIDGETS_PROFILE_NAME="$(locate_profile "$EXPECTED_WIDGETS_BUNDLE_ID" true)"
+          fi
           rm -rf "$PROFILE_SCAN_DIR"
 
-          [[ -n "$PROFILE_NAME" ]] || {
-            echo "::error::No App Store provisioning profile for $EXPECTED_BUNDLE_ID was installed by Match."
-            exit 65
-          }
-          [[ "$PROFILE_TEAM" == "$ASC_TEAM_ID" ]] || {
-            echo "::error::Provisioning profile team for $EXPECTED_BUNDLE_ID does not match ASC_TEAM_ID."
-            exit 65
-          }
-          [[ "$PROFILE_GET_TASK" != 'true' ]] || {
-            echo "::error::Installed profile for $EXPECTED_BUNDLE_ID has get-task-allow=true and is not an App Store distribution profile."
-            exit 65
-          }
           security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -q 'Apple Distribution' || {
             echo '::error::No Apple Distribution signing identity was installed into the ephemeral keychain.'
             exit 65
@@ -1011,6 +1160,10 @@ jobs:
 
           echo "APPSTORE_PROFILE_NAME=$PROFILE_NAME" >> "$GITHUB_ENV"
           echo "Provisioning profile: $PROFILE_NAME"
+          if [[ "$WIDGETS_TARGET_PRESENT" == 'true' ]]; then
+            echo "WIDGETS_PROFILE_NAME=$WIDGETS_PROFILE_NAME" >> "$GITHUB_ENV"
+            echo "Widgets provisioning profile: $WIDGETS_PROFILE_NAME"
+          fi
 
       - name: Check build number is higher than the latest TestFlight build
         if: ${{ env.MODE == 'testflight' }}
@@ -1064,6 +1217,51 @@ jobs:
           echo "SIGNED_EXPORT_DIR=$EXPORT_DIR" >> "$GITHUB_ENV"
           echo "SIGNED_EXPORT_OPTIONS=$EXPORT_OPTIONS" >> "$GITHUB_ENV"
 
+          # Without the widgets target: one signed target, the profile is a global override (as before).
+          # With it: app and extension need different profiles, so the profile cannot be a global
+          # xcodebuild override. It is written per target into the generated project's Release
+          # configuration (xcodeproj gem from the pinned fastlane; same approach as english-ios.yml).
+          PROFILE_OVERRIDE=(PROVISIONING_PROFILE_SPECIFIER="$APPSTORE_PROFILE_NAME")
+          if [[ "$WIDGETS_TARGET_PRESENT" == 'true' ]]; then
+            PROFILE_OVERRIDE=()
+            export SIGN_APP_TARGET="$SCHEME" SIGN_APP_ID="$EXPECTED_BUNDLE_ID" SIGN_APP_PROFILE="$APPSTORE_PROFILE_NAME"
+            export SIGN_EXT_TARGET="$WIDGETS_TARGET" SIGN_EXT_ID="$EXPECTED_WIDGETS_BUNDLE_ID" SIGN_EXT_PROFILE="$WIDGETS_PROFILE_NAME"
+            export SIGN_TEAM_ID="$ASC_TEAM_ID"
+            ruby - "$IOS_PROJECT_PATH" <<'RUBY'
+          require 'xcodeproj'
+          project = Xcodeproj::Project.open(ARGV[0])
+          wanted = {
+            ENV.fetch('SIGN_APP_TARGET') => [ENV.fetch('SIGN_APP_ID'), ENV.fetch('SIGN_APP_PROFILE')],
+            ENV.fetch('SIGN_EXT_TARGET') => [ENV.fetch('SIGN_EXT_ID'), ENV.fetch('SIGN_EXT_PROFILE')],
+          }
+          signed = {}
+          project.native_targets.each do |target|
+            next unless wanted.key?(target.name)
+            bundle, profile = wanted[target.name]
+            target.build_configurations.each do |config|
+              next unless config.name == 'Release'
+              declared = config.build_settings['PRODUCT_BUNDLE_IDENTIFIER'].to_s.delete('"')
+              if !declared.empty? && declared != bundle
+                puts "::error::Target #{target.name} declares bundle ID '#{declared}', expected #{bundle}."
+                exit 65
+              end
+              config.build_settings['CODE_SIGN_STYLE'] = 'Manual'
+              config.build_settings['DEVELOPMENT_TEAM'] = ENV.fetch('SIGN_TEAM_ID')
+              config.build_settings['CODE_SIGN_IDENTITY'] = 'Apple Distribution'
+              config.build_settings['PROVISIONING_PROFILE_SPECIFIER'] = profile
+              signed[target.name] = true
+            end
+          end
+          missing = wanted.keys.reject { |name| signed[name] }
+          unless missing.empty?
+            puts "::error::No Release configuration found for target(s): #{missing.join(', ')}"
+            exit 66
+          end
+          project.save
+          puts "Per-target signing set for #{signed.size} targets (app + widgets)."
+          RUBY
+          fi
+
           set +e
           xcodebuild archive \
             -quiet \
@@ -1077,7 +1275,7 @@ jobs:
             CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM="$ASC_TEAM_ID" \
             CODE_SIGN_IDENTITY='Apple Distribution' \
-            PROVISIONING_PROFILE_SPECIFIER="$APPSTORE_PROFILE_NAME" > "$ARCHIVE_LOG" 2>&1
+            ${PROFILE_OVERRIDE[@]+"${PROFILE_OVERRIDE[@]}"} > "$ARCHIVE_LOG" 2>&1
           status=$?
           set -e
           if (( status != 0 )); then
@@ -1094,16 +1292,24 @@ jobs:
           export BUNDLE_ID_FOR_PLIST="$EXPECTED_BUNDLE_ID"
           export PROFILE_NAME_FOR_PLIST="$APPSTORE_PROFILE_NAME"
           export TEAM_ID_FOR_PLIST="$ASC_TEAM_ID"
+          # Widgets extension profile: only when the target exists (empty = app profile only).
+          export EXT_BUNDLE_ID_FOR_PLIST='' EXT_PROFILE_NAME_FOR_PLIST=''
+          if [[ "$WIDGETS_TARGET_PRESENT" == 'true' ]]; then
+            export EXT_BUNDLE_ID_FOR_PLIST="$EXPECTED_WIDGETS_BUNDLE_ID" EXT_PROFILE_NAME_FOR_PLIST="$WIDGETS_PROFILE_NAME"
+          fi
           python3 - "$EXPORT_OPTIONS" <<'PY'
           import os, plistlib, sys
 
+          profiles = {os.environ["BUNDLE_ID_FOR_PLIST"]: os.environ["PROFILE_NAME_FOR_PLIST"]}
+          if os.environ.get("EXT_BUNDLE_ID_FOR_PLIST"):
+              profiles[os.environ["EXT_BUNDLE_ID_FOR_PLIST"]] = os.environ["EXT_PROFILE_NAME_FOR_PLIST"]
           payload = {
               "method": "app-store-connect",
               "destination": "export",
               "signingStyle": "manual",
               "signingCertificate": "Apple Distribution",
               "teamID": os.environ["TEAM_ID_FOR_PLIST"],
-              "provisioningProfiles": {os.environ["BUNDLE_ID_FOR_PLIST"]: os.environ["PROFILE_NAME_FOR_PLIST"]},
+              "provisioningProfiles": profiles,
               "manageAppVersionAndBuildNumber": False,
               "stripSwiftSymbols": True,
               "uploadSymbols": True,
@@ -1170,6 +1376,72 @@ jobs:
             echo "::error::Signed IPA bundle ID mismatch: $SIGNED_BUNDLE_ID"
             exit 65
           }
+
+          # Widgets extension (only when the target exists): embedded in PlugIns/ with its own
+          # profile and the app's version/build; FINAL signed entitlements (codesign, not the
+          # profiles) of app and extension carry the App Group and no get-task-allow.
+          # Prints key names and PASS/FAIL only.
+          if [[ "$WIDGETS_TARGET_PRESENT" == 'true' ]]; then
+            SIGNED_APPEX=''
+            shopt -s nullglob
+            for ext in "$SIGNED_APP"/PlugIns/*.appex; do
+              ext_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$ext/Info.plist" 2>/dev/null || true)"
+              [[ "$ext_id" == "$EXPECTED_WIDGETS_BUNDLE_ID" ]] && SIGNED_APPEX="$ext"
+            done
+            shopt -u nullglob
+            [[ -n "$SIGNED_APPEX" ]] || {
+              echo "::error::Widgets extension $EXPECTED_WIDGETS_BUNDLE_ID is not in the exported IPA's PlugIns/."
+              exit 65
+            }
+            test -f "$SIGNED_APPEX/embedded.mobileprovision" || {
+              echo '::error::Widgets extension in the signed IPA is missing embedded.mobileprovision.'
+              exit 65
+            }
+            EXT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$SIGNED_APPEX/Info.plist" 2>/dev/null || true)"
+            EXT_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$SIGNED_APPEX/Info.plist" 2>/dev/null || true)"
+            [[ "$EXT_VERSION" == "$SIGNED_VERSION" && "$EXT_BUILD" == "$SIGNED_BUILD_NUMBER" ]] || {
+              echo "::error::Widgets extension is ${EXT_VERSION:-?} (${EXT_BUILD:-?}), the app is $SIGNED_VERSION ($SIGNED_BUILD_NUMBER); App Store Connect rejects a mismatch."
+              exit 65
+            }
+            ent_fail=0
+            for bin in "$SIGNED_APP" "$SIGNED_APPEX"; do
+              label="$(basename "$bin")"
+              ent_file="$VERIFY_DIR/entitlements-$label.plist"
+              # stderr (the Executable= line) is dropped; stdout is the entitlements plist only.
+              if ! codesign -d --entitlements :- "$bin" 2>/dev/null > "$ent_file" || [[ ! -s "$ent_file" ]]; then
+                echo "::error::$label: codesign could not read the signed entitlements."
+                ent_fail=1
+                continue
+              fi
+              python3 -I - "$ent_file" "$label" "$EXPECTED_APP_GROUP" <<'PY' || ent_fail=1
+          import plistlib, sys
+          path, label, group = sys.argv[1:4]
+          try:
+              with open(path, "rb") as fh:
+                  ent = plistlib.loads(fh.read())
+          except Exception:
+              print(f"::error::{label}: the signed entitlements are not a readable plist.")
+              sys.exit(1)
+          groups = ent.get("com.apple.security.application-groups", [])
+          if isinstance(groups, str):
+              groups = [groups]
+          bad = 0
+          if group in groups:
+              print(f"{label}: com.apple.security.application-groups contains {group}: PASS")
+          else:
+              print(f"::error::{label}: signed entitlements lack App Group {group}.")
+              bad = 1
+          if ent.get("get-task-allow") in (None, False):
+              print(f"{label}: get-task-allow false or absent: PASS")
+          else:
+              print(f"::error::{label}: signed entitlements have get-task-allow=true.")
+              bad = 1
+          sys.exit(bad)
+          PY
+            done
+            (( ent_fail == 0 )) || exit 65
+            echo "Widgets extension embedded and signed: $(basename "$SIGNED_APPEX")"
+          fi
 
           MIN_OS="$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$SIGNED_APP/Info.plist" 2>/dev/null || true)"
           NON_EXEMPT="$(/usr/libexec/PlistBuddy -c 'Print :ITSAppUsesNonExemptEncryption' "$SIGNED_APP/Info.plist" 2>/dev/null || true)"
@@ -1258,6 +1530,11 @@ jobs:
             echo "- Mode: \`${MODE}\`"
             echo "- Version: \`${APP_VERSION}\` (${BUILD_NUMBER})"
             echo "- Bundle ID: \`${CONFIGURED_BUNDLE_ID}\`"
+            if [[ "${WIDGETS_TARGET_PRESENT:-false}" == 'true' ]]; then
+              echo "- Widgets extension: \`${WIDGETS_TARGET}\` (\`${WIDGETS_BUNDLE_ID:-}\`, App Group \`${EXPECTED_APP_GROUP}\`)"
+            else
+              echo '- Widgets extension: off'
+            fi
             echo "- Private source: \`${PRIVATE_SOURCE_REPOSITORY}@${SOURCE_REF}\` (\`${SOURCE_SHORT_SHA}\`)"
             XCODE_VERSION_TEXT="$(xcodebuild -version 2>/dev/null || true)"
             echo "- Xcode: \`${XCODE_VERSION_TEXT%%$'\n'*}\`"

@@ -55,6 +55,8 @@ jobs:
       ENGLISH_WIDGETS_BUNDLE_ID: com.readori.english.widgets
       ENGLISH_APP_GROUP: group.com.readori.english
       RADIO_BUNDLE_ID: com.readori.radio
+      RADIO_WIDGETS_BUNDLE_ID: com.readori.radio.widgets
+      RADIO_APP_GROUP: group.com.readori.radio
       MATCH_GIT_URL: https://github.com/readori/readori-certificates.git
       MATCH_GIT_BRANCH: main
 
@@ -111,7 +113,7 @@ jobs:
                 echo '::error::refresh_radio_profile requires destructive_confirmation=WRITE.'
                 exit 64
               }
-              echo '::notice::Preserves the shared Distribution identity and other app profiles; force-regenerates only com.readori.radio (Meridian).'
+              echo '::notice::Preserves the shared Distribution identity and other app profiles; force-regenerates only com.readori.radio (Hourwave, formerly Meridian) and its widgets extension com.readori.radio.widgets.'
               ;;
             fresh_bootstrap_all)
               [[ "$DESTRUCTIVE_CONFIRMATION" == 'RESET_ALL_SIGNING' ]] || {
@@ -767,14 +769,18 @@ jobs:
           echo 'English App Store profiles refresh (app + widgets extension): PASS'
 
       # ============================================================
-      # 7C4. REFRESH RADIO (MERIDIAN) PROFILE ONLY
+      # 7C4. REFRESH RADIO (HOURWAVE, FORMERLY MERIDIAN) PROFILES ONLY
       #      Reuses the existing shared Distribution identity; creates/regenerates
-      #      only the Radio App Store profile (com.readori.radio, no extensions).
-      #      The App ID must already exist in the Apple Developer portal; this
-      #      workflow never creates Identifiers.
-      #      radio-ios.yml installs this profile readonly for archive/testflight.
+      #      only the Radio App Store profiles: the app (com.readori.radio) and its
+      #      WidgetKit extension (com.readori.radio.widgets, MOB-05). Both use the
+      #      App Group group.com.readori.radio. Both App IDs (with the App Groups
+      #      capability and that group assigned; CarPlay Audio on the app) must already
+      #      exist in the Apple Developer portal; this workflow never creates
+      #      Identifiers or App Groups.
+      #      radio-ios.yml installs these profiles readonly for archive/testflight (the
+      #      widgets profile only when it builds with widgets=true).
       # ============================================================
-      - name: Refresh Radio App Store profile only
+      - name: Refresh Radio App Store profiles only (app + widgets extension)
         if: ${{ inputs.signing_mode == 'refresh_radio_profile' }}
         env:
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
@@ -793,10 +799,16 @@ jobs:
           )
 
           echo 'Preflight: prove an existing shared Distribution identity is usable...'
-          MATCH_READONLY=true fastlane match appstore             --app_identifier "$RADIO_BUNDLE_ID"             --readonly true             --skip_provisioning_profiles true             "${COMMON[@]}"
+          MATCH_READONLY=true fastlane match appstore \
+            --app_identifier "$RADIO_BUNDLE_ID" \
+            --readonly true \
+            --skip_provisioning_profiles true \
+            "${COMMON[@]}"
 
           security unlock-keychain -p "$SIGNING_KEYCHAIN_PASSWORD" "$SIGNING_KEYCHAIN_PATH"
-          security set-key-partition-list             -S apple-tool:,apple:,codesign:             -s -k "$SIGNING_KEYCHAIN_PASSWORD" "$SIGNING_KEYCHAIN_PATH" >/dev/null
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$SIGNING_KEYCHAIN_PASSWORD" "$SIGNING_KEYCHAIN_PATH" >/dev/null
 
           ID_COUNT="$(security find-identity -v -p codesigning "$SIGNING_KEYCHAIN_PATH" | grep -c 'Apple Distribution\|iPhone Distribution' || true)"
           [[ "$ID_COUNT" -ge 1 ]] || {
@@ -804,46 +816,70 @@ jobs:
             exit 78
           }
 
-          MATCH_READONLY=false fastlane match appstore             --app_identifier "$RADIO_BUNDLE_ID"             --readonly false             --force             --generate_apple_certs false             --skip_confirmation true             "${COMMON[@]}"
+          # One match call covers the app and its widgets extension,
+          # so both profiles are signed by the same shared Distribution identity.
+          MATCH_READONLY=false fastlane match appstore \
+            --app_identifier "$RADIO_BUNDLE_ID,$RADIO_WIDGETS_BUNDLE_ID" \
+            --readonly false \
+            --force \
+            --generate_apple_certs false \
+            --skip_confirmation true \
+            "${COMMON[@]}"
 
-          # Verify the freshly written profile here (the shared validation step below is
-          # skipped for this mode). application-identifier must match exactly.
-          PROFILE_FOUND=0
-          RADIO_CARPLAY=no
-          RADIO_ENT_KEYS=''
-          for root in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
-            [[ -d "$root" ]] || continue
-            for p in "$root"/*.mobileprovision; do
-              [[ -f "$p" ]] || continue
-              tmp="$(mktemp)"
-              if security cms -D -i "$p" > "$tmp" 2>/dev/null; then
-                appid="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$tmp" 2>/dev/null || true)"
-                gettask="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$tmp" 2>/dev/null || true)"
-                if [[ "$appid" == "$ASC_TEAM_ID.$RADIO_BUNDLE_ID" && "$gettask" != 'true' ]]; then
-                  PROFILE_FOUND=1
-                  # CarPlay audio (OPS-02): report presence and entitlement key names only.
-                  if /usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.carplay-audio' "$tmp" >/dev/null 2>&1; then
-                    RADIO_CARPLAY=yes
+          # Verify the freshly written profiles here (the shared validation step below is
+          # skipped for this mode). application-identifier must match exactly, so the app
+          # profile never satisfies the extension check (or the reverse). Only booleans and
+          # entitlement key names are printed, never profile contents.
+          MISSING=0
+          for bundle in "$RADIO_BUNDLE_ID" "$RADIO_WIDGETS_BUNDLE_ID"; do
+            PROFILE_FOUND=no
+            GROUP_OK=no
+            CARPLAY=no
+            ENT_KEYS=''
+            for root in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+              [[ -d "$root" ]] || continue
+              for p in "$root"/*.mobileprovision; do
+                [[ -f "$p" ]] || continue
+                tmp="$(mktemp)"
+                if security cms -D -i "$p" > "$tmp" 2>/dev/null; then
+                  appid="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$tmp" 2>/dev/null || true)"
+                  gettask="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$tmp" 2>/dev/null || true)"
+                  if [[ "$appid" == "$ASC_TEAM_ID.$bundle" && "$gettask" != 'true' ]]; then
+                    PROFILE_FOUND=yes
+                    if /usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.security.application-groups' "$tmp" 2>/dev/null | grep -qx "[[:space:]]*$RADIO_APP_GROUP"; then
+                      GROUP_OK=yes
+                    fi
+                    # CarPlay audio (OPS-02): presence only.
+                    if /usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.carplay-audio' "$tmp" >/dev/null 2>&1; then
+                      CARPLAY=yes
+                    fi
+                    ENT_KEYS="$(plutil -extract Entitlements xml1 -o - "$tmp" 2>/dev/null | grep -o '<key>[^<]*</key>' | sed 's#</*key>##g' | sort | paste -sd' ' - || true)"
                   fi
-                  RADIO_ENT_KEYS="$(plutil -extract Entitlements xml1 -o - "$tmp" 2>/dev/null | grep -o '<key>[^<]*</key>' | sed 's#</*key>##g' | sort | paste -sd' ' - || true)"
                 fi
-              fi
-              rm -f "$tmp"
+                rm -f "$tmp"
+              done
             done
+            echo "Profile $bundle: installed=$PROFILE_FOUND app_group($RADIO_APP_GROUP)=$GROUP_OK"
+            echo "Profile $bundle entitlement keys: $ENT_KEYS"
+            if [[ "$PROFILE_FOUND" != 'yes' ]]; then
+              echo "::error::No installed App Store profile found for $bundle after refresh."
+              echo '::error::Confirm this App ID exists in the Apple Developer portal (Identifiers), then rerun refresh_radio_profile.'
+              MISSING=1
+            elif [[ "$GROUP_OK" != 'yes' ]]; then
+              echo "::error::The App Store profile for $bundle does not include the App Group $RADIO_APP_GROUP."
+              echo "::error::In the Apple Developer portal: enable the App Groups capability on $bundle and assign $RADIO_APP_GROUP, then rerun refresh_radio_profile."
+              MISSING=1
+            fi
+            if [[ "$bundle" == "$RADIO_BUNDLE_ID" ]]; then
+              echo "CarPlay audio entitlement in app profile: $CARPLAY"
+              if [[ "$PROFILE_FOUND" == 'yes' && "$CARPLAY" != 'yes' ]]; then
+                echo '::warning::com.apple.developer.carplay-audio is not in the new Radio app profile. Enable CarPlay Audio under the App ID Additional Capabilities in the Apple Developer portal, then rerun refresh_radio_profile.'
+              fi
+            fi
           done
-          [[ "$PROFILE_FOUND" -eq 1 ]] || {
-            echo "::error::No installed App Store profile found for $RADIO_BUNDLE_ID after refresh."
-            echo '::error::Confirm this App ID exists in the Apple Developer portal (Identifiers), then rerun refresh_radio_profile.'
-            exit 78
-          }
-          echo "App Store profile installed: $RADIO_BUNDLE_ID"
-          echo "Radio profile entitlement keys: $RADIO_ENT_KEYS"
-          echo "CarPlay audio entitlement in profile: $RADIO_CARPLAY"
-          if [[ "$RADIO_CARPLAY" != 'yes' ]]; then
-            echo '::warning::com.apple.developer.carplay-audio is not in the new Radio profile. Enable CarPlay Audio under the App ID Additional Capabilities in the Apple Developer portal, then rerun refresh_radio_profile.'
-          fi
+          [[ "$MISSING" -eq 0 ]] || exit 78
 
-          echo 'Radio App Store profile refresh: PASS'
+          echo 'Radio App Store profiles refresh (app + widgets extension, App Group): PASS'
 
       # ============================================================
       # 7D. READONLY VERIFY
@@ -876,9 +912,9 @@ jobs:
       # 8. VALIDATE INSTALLED PROFILES
       #    Only the profiles this mode installed are checked: a refresh_*_profile
       #    mode installs just its own app's profile, so requiring the others here
-      #    would always fail. refresh_paobuwan_profile and refresh_english_profile
-      #    verify their two profiles inside their own steps; refresh_radio_profile
-      #    verifies its single profile inside its own step.
+      #    would always fail. refresh_paobuwan_profile, refresh_english_profile and
+      #    refresh_radio_profile verify their two profiles (app + extension) inside
+      #    their own steps.
       # ============================================================
       - name: Validate Readori, CF Mail, and ShiftMile App Store profiles
         if: ${{ inputs.signing_mode != 'refresh_paobuwan_profile' && inputs.signing_mode != 'refresh_english_profile' && inputs.signing_mode != 'refresh_radio_profile' }}
@@ -1002,9 +1038,9 @@ jobs:
             echo "- Mode: \`${{ inputs.signing_mode }}\`"
             echo "- Match repo: \`$MATCH_GIT_URL@$MATCH_GIT_BRANCH\`"
             echo '- Match auth: HTTPS + TARGET_REPO_PAT'
-            echo '- Active App IDs: com.readori.app + com.readori.mail + com.readori.shiftmile + com.readori.paobuwan (+ extension com.readori.paobuwan.LiveActivity) + com.readori.english (+ extension com.readori.english.widgets, App Group group.com.readori.english) + com.readori.radio'
+            echo '- Active App IDs: com.readori.app + com.readori.mail + com.readori.shiftmile + com.readori.paobuwan (+ extension com.readori.paobuwan.LiveActivity) + com.readori.english (+ extension com.readori.english.widgets, App Group group.com.readori.english) + com.readori.radio (+ extension com.readori.radio.widgets, App Group group.com.readori.radio)'
             echo '- Fresh bootstrap target: one shared Apple Distribution identity + three App Store profiles'
-            echo '- Refresh modes: reuse existing identity and regenerate only the selected App Store profile (refresh_readori_profile covers the app and its voice-pack downloader extension; refresh_paobuwan_profile covers the app and its Live Activity extension; refresh_english_profile covers the app and its widgets extension; refresh_radio_profile covers com.readori.radio only)'
+            echo '- Refresh modes: reuse existing identity and regenerate only the selected App Store profile (refresh_readori_profile covers the app and its voice-pack downloader extension; refresh_paobuwan_profile covers the app and its Live Activity extension; refresh_english_profile covers the app and its widgets extension; refresh_radio_profile covers the app and its widgets extension)'
             echo '- APNs keys / ASC API keys / Identifiers are never deleted by this workflow'
             echo '- Apple Developer certificate/profile revocation is intentionally manual'
             echo '- Scope: certificates and provisioning profiles only; this workflow builds no IPA'
