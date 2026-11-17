@@ -92,15 +92,18 @@ jobs:
         run: |
           set -euo pipefail
           # The ingest config is plain JSON (no comments).
-          read -r worker db < <(node -e '
+          read -r worker db bucket queue < <(node -e '
             const c = JSON.parse(require("fs").readFileSync("wrangler.jsonc", "utf8"));
             const e = (c.env || {})[process.argv[1]] || {};
             const w = e.name || `${c.name}-${process.argv[1]}`;
             const d = ((e.d1_databases || [])[0] || {}).database_name || "";
+            const b = ((e.r2_buckets || [])[0] || {}).bucket_name || "";
+            const q = (((e.queues || {}).producers || [])[0] || {}).queue || "";
             const ok = (s) => /^[a-z0-9][a-z0-9-]{0,62}$/.test(s);
-            if (!ok(w) || !ok(d)) { console.error("::error::no valid worker/db name in the config"); process.exit(1); }
-            console.log(w, d);' "$TARGET_ENV")
-          echo "::add-mask::$worker"; echo "::add-mask::$db"
+            if (![w, d, b, q].every(ok)) { console.error("::error::no valid worker/db/bucket/queue name in the config"); process.exit(1); }
+            console.log(w, d, b, q);' "$TARGET_ENV")
+          # Masked so the provision output and summaries never print them either.
+          for n in "$worker" "$db" "$bucket" "$queue"; do echo "::add-mask::$n"; done
           { echo "INGEST_WORKER=$worker"; echo "DB_NAME=$db"; } >> "$GITHUB_ENV"
           echo 'names resolved (not printed)'
 
@@ -240,6 +243,15 @@ jobs:
               | grep -E '^product=(catalog|health) ' | tee -a "$GITHUB_STEP_SUMMARY" || true
           else
             echo 'status query failed (0004 not applied yet?)'
+          fi
+          # While INGEST_DRY_RUN=true these must all be 0 (dry run writes only ingest_* bookkeeping).
+          q2="SELECT (SELECT count(*) FROM stations) AS st, (SELECT count(*) FROM station_streams) AS ss, (SELECT count(*) FROM stream_health) AS sh"
+          if pnpm exec wrangler d1 execute "$DB_NAME" --remote --json \
+               --config wrangler.generated.json --env "$TARGET_ENV" --command "$q2" > "$out" 2> /dev/null < /dev/null; then
+            jq -r '.[0].results[0] | "data_rows stations=\(.st) station_streams=\(.ss) stream_health=\(.sh)"' "$out" \
+              | grep -E '^data_rows stations=[0-9]+ station_streams=[0-9]+ stream_health=[0-9]+$' | tee -a "$GITHUB_STEP_SUMMARY" || true
+          else
+            echo 'data count query failed'
           fi
           rm -f "$out"
 
