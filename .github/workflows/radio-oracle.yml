@@ -579,9 +579,10 @@ jobs:
           if [[ -z $mark || $mark == none || $mark == "$before" ]]; then result=no-marker; code=''; fi
           echo "job=$JOB result=${result:-unknown} exit_code=${code:-unknown} elapsed_min=$elapsed" | tee -a "$GITHUB_STEP_SUMMARY"
           if [[ $result != success ]]; then
-            # Category + filtered 120-char text of the job's last error line (install.sh last-error).
+            # Category + error code token of the job's last error line (install.sh last-error); the
+            # line's text can name hosts or addresses and is never printed.
             if REMOTE_RAW="$RUNNER_TEMP/last-error.out" bash "$r" hw last-error "$JOB" > /dev/null; then
-              grep -E '^error_(kind|text)=[A-Za-z0-9:._/-]{0,120}$' "$RUNNER_TEMP/last-error.out" | tee -a "$GITHUB_STEP_SUMMARY" || true
+              grep -E '^error_(kind|code)=[A-Za-z0-9_-]{1,48}$' "$RUNNER_TEMP/last-error.out" | tee -a "$GITHUB_STEP_SUMMARY" || true
             fi
             rm -f "$RUNNER_TEMP/last-error.out"
             echo "::error::job $JOB did not succeed"; exit 1
