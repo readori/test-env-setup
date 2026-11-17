@@ -13,6 +13,8 @@
 #                 for up to 120 min; `probe_limit` caps the streams probed (probe/dry only).
 #   rollback    : swap hourwave-batch:previous and :current, restart hourwave-serve;
 #                 `disable_timer` also stops the daily timer.
+#   (status also runs `origin`: GET the batch origin through its Access app the way the ingest
+#    Worker will — HTTP code and byte count per served path only.)
 #
 # Safety rules (public repo, public logs): workflow_dispatch only; no `set -x`; secrets only on the
 # steps that need them, written to $RUNNER_TEMP with mode 600 and removed at the end; hosts, IPs,
@@ -23,6 +25,8 @@
 # Secrets: ORACLE_SSH_KEY (or the old name ORACLE_API_TOKEN), ORACLE_SSH_HOST, ORACLE_SSH_USER,
 # ORACLE_ACCESS_CLIENT_ID / ORACLE_ACCESS_CLIENT_SECRET (Access service token of the SSH route),
 # TARGET_REPO_PAT (read access to readori/Radio; build-image and deploy only).
+# HOURWAVE_BATCH_HOST / HOURWAVE_BATCH_ACCESS_CLIENT_ID / HOURWAVE_BATCH_ACCESS_CLIENT_SECRET
+# (the ingest Worker's own Access service token; status `origin` job only).
 name: Radio Oracle
 
 run-name: Radio Oracle · ${{ inputs.mode }}${{ inputs.mode == 'run-once' && format(' · {0}', inputs.job) || '' }}${{ (inputs.mode == 'build-image' || inputs.mode == 'deploy') && format(' · {0}', inputs.ref) || '' }}
@@ -612,3 +616,37 @@ jobs:
         if: always()
         shell: bash
         run: rm -rf "$RUNNER_TEMP/ssh" "$RUNNER_TEMP/cloudflared"
+
+  origin:
+    name: Batch origin through Access
+    if: inputs.mode == 'status'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: GET served paths (code and size only)
+        shell: bash
+        env:
+          BATCH_HOST: ${{ secrets.HOURWAVE_BATCH_HOST }}
+          BATCH_ID: ${{ secrets.HOURWAVE_BATCH_ACCESS_CLIENT_ID }}
+          BATCH_SECRET: ${{ secrets.HOURWAVE_BATCH_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -uo pipefail
+          [[ -n $BATCH_HOST && -n $BATCH_ID && -n $BATCH_SECRET ]] || { echo '::error::HOURWAVE_BATCH_* secrets are not set'; exit 1; }
+          host="${BATCH_HOST#https://}"; host="${host%%/*}"
+          echo "::add-mask::$host"
+          [[ $host =~ ^[A-Za-z0-9.-]{1,253}$ ]] || { echo '::error::HOURWAVE_BATCH_HOST is not a hostname'; exit 1; }
+          hdr="$RUNNER_TEMP/access.hdr"; ( umask 077; printf 'CF-Access-Client-Id: %s\nCF-Access-Client-Secret: %s\n' "$BATCH_ID" "$BATCH_SECRET" > "$hdr" )
+          body="$RUNNER_TEMP/origin.body"; fail=0
+          # Anonymous first: Access must refuse it (403, or a redirect to the login page).
+          code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "https://$host/v1/status.json" 2> /dev/null || echo 000)"
+          echo "anonymous_status_json=$code" | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ $code =~ ^(302|401|403)$ ]] || fail=1
+          for path in v1/status.json v1/catalog/latest.json v1/health/latest.json; do
+            out="$(curl -sS -o "$body" -w '%{http_code} %{size_download} %{content_type}' --max-time 30 -H "@$hdr" "https://$host/$path" 2> /dev/null || echo '000 0 none')"
+            read -r code size ctype <<< "$out"
+            [[ $ctype =~ ^[A-Za-z0-9/.+-]{1,40} ]] && ctype="${BASH_REMATCH[0]}" || ctype=none
+            echo "path=${path//\//_} code=$code bytes=$size content_type=$ctype" | tee -a "$GITHUB_STEP_SUMMARY"
+            [[ $path == v1/status.json && $code != 200 ]] && fail=1
+          done
+          rm -f "$hdr" "$body"
+          (( fail == 0 )) || { echo '::error::origin check failed (anonymous request not refused, or status.json not served)'; exit 1; }
