@@ -241,3 +241,31 @@ jobs:
             echo 'status query failed (0004 not applied yet?)'
           fi
           rm -f "$out"
+
+      - name: CPU and outcomes, last 24 h (Workers Analytics; numbers only)
+        if: inputs.mode == 'status' || inputs.mode == 'deploy'
+        shell: bash
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -uo pipefail
+          echo "::add-mask::$CF_ACCOUNT"
+          since="$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
+          body="$(jq -n --arg a "$CF_ACCOUNT" --arg s "$INGEST_WORKER" --arg t "$since" '{
+            query: "query($a:String!,$s:String!,$t:Time!){viewer{accounts(filter:{accountTag:$a}){workersInvocationsAdaptive(limit:20,filter:{scriptName:$s,datetime_geq:$t}){sum{requests errors subrequests} quantiles{cpuTimeP50 cpuTimeP99 cpuTimeP999} dimensions{status}}}}}",
+            variables: {a: $a, s: $s, t: $t}}')"
+          out="$(mktemp)"
+          if ! curl -sS -H "Authorization: Bearer $CF_TOKEN" -H 'content-type: application/json' \
+               --data "$body" https://api.cloudflare.com/client/v4/graphql > "$out" 2> /dev/null; then
+            echo 'analytics=unreachable'; rm -f "$out"; exit 0
+          fi
+          if jq -e '.errors | length > 0' "$out" > /dev/null 2>&1; then
+            echo "analytics=error $(jq -r '.errors[0].extensions.code // "unknown"' "$out" | tr -cd 'A-Za-z0-9_' | cut -c1-40)"
+            rm -f "$out"; exit 0
+          fi
+          # cpuTime is in microseconds; the Free plan limit is 10 ms per invocation.
+          jq -r '.data.viewer.accounts[0].workersInvocationsAdaptive[]? |
+              "status=\(.dimensions.status) invocations=\(.sum.requests) errors=\(.sum.errors) subrequests=\(.sum.subrequests) cpu_p50_ms=\((.quantiles.cpuTimeP50 // 0) / 1000) cpu_p99_ms=\((.quantiles.cpuTimeP99 // 0) / 1000) cpu_p999_ms=\((.quantiles.cpuTimeP999 // 0) / 1000)"' "$out" \
+            | grep -E '^status=[A-Za-z]{1,40} invocations=[0-9]+ ' | tee -a "$GITHUB_STEP_SUMMARY" || echo 'invocations=0'
+          rm -f "$out"
