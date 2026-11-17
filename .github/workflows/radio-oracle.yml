@@ -548,10 +548,10 @@ jobs:
           started="$RUNNER_TEMP/run-once.out"
           # PROBE_LIMIT is validated (digits or empty); unquoted so that empty adds no argument.
           REMOTE_RAW="$started" bash "$r" hw run-once "$JOB" $PROBE_LIMIT
-          before="$(sed -nE 's/^before_inactive_mono=([0-9]+)$/\1/p' "$started")"
+          before="$(sed -nE 's/^before_done=([0-9]+:[0-9]+|none)$/\1/p' "$started")"
           [[ -n $before ]] || { echo '::error::the job did not start'; exit 1; }
           start=$(date +%s); deadline=$((start + 120 * 60)); fails=0; reported=0
-          state=''; result=''; code=''; elapsed=0
+          state=''; result=''; code=''; mark=''; elapsed=0
           poll="$RUNNER_TEMP/job-state.out"
           while :; do
             sleep 60
@@ -561,9 +561,10 @@ jobs:
               state="$(sed -nE 's/^active=([a-z-]+)$/\1/p' "$poll")"
               result="$(sed -nE 's/^result=([a-z-]+)$/\1/p' "$poll")"
               code="$(sed -nE 's/^exit_code=([0-9]+)$/\1/p' "$poll")"
-              # Type=oneshot: a finished run moves InactiveEnterTimestampMonotonic (install.sh job-state).
-              mono="$(sed -nE 's/^inactive_mono=([0-9]+)$/\1/p' "$poll")"
-              if [[ $state == failed || ( $state == inactive && $mono != "$before" ) ]]; then break; fi
+              # systemd unloads a finished oneshot instance, so the end of a run is run-job.sh's
+              # done marker ("<end ns>:<exit code>") changing (install.sh job-state).
+              mark="$(sed -nE 's/^done=([0-9]+:[0-9]+|none)$/\1/p' "$poll")"
+              if [[ $state == failed || ( $state == inactive && -n $mark && $mark != none && $mark != "$before" ) ]]; then break; fi
             else
               fails=$((fails + 1))
               (( fails < 5 )) || { echo '::error::lost the VM while polling (5 failures in a row)'; exit 1; }
@@ -574,6 +575,8 @@ jobs:
               exit 1
             fi
           done
+          # failed with no new marker (killed before the trap ran): the marker read is the previous run's.
+          if [[ -z $mark || $mark == none || $mark == "$before" ]]; then result=no-marker; code=''; fi
           echo "job=$JOB result=${result:-unknown} exit_code=${code:-unknown} elapsed_min=$elapsed" | tee -a "$GITHUB_STEP_SUMMARY"
           if [[ $result != success ]]; then
             # Category + filtered 120-char text of the job's last error line (install.sh last-error).
