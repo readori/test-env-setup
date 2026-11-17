@@ -105,7 +105,7 @@ jobs:
           echo 'names resolved (not printed)'
 
       - name: Cron Trigger slots (Workers Free allows 5 per account)
-        if: inputs.mode == 'deploy'
+        if: inputs.mode == 'deploy' || inputs.mode == 'status'
         shell: bash
         env:
           CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -124,6 +124,7 @@ jobs:
             if [[ $s == "$INGEST_WORKER" ]]; then mine=$n; else used=$((used + n)); fi
           done <<< "$scripts"
           echo "cron_triggers_other_workers=$used cron_triggers_this_worker=$mine" | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ $MODE == status ]] && exit 0
           (( used + 1 <= 5 )) || { echo '::error::no free Cron Trigger slot (5 per account on Workers Free); ask the owner'; exit 1; }
 
       - name: Provision (queue find-or-create, D1/R2 ids)
