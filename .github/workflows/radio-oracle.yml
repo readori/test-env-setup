@@ -649,7 +649,9 @@ jobs:
             read -r code size ctype <<< "$out"
             [[ $ctype =~ ^[A-Za-z0-9/.+-]{1,40} ]] && ctype="${BASH_REMATCH[0]}" || ctype=none
             echo "path=${path//\//_} code=$code bytes=$size content_type=$ctype" | tee -a "$GITHUB_STEP_SUMMARY"
-            [[ $path == v1/status.json && $code != 200 ]] && fail=1
+            # 404 = the tunnel and Access let us through to hourwave-serve, but nothing is published
+            # yet (only `dry` has run). 000/5xx = the path itself is broken.
+            [[ $code =~ ^(200|404)$ ]] || fail=1
           done
           rm -f "$hdr" "$body"
-          (( fail == 0 )) || { echo '::error::origin check failed (anonymous request not refused, or status.json not served)'; exit 1; }
+          (( fail == 0 )) || { echo '::error::origin check failed (anonymous request not refused, or the origin is unreachable)'; exit 1; }
