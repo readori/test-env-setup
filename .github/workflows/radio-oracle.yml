@@ -1,24 +1,62 @@
-# Radio (Hourwave) Oracle batch VM — read-only probes (owner 2026-11-14: "通过 CI 处理").
+# Radio (Hourwave) Oracle batch VM (owner 2026-11-14: "通过 CI 处理"; plan DATA-02 §5, OPS-11).
 #
-#   probe : checks the shape of secrets.ORACLE_API_TOKEN (an OCI API key) and, when it carries a
-#           full OCI CLI config, one read-only authenticated call. Prints booleans and counts only.
+#   probe       : checks the shape of secrets.ORACLE_API_TOKEN (an OCI API key) and, when it carries
+#                 a full OCI CLI config, one read-only authenticated call. Booleans and counts only.
+#   ssh-probe   : one SSH login through the Hourwave tunnel; read-only sudo/docker/cloudflared checks.
+#   status      : hourwave-* containers, hourwave-batch tags, timer last/next, job results, serve,
+#                 disk and memory, allow-listed status.json fields. Never journal lines.
+#   build-image : private source at `ref` -> arm64 image hourwave-batch:<sha> on an arm64 runner
+#                 (quiet build, no cache export, no push, no artifact) -> `selftest` in the image.
+#   deploy      : build-image -> `docker save | gzip | ssh docker load` over the tunnel -> scp
+#                 workers/oracle-batch/deploy/* -> `sudo install.sh deploy <sha>` on the VM.
+#   run-once    : start hourwave-batch@<job> (dry = daily into /out/dry, never served) and poll it
+#                 for up to 120 min; `probe_limit` caps the streams probed (probe/dry only).
+#   rollback    : swap hourwave-batch:previous and :current, restart hourwave-serve;
+#                 `disable_timer` also stops the daily timer.
 #
-# Safety rules (public repo, public logs): workflow_dispatch only; no checkout of private source;
-# the secret is only on the steps that need it, written to $RUNNER_TEMP with mode 600 and removed;
-# OCIDs, fingerprints, namespaces and hosts are never printed; no artifacts.
+# Safety rules (public repo, public logs): workflow_dispatch only; no `set -x`; secrets only on the
+# steps that need them, written to $RUNNER_TEMP with mode 600 and removed at the end; hosts, IPs,
+# OCIDs, fingerprints, file contents and journal lines are never printed; remote output is printed
+# only as allow-listed key=value tokens; tool output goes to files under $RUNNER_TEMP; no artifacts,
+# no Actions cache, no registry push. On the VM only hourwave-* containers/images/units are touched.
+#
+# Secrets: ORACLE_SSH_KEY (or the old name ORACLE_API_TOKEN), ORACLE_SSH_HOST, ORACLE_SSH_USER,
+# ORACLE_ACCESS_CLIENT_ID / ORACLE_ACCESS_CLIENT_SECRET (Access service token of the SSH route),
+# TARGET_REPO_PAT (read access to readori/Radio; build-image and deploy only).
 name: Radio Oracle
 
-run-name: Radio Oracle · ${{ inputs.mode }}
+run-name: Radio Oracle · ${{ inputs.mode }}${{ inputs.mode == 'run-once' && format(' · {0}', inputs.job) || '' }}${{ (inputs.mode == 'build-image' || inputs.mode == 'deploy') && format(' · {0}', inputs.ref) || '' }}
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'probe = read-only checks of the OCI key'
+        description: 'status | build-image | deploy | run-once | rollback | probe (OCI key) | ssh-probe'
         required: true
-        default: probe
+        default: status
         type: choice
-        options: [probe, ssh-probe]
+        options: [status, build-image, deploy, run-once, rollback, probe, ssh-probe]
+      ref:
+        description: 'build-image / deploy: private readori/Radio branch, tag, or SHA'
+        required: false
+        default: 'main'
+        type: string
+      job:
+        description: 'run-once: dry (daily into /out/dry, not served) | daily | sync | probe'
+        required: false
+        default: dry
+        type: choice
+        options: [dry, daily, sync, probe]
+      probe_limit:
+        description: 'run-once probe/dry: probe at most this many streams (empty = all)'
+        required: false
+        default: ''
+        type: string
+      disable_timer:
+        description: 'rollback: also disable the daily timer'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -160,3 +198,404 @@ jobs:
           fi
           rm -rf "$d"
           exit $rc
+
+  # build-image and deploy share one job: without artifacts the image cannot move between jobs.
+  image:
+    name: Image (${{ inputs.mode }})
+    if: inputs.mode == 'build-image' || inputs.mode == 'deploy'
+    # Native arm64 runner (plan §5). If it is unavailable, set the repository variable
+    # RADIO_ORACLE_BUILD_RUNNER=ubuntu-latest: the build then runs under QEMU (slower, same image).
+    runs-on: ${{ vars.RADIO_ORACLE_BUILD_RUNNER || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 90
+    env:
+      SOURCE_REF: ${{ inputs.ref }}
+      MODE: ${{ inputs.mode }}
+    steps:
+      - name: Validate request
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REF" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]] || { echo '::error::ref must be a branch, tag or SHA (no leading -)'; exit 64; }
+
+      - name: Checkout private source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/Radio
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: QEMU for arm64 (only on an x64 runner)
+        if: runner.arch == 'X64'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+
+      - name: Build the arm64 image (quiet; no cache export, no push)
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git -C source rev-parse --short=12 HEAD)"
+          [[ $sha =~ ^[0-9a-f]{12}$ ]] || { echo '::error::could not read the source commit'; exit 1; }
+          [[ -f source/workers/oracle-batch/Dockerfile ]] || { echo '::error::workers/oracle-batch/Dockerfile is missing at this ref'; exit 66; }
+          echo "Private source commit: $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          log="$RUNNER_TEMP/build.log"
+          # The full build log (private source paths, compiler output) stays on the runner; the
+          # public log gets the failing step's position only.
+          if ! docker build --platform linux/arm64 --progress=plain --pull \
+              --build-arg GIT_SHA="$sha" -f source/workers/oracle-batch/Dockerfile \
+              -t "hourwave-batch:$sha" source > "$log" 2>&1; then
+            # The failing vertex is the first "#<n> ERROR" line; print only its [stage i/n] position
+            # and exit code (stages build in parallel, so the last header may be another stage).
+            n="$(grep -m1 -oE '^#[0-9]+ ERROR' "$log" | grep -oE '[0-9]+' || true)"
+            where='unknown'; code=''
+            if [[ -n $n ]]; then
+              where="$(grep -m1 -oE "^#$n \[[a-z0-9-]+ +[0-9]+/[0-9]+\]" "$log" | grep -oE '\[[a-z0-9-]+ +[0-9]+/[0-9]+\]' || true)"
+              code="$(grep -m1 -E "^#$n ERROR" "$log" | grep -oE 'exit code: [0-9]+' || true)"
+            fi
+            echo "::error::image build failed (step ${where:-unknown}${code:+, $code}; full log stays on the runner)"
+            exit 1
+          fi
+          rm -f "$log"
+          size="$(docker image inspect -f '{{.Size}}' "hourwave-batch:$sha")"
+          arch="$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "hourwave-batch:$sha")"
+          echo "image=built platform=$arch size_mb=$((size / 1048576))" | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ $arch == linux/arm64 ]] || { echo '::error::image is not linux/arm64'; exit 1; }
+
+      - name: Selftest inside the image (offline, read-only, unprivileged)
+        shell: bash
+        env:
+          SHA: ${{ steps.build.outputs.sha }}
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/selftest.log"
+          rc=0
+          docker run --rm --network none --read-only --tmpfs /tmp:size=64m \
+            --cap-drop ALL --security-opt no-new-privileges --user 10001:10001 \
+            "hourwave-batch:$SHA" selftest > "$log" 2>&1 || rc=$?
+          grep -E '^(pass|FAIL) [A-Za-z0-9 ,./-]{1,80}$|^selftest: (ok|[0-9]+ failed)$' "$log" | tee -a "$GITHUB_STEP_SUMMARY" || true
+          rm -f "$log"
+          exit $rc
+
+      - name: Install cloudflared (official release, pinned, checksum)
+        if: inputs.mode == 'deploy'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_ARCH" in
+            X64) arch=amd64; sum=053b80b0a23031a038fdbf3c073f59f82b8f1f152aa67971d7383ffafc0dbab0 ;;
+            ARM64) arch=arm64; sum=89297ebfb9e8c99c0dc013a1140601453cf3798d8306c5591651f4a3f5210be8 ;;
+            *) echo '::error::unsupported runner architecture'; exit 1 ;;
+          esac
+          curl -fsSL -o "$RUNNER_TEMP/cloudflared" "https://github.com/cloudflare/cloudflared/releases/download/2026.10.3/cloudflared-linux-$arch"
+          echo "$sum  $RUNNER_TEMP/cloudflared" | sha256sum --check --quiet -
+          chmod +x "$RUNNER_TEMP/cloudflared"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/cloudflared" --version
+
+      - name: SSH setup (key, host alias, remote helper)
+        if: inputs.mode == 'deploy'
+        shell: bash
+        env:
+          KEY: ${{ secrets.ORACLE_SSH_KEY || secrets.ORACLE_API_TOKEN }}
+          HOST: ${{ secrets.ORACLE_SSH_HOST }}
+          SSH_USER: ${{ secrets.ORACLE_SSH_USER }}
+        run: |
+          set -euo pipefail
+          umask 077
+          echo "::add-mask::$HOST"
+          [[ -n "$KEY" && -n "$HOST" && -n "$SSH_USER" ]] || { echo '::error::ORACLE_SSH_KEY, ORACLE_SSH_HOST or ORACLE_SSH_USER is not set'; exit 1; }
+          d="$RUNNER_TEMP/ssh"; mkdir -p "$d"
+          printf '%s\n' "$KEY" > "$d/key"
+          ssh-keygen -y -f "$d/key" > /dev/null 2>&1 || { echo '::error::the SSH key is not usable'; exit 1; }
+          cat > "$d/config" <<EOF
+          Host hourwave-vm
+            HostName $HOST
+            User $SSH_USER
+            IdentityFile $d/key
+            IdentitiesOnly yes
+            BatchMode yes
+            StrictHostKeyChecking accept-new
+            UserKnownHostsFile $d/known
+            ConnectTimeout 20
+            ServerAliveInterval 30
+            ServerAliveCountMax 4
+            LogLevel ERROR
+            ProxyCommand cloudflared access ssh --hostname %h
+          EOF
+          cat > "$d/remote.sh" <<'SH'
+          #!/usr/bin/env bash
+          # remote.sh run '<command>'  |  remote.sh hw <install.sh arguments (validated by the caller)>
+          # Prints only allow-listed key=value lines of the remote stdout; stderr stays in a file and
+          # is reduced to one failure class. REMOTE_RAW=<file> keeps the raw stdout (for jq).
+          set -uo pipefail
+          d="$(cd "$(dirname "$0")" && pwd)"
+          mode="$1"; shift
+          if [[ $mode == hw ]]; then
+            cmd="if [ -f /srv/hourwave/deploy/install.sh ]; then sudo -n bash /srv/hourwave/deploy/install.sh $*; else echo error=not-deployed; exit 3; fi"
+          else
+            cmd="$1"
+          fi
+          out="$(mktemp "$d/out.XXXXXX")"; err="$(mktemp "$d/err.XXXXXX")"
+          rc=0
+          timeout "${REMOTE_TIMEOUT:-300}" ssh -F "$d/config" hourwave-vm "$cmd" > "$out" 2> "$err" || rc=$?
+          grep -E '^[a-z_]+=[A-Za-z0-9_.:,/+-]{0,80}( [a-z_]+=[A-Za-z0-9_.:,/+-]{0,80})*$' "$out" || true
+          if [[ -n ${REMOTE_RAW:-} ]]; then cp "$out" "$REMOTE_RAW"; fi
+          if [[ $rc -ne 0 ]]; then
+            if [[ $rc -eq 124 ]]; then r=timeout
+            elif [[ $rc -ne 255 ]]; then
+              if grep -q 'sudo:' "$err"; then r=sudo-refused; else r=remote-command-failed; fi
+            elif grep -q 'Permission denied' "$err"; then r=permission-denied
+            elif grep -qiE 'timed out|Connection timed' "$err"; then r=timeout
+            elif grep -qi 'Could not resolve' "$err"; then r=no-dns
+            elif grep -qi 'refused' "$err"; then r=refused
+            elif grep -qiE '403|forbidden|access denied' "$err"; then r=access-denied
+            elif grep -qiE '530|502|websocket|bad handshake|origin' "$err"; then r=tunnel-not-connected
+            else r=other; fi
+            echo "remote_result=$r rc=$rc"
+          fi
+          rm -f "$out" "$err"
+          exit "$rc"
+          SH
+          echo 'ssh_setup=ok'
+
+      - name: Ship the image and deploy files over the tunnel
+        if: inputs.mode == 'deploy'
+        shell: bash
+        env:
+          SHA: ${{ steps.build.outputs.sha }}
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.ORACLE_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.ORACLE_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          s="$RUNNER_TEMP/ssh"
+          bash "$s/remote.sh" run 'rm -rf -- "$HOME/.hourwave-deploy" && mkdir -m 700 -- "$HOME/.hourwave-deploy" && echo step=staging:ok'
+          files=(source/workers/oracle-batch/deploy/*.sh source/workers/oracle-batch/deploy/*.service source/workers/oracle-batch/deploy/*.timer)
+          if ! timeout 300 scp -F "$s/config" -q "${files[@]}" hourwave-vm:.hourwave-deploy/ 2> "$s/scp.err"; then
+            echo 'step=copy-deploy-files:failed'; exit 1
+          fi
+          echo "step=copy-deploy-files:ok files=${#files[@]}"
+          docker save "hourwave-batch:$SHA" 2> "$s/save.err" | gzip -1 \
+            | REMOTE_TIMEOUT=1800 bash "$s/remote.sh" run 'gunzip | sudo -n docker load -q > /dev/null && echo step=image-load:ok'
+
+      - name: Install on the VM (install.sh deploy)
+        if: inputs.mode == 'deploy'
+        shell: bash
+        env:
+          SHA: ${{ steps.build.outputs.sha }}
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.ORACLE_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.ORACLE_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          [[ $SHA =~ ^[0-9a-f]{12}$ ]] || exit 64
+          bash "$RUNNER_TEMP/ssh/remote.sh" run "sudo -n bash \"\$HOME/.hourwave-deploy/install.sh\" deploy $SHA; rc=\$?; rm -rf -- \"\$HOME/.hourwave-deploy\"; exit \$rc" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the SSH material
+        if: always() && inputs.mode == 'deploy'
+        shell: bash
+        run: rm -rf "$RUNNER_TEMP/ssh" "$RUNNER_TEMP/cloudflared"
+
+  vm:
+    name: VM (${{ inputs.mode }})
+    if: inputs.mode == 'status' || inputs.mode == 'run-once' || inputs.mode == 'rollback'
+    runs-on: ubuntu-latest
+    # run-once polls for up to 120 min.
+    timeout-minutes: ${{ inputs.mode == 'run-once' && 140 || 20 }}
+    env:
+      MODE: ${{ inputs.mode }}
+      JOB: ${{ inputs.job }}
+      PROBE_LIMIT: ${{ inputs.probe_limit }}
+      DISABLE_TIMER: ${{ inputs.disable_timer }}
+    steps:
+      - name: Validate request
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ $JOB =~ ^(daily|sync|probe|dry)$ ]] || { echo '::error::job must be daily, sync, probe or dry'; exit 64; }
+          [[ $PROBE_LIMIT =~ ^([1-9][0-9]{0,5})?$ ]] || { echo '::error::probe_limit must be empty or a positive integer below 1000000'; exit 64; }
+          if [[ $MODE == run-once && -n $PROBE_LIMIT && ! $JOB =~ ^(probe|dry)$ ]]; then
+            echo '::error::probe_limit applies to job probe or dry only'; exit 64
+          fi
+          [[ $DISABLE_TIMER =~ ^(true|false)$ ]] || exit 64
+
+      - name: Install cloudflared (official release, pinned, checksum)
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_ARCH" in
+            X64) arch=amd64; sum=053b80b0a23031a038fdbf3c073f59f82b8f1f152aa67971d7383ffafc0dbab0 ;;
+            ARM64) arch=arm64; sum=89297ebfb9e8c99c0dc013a1140601453cf3798d8306c5591651f4a3f5210be8 ;;
+            *) echo '::error::unsupported runner architecture'; exit 1 ;;
+          esac
+          curl -fsSL -o "$RUNNER_TEMP/cloudflared" "https://github.com/cloudflare/cloudflared/releases/download/2026.10.3/cloudflared-linux-$arch"
+          echo "$sum  $RUNNER_TEMP/cloudflared" | sha256sum --check --quiet -
+          chmod +x "$RUNNER_TEMP/cloudflared"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/cloudflared" --version
+
+      - name: SSH setup (key, host alias, remote helper)
+        shell: bash
+        env:
+          KEY: ${{ secrets.ORACLE_SSH_KEY || secrets.ORACLE_API_TOKEN }}
+          HOST: ${{ secrets.ORACLE_SSH_HOST }}
+          SSH_USER: ${{ secrets.ORACLE_SSH_USER }}
+        run: |
+          set -euo pipefail
+          umask 077
+          echo "::add-mask::$HOST"
+          [[ -n "$KEY" && -n "$HOST" && -n "$SSH_USER" ]] || { echo '::error::ORACLE_SSH_KEY, ORACLE_SSH_HOST or ORACLE_SSH_USER is not set'; exit 1; }
+          d="$RUNNER_TEMP/ssh"; mkdir -p "$d"
+          printf '%s\n' "$KEY" > "$d/key"
+          ssh-keygen -y -f "$d/key" > /dev/null 2>&1 || { echo '::error::the SSH key is not usable'; exit 1; }
+          cat > "$d/config" <<EOF
+          Host hourwave-vm
+            HostName $HOST
+            User $SSH_USER
+            IdentityFile $d/key
+            IdentitiesOnly yes
+            BatchMode yes
+            StrictHostKeyChecking accept-new
+            UserKnownHostsFile $d/known
+            ConnectTimeout 20
+            ServerAliveInterval 30
+            ServerAliveCountMax 4
+            LogLevel ERROR
+            ProxyCommand cloudflared access ssh --hostname %h
+          EOF
+          cat > "$d/remote.sh" <<'SH'
+          #!/usr/bin/env bash
+          # remote.sh run '<command>'  |  remote.sh hw <install.sh arguments (validated by the caller)>
+          # Prints only allow-listed key=value lines of the remote stdout; stderr stays in a file and
+          # is reduced to one failure class. REMOTE_RAW=<file> keeps the raw stdout (for jq).
+          set -uo pipefail
+          d="$(cd "$(dirname "$0")" && pwd)"
+          mode="$1"; shift
+          if [[ $mode == hw ]]; then
+            cmd="if [ -f /srv/hourwave/deploy/install.sh ]; then sudo -n bash /srv/hourwave/deploy/install.sh $*; else echo error=not-deployed; exit 3; fi"
+          else
+            cmd="$1"
+          fi
+          out="$(mktemp "$d/out.XXXXXX")"; err="$(mktemp "$d/err.XXXXXX")"
+          rc=0
+          timeout "${REMOTE_TIMEOUT:-300}" ssh -F "$d/config" hourwave-vm "$cmd" > "$out" 2> "$err" || rc=$?
+          grep -E '^[a-z_]+=[A-Za-z0-9_.:,/+-]{0,80}( [a-z_]+=[A-Za-z0-9_.:,/+-]{0,80})*$' "$out" || true
+          if [[ -n ${REMOTE_RAW:-} ]]; then cp "$out" "$REMOTE_RAW"; fi
+          if [[ $rc -ne 0 ]]; then
+            if [[ $rc -eq 124 ]]; then r=timeout
+            elif [[ $rc -ne 255 ]]; then
+              if grep -q 'sudo:' "$err"; then r=sudo-refused; else r=remote-command-failed; fi
+            elif grep -q 'Permission denied' "$err"; then r=permission-denied
+            elif grep -qiE 'timed out|Connection timed' "$err"; then r=timeout
+            elif grep -qi 'Could not resolve' "$err"; then r=no-dns
+            elif grep -qi 'refused' "$err"; then r=refused
+            elif grep -qiE '403|forbidden|access denied' "$err"; then r=access-denied
+            elif grep -qiE '530|502|websocket|bad handshake|origin' "$err"; then r=tunnel-not-connected
+            else r=other; fi
+            echo "remote_result=$r rc=$rc"
+          fi
+          rm -f "$out" "$err"
+          exit "$rc"
+          SH
+          echo 'ssh_setup=ok'
+
+      - name: Status (hourwave-* only)
+        if: inputs.mode == 'status'
+        shell: bash
+        env:
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.ORACLE_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.ORACLE_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          bash "$RUNNER_TEMP/ssh/remote.sh" hw status | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Rollback (previous image -> current)
+        if: inputs.mode == 'rollback'
+        shell: bash
+        env:
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.ORACLE_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.ORACLE_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          flag=''
+          [[ $DISABLE_TIMER == true ]] && flag=--disable-timer
+          bash "$RUNNER_TEMP/ssh/remote.sh" hw rollback $flag | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Run one job and wait (at most 120 min)
+        id: run
+        if: inputs.mode == 'run-once'
+        shell: bash
+        env:
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.ORACLE_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.ORACLE_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          r="$RUNNER_TEMP/ssh/remote.sh"
+          started="$RUNNER_TEMP/run-once.out"
+          # PROBE_LIMIT is validated (digits or empty); unquoted so that empty adds no argument.
+          REMOTE_RAW="$started" bash "$r" hw run-once "$JOB" $PROBE_LIMIT
+          before="$(sed -nE 's/^before_exit_mono=([0-9]+)$/\1/p' "$started")"
+          [[ -n $before ]] || { echo '::error::the job did not start'; exit 1; }
+          start=$(date +%s); deadline=$((start + 120 * 60)); fails=0; reported=0
+          state=''; result=''; code=''; elapsed=0
+          poll="$RUNNER_TEMP/job-state.out"
+          while :; do
+            sleep 60
+            elapsed=$(( ($(date +%s) - start) / 60 ))
+            if REMOTE_RAW="$poll" bash "$r" hw job-state "$JOB" > /dev/null; then
+              fails=0
+              state="$(sed -nE 's/^active=([a-z-]+)$/\1/p' "$poll")"
+              result="$(sed -nE 's/^result=([a-z-]+)$/\1/p' "$poll")"
+              code="$(sed -nE 's/^exit_code=([0-9]+)$/\1/p' "$poll")"
+              mono="$(sed -nE 's/^exit_mono=([0-9]+)$/\1/p' "$poll")"
+              if [[ $state == failed || ( $state == inactive && $mono != "$before" ) ]]; then break; fi
+            else
+              fails=$((fails + 1))
+              (( fails < 5 )) || { echo '::error::lost the VM while polling (5 failures in a row)'; exit 1; }
+            fi
+            if (( elapsed - reported >= 10 )); then echo "elapsed_min=$elapsed active=${state:-unknown}"; reported=$elapsed; fi
+            if (( $(date +%s) >= deadline )); then
+              echo "poll=timeout elapsed_min=$elapsed (the job keeps running on the VM; see mode=status)"
+              exit 1
+            fi
+          done
+          echo "job=$JOB result=${result:-unknown} exit_code=${code:-unknown} elapsed_min=$elapsed" | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ $result == success ]] || { echo "::error::job $JOB did not succeed"; exit 1; }
+
+      - name: status.json (allow-listed fields only)
+        if: always() && (inputs.mode == 'status' || inputs.mode == 'run-once')
+        shell: bash
+        env:
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.ORACLE_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.ORACLE_ACCESS_CLIENT_SECRET }}
+          STATUS_JOB: ${{ inputs.mode == 'run-once' && inputs.job || 'daily' }}
+        run: |
+          set -uo pipefail
+          raw="$RUNNER_TEMP/status.json"
+          if ! REMOTE_RAW="$raw" bash "$RUNNER_TEMP/ssh/remote.sh" hw status-json "$STATUS_JOB"; then
+            echo 'status_json=unavailable'; rm -f "$raw"; exit 0
+          fi
+          if ! jq -r '
+              def n: if type == "number" then floor else 0 end;
+              def s: if type == "string" and test("^[A-Za-z0-9:._-]{1,40}$") then . else "none" end;
+              "status_schema=\(.schema | n) updated_at=\(.updatedAt | s)",
+              (if .catalog then "catalog_run=\(.catalog.runId | s) stations=\(.catalog.stations | n) changed_vs_previous=\(.catalog.changedVsPrevious | n)" else "catalog_run=none" end),
+              (if .health then "health_run=\(.health.runId | s) health_state=\(.health.state | s) targets=\(.health.targets | n) probed=\(.health.probed | n) ok=\(.health.ok | n) dead=\(.health.dead | n) skipped=\(.health.skipped | n) canary_ok=\(.health.canaryOk | n) canary_total=\(.health.canaryTotal | n)" else "health_run=none" end),
+              (if .lastRun then "last_job=\(.lastRun.job | s) last_started=\(.lastRun.startedAt | s) last_duration_s=\((.lastRun.durationMs | n) / 1000 | floor) last_exit=\(.lastRun.exitCode | n)" else "last_job=none" end),
+              (if .disk then "out_disk_free_mb=\((.disk.freeBytes | n) / 1048576 | floor)" else empty end)
+            ' "$raw" > "$raw.lines" 2> /dev/null; then
+            echo 'status_json=unreadable'
+          else
+            grep -E '^[a-z_]+=[A-Za-z0-9:._-]{0,40}( [a-z_]+=[A-Za-z0-9:._-]{0,40})*$' "$raw.lines" | tee -a "$GITHUB_STEP_SUMMARY" || true
+          fi
+          rm -f "$raw" "$raw.lines"
+
+      - name: Remove the SSH material
+        if: always()
+        shell: bash
+        run: rm -rf "$RUNNER_TEMP/ssh" "$RUNNER_TEMP/cloudflared"
