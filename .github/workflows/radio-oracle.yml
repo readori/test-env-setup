@@ -570,7 +570,14 @@ jobs:
             fi
           done
           echo "job=$JOB result=${result:-unknown} exit_code=${code:-unknown} elapsed_min=$elapsed" | tee -a "$GITHUB_STEP_SUMMARY"
-          [[ $result == success ]] || { echo "::error::job $JOB did not succeed"; exit 1; }
+          if [[ $result != success ]]; then
+            # Category + filtered 120-char text of the job's last error line (install.sh last-error).
+            if REMOTE_RAW="$RUNNER_TEMP/last-error.out" bash "$r" hw last-error "$JOB" > /dev/null; then
+              grep -E '^error_(kind|text)=[A-Za-z0-9:._/-]{0,120}$' "$RUNNER_TEMP/last-error.out" | tee -a "$GITHUB_STEP_SUMMARY" || true
+            fi
+            rm -f "$RUNNER_TEMP/last-error.out"
+            echo "::error::job $JOB did not succeed"; exit 1
+          fi
 
       - name: status.json (allow-listed fields only)
         if: always() && (inputs.mode == 'status' || inputs.mode == 'run-once')
