@@ -269,8 +269,8 @@ jobs:
           log="$RUNNER_TEMP/deploy.log"
           redact() { sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<id>/g; s/[0-9a-fA-F]{32}/<id>/g; s#https://[^ ]+#<url>#g'; }
           if ! npx --yes "wrangler@${WRANGLER_VERSION}" deploy --config wrangler.jsonc > "$log" 2>&1; then
-            echo 'deploy failed; error codes only:'
-            { grep -oE '\[ERROR\]|ERR_[A-Z_]+|code: [0-9]+' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
+            echo 'deploy failed; Cloudflare error lines (ids, URLs and emails redacted):'
+            { grep -E '\[ERROR\]|A request to the Cloudflare API|code: [0-9]+' "$log" || echo 'no error line found'; } | redact | sed -E 's/[^ @]+@[^ ]+/<email>/g' | cut -c1-220 | head -20
             exit 1
           fi
           { grep -E 'Uploaded|Deployed|Current Version' "$log" || true; } | redact
