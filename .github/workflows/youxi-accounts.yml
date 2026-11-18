@@ -1,0 +1,334 @@
+# youxi accounts: the account service of the game (private readori/youxi, directory accounts/) —
+# a Cloudflare Worker "youxi-accounts" with one D1 database "youxi-accounts", served on the custom
+# domain youxi-api.readori.com. Owner decision 2026-11-18 (private repo ADR-0018): e-mail + password
+# accounts with cloud saves, data on Cloudflare.
+#
+#   verify : npm ci -> typecheck -> account unit tests -> `wrangler deploy --dry-run` (no credentials)
+#            -> local `wrangler dev` with a local D1 + the repo's own smoke script. No writes anywhere.
+#   deploy : everything in verify, then: find or create the D1 database -> apply migrations ->
+#            `wrangler deploy` -> make sure the Worker secret PEPPER exists -> GET /health.
+#
+# PEPPER (the key behind every stored password hash and e-mail fingerprint) is generated on the
+# runner the first time and stored only as a Worker secret: it is masked, never printed, never
+# copied to GitHub. It is created only when Cloudflare answers that the Worker has no PEPPER and
+# the accounts table is empty; in any other doubtful case the job fails instead of replacing it,
+# because a new PEPPER would lock every existing account out. Never delete the Worker.
+#
+# Trigger: workflow_dispatch only (a human, or the project's AI PM through the API). Never pull_request.
+#
+# Safety rules (public repo, public logs): actions pinned to commit SHAs; wrangler pinned to an exact
+# version; TARGET_REPO_PAT only in checkout, not persisted; Cloudflare secrets only on the steps that
+# call Cloudflare; the account id and database id are masked; tool output goes to files and only error
+# codes and summaries are printed; no Actions artifacts; private files are never printed.
+name: youxi accounts
+
+run-name: youxi accounts · ${{ inputs.mode }} · ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'verify = tests + dry-run + local smoke (no writes); deploy = verify, then D1 migrations + deploy + health'
+        required: true
+        default: verify
+        type: choice
+        options: [verify, deploy]
+      ref:
+        description: 'Private readori/youxi branch, tag, or SHA'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: youxi-accounts
+  cancel-in-progress: false
+
+env:
+  PRIVATE_SOURCE_PATH: source
+  WORKER_NAME: youxi-accounts
+  D1_NAME: youxi-accounts
+  PUBLIC_DOMAIN: youxi-api.readori.com
+  WRANGLER_VERSION: 4.151.3
+  WRANGLER_SEND_METRICS: 'false'
+
+jobs:
+  accounts:
+    name: youxi accounts (${{ inputs.mode }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Validate inputs and credentials
+        shell: bash
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+          INPUT_REF: ${{ inputs.ref }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          [[ "$MODE" == verify || "$MODE" == deploy ]] || { echo '::error::mode must be verify or deploy.'; exit 64; }
+          [[ -n "$INPUT_REF" && "$INPUT_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && ${#INPUT_REF} -le 200 ]] || {
+            echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only, no leading dash).'
+            exit 64
+          }
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || { echo '::error::Missing TARGET_REPO_PAT.'; exit 78; }
+          if [[ "$MODE" == deploy ]]; then
+            [[ -n "${CF_TOKEN:-}" && -n "${CF_ACCOUNT:-}" ]] || { echo '::error::Missing CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID.'; exit 78; }
+          fi
+          echo "mode: $MODE · private source ref: $INPUT_REF"
+
+      - name: Checkout private source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/youxi
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Install dependencies (no credentials in this step)
+        shell: bash
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        run: |
+          set -euo pipefail
+          SOURCE_COMMIT="$(git rev-parse HEAD)"
+          echo "Private source commit: ${SOURCE_COMMIT:0:8}"
+          echo "SOURCE_SHORT=${SOURCE_COMMIT:0:8}" >> "$GITHUB_ENV"
+          echo '### youxi accounts' >> "$GITHUB_STEP_SUMMARY"
+          echo "- Source: \`readori/youxi@${SOURCE_COMMIT:0:8}\`" >> "$GITHUB_STEP_SUMMARY"
+          for f in accounts/src/worker.ts accounts/migrations/0001_init.sql accounts/smoke.mjs; do
+            [[ -f "$f" ]] || { echo "::error::$f is missing at this ref."; exit 1; }
+          done
+          npm ci --no-audit --no-fund --loglevel=error
+
+      - name: Gate - typecheck and account unit tests
+        shell: bash
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        env:
+          CI: 'true'
+        run: |
+          set -euo pipefail
+          npm run --silent typecheck
+          log="$RUNNER_TEMP/unit.log"
+          if ! npx vitest run tests/accounts- --reporter=dot --silent > "$log" 2>&1; then
+            echo 'account unit tests failed; summary lines only:'
+            { grep -E '^ *(Test Files|Tests) ' "$log" || echo 'no summary found'; } | head -5
+            exit 1
+          fi
+          { grep -E '^ *(Test Files|Tests) ' "$log" || true; } | head -5
+          echo '- typecheck + account unit tests: PASS' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Bundle with wrangler dry-run (no credentials)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH"
+          WORK="$RUNNER_TEMP/acct"
+          mkdir -p "$WORK"
+          # Local config: no routes, a placeholder database id (local D1 only).
+          cat > "$WORK/wrangler.local.jsonc" <<EOF
+          {
+            "name": "${WORKER_NAME}",
+            "main": "${SRC}/accounts/src/worker.ts",
+            "compatibility_date": "2026-10-01",
+            "workers_dev": false,
+            "preview_urls": false,
+            "d1_databases": [{ "binding": "DB", "database_name": "${D1_NAME}", "database_id": "00000000-0000-0000-0000-000000000000", "migrations_dir": "${SRC}/accounts/migrations" }]
+          }
+          EOF
+          echo "WORK=$WORK" >> "$GITHUB_ENV"
+          cd "$WORK"
+          log="$RUNNER_TEMP/dry-run.log"
+          if ! npx --yes "wrangler@${WRANGLER_VERSION}" deploy --dry-run --config wrangler.local.jsonc --outdir "$WORK/out" > "$log" 2>&1; then
+            echo 'dry-run failed; error codes only:'
+            { grep -oE '\[ERROR\]|ERR_[A-Z_]+|code: [0-9]+' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
+            exit 1
+          fi
+          echo "wrangler dry-run: PASS ($(du -sk "$WORK/out" | cut -f1) KiB bundle)"
+          echo '- wrangler dry-run: OK' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Local smoke (wrangler dev + local D1, no credentials)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$WORK"
+          # A throw-away PEPPER for the local run only.
+          printf 'PEPPER=%s\n' "$(openssl rand -hex 32)" > .dev.vars
+          mlog="$RUNNER_TEMP/local-migrate.log"
+          if ! CI=true npx --yes "wrangler@${WRANGLER_VERSION}" d1 migrations apply "$D1_NAME" --local --config wrangler.local.jsonc > "$mlog" 2>&1; then
+            echo 'local migrations failed; error codes only:'
+            { grep -oE '\[ERROR\]|ERR_[A-Z_]+|code: [0-9]+|SQLITE_[A-Z_]+' "$mlog" || echo 'no error code found'; } | sort | uniq -c | head -20
+            exit 1
+          fi
+          dlog="$RUNNER_TEMP/dev.log"
+          npx --yes "wrangler@${WRANGLER_VERSION}" dev --config wrangler.local.jsonc --ip 127.0.0.1 --port 8787 > "$dlog" 2>&1 &
+          DEV_PID=$!
+          trap 'kill "$DEV_PID" 2>/dev/null || true' EXIT
+          up=no
+          for i in $(seq 1 30); do
+            c="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8787/health || echo 000)"
+            [[ "$c" == 200 ]] && { up=yes; break; }
+            sleep 2
+          done
+          [[ "$up" == yes ]] || {
+            echo '::error::Local Worker did not answer 200 on /health.'
+            { grep -oE '\[ERROR\]|ERR_[A-Z_]+|code: [0-9]+' "$dlog" || echo 'no error code found'; } | sort | uniq -c | head -20
+            exit 1
+          }
+          slog="$RUNNER_TEMP/smoke.log"
+          rc=0
+          node "$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH/accounts/smoke.mjs" http://127.0.0.1:8787 > "$slog" 2>&1 || rc=$?
+          # The smoke script prints one PASS/FAIL line per step and no secrets (private repo accounts/README.md).
+          grep -E '^(PASS|FAIL) ' "$slog" | cut -c1-160 || true
+          pass="$(grep -c '^PASS ' "$slog" || true)"; fail="$(grep -c '^FAIL ' "$slog" || true)"
+          echo "local smoke: $pass passed, $fail failed (exit $rc)"
+          echo "- local smoke: $pass passed, $fail failed" >> "$GITHUB_STEP_SUMMARY"
+          [[ "$rc" == 0 && "$fail" == 0 && "$pass" -gt 0 ]] || exit 1
+
+      - name: Find or create the D1 database
+        if: inputs.mode == 'deploy'
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$CLOUDFLARE_ACCOUNT_ID"
+          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/d1/database"
+          find_db() {
+            curl -sS --max-time 30 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api?name=$D1_NAME&per_page=50" > "$RUNNER_TEMP/d1-list.json"
+            [[ "$(jq -r '.success' "$RUNNER_TEMP/d1-list.json")" == true ]] || { echo '::error::Could not list D1 databases (does the API token have D1 edit permission?).'; jq -r '.errors[]?.code' "$RUNNER_TEMP/d1-list.json" | head -5; exit 1; }
+            jq -r --arg n "$D1_NAME" '[.result[] | select(.name == $n)][0].uuid // empty' "$RUNNER_TEMP/d1-list.json"
+          }
+          id="$(find_db)"
+          if [[ -z "$id" ]]; then
+            curl -sS --max-time 30 -X POST -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H 'Content-Type: application/json' \
+              --data "{\"name\":\"$D1_NAME\"}" "$api" > "$RUNNER_TEMP/d1-create.json"
+            [[ "$(jq -r '.success' "$RUNNER_TEMP/d1-create.json")" == true ]] || { echo '::error::Could not create the D1 database.'; jq -r '.errors[]?.code' "$RUNNER_TEMP/d1-create.json" | head -5; exit 1; }
+            id="$(find_db)"
+            echo 'D1 database: created'
+            echo '- D1 database: created' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'D1 database: exists'
+            echo '- D1 database: exists' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          [[ "$id" =~ ^[0-9a-f-]{36}$ ]] || { echo '::error::Unexpected D1 database id.'; exit 1; }
+          echo "::add-mask::$id"
+          SRC="$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH"
+          cat > "$WORK/wrangler.jsonc" <<EOF
+          {
+            "name": "${WORKER_NAME}",
+            "main": "${SRC}/accounts/src/worker.ts",
+            "compatibility_date": "2026-10-01",
+            "workers_dev": false,
+            "preview_urls": false,
+            "routes": [{ "pattern": "${PUBLIC_DOMAIN}", "custom_domain": true }],
+            "d1_databases": [{ "binding": "DB", "database_name": "${D1_NAME}", "database_id": "${id}", "migrations_dir": "${SRC}/accounts/migrations" }]
+          }
+          EOF
+
+      - name: Apply D1 migrations
+        if: inputs.mode == 'deploy'
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          cd "$WORK"
+          log="$RUNNER_TEMP/migrate.log"
+          if ! CI=true npx --yes "wrangler@${WRANGLER_VERSION}" d1 migrations apply "$D1_NAME" --remote --config wrangler.jsonc > "$log" 2>&1; then
+            echo 'migrations failed; error codes only:'
+            { grep -oE '\[ERROR\]|ERR_[A-Z_]+|code: [0-9]+|SQLITE_[A-Z_]+' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
+            exit 1
+          fi
+          applied="$(grep -cE '^[^a-zA-Z]*[0-9]{4}_[a-z0-9_]+\.sql' "$log" || true)"
+          echo "D1 migrations: OK (${applied} file line(s) in the report)"
+          echo '- D1 migrations: OK' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy the Worker
+        if: inputs.mode == 'deploy'
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          cd "$WORK"
+          log="$RUNNER_TEMP/deploy.log"
+          redact() { sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<id>/g; s/[0-9a-fA-F]{32}/<id>/g; s#https://[^ ]+#<url>#g'; }
+          if ! npx --yes "wrangler@${WRANGLER_VERSION}" deploy --config wrangler.jsonc > "$log" 2>&1; then
+            echo 'deploy failed; error codes only:'
+            { grep -oE '\[ERROR\]|ERR_[A-Z_]+|code: [0-9]+' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
+            exit 1
+          fi
+          { grep -E 'Uploaded|Deployed|Current Version' "$log" || true; } | redact
+          echo "- deploy ${WORKER_NAME} (source ${SOURCE_SHORT}): OK" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Make sure the PEPPER secret exists (never replaced)
+        if: inputs.mode == 'deploy'
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID"
+          auth=(-H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+          # 1) Does the Worker already have PEPPER? Only a successful, well-formed answer counts.
+          curl -sS --max-time 30 "${auth[@]}" "$api/workers/scripts/$WORKER_NAME/secrets" > "$RUNNER_TEMP/secrets.json"
+          [[ "$(jq -r '.success' "$RUNNER_TEMP/secrets.json")" == true && "$(jq -r '.result | type' "$RUNNER_TEMP/secrets.json")" == array ]] || {
+            echo '::error::Could not read the Worker secret list; refusing to touch PEPPER.'; exit 1; }
+          if jq -e '.result[] | select(.name == "PEPPER")' "$RUNNER_TEMP/secrets.json" > /dev/null; then
+            echo 'PEPPER: already set (kept)'
+            echo '- PEPPER: already set (kept)' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # 2) No PEPPER. Create one only if no account exists yet (a new PEPPER would lock existing accounts out).
+          cd "$WORK"
+          qlog="$RUNNER_TEMP/count.json"
+          CI=true npx --yes "wrangler@${WRANGLER_VERSION}" d1 execute "$D1_NAME" --remote --json --config wrangler.jsonc \
+            --command 'SELECT COUNT(*) AS n FROM accounts' > "$qlog" 2> "$RUNNER_TEMP/count.err" || { echo '::error::Could not count accounts; refusing to create PEPPER.'; exit 1; }
+          n="$(jq -r '.[0].results[0].n // empty' "$qlog")"
+          [[ "$n" =~ ^[0-9]+$ ]] || { echo '::error::Could not read the account count; refusing to create PEPPER.'; exit 1; }
+          [[ "$n" == 0 ]] || { echo "::error::PEPPER is missing but $n account(s) exist. Stop: creating a new PEPPER would lock them out."; exit 1; }
+          pepper="$(openssl rand -hex 32)"
+          echo "::add-mask::$pepper"
+          plog="$RUNNER_TEMP/secret.log"
+          if ! printf '%s' "$pepper" | npx --yes "wrangler@${WRANGLER_VERSION}" secret put PEPPER --config wrangler.jsonc > "$plog" 2>&1; then
+            echo 'secret put failed; error codes only:'
+            { grep -oE '\[ERROR\]|ERR_[A-Z_]+|code: [0-9]+' "$plog" || echo 'no error code found'; } | sort | uniq -c | head -20
+            exit 1
+          fi
+          unset pepper
+          echo 'PEPPER: created (first deploy)'
+          echo '- PEPPER: created (first deploy)' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check the live service
+        if: inputs.mode == 'deploy'
+        shell: bash
+        run: |
+          set -euo pipefail
+          c=000; body=''
+          # A brand-new custom domain needs a few minutes for DNS and its certificate.
+          for i in $(seq 1 30); do
+            body="$(curl -s --max-time 20 -w '\n%{http_code}' "https://${PUBLIC_DOMAIN}/health" || true)"
+            c="$(printf '%s' "$body" | tail -n 1)"
+            [[ "$c" == 200 ]] && break
+            sleep 10
+          done
+          ok="$(printf '%s' "$body" | head -n 1 | jq -r '.ok // empty' 2>/dev/null || true)"
+          echo "https://${PUBLIC_DOMAIN}/health: HTTP $c, ok=$ok"
+          echo "- https://${PUBLIC_DOMAIN}/health: HTTP $c, ok=$ok" >> "$GITHUB_STEP_SUMMARY"
+          [[ "$c" == 200 && "$ok" == true ]] || { echo '::error::The account service did not answer 200 ok on /health.'; exit 1; }
