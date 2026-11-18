@@ -1,0 +1,441 @@
+# youxi iOS CI (Capacitor shell around the Vite web build).
+#
+# Public CI repository -> private source readori/youxi (TypeScript + Three.js + Vite, Capacitor 8, SPM).
+# Modeled on paobuwan-ios.yml (Match signing, altool upload), simplified for a Capacitor project:
+#   npm ci -> npm run ios:sync (vite build + cap sync ios) -> xcodebuild on ios/App/App.xcodeproj.
+#
+# Modes:
+#   verify     : simulator build, no signing, no Apple credentials.
+#   profile    : ONE-TIME setup. Registers the bundle ID com.readori.youxi with the App Store Connect API
+#                if it is missing, then writes an App Store provisioning profile for it to the shared
+#                Match repo, signed by the EXISTING shared Apple Distribution identity (never creates
+#                certificates, never touches other apps' profiles). Needs confirm=WRITE.
+#   testflight : Match (readonly) -> signed archive -> IPA -> altool validate -> altool upload.
+#                Build number: input, or (empty) latest TestFlight build + 1.
+#
+# Safety rules (public repo, public logs):
+#   - workflow_dispatch only; never pull_request.
+#   - third-party actions pinned to commit SHAs; xcodebuild always -quiet.
+#   - private source files are never printed; the signed IPA never leaves the runner (no artifacts).
+#   - signing material is created only after all private-source lifecycle scripts (npm ci, ios:sync) ran.
+name: youxi iOS CI
+
+run-name: youxi iOS · ${{ inputs.mode }} · ${{ inputs.ref }}${{ inputs.build_number && format(' · build {0}', inputs.build_number) || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'verify = simulator build; profile = one-time signing setup (needs confirm=WRITE); testflight = signed build + upload'
+        required: true
+        default: 'verify'
+        type: choice
+        options: [verify, profile, testflight]
+      ref:
+        description: 'Private readori/youxi branch, tag, or SHA'
+        required: true
+        default: 'main'
+        type: string
+      version:
+        description: 'Version (CFBundleShortVersionString), e.g. 0.1.0'
+        required: false
+        default: '0.1.0'
+        type: string
+      build_number:
+        description: 'Build number (CFBundleVersion). Empty = latest TestFlight build + 1.'
+        required: false
+        default: ''
+        type: string
+      confirm:
+        description: 'profile mode only: type WRITE'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: youxi-ios-${{ inputs.mode }}
+  cancel-in-progress: false
+
+env:
+  PRIVATE_SOURCE_REPOSITORY: readori/youxi
+  PRIVATE_SOURCE_PATH: source
+  EXPECTED_BUNDLE_ID: com.readori.youxi
+  BUNDLE_ID_NAME: Youxi
+  XCODE_MAJOR_WANTED: '26'
+  MATCH_GIT_URL: https://github.com/readori/readori-certificates.git
+  MATCH_GIT_BRANCH: main
+  FASTLANE_VERSION: '2.238.0'
+  CI: '1'
+  LANG: en_US.UTF-8
+  MODE: ${{ inputs.mode }}
+  SOURCE_REF: ${{ inputs.ref }}
+  VERSION_INPUT: ${{ inputs.version }}
+  BUILD_NUMBER_INPUT: ${{ inputs.build_number }}
+
+jobs:
+  ios:
+    name: Build youxi iOS
+    runs-on: macos-26
+    timeout-minutes: 75
+
+    steps:
+      - name: Validate request and required secrets
+        shell: bash
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in verify|profile|testflight) ;; *) echo "::error::Unsupported mode: $MODE"; exit 64 ;; esac
+          [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo '::error::ref must be a branch, tag, or SHA.'; exit 64; }
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || { echo '::error::Missing secret TARGET_REPO_PAT.'; exit 78; }
+          [[ "$VERSION_INPUT" =~ ^(0|[1-9][0-9]{0,3})([.](0|[1-9][0-9]{0,3})){1,2}$ ]] || { echo '::error::version must look like 0.1.0'; exit 64; }
+          if [[ -n "$BUILD_NUMBER_INPUT" ]]; then
+            [[ "$BUILD_NUMBER_INPUT" =~ ^[1-9][0-9]{0,8}$ ]] || { echo '::error::build_number must be a whole number.'; exit 64; }
+          fi
+          if [[ "$MODE" == 'profile' && "$CONFIRM" != 'WRITE' ]]; then
+            echo '::error::profile mode writes to the shared Match repo: set confirm=WRITE.'; exit 64
+          fi
+          if [[ "$MODE" != 'verify' ]]; then
+            missing=0
+            for name in MATCH_PASSWORD ASC_ISSUER_ID ASC_KEY_ID ASC_PRIVATE_KEY ASC_TEAM_ID; do
+              [[ -n "${!name:-}" ]] || { echo "::error::Missing secret $name"; missing=1; }
+            done
+            (( missing == 0 )) || exit 78
+          fi
+          echo "Mode: $MODE · ref: $SOURCE_REF · version: $VERSION_INPUT · build: ${BUILD_NUMBER_INPUT:-auto}"
+
+      - name: Checkout private youxi source
+        if: ${{ inputs.mode != 'profile' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/youxi
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Verify private source layout
+        if: ${{ inputs.mode != 'profile' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH"
+          for f in package.json package-lock.json capacitor.config.json ios/App/App.xcodeproj/project.pbxproj; do
+            [[ -e "$SRC/$f" ]] || { echo "::error::Private source is missing $f (Capacitor iOS shell not on this ref?)."; exit 66; }
+          done
+          APP_ID="$(node -e 'process.stdout.write(String(require(process.argv[1]).appId||""))' "$SRC/capacitor.config.json")"
+          [[ "$APP_ID" == "$EXPECTED_BUNDLE_ID" ]] || { echo "::error::capacitor.config.json appId must be $EXPECTED_BUNDLE_ID"; exit 65; }
+          C="$(git -C "$SRC" rev-parse HEAD)"
+          echo "SOURCE_SHORT_SHA=${C:0:8}" >> "$GITHUB_ENV"
+          echo "Private source: ${C:0:8} · bundle ID check: PASS"
+
+      - name: Set up Node.js 22
+        if: ${{ inputs.mode != 'profile' }}
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ${{ env.PRIVATE_SOURCE_PATH }}/package-lock.json
+
+      - name: Select Xcode 26.x
+        shell: bash
+        run: |
+          set -euo pipefail
+          XCODE_APP=''; BEST=''
+          for app in /Applications/Xcode*.app; do
+            [[ -d "$app/Contents/Developer" ]] || continue
+            case "$app" in *[Bb]eta*) continue ;; esac
+            v="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || true)"
+            [[ "${v%%.*}" == "$XCODE_MAJOR_WANTED" ]] || continue
+            if [[ -z "$BEST" ]] || [[ "$(printf '%s\n%s\n' "$BEST" "$v" | sort -V | tail -1)" == "$v" ]]; then BEST="$v"; XCODE_APP="$app"; fi
+          done
+          [[ -n "$XCODE_APP" ]] || { echo "::error::No Xcode ${XCODE_MAJOR_WANTED}.x on this runner."; ls -1 /Applications | grep '^Xcode' || true; exit 69; }
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          xcodebuild -version
+
+      - name: Install npm dependencies and sync web build into the iOS project
+        if: ${{ inputs.mode != 'profile' }}
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          npm ci --no-audit --no-fund --loglevel=error
+          npm run --silent ios:sync > "$RUNNER_TEMP/ios-sync.log" 2>&1 || { grep -iE 'error|fail' "$RUNNER_TEMP/ios-sync.log" | head -20; echo '::error::npm run ios:sync failed.'; exit 1; }
+          test -f ios/App/App/public/index.html || { echo '::error::ios:sync did not produce ios/App/App/public/index.html'; exit 66; }
+          echo 'Web build synced into ios/App/App/public.'
+
+      - name: Build for iOS Simulator (no signing)
+        if: ${{ inputs.mode == 'verify' }}
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild build -quiet \
+            -project ios/App/App.xcodeproj -scheme App -configuration Debug \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData-youxi" \
+            MARKETING_VERSION="$VERSION_INPUT" CURRENT_PROJECT_VERSION="${BUILD_NUMBER_INPUT:-$GITHUB_RUN_NUMBER}" \
+            CODE_SIGNING_ALLOWED=NO
+          APP="$(find "$RUNNER_TEMP/DerivedData-youxi/Build/Products" -maxdepth 2 -type d -name '*.app' -print -quit)"
+          [[ -n "$APP" ]] || { echo '::error::Simulator .app was not produced.'; exit 65; }
+          BID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
+          [[ "$BID" == "$EXPECTED_BUNDLE_ID" ]] || { echo "::error::Bundle ID mismatch: $BID"; exit 65; }
+          test -f "$APP/public/index.html" || { echo '::error::App bundle has no public/index.html (web build not embedded).'; exit 65; }
+          echo "Simulator build OK: $(basename "$APP") · $(du -sh "$APP" | cut -f1)"
+
+      - name: Install pinned fastlane
+        if: ${{ inputs.mode != 'verify' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          GH="$RUNNER_TEMP/fastlane-gems"; rm -rf "$GH"; mkdir -p "$GH"
+          GEM_HOME="$GH" GEM_PATH="$GH" gem install --no-document fastlane -v "$FASTLANE_VERSION" > /dev/null
+          echo "GEM_HOME=$GH" >> "$GITHUB_ENV"; echo "GEM_PATH=$GH" >> "$GITHUB_ENV"; echo "$GH/bin" >> "$GITHUB_PATH"
+
+      - name: Create ephemeral keychain and App Store Connect API key
+        if: ${{ inputs.mode != 'verify' }}
+        shell: bash
+        env:
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_NAME="youxi-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.keychain-db"
+          KEYCHAIN_PATH="$HOME/Library/Keychains/$KEYCHAIN_NAME"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_NAME"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          LOGIN_KEYCHAIN="$(security default-keychain -d user | tr -d '"' | xargs)"
+          security default-keychain -d user -s "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" "$LOGIN_KEYCHAIN"
+          {
+            echo "ORIGINAL_DEFAULT_KEYCHAIN=$LOGIN_KEYCHAIN"
+            echo "KEYCHAIN_NAME=$KEYCHAIN_NAME"; echo "KEYCHAIN_PATH=$KEYCHAIN_PATH"
+            echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD"
+          } >> "$GITHUB_ENV"
+
+          ASC_DIR="$RUNNER_TEMP/youxi-asc"; mkdir -p "$ASC_DIR" "$HOME/.appstoreconnect/private_keys"
+          python3 - "$ASC_DIR" <<'PY'
+          import base64, json, os, sys
+          from pathlib import Path
+          raw = os.environ['ASC_PRIVATE_KEY'].strip().replace('\\n', '\n')
+          key = raw if 'PRIVATE KEY' in raw else base64.b64decode(''.join(raw.split())).decode('utf-8').strip()
+          if 'PRIVATE KEY' not in key:
+              raise SystemExit('ASC_PRIVATE_KEY is not a .p8 key')
+          kid = os.environ['ASC_KEY_ID']
+          d = Path(sys.argv[1])
+          for p in (d / f'AuthKey_{kid}.p8', Path.home() / '.appstoreconnect' / 'private_keys' / f'AuthKey_{kid}.p8'):
+              p.write_text(key + '\n', encoding='utf-8'); os.chmod(p, 0o600)
+          (d / 'api-key.json').write_text(json.dumps({'key_id': kid, 'issuer_id': os.environ['ASC_ISSUER_ID'], 'key': key, 'in_house': False}), encoding='utf-8')
+          os.chmod(d / 'api-key.json', 0o600)
+          PY
+          echo "ASC_API_KEY_JSON=$ASC_DIR/api-key.json" >> "$GITHUB_ENV"
+          echo "ASC_P8_PATH=$ASC_DIR/AuthKey_${ASC_KEY_ID}.p8" >> "$GITHUB_ENV"
+
+          MATCH_AUTH="$(printf '%s:%s' 'readori' "$TARGET_REPO_PAT" | base64 | tr -d '\n')"
+          echo "::add-mask::$MATCH_AUTH"
+          echo "MATCH_AUTH=$MATCH_AUTH" >> "$GITHUB_ENV"
+
+      # ---- profile mode: one-time bundle ID + App Store profile for com.readori.youxi only ----
+      - name: Register bundle ID if missing (App Store Connect API)
+        if: ${{ inputs.mode == 'profile' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruby - <<'RUBY'
+          require 'spaceship'
+          require 'json'
+          k = JSON.parse(File.read(ENV.fetch('ASC_API_KEY_JSON')))
+          Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.create(key_id: k['key_id'], issuer_id: k['issuer_id'], key: k['key'])
+          id = ENV.fetch('EXPECTED_BUNDLE_ID')
+          found = Spaceship::ConnectAPI::BundleId.find(id)
+          if found
+            puts "Bundle ID already registered: #{id}"
+          else
+            Spaceship::ConnectAPI::BundleId.create(name: ENV.fetch('BUNDLE_ID_NAME'), identifier: id, platform: 'IOS')
+            puts "Bundle ID registered: #{id}"
+          end
+          RUBY
+
+      - name: Write App Store profile to Match (existing shared Distribution identity only)
+        if: ${{ inputs.mode == 'profile' }}
+        shell: bash
+        env:
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          COMMON=(--git_url "$MATCH_GIT_URL" --git_branch "$MATCH_GIT_BRANCH" --git_basic_authorization "$MATCH_AUTH"
+                  --team_id "$ASC_TEAM_ID" --api_key_path "$ASC_API_KEY_JSON"
+                  --keychain_name "$KEYCHAIN_NAME" --keychain_password "$KEYCHAIN_PASSWORD")
+          echo 'Preflight: shared Distribution identity must already exist in Match...'
+          MATCH_READONLY=true fastlane match appstore --app_identifier "$EXPECTED_BUNDLE_ID" \
+            --readonly true --skip_provisioning_profiles true "${COMMON[@]}" > "$RUNNER_TEMP/match-pre.log" 2>&1 \
+            || { tail -5 "$RUNNER_TEMP/match-pre.log"; echo '::error::Match preflight failed.'; exit 65; }
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -q 'Apple Distribution\|iPhone Distribution' \
+            || { echo '::error::No shared Distribution identity in Match; refusing to create a certificate.'; exit 78; }
+          MATCH_READONLY=false fastlane match appstore --app_identifier "$EXPECTED_BUNDLE_ID" \
+            --readonly false --force --generate_apple_certs false --skip_confirmation true "${COMMON[@]}" > "$RUNNER_TEMP/match-write.log" 2>&1 \
+            || { grep -iE 'error|could not|not found' "$RUNNER_TEMP/match-write.log" | head -10; echo '::error::Match could not write the youxi profile.'; exit 65; }
+          echo "App Store profile for $EXPECTED_BUNDLE_ID written to Match: PASS"
+
+      # ---- testflight mode ----
+      - name: Install signing assets with Match (readonly)
+        if: ${{ inputs.mode == 'testflight' }}
+        shell: bash
+        env:
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          MATCH_READONLY=true fastlane match appstore --app_identifier "$EXPECTED_BUNDLE_ID" \
+            --git_url "$MATCH_GIT_URL" --git_branch "$MATCH_GIT_BRANCH" --git_basic_authorization "$MATCH_AUTH" \
+            --team_id "$ASC_TEAM_ID" --api_key_path "$ASC_API_KEY_JSON" \
+            --keychain_name "$KEYCHAIN_NAME" --keychain_password "$KEYCHAIN_PASSWORD" \
+            --shallow_clone true --clone_branch_directly true --readonly true > "$RUNNER_TEMP/match.log" 2>&1 \
+            || { grep -iE 'error|could not|no matching' "$RUNNER_TEMP/match.log" | head -10; echo '::error::Readonly Match failed. First run? Run this workflow once with mode=profile, confirm=WRITE.'; exit 65; }
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+
+          PROFILE_NAME=''
+          shopt -s nullglob
+          for p in "$HOME/Library/MobileDevice/Provisioning Profiles/"*.mobileprovision "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/"*.mobileprovision; do
+            pl="$RUNNER_TEMP/prof.plist"
+            security cms -D -i "$p" > "$pl" 2>/dev/null || continue
+            appid="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$pl" 2>/dev/null || true)"
+            gt="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$pl" 2>/dev/null || echo false)"
+            if [[ "$appid" == "$ASC_TEAM_ID.$EXPECTED_BUNDLE_ID" && "$gt" != 'true' ]]; then
+              PROFILE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :Name' "$pl")"
+            fi
+            rm -f "$pl"
+          done
+          [[ -n "$PROFILE_NAME" ]] || { echo "::error::No App Store profile for $EXPECTED_BUNDLE_ID installed."; exit 65; }
+          echo "APPSTORE_PROFILE_NAME=$PROFILE_NAME" >> "$GITHUB_ENV"
+          echo "Provisioning profile: $PROFILE_NAME"
+
+      - name: Resolve build number
+        if: ${{ inputs.mode == 'testflight' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          OUT="$(fastlane run latest_testflight_build_number api_key_path:"$ASC_API_KEY_JSON" app_identifier:"$EXPECTED_BUNDLE_ID" initial_build_number:0 2>&1)"
+          st=$?
+          set -e
+          LATEST="$(printf '%s\n' "$OUT" | sed -n 's/.*Result: \([0-9][0-9]*\).*/\1/p' | tail -1)"
+          if [[ "$st" -ne 0 || -z "$LATEST" ]]; then
+            printf '%s\n' "$OUT" | grep -iE 'could not find app|no app|not found' | head -3 || true
+            echo '::error::Could not read TestFlight builds. Has the App been created in App Store Connect with bundle ID com.readori.youxi?'
+            exit 1
+          fi
+          if [[ -n "$BUILD_NUMBER_INPUT" ]]; then
+            (( BUILD_NUMBER_INPUT > LATEST )) || { echo "::error::build_number $BUILD_NUMBER_INPUT must be higher than latest $LATEST."; exit 1; }
+            BN="$BUILD_NUMBER_INPUT"
+          else
+            BN=$((LATEST + 1))
+          fi
+          echo "BUILD_NUMBER=$BN" >> "$GITHUB_ENV"
+          echo "Latest TestFlight build: $LATEST → this build: $BN"
+
+      - name: Build signed archive and IPA
+        if: ${{ inputs.mode == 'testflight' }}
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        shell: bash
+        env:
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          ARCHIVE="$RUNNER_TEMP/youxi.xcarchive"; EXPORT_DIR="$RUNNER_TEMP/youxi-export"; OPTS="$RUNNER_TEMP/youxi-export.plist"
+          rm -rf "$ARCHIVE" "$EXPORT_DIR"; mkdir -p "$EXPORT_DIR"
+          xcodebuild archive -quiet \
+            -project ios/App/App.xcodeproj -scheme App -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$ARCHIVE" \
+            MARKETING_VERSION="$VERSION_INPUT" CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="$ASC_TEAM_ID" CODE_SIGN_IDENTITY='Apple Distribution' \
+            PROVISIONING_PROFILE_SPECIFIER="$APPSTORE_PROFILE_NAME"
+          python3 - "$OPTS" <<'PY'
+          import os, plistlib, sys
+          plistlib.dump({
+              "method": "app-store-connect", "destination": "export", "signingStyle": "manual",
+              "signingCertificate": "Apple Distribution", "teamID": os.environ["ASC_TEAM_ID"],
+              "provisioningProfiles": {os.environ["EXPECTED_BUNDLE_ID"]: os.environ["APPSTORE_PROFILE_NAME"]},
+              "manageAppVersionAndBuildNumber": False, "uploadSymbols": True,
+          }, open(sys.argv[1], "wb"))
+          PY
+          xcodebuild -exportArchive -quiet -archivePath "$ARCHIVE" -exportPath "$EXPORT_DIR" -exportOptionsPlist "$OPTS"
+          IPA="$(find "$EXPORT_DIR" -maxdepth 1 -name '*.ipa' -print -quit)"
+          [[ -n "$IPA" ]] || { echo '::error::IPA was not exported.'; exit 65; }
+          V="$RUNNER_TEMP/youxi-verify"; rm -rf "$V"; mkdir -p "$V"; unzip -q "$IPA" -d "$V"
+          APP="$(find "$V/Payload" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          codesign --verify --deep --strict "$APP"
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")" == "$EXPECTED_BUNDLE_ID" ]] || { echo '::error::Bundle ID mismatch'; exit 65; }
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist")" == "$BUILD_NUMBER" ]] || { echo '::error::Build number mismatch'; exit 65; }
+          test -f "$APP/public/index.html" || { echo '::error::Web build not embedded'; exit 65; }
+          rm -rf "$V"
+          echo "SIGNED_IPA=$IPA" >> "$GITHUB_ENV"
+          echo "Signed IPA: $(basename "$IPA") · $(du -h "$IPA" | cut -f1)"
+
+      - name: Validate and upload to TestFlight (altool)
+        if: ${{ inputs.mode == 'testflight' }}
+        shell: bash
+        env:
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          set -euo pipefail
+          for action in validate-app upload-app; do
+            LOG="$RUNNER_TEMP/altool-$action.log"
+            set +e
+            xcrun altool --$action --file "$SIGNED_IPA" --type ios --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID" > "$LOG" 2>&1
+            st=$?
+            set -e
+            if [[ "$st" -ne 0 ]] || grep -qiE '^[[:space:]]*[*]{3} Error|ERROR ITMS-' "$LOG"; then
+              MSG="$(grep -iE 'error|ITMS-|bundle version|message' "$LOG" | head -20 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+              echo "::error title=altool $action failed::${MSG:-exit $st}"
+              exit 1
+            fi
+            echo "altool $action: OK"
+          done
+          echo "TestFlight upload accepted: $VERSION_INPUT ($BUILD_NUMBER)"
+
+      - name: Summary
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          {
+            echo "## youxi iOS · $MODE"
+            echo "- Bundle ID: \`$EXPECTED_BUNDLE_ID\`"
+            [[ -n "${SOURCE_SHORT_SHA:-}" ]] && echo "- Source: \`${SOURCE_SHORT_SHA}\`"
+            [[ "$MODE" == 'testflight' ]] && echo "- TestFlight: $VERSION_INPUT (${BUILD_NUMBER:-?}) uploaded"
+            echo "- Xcode: \`$(xcodebuild -version | head -1)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup signing material
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          if [[ -n "${ORIGINAL_DEFAULT_KEYCHAIN:-}" ]]; then
+            security default-keychain -d user -s "$ORIGINAL_DEFAULT_KEYCHAIN" >/dev/null 2>&1
+            security list-keychains -d user -s "$ORIGINAL_DEFAULT_KEYCHAIN" >/dev/null 2>&1
+          fi
+          [[ -n "${KEYCHAIN_NAME:-}" ]] && security delete-keychain "$KEYCHAIN_NAME" >/dev/null 2>&1
+          rm -rf "$RUNNER_TEMP/youxi-asc" "$RUNNER_TEMP/youxi-export" "$RUNNER_TEMP/youxi.xcarchive" >/dev/null 2>&1
+          rm -f "$HOME/.appstoreconnect/private_keys/"AuthKey_*.p8 >/dev/null 2>&1
+          true
