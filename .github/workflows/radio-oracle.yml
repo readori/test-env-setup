@@ -92,6 +92,7 @@ jobs:
           KEY: ${{ secrets.ORACLE_SSH_KEY || secrets.ORACLE_API_TOKEN }}
           HOST: ${{ secrets.ORACLE_SSH_HOST }}
           SSH_USER: ${{ secrets.ORACLE_SSH_USER }}
+          HOST_KEY: ${{ secrets.ORACLE_SSH_HOST_KEY }}
           TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.ORACLE_ACCESS_CLIENT_ID }}
           TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.ORACLE_ACCESS_CLIENT_SECRET }}
         run: |
@@ -108,12 +109,26 @@ jobs:
           echo "service_token_set=$([[ -n "$TUNNEL_SERVICE_TOKEN_ID" && -n "$TUNNEL_SERVICE_TOKEN_SECRET" ]] && echo yes || echo no)"
           # Read-only Q2 checks (plan 0.5): each prints one yes/no or one state word.
           REMOTE='if sudo -n true >/dev/null 2>&1; then echo sudo_n=yes; else echo sudo_n=no; fi; if id -Gn | tr " " "\n" | grep -qx docker; then echo docker_group=yes; else echo docker_group=no; fi; echo "cloudflared_state=$(systemctl is-active cloudflared 2>/dev/null | head -1 | tr -cd "a-z-")"'
+          # VM host key pinned from the secret ORACLE_SSH_HOST_KEY (the "<type> <base64>" line of
+          # /etc/ssh/ssh_host_ed25519_key.pub, read on the VM itself). Never printed: a host key can
+          # be looked up in internet scan indexes and would reveal the VM address.
+          shk=accept-new; pinned=no
+          if [[ -n "${HOST_KEY:-}" ]]; then
+            HOST_KEY="$(printf '%s\n' "$HOST_KEY" | tr -d '\r' | awk 'NF { print $1, $2; exit }')"
+            [[ "$HOST_KEY" =~ ^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa)\ [A-Za-z0-9+/]+={0,2}$ ]] \
+              || { echo '::error::ORACLE_SSH_HOST_KEY must be one "<type> <base64>" public key line'; exit 1; }
+            printf '%s %s\n' "$HOST" "$HOST_KEY" > "$d/known"; shk=yes; pinned=yes
+          else
+            echo '::warning::ORACLE_SSH_HOST_KEY is not set: the VM host key is trusted on first use'
+          fi
+          echo "host_key_pinned=$pinned" | tee -a "$GITHUB_STEP_SUMMARY"
           rc=0
-          timeout 60 ssh -i "$d/key" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$d/known" \
+          timeout 60 ssh -i "$d/key" -o BatchMode=yes -o StrictHostKeyChecking="$shk" -o UserKnownHostsFile="$d/known" \
               -o ConnectTimeout=20 -o LogLevel=ERROR \
               -o ProxyCommand="cloudflared access ssh --hostname %h" \
               "$SSH_USER@$HOST" "$REMOTE" > "$d/out" 2> "$d/err" || rc=$?
           if [[ $rc -eq 0 ]]; then result=ok
+          elif grep -qiE 'Host key verification failed|HOST IDENTIFICATION HAS CHANGED' "$d/err"; then result=host-key-mismatch
           elif grep -q 'Permission denied' "$d/err"; then result=permission-denied
           elif grep -qiE 'timed out|Connection timed' "$d/err"; then result=timeout
           elif grep -qi 'Could not resolve' "$d/err"; then result=no-dns
@@ -314,6 +329,7 @@ jobs:
           KEY: ${{ secrets.ORACLE_SSH_KEY || secrets.ORACLE_API_TOKEN }}
           HOST: ${{ secrets.ORACLE_SSH_HOST }}
           SSH_USER: ${{ secrets.ORACLE_SSH_USER }}
+          HOST_KEY: ${{ secrets.ORACLE_SSH_HOST_KEY }}
         run: |
           set -euo pipefail
           umask 077
@@ -322,6 +338,19 @@ jobs:
           d="$RUNNER_TEMP/ssh"; mkdir -p "$d"
           printf '%s\n' "$KEY" > "$d/key"
           ssh-keygen -y -f "$d/key" > /dev/null 2>&1 || { echo '::error::the SSH key is not usable'; exit 1; }
+          # VM host key pinned from the secret ORACLE_SSH_HOST_KEY (the "<type> <base64>" line of
+          # /etc/ssh/ssh_host_ed25519_key.pub, read on the VM itself). Never printed: a host key can
+          # be looked up in internet scan indexes and would reveal the VM address.
+          shk=accept-new; pinned=no
+          if [[ -n "${HOST_KEY:-}" ]]; then
+            HOST_KEY="$(printf '%s\n' "$HOST_KEY" | tr -d '\r' | awk 'NF { print $1, $2; exit }')"
+            [[ "$HOST_KEY" =~ ^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa)\ [A-Za-z0-9+/]+={0,2}$ ]] \
+              || { echo '::error::ORACLE_SSH_HOST_KEY must be one "<type> <base64>" public key line'; exit 1; }
+            printf '%s %s\n' "$HOST" "$HOST_KEY" > "$d/known"; shk=yes; pinned=yes
+          else
+            echo '::warning::ORACLE_SSH_HOST_KEY is not set: the VM host key is trusted on first use'
+          fi
+          echo "host_key_pinned=$pinned" | tee -a "$GITHUB_STEP_SUMMARY"
           cat > "$d/config" <<EOF
           Host hourwave-vm
             HostName $HOST
@@ -329,7 +358,7 @@ jobs:
             IdentityFile $d/key
             IdentitiesOnly yes
             BatchMode yes
-            StrictHostKeyChecking accept-new
+            StrictHostKeyChecking $shk
             UserKnownHostsFile $d/known
             ConnectTimeout 20
             ServerAliveInterval 30
@@ -359,6 +388,7 @@ jobs:
             if [[ $rc -eq 124 ]]; then r=timeout
             elif [[ $rc -ne 255 ]]; then
               if grep -q 'sudo:' "$err"; then r=sudo-refused; else r=remote-command-failed; fi
+            elif grep -qiE 'Host key verification failed|HOST IDENTIFICATION HAS CHANGED' "$err"; then r=host-key-mismatch
             elif grep -q 'Permission denied' "$err"; then r=permission-denied
             elif grep -qiE 'timed out|Connection timed' "$err"; then r=timeout
             elif grep -qi 'Could not resolve' "$err"; then r=no-dns
@@ -454,6 +484,7 @@ jobs:
           KEY: ${{ secrets.ORACLE_SSH_KEY || secrets.ORACLE_API_TOKEN }}
           HOST: ${{ secrets.ORACLE_SSH_HOST }}
           SSH_USER: ${{ secrets.ORACLE_SSH_USER }}
+          HOST_KEY: ${{ secrets.ORACLE_SSH_HOST_KEY }}
         run: |
           set -euo pipefail
           umask 077
@@ -462,6 +493,19 @@ jobs:
           d="$RUNNER_TEMP/ssh"; mkdir -p "$d"
           printf '%s\n' "$KEY" > "$d/key"
           ssh-keygen -y -f "$d/key" > /dev/null 2>&1 || { echo '::error::the SSH key is not usable'; exit 1; }
+          # VM host key pinned from the secret ORACLE_SSH_HOST_KEY (the "<type> <base64>" line of
+          # /etc/ssh/ssh_host_ed25519_key.pub, read on the VM itself). Never printed: a host key can
+          # be looked up in internet scan indexes and would reveal the VM address.
+          shk=accept-new; pinned=no
+          if [[ -n "${HOST_KEY:-}" ]]; then
+            HOST_KEY="$(printf '%s\n' "$HOST_KEY" | tr -d '\r' | awk 'NF { print $1, $2; exit }')"
+            [[ "$HOST_KEY" =~ ^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa)\ [A-Za-z0-9+/]+={0,2}$ ]] \
+              || { echo '::error::ORACLE_SSH_HOST_KEY must be one "<type> <base64>" public key line'; exit 1; }
+            printf '%s %s\n' "$HOST" "$HOST_KEY" > "$d/known"; shk=yes; pinned=yes
+          else
+            echo '::warning::ORACLE_SSH_HOST_KEY is not set: the VM host key is trusted on first use'
+          fi
+          echo "host_key_pinned=$pinned" | tee -a "$GITHUB_STEP_SUMMARY"
           cat > "$d/config" <<EOF
           Host hourwave-vm
             HostName $HOST
@@ -469,7 +513,7 @@ jobs:
             IdentityFile $d/key
             IdentitiesOnly yes
             BatchMode yes
-            StrictHostKeyChecking accept-new
+            StrictHostKeyChecking $shk
             UserKnownHostsFile $d/known
             ConnectTimeout 20
             ServerAliveInterval 30
@@ -499,6 +543,7 @@ jobs:
             if [[ $rc -eq 124 ]]; then r=timeout
             elif [[ $rc -ne 255 ]]; then
               if grep -q 'sudo:' "$err"; then r=sudo-refused; else r=remote-command-failed; fi
+            elif grep -qiE 'Host key verification failed|HOST IDENTIFICATION HAS CHANGED' "$err"; then r=host-key-mismatch
             elif grep -q 'Permission denied' "$err"; then r=permission-denied
             elif grep -qiE 'timed out|Connection timed' "$err"; then r=timeout
             elif grep -qi 'Could not resolve' "$err"; then r=no-dns
