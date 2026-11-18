@@ -137,7 +137,9 @@ jobs:
           SITE="$RUNNER_TEMP/site"
           mkdir -p "$SITE/public"
           cp -R "$PRIVATE_SOURCE_PATH/dist/." "$SITE/public/"
-          printf '/*\n  X-Robots-Tag: noindex, nofollow\n' > "$SITE/public/_headers"
+          # Vite puts every built file under /assets/ with a content hash in its name, so those can be cached
+          # for a year; index.html keeps the platform default (revalidate every time) and picks up new hashes.
+          printf '/*\n  X-Robots-Tag: noindex, nofollow\n/assets/*\n  Cache-Control: public, max-age=31536000, immutable\n' > "$SITE/public/_headers"
           printf 'User-agent: *\nDisallow: /\n' > "$SITE/public/robots.txt"
           cat > "$SITE/wrangler.jsonc" <<EOF
           {
