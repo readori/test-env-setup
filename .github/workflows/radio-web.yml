@@ -10,7 +10,9 @@
 #   deploy  : + resolve the staging API base, build with it, deploy the web Worker,
 #             then GET the site (/, /en/, /zh/) and the API /health.
 #
-# Staging only. Production waits for the approval-gated pipeline of private BACKLOG OPS-10b.
+# target=production is dry-run only: it bundles with the production environment of the wrangler
+# config so that the config is checked. Deploying production waits for the approval-gated pipeline
+# of private BACKLOG OPS-10b, and is refused here.
 # The site has no Worker script: it only serves files, so it can never proxy or cache audio.
 #
 # Safety rules (public repo, public logs): workflow_dispatch only; actions pinned to SHAs;
@@ -19,7 +21,7 @@
 # files and only error codes are printed; no artifacts; private files are never printed.
 name: Radio Web
 
-run-name: Radio Web · ${{ inputs.mode }} · staging · ${{ inputs.ref }}
+run-name: Radio Web · ${{ inputs.mode }} · ${{ inputs.target }} · ${{ inputs.ref }}
 
 on:
   workflow_dispatch:
@@ -34,18 +36,24 @@ on:
         default: dry-run
         type: choice
         options: [dry-run, deploy]
+      target:
+        description: 'wrangler environment. production is dry-run only (deploy is refused until OPS-10b)'
+        required: true
+        default: staging
+        type: choice
+        options: [staging, production]
 
 permissions:
   contents: read
 
 concurrency:
-  group: radio-web-staging
+  group: radio-web-${{ inputs.target }}
   cancel-in-progress: false
 
 env:
   SOURCE_REF: ${{ inputs.ref }}
   MODE: ${{ inputs.mode }}
-  TARGET_ENV: staging
+  TARGET_ENV: ${{ inputs.target }}
   # WEB_WORKER and API_WORKER are read from the wrangler configs of the checked-out ref (step below).
   WRANGLER_SEND_METRICS: 'false'
   TURBO_TELEMETRY_DISABLED: '1'
@@ -54,7 +62,7 @@ env:
 
 jobs:
   web:
-    name: Web static export (${{ inputs.mode }}, staging)
+    name: Web static export (${{ inputs.mode }}, ${{ inputs.target }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -64,6 +72,11 @@ jobs:
           set -euo pipefail
           [[ "$SOURCE_REF" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]] || { echo '::error::ref must be a branch, tag or SHA (no leading -)'; exit 64; }
           case "$MODE" in dry-run|deploy) ;; *) echo "::error::Unsupported mode: $MODE"; exit 64 ;; esac
+          case "$TARGET_ENV" in staging|production) ;; *) echo "::error::Unsupported target: $TARGET_ENV"; exit 64 ;; esac
+          if [[ "$TARGET_ENV" == production && "$MODE" != dry-run ]]; then
+            echo '::error::production can only be bundled (dry-run) here; deploying it waits for the gated pipeline (OPS-10b)'
+            exit 64
+          fi
 
       - name: Checkout private source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
