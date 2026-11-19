@@ -12,6 +12,9 @@
 #                besides TARGET_REPO_PAT for the checkout).
 #   archive    : + readonly Match signing, App Store archive, IPA export, altool validate (IPA is not kept).
 #   testflight : archive + build-number check against TestFlight + altool upload.
+#   verify + smoke=screenshots (OPS-08): App Store screenshots from apps/mobile/store-shots of the ref
+#                on a 6.9" simulator; with upload_screenshots they replace the 6.9" sets of the editable
+#                App Store version (ASC API key, this step only). No artifact either way.
 #
 # Version and build number: both required workflow inputs, typed by the person dispatching the run
 # (no defaults, no run-number fallback; app.json "version" is ignored). They are written into the
@@ -71,7 +74,7 @@ on:
         required: true
         type: string
       smoke:
-        description: 'verify only: none = build only; launch = also boot a simulator, start the app and check it stays up; drag = launch + Maestro swipes on the first screen'
+        description: 'verify only: none = build only; launch = also boot a simulator, start the app and check it stays up; drag = launch + Maestro swipes on the first screen; screenshots = App Store screenshots from apps/mobile/store-shots of the ref on a 6.9" simulator, both locales (see upload_screenshots)'
         required: false
         default: 'none'
         type: choice
@@ -79,6 +82,12 @@ on:
           - none
           - launch
           - drag
+          - screenshots
+      upload_screenshots:
+        description: 'verify + smoke=screenshots only: replace the 6.9" (APP_IPHONE_67) screenshot sets of the editable App Store version <version> with the captured images (en-US, zh-Hans). Unchecked = capture only; nothing leaves the runner.'
+        required: false
+        default: false
+        type: boolean
       widgets:
         description: 'Build the WidgetKit extension HourwaveWidgets (com.readori.radio.widgets): sets HOURWAVE_WIDGETS=1 for expo prebuild (unchecked = HOURWAVE_WIDGETS=0). The ref must contain the widgets config plugin; signed modes need both profiles from certificates-repo.yml refresh_radio_profile.'
         required: false
@@ -128,6 +137,7 @@ jobs:
       VERSION_INPUT: ${{ inputs.version || '' }}
       BUILD_NUMBER_INPUT: ${{ inputs.build_number || '' }}
       SMOKE: ${{ inputs.smoke || 'none' }}
+      UPLOAD_SCREENSHOTS: ${{ inputs.upload_screenshots && 'true' || 'false' }}
       # Read by the widgets config plugin at expo prebuild (explicit 0 = off whatever app.json says).
       # Job-wide so every step that evaluates the app config sees the same value.
       HOURWAVE_WIDGETS: ${{ inputs.widgets && '1' || '0' }}
@@ -148,6 +158,7 @@ jobs:
           HAS_ASC_KEY_ID: ${{ secrets.ASC_KEY_ID != '' }}
           HAS_ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY != '' }}
           HAS_ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID != '' }}
+          HAS_RADIO_ASC_APP_ID: ${{ secrets.RADIO_ASC_APP_ID != '' }}
           RADIO_ASC_APP_ID: ${{ inputs.mode == 'testflight' && secrets.RADIO_ASC_APP_ID || '' }}
         run: |
           set -euo pipefail
@@ -194,6 +205,27 @@ jobs:
               echo '::error::RADIO_ASC_APP_ID must be the numeric App Store Connect Apple ID.'
               exit 78
             }
+          fi
+
+          # App Store screenshots (OPS-08): capture in verify only; upload needs the ASC key and app id.
+          if [[ "$SMOKE" == 'screenshots' && "$MODE" != 'verify' ]]; then
+            echo '::error::smoke=screenshots runs in verify mode only.'
+            exit 64
+          fi
+          if [[ "$UPLOAD_SCREENSHOTS" == 'true' ]]; then
+            [[ "$MODE" == 'verify' && "$SMOKE" == 'screenshots' ]] || {
+              echo '::error::upload_screenshots needs mode=verify and smoke=screenshots.'
+              exit 64
+            }
+            missing=0
+            for name in ASC_ISSUER_ID ASC_KEY_ID ASC_PRIVATE_KEY RADIO_ASC_APP_ID; do
+              flag="HAS_$name"
+              if [[ "${!flag}" != 'true' ]]; then
+                echo "::error::Missing public-repo secret required for upload_screenshots: $name"
+                missing=1
+              fi
+            done
+            (( missing == 0 )) || exit 78
           fi
 
           # Version and build number are always typed by the person dispatching the run.
@@ -750,7 +782,7 @@ jobs:
 
           echo "JS bundle: embedded ($(du -k "$APP_PATH/main.jsbundle" | awk '{print $1}') KiB)"
           echo 'Simulator build: PASS'
-          if [[ "$SMOKE" == 'launch' || "$SMOKE" == 'drag' ]]; then
+          if [[ "$SMOKE" == 'launch' || "$SMOKE" == 'drag' || "$SMOKE" == 'screenshots' ]]; then
             # Kept for the smoke step below (the runner is discarded afterwards).
             echo "SIM_APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
             echo "SIM_BUNDLE_ID=$BUNDLE_ID" >> "$GITHUB_ENV"
@@ -931,6 +963,214 @@ jobs:
           rm -rf "$OUT" "$RUNNER_TEMP/DerivedData-Radio-Verify"
           if [[ "$verdict" == 0 ]]; then echo 'Simulator smoke: PASS'; else echo 'Simulator smoke: FAIL'; fi
           exit "$verdict"
+
+      # ---------------------------------------------------------------------
+      # 4c. VERIFY mode, smoke=screenshots: App Store screenshots (OPS-08)
+      #     Runs apps/mobile/store-shots/capture.sh of the private ref on a 6.9" iPhone simulator; it
+      #     checks every image is 1320x2868. Public log: locale, file names, pixel sizes and Maestro
+      #     FAILED lines only. Images leave the runner only through the upload step below, into the
+      #     App Store Connect draft (private); no Actions artifact.
+      # ---------------------------------------------------------------------
+      - name: Store screenshots (simulator)
+        if: ${{ env.MODE == 'verify' && inputs.smoke == 'screenshots' }}
+        shell: bash
+        timeout-minutes: 35
+        run: |
+          set -euo pipefail
+          SCRIPT="$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH/$MOBILE_APP_DIR/store-shots/capture.sh"
+          [[ -f "$SCRIPT" ]] || { echo '::error title=Store screenshots::The ref has no apps/mobile/store-shots/capture.sh.'; exit 66; }
+
+          UDID="$(xcrun simctl list devices available -j | jq -r '
+            [.devices | to_entries[] | select(.key | test("iOS")) | .value[] | select(.name | test("^iPhone 1[6-9] Pro Max$"))]
+            | sort_by(.name) | reverse | .[0].udid // empty')"
+          [[ -n "$UDID" ]] || { echo '::error title=Store screenshots::No 6.9" iPhone (16-19 Pro Max) simulator on this runner.'; exit 70; }
+          echo "Simulator: $(xcrun simctl list devices available | grep -F "$UDID" | sed -E 's/ \([0-9A-F-]{36}\).*//' | xargs)"
+          xcrun simctl boot "$UDID" > /dev/null 2>&1 || true
+          xcrun simctl bootstatus "$UDID" -b > /dev/null 2>&1 || { echo '::error title=Store screenshots::Simulator did not boot.'; exit 70; }
+          xcrun simctl install "$UDID" "$SIM_APP_PATH" || { echo '::error title=Store screenshots::Install failed.'; exit 70; }
+
+          export MAESTRO_CLI_NO_ANALYTICS=1 MAESTRO_CLI_ANALYSIS_NOTIFICATION_DISABLED=true
+          curl -fsSL 'https://get.maestro.mobile.dev' | bash > "$RUNNER_TEMP/radio-maestro-install.log" 2>&1 \
+            || { echo '::error title=Store screenshots::Maestro could not be installed.'; exit 70; }
+          export PATH="$HOME/.maestro/bin:$PATH"
+
+          OUT="$RUNNER_TEMP/radio-store-shots"
+          rm -rf "$OUT"
+          set +e
+          bash "$SCRIPT" "$UDID" "$SIM_BUNDLE_ID" "$OUT"
+          status=$?
+          set -e
+          xcrun simctl shutdown "$UDID" > /dev/null 2>&1 || true
+          (( status == 0 )) || exit "$status"
+          echo "STORE_SHOTS_DIR=$OUT" >> "$GITHUB_ENV"
+
+      - name: Upload store screenshots to App Store Connect
+        if: ${{ env.MODE == 'verify' && inputs.smoke == 'screenshots' && inputs.upload_screenshots }}
+        shell: bash
+        timeout-minutes: 20
+        env:
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          RADIO_ASC_APP_ID: ${{ secrets.RADIO_ASC_APP_ID }}
+        run: |
+          set -euo pipefail
+          HELPER="$RUNNER_TEMP/radio-asc-shots.mjs"
+          cat > "$HELPER" <<'JS'
+          // Usage: node asc-shots.mjs <dir> <version>
+          // Replaces the APP_IPHONE_67 (6.7"/6.9") screenshot set of each locale folder in <dir>
+          // (<dir>/<locale>/NN-*.png, sorted by name) on the editable App Store version <version>.
+          // Env: ASC_ISSUER_ID, ASC_KEY_ID, ASC_PRIVATE_KEY (.p8 text), RADIO_ASC_APP_ID.
+          // Public log: locale, counts and states only; no URLs, ids or file contents.
+          import { createHash, createPrivateKey, sign } from 'node:crypto';
+          import { readdirSync, readFileSync, statSync } from 'node:fs';
+          import { join } from 'node:path';
+
+          const API = 'https://api.appstoreconnect.apple.com';
+          const DISPLAY_TYPE = 'APP_IPHONE_67';
+          const EDITABLE = new Set([
+            'PREPARE_FOR_SUBMISSION',
+            'DEVELOPER_REJECTED',
+            'REJECTED',
+            'METADATA_REJECTED',
+            'INVALID_BINARY',
+          ]);
+          const [dir, version] = process.argv.slice(2);
+          const { ASC_ISSUER_ID, ASC_KEY_ID, ASC_PRIVATE_KEY, RADIO_ASC_APP_ID } = process.env;
+
+          function die(msg) {
+            console.error(`::error title=App Store screenshots::${msg}`);
+            process.exit(1);
+          }
+          if (!dir || !/^\d+\.\d+\.\d+$/.test(version ?? '')) die('usage: asc-shots.mjs <dir> <x.y.z>');
+          if (!ASC_ISSUER_ID || !ASC_KEY_ID || !ASC_PRIVATE_KEY || !/^\d+$/.test(RADIO_ASC_APP_ID ?? ''))
+            die('missing ASC_ISSUER_ID / ASC_KEY_ID / ASC_PRIVATE_KEY / RADIO_ASC_APP_ID');
+
+          const key = createPrivateKey(ASC_PRIVATE_KEY);
+          const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+          let tokenAt = 0;
+          let token = '';
+          function jwt() {
+            const now = Math.floor(Date.now() / 1000);
+            if (token && now - tokenAt < 600) return token;
+            const head = b64({ alg: 'ES256', kid: ASC_KEY_ID, typ: 'JWT' });
+            const body = b64({ iss: ASC_ISSUER_ID, iat: now, exp: now + 1080, aud: 'appstoreconnect-v1' });
+            const sig = sign('sha256', Buffer.from(`${head}.${body}`), { key, dsaEncoding: 'ieee-p1363' });
+            token = `${head}.${body}.${sig.toString('base64url')}`;
+            tokenAt = now;
+            return token;
+          }
+
+          async function api(method, path, data) {
+            const res = await fetch(API + path, {
+              method,
+              headers: { Authorization: `Bearer ${jwt()}`, 'Content-Type': 'application/json' },
+              body: data ? JSON.stringify({ data }) : undefined,
+            });
+            if (res.status === 204) return null;
+            const json = await res.json().catch(() => ({}));
+            if (!res.ok) {
+              const e = (json.errors ?? [])[0] ?? {};
+              die(`${method} ${path.split('?')[0].replace(/\/[0-9a-f-]{8,}/gi, '/{id}')} -> ${res.status} ${e.code ?? ''} ${(e.detail ?? '').slice(0, 200)}`);
+            }
+            return json;
+          }
+
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+          // Local files: <dir>/<locale>/*.png
+          // Locale folders only (en-US, zh-Hans); capture.sh also leaves raw/ and logs/ there.
+          const locales = readdirSync(dir)
+            .filter((d) => /^[a-z]{2,3}-[A-Za-z]{2,4}$/.test(d) && statSync(join(dir, d)).isDirectory())
+            .sort();
+          if (locales.length === 0) die('no locale folders');
+          const plan = locales.map((locale) => {
+            const files = readdirSync(join(dir, locale)).filter((f) => /^\d\d-[a-z0-9-]+\.png$/.test(f)).sort();
+            if (files.length < 1 || files.length > 10) die(`${locale}: ${files.length} screenshots (need 1-10)`);
+            return { locale, files };
+          });
+
+          const versions = await api(
+            'GET',
+            `/v1/apps/${RADIO_ASC_APP_ID}/appStoreVersions?filter[platform]=IOS&filter[versionString]=${version}&limit=5`,
+          );
+          const ver = (versions.data ?? [])[0];
+          if (!ver) die(`version ${version} not found`);
+          const state = ver.attributes.appStoreState ?? ver.attributes.appVersionState;
+          if (!EDITABLE.has(state)) die(`version ${version} is ${state}, not editable`);
+
+          const locs = await api('GET', `/v1/appStoreVersions/${ver.id}/appStoreVersionLocalizations?limit=50`);
+          const locId = new Map((locs.data ?? []).map((l) => [l.attributes.locale, l.id]));
+
+          for (const { locale, files } of plan) {
+            const lid = locId.get(locale);
+            if (!lid) die(`${locale}: no localization on version ${version}`);
+            const sets = await api('GET', `/v1/appStoreVersionLocalizations/${lid}/appScreenshotSets?limit=50`);
+            let set = (sets.data ?? []).find((s) => s.attributes.screenshotDisplayType === DISPLAY_TYPE);
+            if (!set) {
+              set = (
+                await api('POST', '/v1/appScreenshotSets', {
+                  type: 'appScreenshotSets',
+                  attributes: { screenshotDisplayType: DISPLAY_TYPE },
+                  relationships: { appStoreVersionLocalization: { data: { type: 'appStoreVersionLocalizations', id: lid } } },
+                })
+              ).data;
+            }
+            const old = await api('GET', `/v1/appScreenshotSets/${set.id}/appScreenshots?limit=50`);
+            for (const s of old.data ?? []) await api('DELETE', `/v1/appScreenshots/${s.id}`);
+
+            const ids = [];
+            for (const f of files) {
+              const bytes = readFileSync(join(dir, locale, f));
+              const shot = (
+                await api('POST', '/v1/appScreenshots', {
+                  type: 'appScreenshots',
+                  attributes: { fileName: f, fileSize: bytes.length },
+                  relationships: { appScreenshotSet: { data: { type: 'appScreenshotSets', id: set.id } } },
+                })
+              ).data;
+              for (const op of shot.attributes.uploadOperations ?? []) {
+                const headers = Object.fromEntries((op.requestHeaders ?? []).map((h) => [h.name, h.value]));
+                const res = await fetch(op.url, {
+                  method: op.method,
+                  headers,
+                  body: bytes.subarray(op.offset, op.offset + op.length),
+                });
+                if (!res.ok) die(`${locale} ${f}: upload part -> ${res.status}`);
+              }
+              await api('PATCH', `/v1/appScreenshots/${shot.id}`, {
+                type: 'appScreenshots',
+                id: shot.id,
+                attributes: { uploaded: true, sourceFileChecksum: createHash('md5').update(bytes).digest('hex') },
+              });
+              ids.push(shot.id);
+            }
+
+            // Wait until Apple has processed every file.
+            let states = [];
+            for (let i = 0; i < 40; i++) {
+              states = [];
+              for (const id of ids) {
+                const s = await api('GET', `/v1/appScreenshots/${id}`);
+                states.push(s.data.attributes.assetDeliveryState?.state ?? 'UNKNOWN');
+              }
+              if (states.every((s) => s === 'COMPLETE' || s === 'FAILED')) break;
+              await sleep(5000);
+            }
+            // Keep the file order.
+            await api(
+              'PATCH',
+              `/v1/appScreenshotSets/${set.id}/relationships/appScreenshots`,
+              ids.map((id) => ({ type: 'appScreenshots', id })),
+            );
+            const count = (k) => states.filter((s) => s === k).length;
+            console.log(`${locale}: ${files.length} uploaded, ${count('COMPLETE')} complete, ${files.length - count('COMPLETE')} not complete`);
+            if (count('COMPLETE') !== files.length) die(`${locale}: ${files.length - count('COMPLETE')} screenshot(s) not processed (${[...new Set(states)].join(', ')})`);
+          }
+          console.log('App Store screenshots: PASS');
+          JS
+          node "$HELPER" "$STORE_SHOTS_DIR" "$APP_VERSION"
+          rm -f "$HELPER"
 
       # ---------------------------------------------------------------------
       # 5. ARCHIVE / TESTFLIGHT: Match signing (readonly), archive, export, altool
@@ -1540,6 +1780,13 @@ jobs:
             echo "- Xcode: \`${XCODE_VERSION_TEXT%%$'\n'*}\`"
             if [[ "$MODE" == 'verify' ]]; then
               echo '- Simulator Release build: passed, JS bundle embedded'
+              if [[ "$SMOKE" == 'screenshots' ]]; then
+                if [[ "$UPLOAD_SCREENSHOTS" == 'true' ]]; then
+                  echo "- Store screenshots: captured and uploaded to App Store Connect (version \`${APP_VERSION}\`, 6.9\" sets)"
+                else
+                  echo '- Store screenshots: captured on the runner only (not uploaded)'
+                fi
+              fi
             fi
             if [[ "$MODE" == 'archive' ]]; then
               echo '- Signed IPA: Apple validation passed (not uploaded anywhere; the runner is discarded).'
@@ -1585,6 +1832,7 @@ jobs:
             [[ -n "$p" ]] && rm -rf "$p" >/dev/null 2>&1
           done
 
+          rm -rf "$RUNNER_TEMP/radio-store-shots" "$RUNNER_TEMP/radio-asc-shots.mjs" >/dev/null 2>&1 || true
           rm -rf "$RUNNER_TEMP/radio-asc" "$RUNNER_TEMP/radio-profile-scan" "$RUNNER_TEMP/fastlane-gems" >/dev/null 2>&1 || true
           rm -f "$RUNNER_TEMP"/radio-*.log "$RUNNER_TEMP"/altool-*.log >/dev/null 2>&1 || true
           echo 'Signing material, IPA and captured logs removed.'
