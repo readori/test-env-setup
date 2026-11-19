@@ -161,17 +161,19 @@ jobs:
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
         env:
           CI: 'true'
+          NO_COLOR: '1'
         run: |
           set -euo pipefail
           npm run --silent typecheck > "$RUNNER_TEMP/typecheck.log" 2>&1 || { echo 'typecheck failed:'; grep -E 'error TS' "$RUNNER_TEMP/typecheck.log" | head -20 | cut -c1-200; exit 1; }
           echo 'typecheck: PASS'
           log="$RUNNER_TEMP/test.log"
+          strip() { sed -E 's/\x1b\[[0-9;]*m//g' "$log"; }
           if ! npm test > "$log" 2>&1; then
             echo 'tests failed; summary and failing test names:'
-            { grep -E '^ *(Test Files|Tests) |FAIL ' "$log" || echo 'no summary found'; } | head -30 | cut -c1-200
+            { strip | grep -E '^ *(Test Files|Tests) |FAIL ' || echo 'no summary found'; } | head -30 | cut -c1-200
             exit 1
           fi
-          summary="$(grep -E '^ *(Test Files|Tests) ' "$log" | sed -E 's/\x1b\[[0-9;]*m//g; s/^ +//' | tr '\n' ';' )"
+          summary="$({ strip | grep -E '^ *(Test Files|Tests) ' || echo 'summary not found'; } | sed -E 's/^ +//' | tr '\n' ';')"
           echo "tests: $summary"
           echo "- gate: typecheck PASS · tests: $summary" >> "$GITHUB_STEP_SUMMARY"
           npm run --silent build:assets > "$RUNNER_TEMP/build.log" 2>&1 || { echo 'build failed:'; tail -n 30 "$RUNNER_TEMP/build.log" | cut -c1-200; exit 1; }
