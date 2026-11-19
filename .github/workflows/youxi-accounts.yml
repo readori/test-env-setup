@@ -165,6 +165,8 @@ jobs:
           cd "$WORK"
           # A throw-away PEPPER for the local run only.
           printf 'PEPPER=%s\n' "$(openssl rand -hex 32)" > .dev.vars
+          # Sign-ups are closed in production (tuning accounts.registrationOpen); the local smoke registers accounts, so open them for this local run only.
+          echo 'REGISTRATION_OPEN=1' >> .dev.vars
           mlog="$RUNNER_TEMP/local-migrate.log"
           if ! CI=true npx --yes "wrangler@${WRANGLER_VERSION}" d1 migrations apply "$D1_NAME" --local --config wrangler.local.jsonc > "$mlog" 2>&1; then
             echo 'local migrations failed; error codes only:'
@@ -233,6 +235,7 @@ jobs:
             "compatibility_date": "2026-10-01",
             "workers_dev": false,
             "preview_urls": false,
+            "triggers": { "crons": ["17 * * * *"] },
             "routes": [{ "pattern": "${PUBLIC_DOMAIN}", "custom_domain": true }],
             "d1_databases": [{ "binding": "DB", "database_name": "${D1_NAME}", "database_id": "${id}", "migrations_dir": "${SRC}/accounts/migrations" }]
           }
