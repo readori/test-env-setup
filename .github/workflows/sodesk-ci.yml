@@ -92,7 +92,12 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      # The runner images ship a Go toolchain; GOTOOLCHAIN=auto fetches the version go.mod asks for.
+      # Linux and Windows images ship a Go toolchain; the macOS image does not put one on PATH.
+      # GOTOOLCHAIN=auto then fetches the exact version go.mod asks for.
+      - name: Install Go (macOS)
+        if: runner.os == 'macOS'
+        run: command -v go >/dev/null || brew install --quiet go
+
       - name: Toolchain
         working-directory: source
         env:
@@ -108,6 +113,7 @@ jobs:
         run: go vet ./...
 
       - name: go test
+        if: always()
         working-directory: source
         run: |
           set -o pipefail
