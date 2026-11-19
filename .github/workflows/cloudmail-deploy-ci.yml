@@ -270,6 +270,8 @@ jobs:
               "json",
               "ai",
               "assets",
+              # The renderer always re-declares the CloudMail realtime hub (ws -> MailHub).
+              "durable_object_namespace",
           }
           unexpected = sorted({
               str(b.get("type"))
@@ -391,6 +393,20 @@ jobs:
               '',
               '[triggers]',
               'crons = ["0 16 * * *"]',
+              '',
+              # CloudMail (upstream cloud-mail v3.6): realtime mail push hub, SQLite Durable Object.
+              # Re-declaring the same migration tag on later deploys is a no-op.
+              '[[durable_objects.bindings]]',
+              'name = "ws"',
+              'class_name = "MailHub"',
+              '',
+              '[[migrations]]',
+              'tag = "v1"',
+              'new_sqlite_classes = ["MailHub"]',
+              '',
+              # CloudMail (upstream cloud-mail v3.4.x): forward on-site mail to verified addresses.
+              '[[send_email]]',
+              'name = "forward"',
               '',
           ])
 
