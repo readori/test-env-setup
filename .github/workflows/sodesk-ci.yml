@@ -118,7 +118,7 @@ jobs:
         run: |
           set -o pipefail
           # Package results plus the output of failing tests only.
-          go test -count=1 ./... 2>&1 | grep -v 'no test files' | tee "$RUNNER_TEMP/test.log"
+          go test -count=1 ./... 2>&1 | grep -a -v 'no test files' | tee "$RUNNER_TEMP/test.log"
 
       - name: Build
         if: always()
