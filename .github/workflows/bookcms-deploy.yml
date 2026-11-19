@@ -1,0 +1,412 @@
+# bookcms deploy: build the novel reading platform (private readori/bookcms, code name NOVEL_PLATFORM)
+# and publish it to Cloudflare as ONE Worker that serves the API (/api), the reader Web app (/) and
+# the Admin app (/admin/) on the account's workers.dev subdomain (private repo DECISIONS D-012).
+# No custom domain yet: the brand and domain are still an open owner decision.
+#
+#   gate    : npm ci -> typecheck -> unit/integration tests (workerd + local D1) -> build Web + Admin.
+#   deploy  : find or create the D1 database and R2 bucket -> apply D1 migrations -> (optional, empty
+#             database only) load the synthetic seed -> `wrangler deploy` -> create the Worker secrets
+#             that are missing (never replaced) -> (optional, once) grant super_admin -> live checks.
+#
+# Only the "staging" environment is deployed from here for now (Worker novel-platform-api-staging,
+# D1 + R2 novel-platform-staging). Production waits for the domain decision and an approval step.
+#
+# Worker secrets (JWT_SECRET, COOKIE_SECRET, HASH_PEPPER, AD_SIGNING_SECRET, CRAWLER_INTERNAL_TOKEN):
+# each is generated on the runner only when Cloudflare answers that the Worker does not have it, is
+# masked, is never printed and is never copied to GitHub. Existing secrets are never replaced.
+#
+# First administrator: register an ordinary account on the deployed site, then request a run with
+# PROMOTE_USERNAME=<that username>. The role is granted only while NO super_admin exists, so this can
+# bootstrap the first administrator once and can never be used to add more. Later administrators are
+# managed in the Admin app (audited).
+#
+# Triggers: workflow_dispatch (a human clicks Run), or a push to main that changes
+# ci-requests/bookcms-deploy.env (how the project's AI PM requests a deploy). Only people with push
+# access to this repo can trigger; never pull_request. The request file is parsed as plain KEY=VALUE
+# text and is never executed. Push requests must name a full 40-character commit SHA.
+#
+# Safety rules (public repo, public logs): no pull_request triggers; actions pinned to commit SHAs;
+# wrangler pinned by the source's package-lock; TARGET_REPO_PAT only in checkout, not persisted;
+# Cloudflare secrets only on the steps that call Cloudflare; the account id, database id and
+# workers.dev subdomain are masked; tool output goes to files and only error codes and summaries are
+# printed; no Actions artifacts; private files are never printed.
+name: bookcms deploy
+
+run-name: bookcms deploy · ${{ github.event_name == 'push' && 'request (ci-requests/bookcms-deploy.env)' || inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Private readori/bookcms branch, tag, or SHA'
+        required: true
+        default: main
+        type: string
+      seed:
+        description: 'Load the synthetic demo catalogue (only into an empty database)'
+        required: false
+        default: false
+        type: boolean
+      promote_username:
+        description: 'Optional: grant super_admin to this username (only while no super_admin exists)'
+        required: false
+        default: ''
+        type: string
+  push:
+    branches: [main]
+    paths: ['ci-requests/bookcms-deploy.env']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bookcms-deploy
+  cancel-in-progress: false
+
+env:
+  PRIVATE_SOURCE_PATH: source
+  DEPLOY_ENV: staging
+  WORKER_NAME: novel-platform-api-staging
+  D1_NAME: novel-platform-staging
+  R2_NAME: novel-platform-staging
+  WRANGLER_SEND_METRICS: 'false'
+
+jobs:
+  deploy:
+    name: Build and deploy bookcms (staging)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Validate request and credentials
+        shell: bash
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_SEED: ${{ inputs.seed }}
+          INPUT_PROMOTE: ${{ inputs.promote_username }}
+          REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/bookcms-deploy.env
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == 'push' ]]; then
+            # Only the request file of this exact commit (public, no credentials).
+            REQ="$RUNNER_TEMP/bookcms-deploy-request.env"
+            curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/bookcms-deploy.env at this commit.'; exit 64; }
+            val() { sed -n "s/^$1=//p" "$REQ" | head -n 1 | tr -d '\r'; }
+            SOURCE_REF="$(val REF)"
+            REQ_ENV="$(val ENV)"
+            SEED="$(val SEED)"
+            PROMOTE="$(val PROMOTE_USERNAME)"
+            [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::REF in a deploy request must be a full 40-character commit SHA.'; exit 64; }
+            [[ -z "$REQ_ENV" || "$REQ_ENV" == staging ]] || { echo '::error::Only ENV=staging can be deployed from this workflow for now.'; exit 64; }
+          else
+            SOURCE_REF="$INPUT_REF"
+            SEED="$INPUT_SEED"
+            PROMOTE="$INPUT_PROMOTE"
+          fi
+          [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && ${#SOURCE_REF} -le 200 ]] || {
+            echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only, no leading dash).'
+            exit 64
+          }
+          [[ -z "$SEED" || "$SEED" == true || "$SEED" == false ]] || { echo '::error::SEED must be true or false.'; exit 64; }
+          [[ -z "$PROMOTE" || "$PROMOTE" =~ ^[A-Za-z0-9_.-]{3,32}$ ]] || { echo '::error::PROMOTE_USERNAME must be 3-32 letters, digits, _ . or -.'; exit 64; }
+          {
+            echo "SOURCE_REF=$SOURCE_REF"
+            echo "SEED=${SEED:-false}"
+            echo "PROMOTE_USERNAME=$PROMOTE"
+          } >> "$GITHUB_ENV"
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || { echo '::error::Missing TARGET_REPO_PAT.'; exit 78; }
+          [[ -n "${CF_TOKEN:-}" && -n "${CF_ACCOUNT:-}" ]] || { echo '::error::Missing CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID.'; exit 78; }
+          echo "Trigger: $EVENT_NAME · private source ref: $SOURCE_REF · seed: ${SEED:-false} · promote: ${PROMOTE:-none}"
+
+      - name: Checkout private source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/bookcms
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Set up Node.js (version from the source's .nvmrc)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: ${{ env.PRIVATE_SOURCE_PATH }}/.nvmrc
+
+      - name: Install dependencies (no credentials in this step)
+        shell: bash
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        run: |
+          set -euo pipefail
+          SOURCE_COMMIT="$(git rev-parse HEAD)"
+          echo "Private source commit: ${SOURCE_COMMIT:0:8}"
+          echo "SOURCE_SHORT=${SOURCE_COMMIT:0:8}" >> "$GITHUB_ENV"
+          echo '### bookcms deploy (staging)' >> "$GITHUB_STEP_SUMMARY"
+          echo "- Source: \`readori/bookcms@${SOURCE_COMMIT:0:8}\`" >> "$GITHUB_STEP_SUMMARY"
+          for f in apps/api/wrangler.toml database/migrations/0001_initial_schema.sql scripts/assemble-assets.ts; do
+            [[ -f "$f" ]] || { echo "::error::$f is missing at this ref."; exit 1; }
+          done
+          grep -q 'REPLACE_WITH_STAGING_D1_DATABASE_ID' apps/api/wrangler.toml || { echo '::error::apps/api/wrangler.toml no longer has the staging placeholders this workflow fills in.'; exit 1; }
+          log="$RUNNER_TEMP/npm-ci.log"
+          npm ci --no-audit --no-fund --loglevel=error > "$log" 2>&1 || { echo 'npm ci failed:'; tail -n 20 "$log" | cut -c1-200; exit 1; }
+          echo "node $(node -v) · wrangler $(cd apps/api && npx wrangler --version 2>/dev/null | tail -n 1)"
+
+      - name: Gate - typecheck, tests, build Web + Admin
+        shell: bash
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        env:
+          CI: 'true'
+        run: |
+          set -euo pipefail
+          npm run --silent typecheck > "$RUNNER_TEMP/typecheck.log" 2>&1 || { echo 'typecheck failed:'; grep -E 'error TS' "$RUNNER_TEMP/typecheck.log" | head -20 | cut -c1-200; exit 1; }
+          echo 'typecheck: PASS'
+          log="$RUNNER_TEMP/test.log"
+          if ! npm test > "$log" 2>&1; then
+            echo 'tests failed; summary and failing test names:'
+            { grep -E '^ *(Test Files|Tests) |FAIL ' "$log" || echo 'no summary found'; } | head -30 | cut -c1-200
+            exit 1
+          fi
+          summary="$(grep -E '^ *(Test Files|Tests) ' "$log" | sed -E 's/\x1b\[[0-9;]*m//g; s/^ +//' | tr '\n' ';' )"
+          echo "tests: $summary"
+          echo "- gate: typecheck PASS · tests: $summary" >> "$GITHUB_STEP_SUMMARY"
+          npm run --silent build:assets > "$RUNNER_TEMP/build.log" 2>&1 || { echo 'build failed:'; tail -n 30 "$RUNNER_TEMP/build.log" | cut -c1-200; exit 1; }
+          [[ -f apps/api/public/index.html && -f apps/api/public/admin/index.html ]] || { echo '::error::Web or Admin index.html was not produced'; exit 1; }
+          # Staging must not be indexed by search engines.
+          printf 'User-agent: *\nDisallow: /\n' > apps/api/public/robots.txt
+          printf '\n/*\n  X-Robots-Tag: noindex, nofollow\n' >> apps/api/public/_headers
+          echo "assets: $(find apps/api/public -type f | wc -l) files, $(du -sk apps/api/public | cut -f1) KiB"
+          echo '- build Web + Admin: OK (staging robots: noindex)' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Find or create the D1 database and R2 bucket; fill in the staging config
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$CLOUDFLARE_ACCOUNT_ID"
+          acct="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID"
+          auth=(-H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+          ok() { [[ "$(jq -r '.success' "$1" 2>/dev/null)" == true ]]; }
+          codes() { jq -r '.errors[]? | "code \(.code)"' "$1" 2>/dev/null | head -5; }
+
+          # --- D1
+          find_db() {
+            curl -sS --max-time 30 "${auth[@]}" "$acct/d1/database?name=$D1_NAME&per_page=50" > "$RUNNER_TEMP/d1-list.json"
+            ok "$RUNNER_TEMP/d1-list.json" || { echo '::error::Could not list D1 databases (does the API token have D1 edit permission?).'; codes "$RUNNER_TEMP/d1-list.json"; exit 1; }
+            jq -r --arg n "$D1_NAME" '[.result[] | select(.name == $n)][0].uuid // empty' "$RUNNER_TEMP/d1-list.json"
+          }
+          id="$(find_db)"
+          if [[ -z "$id" ]]; then
+            curl -sS --max-time 30 -X POST "${auth[@]}" -H 'Content-Type: application/json' \
+              --data "{\"name\":\"$D1_NAME\"}" "$acct/d1/database" > "$RUNNER_TEMP/d1-create.json"
+            ok "$RUNNER_TEMP/d1-create.json" || { echo '::error::Could not create the D1 database.'; codes "$RUNNER_TEMP/d1-create.json"; exit 1; }
+            id="$(find_db)"
+            d1_state=created
+          else
+            d1_state=exists
+          fi
+          [[ "$id" =~ ^[0-9a-f-]{36}$ ]] || { echo '::error::Unexpected D1 database id.'; exit 1; }
+          echo "::add-mask::$id"
+          echo "D1 database: $d1_state"
+          echo "- D1 database \`$D1_NAME\`: $d1_state" >> "$GITHUB_STEP_SUMMARY"
+
+          # --- R2
+          code="$(curl -sS --max-time 30 -o "$RUNNER_TEMP/r2-get.json" -w '%{http_code}' "${auth[@]}" "$acct/r2/buckets/$R2_NAME" || echo 000)"
+          if [[ "$code" == 200 ]]; then
+            r2_state=exists
+          else
+            curl -sS --max-time 30 -X POST "${auth[@]}" -H 'Content-Type: application/json' \
+              --data "{\"name\":\"$R2_NAME\"}" "$acct/r2/buckets" > "$RUNNER_TEMP/r2-create.json"
+            ok "$RUNNER_TEMP/r2-create.json" || { echo '::error::Could not create the R2 bucket (is R2 enabled on the account, and does the token have R2 edit permission?).'; codes "$RUNNER_TEMP/r2-create.json"; exit 1; }
+            r2_state=created
+          fi
+          echo "R2 bucket: $r2_state"
+          echo "- R2 bucket \`$R2_NAME\`: $r2_state" >> "$GITHUB_STEP_SUMMARY"
+
+          # --- workers.dev origin (the site's PUBLIC_ORIGIN until a custom domain is decided)
+          curl -sS --max-time 30 "${auth[@]}" "$acct/workers/subdomain" > "$RUNNER_TEMP/subdomain.json"
+          sub="$(jq -r '.result.subdomain // empty' "$RUNNER_TEMP/subdomain.json")"
+          [[ -n "$sub" && "$sub" =~ ^[a-z0-9-]+$ ]] || { echo '::error::No workers.dev subdomain on the account.'; codes "$RUNNER_TEMP/subdomain.json"; exit 1; }
+          echo "::add-mask::$sub"
+          origin="https://${WORKER_NAME}.${sub}.workers.dev"
+          echo "SITE_URL=$origin" >> "$GITHUB_ENV"
+
+          cfg="$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH/apps/api/wrangler.toml"
+          sed -i "s|REPLACE_WITH_STAGING_D1_DATABASE_ID|$id|; s|REPLACE_WITH_STAGING_ORIGIN|$origin|" "$cfg"
+          # Only the staging section is used; it must have no placeholder left.
+          awk '/^\[env\.staging/{s=1} /^\[env\.production/{s=0} s' "$cfg" | grep -q 'REPLACE_WITH_' && { echo '::error::A staging placeholder is still unfilled.'; exit 1; }
+          echo 'staging config: filled in (database id and origin masked)'
+
+      - name: Apply D1 migrations
+        shell: bash
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}/apps/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/migrate.log"
+          if ! CI=true npx wrangler d1 migrations apply DB --remote --env "$DEPLOY_ENV" > "$log" 2>&1; then
+            echo 'migrations failed; error codes only:'
+            { grep -oE '\[ERROR\]|ERR_[A-Z_]+|code: [0-9]+|SQLITE_[A-Z_]+' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
+            exit 1
+          fi
+          files="$(grep -oE '[0-9]{4}_[a-z0-9_]+\.sql' "$log" | sort -u | tr '\n' ' ' || true)"
+          echo "D1 migrations: OK (${files:-nothing new to apply})"
+          echo "- D1 migrations: OK (${files:-nothing new})" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Load the synthetic demo catalogue (empty database only)
+        if: env.SEED == 'true'
+        shell: bash
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}/apps/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          q="$RUNNER_TEMP/books-count.json"
+          CI=true npx wrangler d1 execute DB --remote --env "$DEPLOY_ENV" --json \
+            --command 'SELECT COUNT(*) AS n FROM books' > "$q" 2> "$RUNNER_TEMP/books-count.err" || { echo '::error::Could not count books.'; exit 1; }
+          n="$(jq -r '.[0].results[0].n // empty' "$q")"
+          [[ "$n" =~ ^[0-9]+$ ]] || { echo '::error::Could not read the book count.'; exit 1; }
+          if [[ "$n" != 0 ]]; then
+            echo "seed: skipped ($n book(s) already exist)"
+            echo "- seed: skipped (database not empty)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          seed="$RUNNER_TEMP/seed.sql"
+          (cd ../.. && npx tsx database/seeds/dev-seed.ts) > "$seed"
+          log="$RUNNER_TEMP/seed.log"
+          if ! CI=true npx wrangler d1 execute DB --remote --env "$DEPLOY_ENV" --file "$seed" > "$log" 2>&1; then
+            echo 'seed failed; error codes only:'
+            { grep -oE '\[ERROR\]|ERR_[A-Z_]+|code: [0-9]+|SQLITE_[A-Z_]+' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
+            exit 1
+          fi
+          echo "seed: loaded ($(grep -c '^INSERT' "$seed") synthetic rows; no user accounts)"
+          echo '- seed: synthetic demo catalogue loaded (no user accounts)' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy the Worker (API + Web + Admin)
+        shell: bash
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}/apps/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/deploy.log"
+          redact() { sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<id>/g; s/[0-9a-fA-F]{32}/<id>/g; s#https://[^ ]+#<url>#g; s/[^ @]+@[^ ]+/<email>/g'; }
+          if ! npx wrangler deploy --env "$DEPLOY_ENV" > "$log" 2>&1; then
+            echo 'deploy failed; Cloudflare error lines (ids, URLs and emails redacted):'
+            { grep -E '\[ERROR\]|A request to the Cloudflare API|code: [0-9]+' "$log" || echo 'no error line found'; } | redact | cut -c1-220 | head -20
+            exit 1
+          fi
+          { grep -E 'Uploaded|Deployed|Current Version|assets|schedule' "$log" || true; } | redact | cut -c1-160
+          echo "- deploy \`$WORKER_NAME\` (source ${SOURCE_SHORT}): OK" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create missing Worker secrets (never replaced)
+        shell: bash
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}/apps/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$WORKER_NAME/secrets"
+          curl -sS --max-time 30 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api" > "$RUNNER_TEMP/secrets.json"
+          [[ "$(jq -r '.success' "$RUNNER_TEMP/secrets.json")" == true && "$(jq -r '.result | type' "$RUNNER_TEMP/secrets.json")" == array ]] || {
+            echo '::error::Could not read the Worker secret list; refusing to touch secrets.'; exit 1; }
+          umask 077
+          file="$RUNNER_TEMP/new-secrets.json"
+          trap 'rm -f "$file"' EXIT
+          echo '{}' > "$file"
+          created=()
+          for name in JWT_SECRET COOKIE_SECRET HASH_PEPPER AD_SIGNING_SECRET CRAWLER_INTERNAL_TOKEN; do
+            if jq -e --arg n "$name" '.result[] | select(.name == $n)' "$RUNNER_TEMP/secrets.json" > /dev/null; then
+              continue
+            fi
+            v="$(openssl rand -base64 48 | tr '+/' '-_' | tr -d '=\n')"
+            echo "::add-mask::$v"
+            jq --arg n "$name" --arg v "$v" '. + {($n): $v}' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+            unset v
+            created+=("$name")
+          done
+          if (( ${#created[@]} == 0 )); then
+            echo 'secrets: all 5 already set (kept)'
+            echo '- Worker secrets: all 5 already set (kept)' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          log="$RUNNER_TEMP/secret.log"
+          if ! npx wrangler secret bulk "$file" --env "$DEPLOY_ENV" > "$log" 2>&1; then
+            echo 'secret bulk failed; error codes only:'
+            { grep -oE '\[ERROR\]|ERR_[A-Z_]+|code: [0-9]+' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
+            exit 1
+          fi
+          echo "secrets: created ${created[*]} (values never printed)"
+          echo "- Worker secrets created: ${created[*]}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Grant the first super_admin (only while none exists)
+        if: env.PROMOTE_USERNAME != ''
+        shell: bash
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}/apps/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          d1() { CI=true npx wrangler d1 execute DB --remote --env "$DEPLOY_ENV" --json --command "$1" 2> "$RUNNER_TEMP/d1.err"; }
+          n="$(d1 "SELECT COUNT(*) AS n FROM user_roles WHERE role = 'super_admin'" | jq -r '.[0].results[0].n // empty')"
+          [[ "$n" =~ ^[0-9]+$ ]] || { echo '::error::Could not count administrators.'; exit 1; }
+          if [[ "$n" != 0 ]]; then
+            echo '::error::A super_admin already exists. This bootstrap only grants the FIRST one; manage further roles in the Admin app.'
+            exit 1
+          fi
+          # PROMOTE_USERNAME was validated as [A-Za-z0-9_.-]{3,32}, so it cannot break out of the quotes.
+          u="$(d1 "SELECT COUNT(*) AS n FROM users WHERE username = '$PROMOTE_USERNAME' AND status = 'active'" | jq -r '.[0].results[0].n // empty')"
+          [[ "$u" == 1 ]] || { echo "::error::No active account with username '$PROMOTE_USERNAME'. Register on the site first."; exit 1; }
+          now="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+          d1 "INSERT OR IGNORE INTO user_roles (user_id, role, created_at) SELECT id, 'super_admin', '$now' FROM users WHERE username = '$PROMOTE_USERNAME' AND status = 'active'" > /dev/null
+          n="$(d1 "SELECT COUNT(*) AS n FROM user_roles r JOIN users u ON u.id = r.user_id WHERE r.role = 'super_admin' AND u.username = '$PROMOTE_USERNAME'" | jq -r '.[0].results[0].n // empty')"
+          [[ "$n" == 1 ]] || { echo '::error::The role was not recorded.'; exit 1; }
+          echo "super_admin granted to '$PROMOTE_USERNAME' (sign in again at /admin/ to pick it up)"
+          echo "- super_admin granted to \`$PROMOTE_USERNAME\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check the live site
+        shell: bash
+        env:
+          CSRF_VALUE: novel-platform
+        run: |
+          set -euo pipefail
+          fail=0
+          get() { curl -s -o "$RUNNER_TEMP/body" -w '%{http_code}' --max-time 20 "${SITE_URL}$1" || echo 000; }
+          check() { # path, expected-substring, label
+            local c=000
+            for i in $(seq 1 12); do c="$(get "$1")"; [[ "$c" == 200 ]] && break; sleep 10; done
+            local found=no; grep -q -- "$2" "$RUNNER_TEMP/body" 2>/dev/null && found=yes
+            echo "$3: HTTP $c, content check: $found"
+            echo "- $3: HTTP $c, content check: $found" >> "$GITHUB_STEP_SUMMARY"
+            [[ "$c" == 200 && "$found" == yes ]] || fail=1
+          }
+          check /api/v1/health '"env":"staging"' 'API /api/v1/health'
+          # /home needs every Worker secret (the API refuses to serve without them).
+          check /api/v1/home '"data"' 'API /api/v1/home (secrets in place)'
+          check / '<div id="root"' 'Web /'
+          check /admin/ '<div id="root"' 'Admin /admin/'
+          # One login with an unknown address: still runs the full PBKDF2 check (no user enumeration),
+          # so a 401 proves password hashing fits the Worker CPU limit (needs Workers Paid).
+          c="$(curl -s -o "$RUNNER_TEMP/login" -w '%{http_code}' --max-time 30 -X POST "${SITE_URL}/api/v1/auth/login" \
+                -H 'Content-Type: application/json' -H "X-Requested-With: ${CSRF_VALUE}" \
+                --data '{"email":"deploy-check@example.invalid","password":"deploy-check-password"}' || echo 000)"
+          echo "login with unknown address: HTTP $c (401 expected)"
+          echo "- login CPU check: HTTP $c (401 expected)" >> "$GITHUB_STEP_SUMMARY"
+          [[ "$c" == 401 ]] || { echo '::error::Login did not answer 401. HTTP 503/1102 usually means the account is on Workers Free (10 ms CPU), which is too little for password hashing.'; fail=1; }
+          if curl -sI --max-time 20 "${SITE_URL}/" | grep -qi '^x-robots-tag: noindex'; then robots=yes; else robots=no; fi
+          echo "noindex header: $robots"
+          echo "- noindex header: $robots" >> "$GITHUB_STEP_SUMMARY"
+          (( fail == 0 )) || { echo '::error::A live check failed.'; exit 1; }
+          echo "Site: https://${WORKER_NAME}.<account workers.dev subdomain>.workers.dev (subdomain masked in public logs)" >> "$GITHUB_STEP_SUMMARY"
