@@ -46,7 +46,7 @@
 #     (pnpm install / turbo build / prebuild / pod install) has run, and is removed at the end.
 name: Radio iOS
 
-run-name: Radio iOS · ${{ inputs.mode || 'verify' }} · ${{ inputs.ref || 'main' }} · ${{ inputs.version }} (${{ inputs.build_number }})${{ inputs.widgets && ' · widgets' || '' }}
+run-name: Radio iOS · ${{ inputs.mode || 'verify' }} · ${{ inputs.ref || 'main' }} · ${{ inputs.version }} (${{ inputs.build_number }})${{ inputs.widgets && ' · widgets' || '' }} · api ${{ inputs.api_target || 'unset' }}
 
 on:
   workflow_dispatch:
@@ -88,6 +88,15 @@ on:
         required: false
         default: false
         type: boolean
+      api_target:
+        description: 'API the app talks to: staging | production. unset = staging for verify; archive and testflight must choose explicitly.'
+        required: false
+        default: unset
+        type: choice
+        options:
+          - unset
+          - staging
+          - production
       widgets:
         description: 'Build the WidgetKit extension HourwaveWidgets (com.readori.radio.widgets): sets HOURWAVE_WIDGETS=1 for expo prebuild (unchecked = HOURWAVE_WIDGETS=0). The ref must contain the widgets config plugin; signed modes need both profiles from certificates-repo.yml refresh_radio_profile.'
         required: false
@@ -291,27 +300,27 @@ jobs:
       - name: Resolve and mask the API base URL (EXPO_PUBLIC_*_API)
         shell: bash
         env:
-          API_BASE: ${{ secrets.RADIO_STAGING_API }}
-          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+          API_TARGET: ${{ inputs.api_target || 'unset' }}
+          RUN_MODE: ${{ inputs.mode || 'verify' }}
+          STAGING_API: ${{ secrets.RADIO_STAGING_API }}
+          PRODUCTION_API: ${{ secrets.RADIO_PRODUCTION_API }}
         run: |
           set -euo pipefail
-          # RADIO_STAGING_API wins when set. Otherwise derive the staging Worker URL: the Worker
-          # name is read from workers/api/wrangler.jsonc of the checked-out ref (env staging, not
-          # printed) on the account's workers.dev subdomain, deployed by radio-api.yml.
-          if [ -z "$API_BASE" ] && [ -n "$CF_TOKEN" ] && [ -n "$CF_ACCOUNT" ]; then
-            echo "::add-mask::$CF_ACCOUNT"
-            sub="$(curl -sS -H "Authorization: Bearer $CF_TOKEN" \
-              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/workers/subdomain" | jq -r '.result.subdomain // empty')"
-            if [ -n "$sub" ]; then
-              echo "::add-mask::$sub"
-              HELPER="$RUNNER_TEMP/names.mjs"
-              cat > "$HELPER" <<'JS'
-          // Usage: node names.mjs <wrangler.jsonc> <env|-> <worker|db|bucket>
-          // Prints one resource name read from the wrangler config of the checked-out ref, so the
-          // workflows work for the meridian-* and the hourwave-* code alike. Errors never echo config content.
+          # OPS-10b: the API address comes only from RADIO_STAGING_API / RADIO_PRODUCTION_API (no
+          # Cloudflare credentials in this job). Signed builds must name their API explicitly.
+          case "$API_TARGET" in
+            unset)
+              [[ "$RUN_MODE" == verify ]] || { echo '::error::archive/testflight need api_target staging or production (explicit)'; exit 64; }
+              API_TARGET=staging ;;
+            staging|production) ;;
+            *) echo "::error::Unsupported api_target: $API_TARGET"; exit 64 ;;
+          esac
+          if [[ "$API_TARGET" == production ]]; then
+            API_BASE="${PRODUCTION_API%/}"
+            HELPER="$RUNNER_TEMP/domain.mjs"
+            cat > "$HELPER" <<'JS'
+          // Usage: node domain.mjs <wrangler.jsonc>  -> the single custom domain of env.production
           import { readFileSync } from 'node:fs';
-
           function jsonc(text) {
             let out = '';
             let inString = false;
@@ -319,7 +328,7 @@ jobs:
               const c = text[i];
               if (inString) {
                 out += c;
-                if (c === '\\') out += text[++i];
+                if (c === '\') out += text[++i];
                 else if (c === '"') inString = false;
               } else if (c === '"') {
                 inString = true;
@@ -335,41 +344,33 @@ jobs:
             }
             return JSON.parse(out.replace(/,(\s*[}\]])/g, '$1'));
           }
-
-          const [file, env, kind] = process.argv.slice(2);
-          let name;
+          let domain;
           try {
-            const top = jsonc(readFileSync(file, 'utf8'));
-            const sect = env === '-' ? top : (top.env ?? {})[env] ?? {};
-            if (kind === 'worker') name = sect.name ?? (env === '-' ? top.name : `${top.name}-${env}`);
-            else if (kind === 'db') name = (sect.d1_databases ?? [])[0]?.database_name;
-            else if (kind === 'bucket') name = (sect.r2_buckets ?? [])[0]?.bucket_name;
-          } catch {
-            console.error(`::error::cannot read the ${kind} name from the wrangler config`);
+            const sect = jsonc(readFileSync(process.argv[2], 'utf8')).env?.production ?? {};
+            const domains = (sect.routes ?? []).filter((r) => r.custom_domain === true);
+            domain = domains.length === 1 ? domains[0].pattern : undefined;
+          } catch {}
+          if (!/^[a-z0-9][a-z0-9.-]{1,252}[a-z0-9]$/.test(domain ?? '')) {
+            console.error('::error::no production custom domain in workers/api/wrangler.jsonc');
             process.exit(1);
           }
-          if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(name ?? '')) {
-            console.error(`::error::no valid ${kind} name in the wrangler config`);
-            process.exit(1);
-          }
-          process.stdout.write(name);
+          process.stdout.write(domain);
           JS
-              if api_worker="$(node "$HELPER" "$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH/workers/api/wrangler.jsonc" staging worker)"; then
-                API_BASE="https://${api_worker}.${sub}.workers.dev"
-              fi
-            fi
-          fi
-          if [ -n "$API_BASE" ]; then
-            echo "::add-mask::$API_BASE"
-            # Only Metro (turbo export, Xcode "Bundle React Native code") reads these; it is a
-            # public client endpoint, masked because the workers.dev subdomain identifies the account.
-            # Both names during the OPS-12 rename: the ref's code reads one of them.
-            echo "EXPO_PUBLIC_MERIDIAN_API=$API_BASE" >> "$GITHUB_ENV"
-            echo "EXPO_PUBLIC_HOURWAVE_API=$API_BASE" >> "$GITHUB_ENV"
-            echo "API base: set (masked)"
+            domain="$(node "$HELPER" "$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH/workers/api/wrangler.jsonc")"
+            echo "::add-mask::$domain"
+            # The secret cannot be read, so check it against the ref's config (neither is printed).
+            [[ "$API_BASE" == "https://${domain}" ]] || { echo '::error::RADIO_PRODUCTION_API is not https://<custom domain of env.production in workers/api/wrangler.jsonc>'; exit 1; }
           else
-            echo "::warning::No API base (RADIO_STAGING_API unset and staging URL not derivable); the app will be built without one."
+            API_BASE="${STAGING_API%/}"
+            [[ "$API_BASE" == https://* ]] || { echo '::error::RADIO_STAGING_API is not set (or not https)'; exit 1; }
           fi
+          echo "::add-mask::$API_BASE"
+          # Only Metro (turbo export, Xcode "Bundle React Native code") reads these.
+          # Both names during the OPS-12 rename: the ref's code reads one of them.
+          echo "EXPO_PUBLIC_MERIDIAN_API=$API_BASE" >> "$GITHUB_ENV"
+          echo "EXPO_PUBLIC_HOURWAVE_API=$API_BASE" >> "$GITHUB_ENV"
+          echo "API base: ${API_TARGET} (masked)"
+          echo "- API: \`${API_TARGET}\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify private source layout
         shell: bash

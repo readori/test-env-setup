@@ -1,31 +1,41 @@
-# DRAFT for the PUBLIC CI repository readori/test-env-setup, as .github/workflows/radio-api.yml.
-# It is not a workflow here: the private repo keeps no workflows (CLAUDE.md). The main session
-# reviews it and copies it over. Modeled on radio-cloudflare.yml (same safety rules).
+# Radio (Hourwave) API Worker + catalog snapshot, for staging and production (OPS-10b).
+# Public CI repository -> private source readori/Radio. The private repo keeps no workflows.
 #
-#   dry-run  : install, bundle the API Worker with `wrangler deploy --dry-run` (no credentials).
-#   d1-check : provision, then ONLY read the D1: table names, recorded migrations and the row count
-#              of the old `entitlements` table (stops if it is not empty). Writes nothing.
-#   deploy   : provision (finds the existing D1 + snapshots bucket), the same D1 check, D1
-#              migrations (`wrangler d1 migrations apply`, tables that already exist are recorded
-#              in d1_migrations first), deploy the API Worker, GET /health, and a check that
-#              the two App Store endpoints answer 400 to an empty body.
-#   snapshot : import the catalog from Radio Browser (no credentials; counts only in the log),
-#              upload it to R2 (shards first, manifest last), then read it back through the Worker.
-#              The import needs land polygons for the globe points (DATA-10): Natural Earth
-#              admin-0 map units 1:50m (public domain), fetched from a pinned commit of
-#              nvkelso/natural-earth-vector and checked against a SHA-256 before use.
+# Two jobs, as in paobuwan-worker.yml:
+#   validate (no approval): install, bundle with `wrangler deploy --dry-run`, and read-only checks.
+#            production also: the `radio-production` environment must exist with required
+#            reviewers (else the run fails: a job naming a missing environment would create an
+#            unprotected one), resources are only looked up (never created), the D1 is only read,
+#            and the custom domain's current owner is reported.
+#   deploy-staging / deploy-production: every write. deploy-production names the environment
+#            `radio-production` literally, so nothing in it runs before the product owner approves.
+#            Both check out the exact commit validate resolved.
+#
+# Modes:
+#   dry-run  : validate only, no Cloudflare credentials.
+#   d1-check : validate + read the D1 (tables, recorded migrations). staging creates missing
+#              resources here as before; production only looks them up.
+#   provision: production only. Creates exactly the resources named in `create` (comma list; each
+#              must be a resource name of env.production in workers/api/wrangler.jsonc), nothing else.
+#   deploy   : D1 migrations (UTC time written to the summary first, for Time Travel), deploy the
+#              API Worker, health check (+ catalog snapshot read-back unless first_rollout), App
+#              Store endpoints answer 400 to an empty body. If the deploy succeeded but a check
+#              failed, `wrangler rollback` restores the previous Worker version (D1 is NOT rolled
+#              back), except with first_rollout (there is no previous version).
+#   snapshot : import the catalog from Radio Browser (counts only in the log), upload it to the
+#              environment's R2 bucket (shards first, manifest last), read it back through the Worker.
+#              Land polygons: Natural Earth admin-0 map units 1:50m (public domain), pinned commit,
+#              SHA-256 checked.
 #   all      : deploy, then snapshot.
+#   rollback : `wrangler rollback` of the API Worker to its previous version (D1 untouched).
 #
-# Name-agnostic (OPS-12 phase 0): the package filter is a path, and the Worker, D1 and R2 names are
-# read from workers/api/wrangler.jsonc of the checked-out ref (never printed).
-#
-# Secrets needed: TARGET_REPO_PAT, CLOUDFLARE_API_TOKEN (must be allowed to write R2 objects in
-# the account), CLOUDFLARE_ACCOUNT_ID. No new secret.
-# The import prints only counts (no station names, no URLs, no hosts). Nothing is uploaded as an
-# Actions artifact.
+# Name-agnostic: Worker, D1, R2 names and the production custom domain are read from
+# workers/api/wrangler.jsonc of the checked-out ref and masked (never printed).
+# Secrets: TARGET_REPO_PAT (checkout only), CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID (only on
+# steps that call Cloudflare). Nothing is uploaded as an Actions artifact.
 name: Radio API
 
-run-name: Radio API · ${{ inputs.mode }} · staging · ${{ inputs.ref }}
+run-name: Radio API · ${{ inputs.mode }} · ${{ inputs.target }} · ${{ inputs.ref }}${{ inputs.first_rollout && ' · first rollout' || '' }}
 
 on:
   workflow_dispatch:
@@ -36,37 +46,97 @@ on:
         default: 'main'
         type: string
       mode:
-        description: 'dry-run | d1-check (read-only) | deploy | snapshot (import + upload to R2) | all'
+        description: 'dry-run | d1-check (read-only) | provision (production: create the resources listed in create) | deploy | snapshot | all | rollback'
         required: true
         default: dry-run
         type: choice
-        options: [dry-run, d1-check, deploy, snapshot, all]
+        options: [dry-run, d1-check, provision, deploy, snapshot, all, rollback]
+      target:
+        description: 'staging | production (production writes wait for radio-production approval)'
+        required: true
+        default: staging
+        type: choice
+        options: [staging, production]
+      create:
+        description: 'provision only: comma list of exact resource names to create (D1 and/or R2 of env.production)'
+        required: false
+        default: ''
+        type: string
+      first_rollout:
+        description: 'production deploy only: the first deploy (no snapshot yet: health without the snapshot read-back, no automatic rollback)'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
 
 concurrency:
-  group: radio-api-staging
+  group: radio-api-${{ inputs.target }}
   cancel-in-progress: false
 
 env:
   SOURCE_REF: ${{ inputs.ref }}
   MODE: ${{ inputs.mode }}
-  TARGET_ENV: staging
+  TARGET_ENV: ${{ inputs.target }}
+  CREATE: ${{ inputs.create }}
+  FIRST_ROLLOUT: ${{ inputs.first_rollout && 'true' || 'false' }}
   WRANGLER_SEND_METRICS: 'false'
   TURBO_TELEMETRY_DISABLED: '1'
 
 jobs:
-  api:
-    name: API Worker + catalog snapshot (${{ inputs.mode }}, staging)
+  # ========================================================================
+  # 1. Validate (no approval, no writes for production)
+  # ========================================================================
+  validate:
+    name: Validate (${{ inputs.mode }}, ${{ inputs.target }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      source_commit: ${{ steps.source.outputs.commit }}
     steps:
       - name: Validate request
         shell: bash
         run: |
           set -euo pipefail
           [[ "$SOURCE_REF" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]] || { echo '::error::ref must be a branch, tag or SHA (no leading -)'; exit 64; }
+          case "$TARGET_ENV" in staging|production) ;; *) echo "::error::Unsupported target: $TARGET_ENV"; exit 64 ;; esac
+          case "$MODE" in dry-run|d1-check|provision|deploy|snapshot|all|rollback) ;; *) echo "::error::Unsupported mode: $MODE"; exit 64 ;; esac
+          if [[ "$MODE" == provision ]]; then
+            [[ "$TARGET_ENV" == production ]] || { echo '::error::provision is for production only (staging creates missing resources on deploy)'; exit 64; }
+            [[ "$CREATE" =~ ^[a-z0-9-]+(,[a-z0-9-]+)*$ ]] || { echo '::error::create must be a comma list of resource names'; exit 64; }
+          else
+            [[ -z "$CREATE" ]] || { echo '::error::create is only for mode provision'; exit 64; }
+          fi
+          if [[ "$FIRST_ROLLOUT" == true ]]; then
+            [[ "$TARGET_ENV" == production && "$MODE" == deploy ]] || { echo '::error::first_rollout is only for a production deploy'; exit 64; }
+          fi
+          echo "request OK: mode=$MODE target=$TARGET_ENV first_rollout=$FIRST_ROLLOUT"
+
+      - name: Production gate exists (radio-production has required reviewers)
+        if: inputs.target == 'production'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # A job that names a missing environment silently creates an unprotected one, so the
+          # production run stops here unless the gate is really there.
+          body="$(mktemp)"
+          code="$(curl -sS -o "$body" -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/environments/radio-production" || echo 000)"
+          [[ "$code" == 200 ]] || { echo "::error::cannot read environment radio-production (HTTP $code); production is refused"; exit 1; }
+          node -e '
+            const e = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+            const rules = (e.protection_rules ?? []).filter((r) => r.type === "required_reviewers");
+            const reviewers = rules.flatMap((r) => r.reviewers ?? []);
+            if (reviewers.length === 0) { console.error("::error::radio-production has no required reviewers; production is refused"); process.exit(1); }
+            console.log(`radio-production: ${reviewers.length} required reviewer(s)`);
+          ' "$body"
+          echo '- production gate: `radio-production` has required reviewers' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Checkout private source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -79,31 +149,44 @@ jobs:
           persist-credentials: false
           clean: true
 
-      - name: Set up Node.js 24
+      - name: Pin the source commit
+        id: source
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::cannot resolve the source commit'; exit 1; }
+          echo "commit=$sha" >> "$GITHUB_OUTPUT"
+          echo "Private source commit: ${sha:0:8} (the deploy job checks out exactly this commit)"
+
+      - &node_step
+        name: Set up Node.js 24
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
 
-      - name: Install dependencies and build packages/core (no credentials in this step)
+      - &install_step
+        name: Install dependencies and build packages/core (no credentials in this step)
         shell: bash
         working-directory: source
         run: |
           set -euo pipefail
           [[ -f workers/api/wrangler.jsonc ]] || { echo '::error::workers/api is missing at this ref'; exit 66; }
-          echo "Private source commit: $(git rev-parse --short=8 HEAD)"
           corepack enable
           pnpm install --frozen-lockfile --reporter=silent
           pnpm --filter ./packages/core build
 
-      - name: Resolve Worker, D1 and R2 names from the wrangler config (not printed)
+      - &names_step
+        name: Resolve Worker, D1, R2 names and the custom domain from the wrangler config (not printed)
         shell: bash
         working-directory: source
         run: |
           set -euo pipefail
           cat > "$RUNNER_TEMP/names.mjs" <<'JS'
-          // Usage: node names.mjs <wrangler.jsonc> <env|-> <worker|db|bucket>
-          // Prints one resource name read from the wrangler config of the checked-out ref, so the
-          // workflows work for the meridian-* and the hourwave-* code alike. Errors never echo config content.
+          // Usage: node names.mjs <wrangler.jsonc> <env|-> <worker|db|bucket|domain>
+          // Prints one resource name (or the env's single custom domain) read from the wrangler
+          // config of the checked-out ref. Errors never echo config content.
           import { readFileSync } from 'node:fs';
 
           function jsonc(text) {
@@ -138,12 +221,17 @@ jobs:
             if (kind === 'worker') name = sect.name ?? (env === '-' ? top.name : `${top.name}-${env}`);
             else if (kind === 'db') name = (sect.d1_databases ?? [])[0]?.database_name;
             else if (kind === 'bucket') name = (sect.r2_buckets ?? [])[0]?.bucket_name;
+            else if (kind === 'domain') {
+              const domains = (sect.routes ?? []).filter((r) => r.custom_domain === true);
+              name = domains.length === 1 ? domains[0].pattern : undefined;
+            }
           } catch {
             console.error(`::error::cannot read the ${kind} name from the wrangler config`);
             process.exit(1);
           }
-          if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(name ?? '')) {
-            console.error(`::error::no valid ${kind} name in the wrangler config`);
+          const valid = kind === 'domain' ? /^[a-z0-9][a-z0-9.-]{1,252}[a-z0-9]$/ : /^[a-z0-9][a-z0-9-]{0,62}$/;
+          if (!valid.test(name ?? '')) {
+            console.error(`::error::no valid ${kind} in the wrangler config`);
             process.exit(1);
           }
           process.stdout.write(name);
@@ -154,6 +242,12 @@ jobs:
           # Masked so later steps (provision output, summaries) never print them either.
           for n in "$api" "$db" "$bucket"; do echo "::add-mask::$n"; done
           { echo "API_WORKER=$api"; echo "DB_NAME=$db"; echo "BUCKET_NAME=$bucket"; } >> "$GITHUB_ENV"
+          if [[ "$TARGET_ENV" == production ]]; then
+            # production has workers.dev off: health and the App Store check use the custom domain.
+            domain="$(node "$RUNNER_TEMP/names.mjs" workers/api/wrangler.jsonc production domain)"
+            echo "::add-mask::$domain"
+            echo "API_DOMAIN=$domain" >> "$GITHUB_ENV"
+          fi
           echo 'resource names resolved (not printed)'
 
       - name: Bundle (wrangler dry-run, no credentials)
@@ -171,7 +265,8 @@ jobs:
           echo "- dry-run bundle (${TARGET_ENV}): OK" >> "$GITHUB_STEP_SUMMARY"
           node scripts/provision.mjs --env "$TARGET_ENV" --plan | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Mask workers.dev subdomain
+      - &mask_subdomain_step
+        name: Mask the account id and workers.dev subdomain
         if: inputs.mode != 'dry-run'
         shell: bash
         env:
@@ -186,8 +281,41 @@ jobs:
           echo "::add-mask::$sub"
           echo 'subdomain masked'
 
-      - name: Provision the staging resources
-        if: inputs.mode == 'deploy' || inputs.mode == 'all' || inputs.mode == 'd1-check'
+      - name: Custom domain owner (production, read-only)
+        if: inputs.target == 'production' && inputs.mode != 'dry-run'
+        shell: bash
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          body="$(mktemp)"
+          code="$(curl -sS -o "$body" -w '%{http_code}' -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/workers/domains?hostname=$API_DOMAIN" || echo 000)"
+          if [[ "$code" != 200 ]]; then
+            echo "::warning::cannot list Workers custom domains (HTTP $code); owner of the API domain unknown"
+            exit 0
+          fi
+          owner="$(node -e '
+            const j = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+            const hits = (j.result ?? []).filter((d) => d.hostname === process.env.API_DOMAIN);
+            if (hits.length === 0) console.log("none");
+            else if (hits.every((d) => d.service === process.env.API_WORKER)) console.log("this");
+            else console.log("other");
+          ' "$body")"
+          case "$owner" in
+            none) msg='API custom domain: not attached yet (the first deploy attaches it)' ;;
+            this) msg='API custom domain: attached to this API Worker' ;;
+            *) msg='API custom domain: attached to ANOTHER Worker' ;;
+          esac
+          echo "$msg" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [[ "$owner" == other && ( "$MODE" == deploy || "$MODE" == all ) ]]; then
+            echo '::error::the API custom domain belongs to another Worker; detach it in the Cloudflare dashboard first'
+            exit 1
+          fi
+
+      - name: Look up (staging - create) the resources
+        if: inputs.mode == 'd1-check' || (inputs.target == 'production' && inputs.mode != 'dry-run' && inputs.mode != 'provision')
         shell: bash
         working-directory: source/workers/api
         env:
@@ -195,10 +323,11 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
+          # production: find-only (provision.mjs creates nothing without --create).
           node scripts/provision.mjs --env "$TARGET_ENV" | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Write the D1 helper (no credentials in this step)
-        if: inputs.mode == 'deploy' || inputs.mode == 'all' || inputs.mode == 'd1-check'
+      - &d1_helper_step
+        name: Write the D1 helper (no credentials in this step)
         shell: bash
         run: |
           set -euo pipefail
@@ -211,6 +340,9 @@ jobs:
 
           const phase = process.argv[2];
           const env = process.env.TARGET_ENV;
+          // The one-off repairs below are for the old staging D1 only. production is a new D1:
+          // a repair condition there means something is wrong, so it stops instead.
+          const repairAllowed = env === 'staging';
           const DB = process.env.DB_NAME; // from the ref's wrangler config (step above)
           if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(DB ?? '')) {
             console.error('::error::DB_NAME is not set');
@@ -274,24 +406,29 @@ jobs:
             process.exit(1);
           }
           const recorded = new Set(tables.includes('d1_migrations') ? sql('SELECT name FROM d1_migrations').map((r) => r.name) : []);
-          // One-off repair: an earlier run recorded 0005_accounts.sql without running it (the rule
-          // below used to accept ANY of its tables; 0005 drops and rebuilds `favorites`, which
-          // already existed). Its own tables are missing, so unrecord it and let apply run it; its
-          // guard aborts the whole file if the old users / devices / favorites tables hold a row.
+          // One-off staging repair: an earlier run recorded 0005_accounts.sql without running it.
+          // Its own tables are missing, so unrecord it and let apply run it; its guard aborts the
+          // whole file if the old users / devices / favorites tables hold a row.
           if (recorded.has('0005_accounts.sql') && !tables.includes('auth_accounts')) {
+            if (!repairAllowed) {
+              console.error(`::error::0005_accounts.sql is recorded but auth_accounts is missing (${env}); not repairing outside staging`);
+              process.exit(1);
+            }
             console.log('0005_accounts.sql recorded but not applied (auth_accounts missing): unrecording it');
             sql("DELETE FROM d1_migrations WHERE name = '0005_accounts.sql'");
             recorded.delete('0005_accounts.sql');
           }
-          // A migration that is not recorded but ALL of whose tables already exist was applied by
-          // hand: record it instead of running it again ("table already exists"). 0003 only drops,
-          // so it has no CREATE TABLE and always runs; it is idempotent. A migration that drops and
-          // rebuilds an existing table (0005) still has new tables missing, so it runs.
+          // Staging: a migration that is not recorded but ALL of whose tables already exist was
+          // applied by hand: record it instead of running it again ("table already exists").
           const baseline = files.filter((f) => !recorded.has(f)).filter((f) => {
             const created = [...readFileSync(`${MIGRATIONS}/${f}`, 'utf8').matchAll(/CREATE TABLE `([^`]+)`/g)].map((m) => m[1]);
             return created.length > 0 && created.every((t) => tables.includes(t));
           });
           if (baseline.length > 0) {
+            if (!repairAllowed) {
+              console.error(`::error::tables of unrecorded migrations already exist (${baseline.join(', ')}, ${env}); not recording them outside staging`);
+              process.exit(1);
+            }
             console.log(`already present, recorded without running: ${baseline.join(', ')}`);
             sql('CREATE TABLE IF NOT EXISTS d1_migrations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL)');
             for (const f of baseline) sql(`INSERT OR IGNORE INTO d1_migrations (name) VALUES ('${f}')`);
@@ -313,8 +450,8 @@ jobs:
           console.log('migration state OK');
           JS
 
-      - name: D1 pre-check (read-only; stops if entitlements is not empty)
-        if: inputs.mode == 'deploy' || inputs.mode == 'all' || inputs.mode == 'd1-check'
+      - name: D1 read-only check
+        if: inputs.mode == 'd1-check' || (inputs.target == 'production' && (inputs.mode == 'deploy' || inputs.mode == 'all'))
         shell: bash
         working-directory: source/workers/api
         env:
@@ -323,54 +460,46 @@ jobs:
         run: |
           set -euo pipefail
           node "$RUNNER_TEMP/d1.mjs" check | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: D1 migrations (wrangler d1 migrations apply)
-        if: inputs.mode == 'deploy' || inputs.mode == 'all'
-        shell: bash
-        working-directory: source/workers/api
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          set -euo pipefail
-          node "$RUNNER_TEMP/d1.mjs" migrate | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Deploy API Worker
-        if: inputs.mode == 'deploy' || inputs.mode == 'all'
-        shell: bash
-        working-directory: source/workers/api
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          set -euo pipefail
-          log="$(mktemp)"
-          redact() { sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<id>/g; s/[0-9a-fA-F]{32}/<id>/g'; }
-          if ! pnpm exec wrangler deploy --config wrangler.generated.json --env "$TARGET_ENV" > "$log" 2>&1; then
-            echo 'deploy failed; error codes only:'
-            { grep -oE 'TS[0-9]{4,5}|\[ERROR\]|ERR_[A-Z_]+|code: [0-9]+' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
-            # Cloudflare API messages ("... [code: N]") name the cause; ids redacted, Worker / D1
-            # names are masked earlier in this job. No source lines are printed.
-            echo 'Cloudflare API messages:'
-            { grep -E '\[code: [0-9]+\]' "$log" || true; } | redact | cut -c1-240 | sort -u | head -5
-            exit 1
+          if [[ "$TARGET_ENV" == production && "$MODE" != d1-check ]]; then
+            echo '- Next: waiting for `radio-production` approval before the deploy job.' >> "$GITHUB_STEP_SUMMARY"
           fi
-          { grep -E 'Uploaded|Deployed|Current Version' "$log" || true; } | redact
-          echo "- deploy API Worker (${TARGET_ENV}): OK" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Health check
-        if: inputs.mode == 'deploy' || inputs.mode == 'all'
+  # ========================================================================
+  # 2. Writes. Same steps for both targets (YAML anchor); only production waits for approval.
+  # ========================================================================
+  deploy-staging:
+    name: Write (${{ inputs.mode }}, staging)
+    needs: validate
+    if: inputs.target == 'staging' && (inputs.mode == 'deploy' || inputs.mode == 'snapshot' || inputs.mode == 'all' || inputs.mode == 'rollback')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SOURCE_COMMIT: ${{ needs.validate.outputs.source_commit }}
+    steps: &write_steps
+      - name: Checkout the validated commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/Radio
+          ref: ${{ env.SOURCE_COMMIT }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Confirm the commit
         shell: bash
-        working-directory: source/workers/api
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        working-directory: source
         run: |
           set -euo pipefail
-          node scripts/health.mjs --env "$TARGET_ENV" | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ && "$(git rev-parse HEAD)" == "$SOURCE_COMMIT" ]] || { echo '::error::checked-out commit is not the validated one'; exit 1; }
+          echo "Private source commit: ${SOURCE_COMMIT:0:8} (validated)"
 
-      - name: App Store endpoints answer 400 to an empty body
-        if: inputs.mode == 'deploy' || inputs.mode == 'all'
+      - *node_step
+      - *install_step
+      - *names_step
+
+      - name: Mask the account id and workers.dev subdomain
         shell: bash
         env:
           CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -382,14 +511,150 @@ jobs:
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/workers/subdomain" | jq -r '.result.subdomain // empty')"
           [[ -n "$sub" ]] || { echo '::error::No workers.dev subdomain on the account'; exit 1; }
           echo "::add-mask::$sub"
-          base="https://${API_WORKER}.${sub}.workers.dev"
+          echo "WORKERS_SUBDOMAIN=$sub" >> "$GITHUB_ENV"
+          echo 'subdomain masked'
+
+      - name: Create the listed production resources (provision)
+        if: inputs.mode == 'provision'
+        shell: bash
+        working-directory: source/workers/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_ENV" == production ]] || { echo '::error::provision is for production only'; exit 64; }
+          # Every listed name must be exactly one of env.production's D1 / R2 names.
+          for n in ${CREATE//,/ }; do
+            [[ "$n" == "$DB_NAME" || "$n" == "$BUCKET_NAME" ]] || { echo '::error::create lists a name that is not a resource of env.production'; exit 64; }
+          done
+          node scripts/provision.mjs --env production --create "$CREATE" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Look up (staging - create) the resources
+        if: inputs.mode == 'deploy' || inputs.mode == 'all' || inputs.mode == 'rollback'
+        shell: bash
+        working-directory: source/workers/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          node scripts/provision.mjs --env "$TARGET_ENV" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - *d1_helper_step
+
+      - name: D1 check (stops if entitlements is not empty)
+        if: inputs.mode == 'provision' || inputs.mode == 'deploy' || inputs.mode == 'all'
+        shell: bash
+        working-directory: source/workers/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          node "$RUNNER_TEMP/d1.mjs" check | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: D1 migrations (UTC time recorded first, for Time Travel)
+        if: inputs.mode == 'deploy' || inputs.mode == 'all'
+        shell: bash
+        working-directory: source/workers/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          echo "- D1 state before migrations (UTC, for Time Travel restore): \`$(date -u +%Y-%m-%dT%H:%M:%SZ)\`" | tee -a "$GITHUB_STEP_SUMMARY"
+          node "$RUNNER_TEMP/d1.mjs" migrate | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy API Worker
+        id: deploy
+        if: inputs.mode == 'deploy' || inputs.mode == 'all'
+        shell: bash
+        working-directory: source/workers/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          redact() { sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<id>/g; s/[0-9a-fA-F]{32}/<id>/g; s#https?://[^ ]+#<url>#g'; }
+          if ! pnpm exec wrangler deploy --config wrangler.generated.json --env "$TARGET_ENV" > "$log" 2>&1; then
+            echo 'deploy failed; error codes only:'
+            { grep -oE 'TS[0-9]{4,5}|\[ERROR\]|ERR_[A-Z_]+|code: [0-9]+' "$log" || echo 'no error code found'; } | sort | uniq -c | head -20
+            echo 'Cloudflare API messages:'
+            { grep -E '\[code: [0-9]+\]' "$log" || true; } | redact | cut -c1-240 | sort -u | head -5
+            exit 1
+          fi
+          { grep -E 'Uploaded|Deployed|Current Version' "$log" || true; } | redact
+          echo "- deploy API Worker (${TARGET_ENV}): OK" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Health check
+        id: health
+        if: inputs.mode == 'deploy' || inputs.mode == 'all'
+        shell: bash
+        working-directory: source/workers/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          # The first production rollout has no snapshot yet: /health itself does not need one.
+          if [[ "$FIRST_ROLLOUT" == true ]]; then
+            node scripts/health.mjs --env "$TARGET_ENV" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            node scripts/health.mjs --env "$TARGET_ENV" --snapshot | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: App Store endpoints answer 400 to an empty body
+        id: appstore
+        if: inputs.mode == 'deploy' || inputs.mode == 'all'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$TARGET_ENV" == production ]]; then base="https://${API_DOMAIN}"; else base="https://${API_WORKER}.${WORKERS_SUBDOMAIN}.workers.dev"; fi
           failed=0
           for path in /entitlements/verify /appstore/notifications; do
-            code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' --data '{}' "${base}${path}" || echo 000)"
+            code=000
+            for i in 1 2 3 4 5 6; do
+              code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -X POST -H 'content-type: application/json' --data '{}' "${base}${path}" || echo 000)"
+              [[ "$code" == 400 ]] && break
+              sleep 10
+            done
             echo "POST ${path} with an empty body -> ${code}" | tee -a "$GITHUB_STEP_SUMMARY"
             [[ "$code" == 400 ]] || { echo "::error::expected 400 from ${path}"; failed=1; }
           done
           exit "$failed"
+
+      - name: Roll back the API Worker when a post-deploy check fails
+        if: failure() && steps.deploy.outcome == 'success' && (steps.health.outcome == 'failure' || steps.appstore.outcome == 'failure') && env.FIRST_ROLLOUT != 'true'
+        shell: bash
+        working-directory: source/workers/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: &rollback_script |
+          set -uo pipefail
+          redact() { sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<id>/g; s/[0-9a-fA-F]{32}/<id>/g; s#https?://[^ ]+#<url>#g'; }
+          log="$(mktemp)"
+          pnpm exec wrangler rollback --config wrangler.generated.json --env "$TARGET_ENV" \
+            --message "Rollback from public CI (radio-api.yml, ${MODE})" > "$log" 2>&1
+          status=$?
+          { grep -E 'rolled back|Rolled back|Worker Version|SUCCESS|\[ERROR\]|code: [0-9]+' "$log" || true; } | redact | cut -c1-200 | head -10
+          if [[ "$status" -ne 0 ]]; then
+            echo '::error::Worker rollback failed; roll back from the Cloudflare Deployments page.'
+            exit "$status"
+          fi
+          echo "- API Worker rolled back to its previous version (D1 NOT rolled back)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '::warning::API Worker code was rolled back; D1 migrations were not. Restore D1 with Time Travel to the UTC time in the summary if needed.'
+
+      - name: Roll back the API Worker (mode rollback)
+        if: inputs.mode == 'rollback'
+        shell: bash
+        working-directory: source/workers/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: *rollback_script
 
       - name: Fetch Natural Earth land polygons (public domain; pinned commit, checksum checked)
         if: inputs.mode == 'snapshot' || inputs.mode == 'all'
@@ -436,3 +701,16 @@ jobs:
         run: |
           set -euo pipefail
           node scripts/health.mjs --env "$TARGET_ENV" --snapshot | tee -a "$GITHUB_STEP_SUMMARY"
+
+  deploy-production:
+    name: Write (${{ inputs.mode }}, production, approved)
+    needs: validate
+    if: inputs.target == 'production' && (inputs.mode == 'provision' || inputs.mode == 'deploy' || inputs.mode == 'snapshot' || inputs.mode == 'all' || inputs.mode == 'rollback')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Literal name: the job does not start until a required reviewer approves (validate checked
+    # the rule exists). Never the unprotected `production` environment.
+    environment: radio-production
+    env:
+      SOURCE_COMMIT: ${{ needs.validate.outputs.source_commit }}
+    steps: *write_steps
