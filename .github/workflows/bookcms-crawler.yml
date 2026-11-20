@@ -114,6 +114,24 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
           rm -f "$RUNNER_TEMP/r.json"
 
+      - name: 'API side (status only) - crawler URL and Access secrets on the staging Worker'
+        if: steps.req.outputs.mode == 'status'
+        shell: bash
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -uo pipefail
+          echo "::add-mask::$CF_ACCOUNT"
+          A="https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/workers/scripts/$WORKER_NAME"
+          curl -sS --max-time 30 -H "Authorization: Bearer $CF_TOKEN" "$A/settings" > "$RUNNER_TEMP/s.json"
+          url="$(jq -r '[.result.bindings[]? | select(.name=="CRAWLER_SERVICE_URL")][0].text // "absent"' "$RUNNER_TEMP/s.json")"
+          [[ "$url" == "https://$CRAWLER_HOSTNAME" ]] && u=configured || { [[ -z "$url" || "$url" == absent ]] && u=empty || u=other; }
+          curl -sS --max-time 30 -H "Authorization: Bearer $CF_TOKEN" "$A/secrets" > "$RUNNER_TEMP/k.json"
+          n="$(jq -r '[.result[]?.name | select(startswith("CRAWLER_ACCESS_CLIENT_"))] | length' "$RUNNER_TEMP/k.json")"
+          echo "worker_crawler_url=$u worker_access_secrets=$n" | tee -a "$GITHUB_STEP_SUMMARY"
+          rm -f "$RUNNER_TEMP/s.json" "$RUNNER_TEMP/k.json"
+
       - name: Install cloudflared (official release, pinned, checksum)
         shell: bash
         run: |
