@@ -350,7 +350,7 @@ jobs:
             sshv "$PRE
               echo \"crawler_health=\$(\$D inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' bookcms-crawler)\"
               echo \"worker_state=\$(\$D exec bookcms-crawler node -e 'fetch(\"http://127.0.0.1:8081/health\").then(r=>r.json()).then(j=>console.log(j.data.worker?.state??\"none\")).catch(()=>console.log(\"unreachable\"))' 2>/dev/null | tr -cd 'a-z_')\"
-              echo \"claim_failures=\$(\$D logs bookcms-crawler 2>&1 | grep -c 'claim failed')\"
+              echo \"claim_failures=\$(\$D logs --since 30s bookcms-crawler 2>&1 | grep -c 'claim failed')\"
               echo \"restarts=\$(\$D inspect -f '{{.RestartCount}}' bookcms-crawler)\"" >> "$d/out" 2>> "$d/err" || rc=$?
           fi
           show "$d/out"

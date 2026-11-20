@@ -11,6 +11,9 @@
 # Only the "staging" environment is deployed from here for now (Worker novel-platform-api-staging,
 # D1 + R2 novel-platform-staging). Production waits for the domain decision and an approval step.
 #
+# Crawler service (run on the VM by bookcms-crawler.yml): the secret BOOKCMS_CRAWLER_SERVICE_URL
+# (https://<tunnel hostname>) and, optionally, BOOKCMS_CRAWLER_ACCESS_CLIENT_ID/SECRET are applied here.
+#
 # Worker secrets (JWT_SECRET, COOKIE_SECRET, HASH_PEPPER, AD_SIGNING_SECRET, CRAWLER_INTERNAL_TOKEN):
 # each is generated on the runner only when Cloudflare answers that the Worker does not have it, is
 # masked, is never printed and is never copied to GitHub. Existing secrets are never replaced.
@@ -187,6 +190,7 @@ jobs:
       - name: Find or create the D1 database and R2 bucket; fill in the staging config
         shell: bash
         env:
+          CRAWLER_URL: ${{ secrets.BOOKCMS_CRAWLER_SERVICE_URL }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
         run: |
@@ -241,6 +245,15 @@ jobs:
 
           cfg="$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH/apps/api/wrangler.toml"
           sed -i "s|REPLACE_WITH_STAGING_D1_DATABASE_ID|$id|; s|REPLACE_WITH_STAGING_ORIGIN|$origin|" "$cfg"
+          # Crawler service URL (rule previews), from the secret BOOKCMS_CRAWLER_SERVICE_URL when set.
+          if [[ -n "${CRAWLER_URL:-}" ]]; then
+            [[ "$CRAWLER_URL" =~ ^https://[A-Za-z0-9.-]+/?$ ]] || { echo '::error::BOOKCMS_CRAWLER_SERVICE_URL must be https://<host>'; exit 1; }
+            awk -v url="$CRAWLER_URL" '/^\[env\.staging\.vars\]/{s=1} /^\[\[env\.staging\.d1/{s=0} s && /^CRAWLER_SERVICE_URL = ""/{$0="CRAWLER_SERVICE_URL = \"" url "\""} {print}' "$cfg" > "$cfg.new" && mv "$cfg.new" "$cfg"
+            grep -qF "CRAWLER_SERVICE_URL = \"$CRAWLER_URL\"" "$cfg" || { echo '::error::could not set CRAWLER_SERVICE_URL'; exit 1; }
+            echo '- crawler service URL: configured' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '- crawler service URL: not configured (rule previews unavailable)' >> "$GITHUB_STEP_SUMMARY"
+          fi
           # Only the staging section is used; it must have no placeholder left.
           awk '/^\[env\.staging/{s=1} /^\[env\.production/{s=0} s' "$cfg" | grep -q 'REPLACE_WITH_' && { echo '::error::A staging placeholder is still unfilled.'; exit 1; }
           echo 'staging config: filled in (database id and origin masked)'
@@ -315,6 +328,8 @@ jobs:
         shell: bash
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}/apps/api
         env:
+          ACCESS_ID: ${{ secrets.BOOKCMS_CRAWLER_ACCESS_CLIENT_ID }}
+          ACCESS_SECRET: ${{ secrets.BOOKCMS_CRAWLER_ACCESS_CLIENT_SECRET }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
         run: |
@@ -338,6 +353,12 @@ jobs:
             unset v
             created+=("$name")
           done
+          # Optional Cloudflare Access service token for the crawler route. These values come from
+          # GitHub secrets, so they are (re)applied on every deploy when present.
+          if [[ -n "${ACCESS_ID:-}" && -n "${ACCESS_SECRET:-}" ]]; then
+            jq --arg i "$ACCESS_ID" --arg s "$ACCESS_SECRET" '. + {CRAWLER_ACCESS_CLIENT_ID:$i, CRAWLER_ACCESS_CLIENT_SECRET:$s}' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+            created+=("CRAWLER_ACCESS_CLIENT_ID/SECRET")
+          fi
           if (( ${#created[@]} == 0 )); then
             echo 'secrets: all 5 already set (kept)'
             echo '- Worker secrets: all 5 already set (kept)' >> "$GITHUB_STEP_SUMMARY"
