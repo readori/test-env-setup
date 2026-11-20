@@ -245,7 +245,11 @@ jobs:
 
           cfg="$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH/apps/api/wrangler.toml"
           sed -i "s|REPLACE_WITH_STAGING_D1_DATABASE_ID|$id|; s|REPLACE_WITH_STAGING_ORIGIN|$origin|" "$cfg"
-          # Crawler service URL (rule previews), from the secret BOOKCMS_CRAWLER_SERVICE_URL when set.
+          # Crawler service URL (rule previews): the secret BOOKCMS_CRAWLER_SERVICE_URL, or the hostname
+          # bookcms-crawler.yml (mode tunnel) routes to the VM once its DNS record exists.
+          if [[ -z "${CRAWLER_URL:-}" ]] && getent hosts bookcms-crawler.readori.com > /dev/null 2>&1; then
+            CRAWLER_URL=https://bookcms-crawler.readori.com
+          fi
           if [[ -n "${CRAWLER_URL:-}" ]]; then
             [[ "$CRAWLER_URL" =~ ^https://[A-Za-z0-9.-]+/?$ ]] || { echo '::error::BOOKCMS_CRAWLER_SERVICE_URL must be https://<host>'; exit 1; }
             awk -v url="$CRAWLER_URL" '/^\[env\.staging\.vars\]/{s=1} /^\[\[env\.staging\.d1/{s=0} s && /^CRAWLER_SERVICE_URL = ""/{$0="CRAWLER_SERVICE_URL = \"" url "\""} {print}' "$cfg" > "$cfg.new" && mv "$cfg.new" "$cfg"

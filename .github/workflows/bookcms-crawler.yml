@@ -26,11 +26,11 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'probe | deploy | status | stop'
+        description: 'probe | deploy | tunnel | status | stop'
         required: true
         default: status
         type: choice
-        options: [probe, deploy, status, stop]
+        options: [probe, deploy, tunnel, status, stop]
       ref:
         description: 'deploy: private readori/bookcms branch, tag or SHA'
         required: false
@@ -51,6 +51,8 @@ env:
   ZONE_NAME: readori.com
   WORKER_NAME: novel-platform-api-staging
   CLOUDFLARED_VERSION: 2026.10.3
+  CRAWLER_HOSTNAME: bookcms-crawler.readori.com
+  TUNNEL_NAME: bookcms-crawler
 
 jobs:
   facts:
@@ -81,7 +83,7 @@ jobs:
               [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::REF in a deploy request must be a full 40-character commit SHA.'; exit 64; }
             fi
           fi
-          [[ "$mode" =~ ^(probe|deploy|status|stop)$ ]] || { echo "::error::unsupported mode"; exit 64; }
+          [[ "$mode" =~ ^(probe|deploy|tunnel|status|stop)$ ]] || { echo "::error::unsupported mode"; exit 64; }
           [[ -n "$ref" && "$ref" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && ${#ref} -le 200 ]] || { echo '::error::invalid ref'; exit 64; }
           echo "mode=$mode" | tee -a "$GITHUB_OUTPUT"
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
@@ -364,4 +366,206 @@ jobs:
           rm -rf "$d"
           [[ $rc -eq 0 ]] || exit $rc
           [[ "$health" == healthy && "$state" =~ ^(polling|running)$ && "$fails" == 0 ]] || { echo '::error::crawler is not healthy, not polling, or its claims are refused'; exit 1; }
+          echo 'result=ok' | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # tunnel: inbound route API -> crawler for rule previews. Idempotent; every Cloudflare call reports
+  # ok / created / exists / denied(<code>) so a missing token permission is named precisely.
+  #   tunnel (remotely managed) -> ingress CRAWLER_HOSTNAME -> http://bookcms-crawler:8081 -> DNS CNAME
+  #   -> Access app (service auth only) + service token (rotated each run, given to the staging Worker
+  #   as CRAWLER_ACCESS_CLIENT_ID/SECRET) -> connector container bookcms-cloudflared on the VM ->
+  #   checks: anonymous request refused by Access, request with the service token reaches /health.
+  tunnel:
+    name: Tunnel, DNS and Access for rule previews
+    needs: facts
+    if: needs.facts.outputs.mode == 'tunnel'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install cloudflared (official release, pinned, checksum)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/cloudflared" "https://github.com/cloudflare/cloudflared/releases/download/$CLOUDFLARED_VERSION/cloudflared-linux-amd64"
+          echo "053b80b0a23031a038fdbf3c073f59f82b8f1f152aa67971d7383ffafc0dbab0  $RUNNER_TEMP/cloudflared" | sha256sum --check --quiet -
+          chmod +x "$RUNNER_TEMP/cloudflared"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Cloudflare configuration (tunnel, DNS, Access, Worker secrets)
+        shell: bash
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -uo pipefail
+          umask 077
+          echo "::add-mask::$CF_ACCOUNT"
+          A="https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT"
+          R="$RUNNER_TEMP/r.json"
+          call() { # method url [json-body-file]
+            local m="$1" u="$2" b="${3:-}"
+            if [[ -n $b ]]; then curl -sS --max-time 30 -X "$m" -H "Authorization: Bearer $CF_TOKEN" -H 'Content-Type: application/json' --data @"$b" "$u" > "$R" 2>/dev/null
+            else curl -sS --max-time 30 -X "$m" -H "Authorization: Bearer $CF_TOKEN" "$u" > "$R" 2>/dev/null; fi
+            [[ "$(jq -r '.success // false' "$R" 2>/dev/null)" == true ]]
+          }
+          codes() { jq -r '[.errors[]?.code] | map(tostring) | join(",")' "$R" 2>/dev/null; }
+          out() { echo "$1" | tee -a "$GITHUB_STEP_SUMMARY"; }
+          body() { printf '%s' "$1" > "$RUNNER_TEMP/b.json"; echo "$RUNNER_TEMP/b.json"; }
+          H="$CRAWLER_HOSTNAME"
+
+          # 1) tunnel
+          call GET "$A/cfd_tunnel?is_deleted=false&name=$TUNNEL_NAME" || { out "tunnel=denied($(codes)) need=Account:Cloudflare_Tunnel:Read"; exit 1; }
+          tid="$(jq -r '.result[0].id // empty' "$R")"
+          if [[ -z $tid ]]; then
+            call POST "$A/cfd_tunnel" "$(body "$(jq -n --arg n "$TUNNEL_NAME" '{name:$n, config_src:"cloudflare"}')")" \
+              || { out "tunnel=denied($(codes)) need=Account:Cloudflare_Tunnel:Edit"; exit 1; }
+            tid="$(jq -r '.result.id' "$R")"; out "tunnel=created"
+          else out "tunnel=exists"; fi
+          echo "::add-mask::$tid"
+
+          # 2) ingress (remotely managed configuration)
+          call PUT "$A/cfd_tunnel/$tid/configurations" "$(body "$(jq -n --arg h "$H" '{config:{ingress:[{hostname:$h, service:"http://bookcms-crawler:8081"},{service:"http_status:404"}]}}')")" \
+            && out "ingress=ok" || { out "ingress=denied($(codes)) need=Account:Cloudflare_Tunnel:Edit"; exit 1; }
+
+          # 3) DNS
+          call GET "https://api.cloudflare.com/client/v4/zones?name=$ZONE_NAME" || { out "zone=denied($(codes))"; exit 1; }
+          zid="$(jq -r '.result[0].id // empty' "$R")"; [[ -n $zid ]] || { out "zone=not_found"; exit 1; }
+          echo "::add-mask::$zid"
+          Z="https://api.cloudflare.com/client/v4/zones/$zid"
+          if ! call GET "$Z/dns_records?name=$H"; then out "dns=denied($(codes)) need=Zone:DNS:Edit(${ZONE_NAME})"; exit 1; fi
+          rid="$(jq -r '.result[0].id // empty' "$R")"
+          rec="$(jq -n --arg h "$H" --arg c "$tid.cfargotunnel.com" '{type:"CNAME", name:$h, content:$c, proxied:true, comment:"bookcms crawler tunnel (bookcms-crawler.yml)"}')"
+          if [[ -z $rid ]]; then
+            call POST "$Z/dns_records" "$(body "$rec")" && out "dns=created" || { out "dns=denied($(codes)) need=Zone:DNS:Edit(${ZONE_NAME})"; exit 1; }
+          else
+            call PUT "$Z/dns_records/$rid" "$(body "$rec")" && out "dns=updated" || { out "dns=denied($(codes)) need=Zone:DNS:Edit(${ZONE_NAME})"; exit 1; }
+          fi
+
+          # 4) Access: service token (rotated every run) + self-hosted app allowing only that token
+          access=yes
+          if call GET "$A/access/service_tokens?name=bookcms-crawler-api"; then
+            sid="$(jq -r '[.result[]? | select(.name=="bookcms-crawler-api")][0].id // empty' "$R")"
+            if [[ -n $sid ]]; then call POST "$A/access/service_tokens/$sid/rotate" && out "service_token=rotated" || { out "service_token=denied($(codes)) need=Account:Access_Service_Tokens:Edit"; access=no; }
+            else call POST "$A/access/service_tokens" "$(body '{"name":"bookcms-crawler-api","duration":"8760h"}')" && { sid="$(jq -r '.result.id' "$R")"; out "service_token=created"; } || { out "service_token=denied($(codes)) need=Account:Access_Service_Tokens:Edit"; access=no; }
+            fi
+            if [[ $access == yes ]]; then
+              cid="$(jq -r '.result.client_id // empty' "$R")"; csec="$(jq -r '.result.client_secret // empty' "$R")"
+              [[ -n $cid && -n $csec ]] || { out "service_token=no_secret_returned"; access=no; }
+              echo "::add-mask::$cid"; echo "::add-mask::$csec"
+            fi
+          else out "service_token=denied($(codes)) need=Account:Access_Service_Tokens:Read"; access=no; fi
+          if [[ $access == yes ]]; then
+            # reusable policy: allow only this service token
+            pid=""
+            if call GET "$A/access/policies?per_page=100"; then
+              pid="$(jq -r '[.result[]? | select(.name=="bookcms-crawler api service token")][0].id // empty' "$R")"
+              if [[ -z $pid ]]; then
+                call POST "$A/access/policies" "$(body "$(jq -n --arg t "$sid" '{name:"bookcms-crawler api service token", decision:"non_identity", include:[{service_token:{token_id:$t}}]}')")" \
+                  && { pid="$(jq -r '.result.id' "$R")"; out "access_policy=created"; } || { out "access_policy=denied($(codes)) need=Account:Access_Apps_and_Policies:Edit"; access=no; }
+              else out "access_policy=exists"; fi
+            else out "access_policy=denied($(codes)) need=Account:Access_Apps_and_Policies:Read"; access=no; fi
+            if [[ $access == yes ]]; then
+              if call GET "$A/access/apps?domain=$H"; then
+                app="$(jq -r --arg h "$H" '[.result[]? | select(.domain==$h)][0].id // empty' "$R")"
+                appbody="$(jq -n --arg h "$H" --arg p "$pid" '{name:"bookcms-crawler", domain:$h, type:"self_hosted", session_duration:"24h", app_launcher_visible:false, policies:[{id:$p, precedence:1}]}')"
+                if [[ -z $app ]]; then
+                  call POST "$A/access/apps" "$(body "$appbody")" && out "access_app=created" || { out "access_app=denied($(codes)) need=Account:Access_Apps_and_Policies:Edit"; access=no; }
+                else
+                  call PUT "$A/access/apps/$app" "$(body "$appbody")" && out "access_app=updated" || { out "access_app=denied($(codes)) need=Account:Access_Apps_and_Policies:Edit"; access=no; }
+                fi
+              else out "access_app=denied($(codes)) need=Account:Access_Apps_and_Policies:Read"; access=no; fi
+            fi
+          fi
+          if [[ $access == yes ]]; then
+            for kv in "CRAWLER_ACCESS_CLIENT_ID:$cid" "CRAWLER_ACCESS_CLIENT_SECRET:$csec"; do
+              n="${kv%%:*}"; v="${kv#*:}"
+              call PUT "$A/workers/scripts/$WORKER_NAME/secrets" "$(body "$(jq -n --arg n "$n" --arg v "$v" '{name:$n, text:$v, type:"secret_text"}')")" \
+                || { out "worker_secret_$n=failed($(codes))"; exit 1; }
+            done
+            out "worker_access_secrets=set"
+            printf 'CF-Access-Client-Id: %s\nCF-Access-Client-Secret: %s\n' "$cid" "$csec" > "$RUNNER_TEMP/access.hdr"
+          fi
+          rm -f "$RUNNER_TEMP/b.json"
+
+          # 5) connector token for the VM
+          call GET "$A/cfd_tunnel/$tid/token" || { out "tunnel_token=denied($(codes))"; exit 1; }
+          tok="$(jq -r '.result // empty' "$R")"; [[ -n $tok ]] || { out "tunnel_token=empty"; exit 1; }
+          echo "::add-mask::$tok"
+          printf 'TUNNEL_TOKEN=%s\n' "$tok" > "$RUNNER_TEMP/tunnel.env"
+          rm -f "$R"
+          echo "ACCESS=$access" >> "$GITHUB_ENV"
+
+      - name: Start the connector on the VM (bookcms-cloudflared)
+        shell: bash
+        env:
+          KEY: ${{ secrets.ORACLE_SSH_KEY || secrets.ORACLE_API_TOKEN }}
+          HOST: ${{ secrets.ORACLE_SSH_HOST }}
+          SSH_USER: ${{ secrets.ORACLE_SSH_USER }}
+          HOST_KEY: ${{ secrets.ORACLE_SSH_HOST_KEY }}
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.ORACLE_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.ORACLE_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -uo pipefail
+          umask 077
+          echo "::add-mask::$HOST"
+          d="$RUNNER_TEMP/ssh"; mkdir -p "$d"
+          printf '%s\n' "$KEY" > "$d/key"
+          shk=accept-new
+          if [[ -n "${HOST_KEY:-}" ]]; then
+            printf '%s %s\n' "$HOST" "$(printf '%s\n' "$HOST_KEY" | tr -d '\r' | awk 'NF { print $1, $2; exit }')" > "$d/known"; shk=yes
+          fi
+          sshv() {
+            timeout 300 ssh -i "$d/key" -o BatchMode=yes -o StrictHostKeyChecking="$shk" -o UserKnownHostsFile="$d/known" \
+              -o ConnectTimeout=20 -o LogLevel=ERROR -o ProxyCommand="cloudflared access ssh --hostname %h" "$SSH_USER@$HOST" "$@"
+          }
+          PRE='set -uo pipefail; D=docker; docker info >/dev/null 2>&1 || D="sudo -n docker"; $D info >/dev/null 2>&1 || { echo docker=unavailable; exit 3; }'
+          rc=0; : > "$d/out"
+          sshv 'umask 077; mkdir -p ~/bookcms-crawler; cat > ~/bookcms-crawler/tunnel.env; echo tunnel_token=staged' < "$RUNNER_TEMP/tunnel.env" >> "$d/out" 2>> "$d/err" || rc=$?
+          rm -f "$RUNNER_TEMP/tunnel.env"
+          if [[ $rc -eq 0 ]]; then
+            sshv "$PRE
+              \$D network inspect bookcms-net >/dev/null 2>&1 || \$D network create bookcms-net >/dev/null
+              \$D rm -f bookcms-cloudflared >/dev/null 2>&1
+              \$D run -d --name bookcms-cloudflared --restart unless-stopped --cpus 0.5 --memory 256m --pids-limit 128 \
+                --security-opt no-new-privileges --log-opt max-size=5m --log-opt max-file=2 --network bookcms-net \
+                --env-file ~/bookcms-crawler/tunnel.env cloudflare/cloudflared:2026.11.0 tunnel --no-autoupdate run >/dev/null \
+                && echo connector=started || echo connector=failed
+              rm -f ~/bookcms-crawler/tunnel.env; echo tunnel_token=removed
+              sleep 10
+              echo \"connector_state=\$(\$D inspect -f '{{.State.Status}}' bookcms-cloudflared 2>/dev/null || echo absent)\"
+              echo \"crawler_state=\$(\$D inspect -f '{{.State.Status}}' bookcms-crawler 2>/dev/null || echo absent)\"" >> "$d/out" 2>> "$d/err" || rc=$?
+          fi
+          grep -E '^[a-z_]+=[A-Za-z0-9 ._:,()%-]{0,80}$' "$d/out" | tee -a "$GITHUB_STEP_SUMMARY" || true
+          [[ $rc -eq 0 ]] || { echo "result=ssh_failed rc=$rc" | tee -a "$GITHUB_STEP_SUMMARY"; }
+          started=no; grep -q '^connector_state=running' "$d/out" && started=yes
+          rm -rf "$d"
+          [[ $rc -eq 0 && $started == yes ]]
+
+      - name: Check the route (anonymous refused, service token accepted)
+        shell: bash
+        run: |
+          set -uo pipefail
+          H="$CRAWLER_HOSTNAME"
+          anon=000
+          for i in $(seq 1 12); do
+            anon="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://$H/health" || echo 000)"
+            [[ $anon != 000 && $anon != 530 && $anon != 502 && $anon != 1033 ]] && break
+            sleep 10
+          done
+          echo "anonymous_health=$anon" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [[ "$ACCESS" == yes ]]; then
+            [[ $anon =~ ^(302|401|403)$ ]] || { echo '::error::the crawler route is not protected by Access'; exit 1; }
+            code=000
+            for i in $(seq 1 6); do
+              code="$(curl -s -o "$RUNNER_TEMP/h.json" -w '%{http_code}' --max-time 15 -H "@$RUNNER_TEMP/access.hdr" "https://$H/health" || echo 000)"
+              [[ $code == 200 ]] && break
+              sleep 10
+            done
+            svc="$(jq -r '.data.service // empty' "$RUNNER_TEMP/h.json" 2>/dev/null)"
+            rm -f "$RUNNER_TEMP/access.hdr" "$RUNNER_TEMP/h.json"
+            echo "token_health=$code service=${svc:-none}" | tee -a "$GITHUB_STEP_SUMMARY"
+            [[ $code == 200 && $svc == crawler ]] || { echo '::error::the service token does not reach the crawler'; exit 1; }
+          else
+            echo '::warning::Access is not configured (missing permission): the route is protected by the HMAC signature only'
+            [[ $anon == 200 ]] || { echo '::error::the crawler is not reachable through the tunnel'; exit 1; }
+          fi
           echo 'result=ok' | tee -a "$GITHUB_STEP_SUMMARY"
