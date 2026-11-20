@@ -437,10 +437,14 @@ jobs:
           zid="$(jq -r '.result[0].id // empty' "$R")"; [[ -n $zid ]] || { out "zone=not_found"; exit 1; }
           echo "::add-mask::$zid"
           Z="https://api.cloudflare.com/client/v4/zones/$zid"
-          if ! call GET "$Z/dns_records?name=$H"; then out "dns=denied($(codes)) need=Zone:DNS:Edit(${ZONE_NAME})"; exit 1; fi
-          rid="$(jq -r '.result[0].id // empty' "$R")"
+          rid=""; dns_api=yes
+          if call GET "$Z/dns_records?name=$H"; then rid="$(jq -r '.result[0].id // empty' "$R")"; else dns_api=no; fi
           rec="$(jq -n --arg h "$H" --arg c "$tid.cfargotunnel.com" '{type:"CNAME", name:$h, content:$c, proxied:true, comment:"bookcms crawler tunnel (bookcms-crawler.yml)"}')"
-          if [[ -z $rid ]]; then
+          if [[ $dns_api == no ]]; then
+            # No DNS permission: accept a record created in the dashboard (tunnel "Public Hostname").
+            if getent hosts "$H" > /dev/null 2>&1; then out "dns=exists(dashboard)"
+            else out "dns=missing need=Zone:DNS:Edit(${ZONE_NAME}) or a Public Hostname on tunnel ${TUNNEL_NAME} in the dashboard"; exit 1; fi
+          elif [[ -z $rid ]]; then
             call POST "$Z/dns_records" "$(body "$rec")" && out "dns=created" || { out "dns=denied($(codes)) need=Zone:DNS:Edit(${ZONE_NAME})"; exit 1; }
           else
             call PUT "$Z/dns_records/$rid" "$(body "$rec")" && out "dns=updated" || { out "dns=denied($(codes)) need=Zone:DNS:Edit(${ZONE_NAME})"; exit 1; }
