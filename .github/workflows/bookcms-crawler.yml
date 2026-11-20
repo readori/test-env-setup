@@ -105,6 +105,12 @@ jobs:
             echo "zone_found=$([[ -n $zone ]] && echo yes || echo no)"
             [[ -n $zone ]] && { echo "::add-mask::$zone"; echo "dns_read=$(api "/zones/$zone/dns_records?per_page=1") errors=$(codes)"; }
             echo "worker_secrets_read=$(api "/accounts/$CF_ACCOUNT/workers/scripts/$WORKER_NAME/secrets") errors=$(codes)"
+            v=$(api "/accounts/$CF_ACCOUNT/tokens/verify"); kind=account
+            [[ $v == true ]] || { v=$(api "/user/tokens/verify"); kind=user; }
+            tid="$(jq -r '.result.id // empty' "$RUNNER_TEMP/r.json" 2>/dev/null)"
+            echo "token_kind=$kind token_id_prefix=${tid:0:6} token_status=$(jq -r '.result.status // "unknown"' "$RUNNER_TEMP/r.json" 2>/dev/null)"
+            echo "access_policies_read=$(api "/accounts/$CF_ACCOUNT/access/policies?per_page=1") errors=$(codes)"
+            echo "accounts_visible=$(api "/accounts?per_page=50" >/dev/null; jq -r '.result | length' "$RUNNER_TEMP/r.json" 2>/dev/null || echo 0)"
           } | tee -a "$GITHUB_STEP_SUMMARY"
           rm -f "$RUNNER_TEMP/r.json"
 
