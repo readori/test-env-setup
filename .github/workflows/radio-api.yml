@@ -63,7 +63,7 @@ on:
         default: ''
         type: string
       first_rollout:
-        description: 'production deploy only: the first deploy (no snapshot yet: health without the snapshot read-back, no automatic rollback)'
+        description: 'production deploy or all only: the first deploy (no snapshot yet: health without the snapshot read-back, no automatic rollback)'
         required: false
         default: false
         type: boolean
@@ -112,7 +112,7 @@ jobs:
             [[ -z "$CREATE" ]] || { echo '::error::create is only for mode provision'; exit 64; }
           fi
           if [[ "$FIRST_ROLLOUT" == true ]]; then
-            [[ "$TARGET_ENV" == production && "$MODE" == deploy ]] || { echo '::error::first_rollout is only for a production deploy'; exit 64; }
+            [[ "$TARGET_ENV" == production && ( "$MODE" == deploy || "$MODE" == all ) ]] || { echo '::error::first_rollout is only for a production deploy or all'; exit 64; }
           fi
           echo "request OK: mode=$MODE target=$TARGET_ENV first_rollout=$FIRST_ROLLOUT"
 
