@@ -534,6 +534,21 @@ jobs:
           }
           echo 'expo prebuild: PASS'
 
+          # BUG-1120: identify reads http streams with URLSession, which only NSAllowsArbitraryLoads
+          # permits (ForMedia covers AVFoundation only, and any of the specific keys makes iOS ignore
+          # NSAllowsArbitraryLoads). Checked on the generated plist; nothing is printed from it.
+          ATS_OK=0
+          for plist in ios/*/Info.plist; do
+            [[ -f "$plist" ]] || continue
+            ats="$(plutil -extract NSAppTransportSecurity json -o - "$plist" 2>/dev/null || echo '{}')"
+            if python3 -c 'import json,sys; d=json.loads(sys.argv[1]); bad=[k for k in ("NSAllowsArbitraryLoadsForMedia","NSAllowsArbitraryLoadsInWebContent","NSAllowsLocalNetworking") if k in d]; sys.exit(0 if d.get("NSAllowsArbitraryLoads") is True and not bad else 1)' "$ats"; then ATS_OK=1; fi
+          done
+          (( ATS_OK == 1 )) || {
+            echo '::error::Info.plist ATS must have NSAllowsArbitraryLoads=true and none of ForMedia/InWebContent/LocalNetworking (identify reads http streams).'
+            exit 66
+          }
+          echo 'ATS for http streams: PASS'
+
           # Widgets extension target (MOB-05): present only when the plugin ran with HOURWAVE_WIDGETS=1.
           # Checked here, before pod install (only ios/<App>.xcodeproj exists, no Pods project yet).
           PROJECT_PATH=''
