@@ -328,7 +328,7 @@ jobs:
               const c = text[i];
               if (inString) {
                 out += c;
-                if (c === '\') out += text[++i];
+                if (c === '\\') out += text[++i];
                 else if (c === '"') inString = false;
               } else if (c === '"') {
                 inString = true;
