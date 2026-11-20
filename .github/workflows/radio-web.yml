@@ -459,13 +459,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          code() { curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$1" || echo 000; }
+          code() { local c rc=0; c="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$1")" || rc=$?; if (( rc == 0 )); then echo "$c"; else echo "000 (curl exit $rc)"; fi; }
           # A newly attached custom domain can take a few minutes (DNS, certificate).
           tries=6; [[ "$TARGET_ENV" == production ]] && tries=24
+          # First rollout: the domain just moved Workers; its certificate took about 5 minutes once, so wait up to 15 for the first path.
+          first_tries=$tries; [[ "$FIRST_ROLLOUT" == true ]] && first_tries=90
           fail=0
           for path in / /en/ /zh/ /takedown/ /en/legal/privacy/; do
             c=000
-            for i in $(seq "$tries"); do c="$(code "${WEB_URL}${path}")"; [[ "$c" == 200 ]] && break; sleep 10; done
+            n=$tries; [[ "$path" == / ]] && n=$first_tries
+            for i in $(seq "$n"); do c="$(code "${WEB_URL}${path}")"; [[ "$c" == 200 ]] && break; sleep 10; done
             echo "site ${path}: HTTP $c"
             echo "- site \`${path}\`: HTTP $c" >> "$GITHUB_STEP_SUMMARY"
             [[ "$c" == 200 ]] || fail=1
