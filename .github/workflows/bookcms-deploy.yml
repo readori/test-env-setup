@@ -72,6 +72,9 @@ env:
   WORKER_NAME: novel-platform-api-staging
   D1_NAME: novel-platform-staging
   R2_NAME: novel-platform-staging
+  # Custom domain the owner attached to the staging Worker (2026-11-20). Kept in the generated config
+  # so that `wrangler deploy` never drops it; also the site's PUBLIC_ORIGIN (links in e-mails).
+  CUSTOM_DOMAIN: bookcms.readori.com
   WRANGLER_SEND_METRICS: 'false'
 
 jobs:
@@ -242,9 +245,13 @@ jobs:
           echo "::add-mask::$sub"
           origin="https://${WORKER_NAME}.${sub}.workers.dev"
           echo "SITE_URL=$origin" >> "$GITHUB_ENV"
+          public_origin="https://$CUSTOM_DOMAIN"
 
           cfg="$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH/apps/api/wrangler.toml"
-          sed -i "s|REPLACE_WITH_STAGING_D1_DATABASE_ID|$id|; s|REPLACE_WITH_STAGING_ORIGIN|$origin|" "$cfg"
+          sed -i "s|REPLACE_WITH_STAGING_D1_DATABASE_ID|$id|; s|REPLACE_WITH_STAGING_ORIGIN|$public_origin|" "$cfg"
+          # Keep the custom domain attached on every deploy (wrangler otherwise drops dashboard routes).
+          awk -v d="$CUSTOM_DOMAIN" '{print} /^name = "novel-platform-api-staging"$/{print "workers_dev = true"; print "routes = [{ pattern = \"" d "\", custom_domain = true }]"}' "$cfg" > "$cfg.new" && mv "$cfg.new" "$cfg"
+          grep -qF "pattern = \"$CUSTOM_DOMAIN\"" "$cfg" || { echo '::error::could not add the custom domain route'; exit 1; }
           # Crawler service URL (rule previews): the secret BOOKCMS_CRAWLER_SERVICE_URL, or the hostname
           # bookcms-crawler.yml (mode tunnel) routes to the VM once its DNS record exists.
           if [[ -z "${CRAWLER_URL:-}" ]] && getent hosts bookcms-crawler.readori.com > /dev/null 2>&1; then
@@ -424,6 +431,10 @@ jobs:
           check /api/v1/home '"data"' 'API /api/v1/home (secrets in place)'
           check / '<div id="root"' 'Web /'
           check /admin/ '<div id="root"' 'Admin /admin/'
+          c="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://$CUSTOM_DOMAIN/api/v1/health" || echo 000)"
+          echo "custom domain https://$CUSTOM_DOMAIN/api/v1/health: HTTP $c"
+          echo "- custom domain $CUSTOM_DOMAIN: HTTP $c" >> "$GITHUB_STEP_SUMMARY"
+          [[ "$c" == 200 ]] || fail=1
           # One login with an unknown address: still runs the full PBKDF2 check (no user enumeration),
           # so a 401 proves password hashing fits the Worker CPU limit (needs Workers Paid).
           c="$(curl -s -o "$RUNNER_TEMP/login" -w '%{http_code}' --max-time 30 -X POST "${SITE_URL}/api/v1/auth/login" \
