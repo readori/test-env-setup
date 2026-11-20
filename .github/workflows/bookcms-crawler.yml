@@ -1,0 +1,140 @@
+# bookcms crawler service -> the owner's shared Ubuntu VM (same host and SSH route as radio-oracle.yml
+# and youxi-rooms.yml: Cloudflare Tunnel + Access service token). Owner 2026-11-20: "单独docker容器跑爬虫".
+#
+#   probe : READ-ONLY. Which Cloudflare API capabilities the token has (tunnels, the zone's DNS,
+#           Access apps), and on the VM: OS, architecture, docker, free memory/disk, existing
+#           bookcms-* containers. Prints booleans, counts and key=value lines only.
+#
+# Rules on the shared VM: touch only bookcms-* containers / images / volumes / the bookcms-net network;
+# CPU and memory limits on every container; no global prune; no published ports.
+# Public repo, public logs: no pull_request trigger; the VM host and account id are masked; only
+# allow-listed key=value lines are printed; no artifacts.
+name: bookcms crawler
+
+run-name: bookcms crawler · ${{ github.event_name == 'push' && 'request (ci-requests/bookcms-crawler.env)' || inputs.mode }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'probe = read-only capability and host check'
+        required: true
+        default: probe
+        type: choice
+        options: [probe]
+  push:
+    branches: [main]
+    paths: ['ci-requests/bookcms-crawler.env']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bookcms-crawler
+  cancel-in-progress: false
+
+env:
+  ZONE_NAME: readori.com
+
+jobs:
+  probe:
+    name: Probe (read-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Read request
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_MODE: ${{ inputs.mode }}
+          REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/bookcms-crawler.env
+        run: |
+          set -euo pipefail
+          mode="$INPUT_MODE"
+          if [[ "$EVENT_NAME" == push ]]; then
+            curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$RUNNER_TEMP/req.env"
+            mode="$(sed -n 's/^MODE=//p' "$RUNNER_TEMP/req.env" | head -n 1 | tr -d '\r')"
+          fi
+          [[ "$mode" == probe ]] || { echo "::error::unsupported mode '$mode'"; exit 64; }
+          echo "mode=$mode"
+
+      - name: Cloudflare API capabilities (read-only)
+        shell: bash
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -uo pipefail
+          echo "::add-mask::$CF_ACCOUNT"
+          api() { curl -sS --max-time 30 -H "Authorization: Bearer $CF_TOKEN" "https://api.cloudflare.com/client/v4$1" > "$RUNNER_TEMP/r.json" 2>/dev/null; jq -r '.success // false' "$RUNNER_TEMP/r.json" 2>/dev/null || echo false; }
+          codes() { jq -r '[.errors[]?.code] | map(tostring) | join(",")' "$RUNNER_TEMP/r.json" 2>/dev/null; }
+          {
+            ok=$(api "/accounts/$CF_ACCOUNT/tokens/verify"); [[ $ok == true ]] || ok=$(api "/user/tokens/verify")
+            echo "token_verify=$ok"
+            ok=$(api "/accounts/$CF_ACCOUNT/cfd_tunnel?is_deleted=false&per_page=50")
+            echo "tunnels_read=$ok tunnels=$(jq -r '.result | length' "$RUNNER_TEMP/r.json" 2>/dev/null || echo 0) bookcms_tunnel=$(jq -r '[.result[]? | select(.name=="bookcms-crawler")] | length' "$RUNNER_TEMP/r.json" 2>/dev/null || echo 0) errors=$(codes)"
+            ok=$(api "/zones?name=$ZONE_NAME")
+            zone="$(jq -r '.result[0].id // empty' "$RUNNER_TEMP/r.json" 2>/dev/null)"
+            echo "zone_read=$ok zone_found=$([[ -n $zone ]] && echo yes || echo no) errors=$(codes)"
+            if [[ -n $zone ]]; then
+              echo "::add-mask::$zone"
+              ok=$(api "/zones/$zone/dns_records?per_page=1")
+              echo "dns_read=$ok errors=$(codes)"
+              ok=$(api "/zones/$zone/dns_records?name=bookcms-crawler.$ZONE_NAME")
+              echo "bookcms_crawler_dns_exists=$(jq -r '.result | length' "$RUNNER_TEMP/r.json" 2>/dev/null || echo 0)"
+            fi
+            ok=$(api "/accounts/$CF_ACCOUNT/access/apps?per_page=50")
+            echo "access_apps_read=$ok errors=$(codes)"
+            ok=$(api "/accounts/$CF_ACCOUNT/access/service_tokens?per_page=50")
+            echo "access_service_tokens_read=$ok errors=$(codes)"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          rm -f "$RUNNER_TEMP/r.json"
+
+      - name: Install cloudflared (official release, pinned, checksum)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/cloudflared" https://github.com/cloudflare/cloudflared/releases/download/2026.10.3/cloudflared-linux-amd64
+          echo "053b80b0a23031a038fdbf3c073f59f82b8f1f152aa67971d7383ffafc0dbab0  $RUNNER_TEMP/cloudflared" | sha256sum --check --quiet -
+          chmod +x "$RUNNER_TEMP/cloudflared"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: VM facts (read-only, through the SSH tunnel)
+        shell: bash
+        env:
+          KEY: ${{ secrets.ORACLE_SSH_KEY || secrets.ORACLE_API_TOKEN }}
+          HOST: ${{ secrets.ORACLE_SSH_HOST }}
+          SSH_USER: ${{ secrets.ORACLE_SSH_USER }}
+          HOST_KEY: ${{ secrets.ORACLE_SSH_HOST_KEY }}
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.ORACLE_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.ORACLE_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -uo pipefail
+          umask 077
+          echo "::add-mask::$HOST"
+          d="$RUNNER_TEMP/ssh"; mkdir -p "$d"
+          printf '%s\n' "$KEY" > "$d/key"
+          shk=accept-new
+          if [[ -n "${HOST_KEY:-}" ]]; then
+            printf '%s %s\n' "$HOST" "$(printf '%s\n' "$HOST_KEY" | tr -d '\r' | awk 'NF { print $1, $2; exit }')" > "$d/known"; shk=yes
+          fi
+          REMOTE='D=docker; docker info >/dev/null 2>&1 || D="sudo -n docker"
+            . /etc/os-release 2>/dev/null; echo "os=${ID:-unknown}_${VERSION_ID:-unknown} arch=$(uname -m)"
+            if $D info >/dev/null 2>&1; then echo "docker=ok version=$($D version -f "{{.Server.Version}}" 2>/dev/null | tr -cd "0-9.")"; else echo docker=unavailable; fi
+            echo "mem_available_mb=$(awk "/MemAvailable/ {print int(\$2/1024)}" /proc/meminfo) cpus=$(nproc)"
+            echo "disk_free_gb=$(df -BG --output=avail / | tail -1 | tr -cd 0-9)"
+            echo "containers_total=$($D ps -q 2>/dev/null | wc -l) bookcms_containers=$($D ps -a --filter name=^bookcms- -q 2>/dev/null | wc -l)"
+            echo "bookcms_net=$($D network inspect bookcms-net >/dev/null 2>&1 && echo yes || echo no)"'
+          rc=0
+          timeout 90 ssh -i "$d/key" -o BatchMode=yes -o StrictHostKeyChecking="$shk" -o UserKnownHostsFile="$d/known" \
+            -o ConnectTimeout=20 -o LogLevel=ERROR -o ProxyCommand="cloudflared access ssh --hostname %h" \
+            "$SSH_USER@$HOST" "$REMOTE" > "$d/out" 2> "$d/err" || rc=$?
+          grep -E '^[a-z_]+=[A-Za-z0-9 ._:-]{0,80}$' "$d/out" | tee -a "$GITHUB_STEP_SUMMARY" || true
+          if [[ $rc -ne 0 ]]; then
+            if grep -q 'Permission denied' "$d/err"; then why=permission-denied
+            elif grep -qiE '530|502|websocket|bad handshake' "$d/err"; then why=tunnel-not-connected
+            elif [[ $rc -eq 124 ]]; then why=timeout; else why="exit-$rc"; fi
+            echo "ssh_result=failed ($why)" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          rm -rf "$d"
+          exit $rc
