@@ -141,10 +141,16 @@ jobs:
                 sshv "$PRE; T=$IMAGE_TAG; cd ~/youxi-rooms/build || exit 4
                   \$D network inspect youxi-net >/dev/null 2>&1 || \$D network create youxi-net >/dev/null || { echo network=failed; exit 5; }
                   if \$D build -q -f server/Dockerfile -t youxi-rooms:\$T . > ../build.log 2>&1; then echo build=ok; else echo build=failed; rm -f ~/youxi-rooms/tunnel.env; exit 6; fi
+                  # T095 聊天：持久目录放举报文件（30 天自动删，只写文件不打印）和公开编号密钥（只在 VM 上生成一次，600 权限，从不打印）
+                  mkdir -p ~/youxi-rooms/data/reports || { echo data_dir=failed; exit 8; }
+                  if [ ! -s ~/youxi-rooms/data/pid.env ]; then (umask 077; printf 'YOUXI_PID_KEY=%s\n' \"\$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')\" > ~/youxi-rooms/data/pid.env) && echo pidkey=created || { echo pidkey=failed; exit 8; }; else echo pidkey=kept; fi
+                  \$D run --rm --user 0 --network none -v ~/youxi-rooms/data/reports:/data/reports --entrypoint sh youxi-rooms:\$T -c 'chown node:node /data/reports && chmod 700 /data/reports' >/dev/null 2>&1 && echo reports_dir=ok || { echo reports_dir=failed; exit 8; }
                   \$D rm -f youxi-rooms >/dev/null 2>&1
                   \$D run -d --name youxi-rooms --restart unless-stopped --read-only --tmpfs /tmp \
                     --cpus 1 --memory 512m --pids-limit 256 --security-opt no-new-privileges \
-                    --log-opt max-size=5m --log-opt max-file=2 --network youxi-net youxi-rooms:\$T >/dev/null && echo rooms=started || { echo rooms=failed; exit 7; }
+                    --log-opt max-size=5m --log-opt max-file=2 --network youxi-net \
+                    -v ~/youxi-rooms/data/reports:/data/reports -e YOUXI_REPORT_DIR=/data/reports --env-file ~/youxi-rooms/data/pid.env \
+                    youxi-rooms:\$T >/dev/null && echo rooms=started || { echo rooms=failed; exit 7; }
                   if [ \"\$(\$D inspect -f '{{.State.Running}}' youxi-cloudflared 2>/dev/null)\" = true ]; then echo tunnel=kept
                   else \$D rm -f youxi-cloudflared >/dev/null 2>&1
                     \$D run -d --name youxi-cloudflared --restart unless-stopped --cpus 0.5 --memory 256m --pids-limit 128 \
