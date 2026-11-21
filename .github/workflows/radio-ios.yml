@@ -709,6 +709,33 @@ jobs:
           echo "Deployment target: ${DEPLOYMENT_TARGET:-unknown}"
 
       # ---------------------------------------------------------------------
+      # 3b. VERIFY mode: Swift unit tests of the identify capture rules (FEAT-24)
+      # modules/hourwave-recognize/ios/Package.swift (Core/ + CoreTests/, Foundation only).
+      # Output: one PASS line, or the error lines only.
+      # ---------------------------------------------------------------------
+      - name: Swift tests (hourwave-recognize Core)
+        if: ${{ env.MODE == 'verify' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH"
+          PKG=modules/hourwave-recognize/ios
+          if [[ ! -f "$PKG/Package.swift" ]]; then
+            echo 'Swift tests: skipped (no Package.swift at this ref)'
+            exit 0
+          fi
+          LOG="$RUNNER_TEMP/radio-swift-test.log"
+          set +e
+          swift test --package-path "$PKG" > "$LOG" 2>&1
+          status=$?
+          set -e
+          if (( status != 0 )); then
+            "$ERROR_SUMMARY" "$LOG" 'Swift tests'
+            exit "$status"
+          fi
+          echo "Swift tests: PASS ($(grep -Eo 'Executed [0-9]+ tests?, with 0 failures' "$LOG" | tail -1))"
+
+      # ---------------------------------------------------------------------
       # 4. VERIFY mode: Simulator Release build, JS bundle embedded (no signing, no secrets)
       # ---------------------------------------------------------------------
       - name: Build app for iOS Simulator (Release, embedded JS bundle)
