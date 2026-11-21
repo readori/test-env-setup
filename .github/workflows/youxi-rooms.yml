@@ -81,7 +81,7 @@ jobs:
           done
           SHA="$(git rev-parse --short=12 HEAD)"
           echo "IMAGE_TAG=$SHA" >> "$GITHUB_ENV"
-          tar czf "$RUNNER_TEMP/ctx.tgz" package.json package-lock.json tsconfig.json src/sim src/net server data governance/budgets.json
+          tar czf "$RUNNER_TEMP/ctx.tgz" package.json package-lock.json tsconfig.json src/sim src/net $([ -d src/chat ] && echo src/chat) server data governance/budgets.json
           echo "source=${SHA} context_kb=$(( $(stat -c %s "$RUNNER_TEMP/ctx.tgz") / 1024 ))" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Install cloudflared (official release, pinned)
