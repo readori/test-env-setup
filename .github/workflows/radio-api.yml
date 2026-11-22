@@ -566,7 +566,13 @@ jobs:
             names="$(pnpm exec wrangler secret list "${cfg[@]}" 2>/dev/null)" || { echo '::error::cannot list the Worker secrets'; exit 1; }
           fi
           put() {
-            printf '%s' "$2" | pnpm exec wrangler secret put "$1" "${cfg[@]}" > /dev/null 2>&1 || { echo "::error::secret put $1 failed"; exit 1; }
+            local log="$RUNNER_TEMP/secret-put.log"
+            if ! printf '%s' "$2" | pnpm exec wrangler secret put "$1" "${cfg[@]}" > "$log" 2>&1; then
+              # Codes and plain words only (names, hosts and ids contain - . / or digits, so they are cut).
+              { grep -oE 'code: [0-9]+|\[ERROR\] [A-Za-z ,]{0,100}' "$log" || echo 'no error code found'; } | sort -u | head -10
+              rm -f "$log"; echo "::error::secret put $1 failed"; exit 1
+            fi
+            rm -f "$log"
             echo "- $1: set" | tee -a "$GITHUB_STEP_SUMMARY"
           }
           if grep -qw 'BETTER_AUTH_SECRET' <<< "$names"; then
