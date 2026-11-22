@@ -148,3 +148,15 @@ jobs:
           set -o pipefail
           grep -q 'SODESK_SERVICE_E2E' internal/service/*_test.go 2>/dev/null || { echo '::notice::no service e2e test on this ref; skipped.'; exit 0; }
           go test -count=1 -v -run TestServiceE2E ./internal/service 2>&1 | tail -n 80
+
+      # Mounts a remote directory through the OS's own WebDAV client (mount_webdav / WebClient).
+      - name: WebDAV mount round trip
+        if: always() && runner.os != 'Linux'
+        working-directory: source
+        env:
+          SODESK_MOUNT_E2E: '1'
+        run: |
+          set -o pipefail
+          ls internal/svc/fs/mount/*dav* >/dev/null 2>&1 || { echo '::notice::no WebDAV mount on this ref; skipped.'; exit 0; }
+          T=TestDavE2EDarwin; [[ "$RUNNER_OS" == 'Windows' ]] && T=TestDavE2EWindows
+          go test -count=1 -v -run "$T" ./internal/svc/fs/mount/ 2>&1 | tail -n 120
