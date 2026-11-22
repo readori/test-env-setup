@@ -992,6 +992,43 @@ jobs:
                   fi
                 done
               fi
+              # Cassette theme (Radio FEAT-30): switch to it, open the landscape deck, tune and open the
+              # tape-box menu. The flow's own result is informational (selectors follow the copy);
+              # the app dying during it fails the smoke.
+              if [[ "$verdict" == 0 ]]; then
+                cat > "$OUT/cassette.yaml" <<YAML
+          appId: $SIM_BUNDLE_ID
+          ---
+          - openLink: hourwave://settings/appearance
+          - waitForAnimationToEnd: { timeout: 3000 }
+          - tapOn: { text: "Cassette.*" }
+          - waitForAnimationToEnd: { timeout: 3000 }
+          - openLink: hourwave://cassette
+          - extendedWaitUntil: { visible: "Drag to tune", timeout: 20000 }
+          - swipe: { start: "30%,40%", end: "8%,40%", duration: 400 }
+          - waitForAnimationToEnd: { timeout: 3000 }
+          - swipe: { start: "85%,45%", end: "60%,45%", duration: 500 }
+          - waitForAnimationToEnd: { timeout: 3000 }
+          - tapOn: { text: "Tape box menu" }
+          - extendedWaitUntil: { visible: "Back to the deck", timeout: 5000 }
+          - tapOn: { text: "Close the tape box" }
+          - waitForAnimationToEnd: { timeout: 3000 }
+          YAML
+                sed -i '' -e 's/^          //' "$OUT/cassette.yaml"
+                if maestro --device "$UDID" test "$OUT/cassette.yaml" > "$OUT/maestro-cassette.log" 2>&1; then
+                  echo 'cassette: Maestro flow passed (deck shown, tuned, menu opened and closed)'
+                else
+                  echo '::warning title=Simulator smoke::Cassette flow did not complete (informational).'
+                  grep -E 'FAILED|not found|Unknown' "$OUT/maestro-cassette.log" | cut -c1-200 | head -3 || true
+                fi
+                sleep 4
+                if alive; then
+                  echo "cassette: app is up (pid, status: $(app_entry))"
+                else
+                  fail 'The app died during the cassette flow.'
+                  why_gone cassette
+                fi
+              fi
             else
               fail 'Maestro could not be installed; the drag part did not run.'
             fi
