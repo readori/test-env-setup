@@ -992,6 +992,55 @@ jobs:
                   fi
                 done
               fi
+              # Q and aura simple homes (Radio FEAT-31): switch to each theme by its swatch id, open its
+              # home and require that the GPU globe mounted and drew again there (a fresh line each);
+              # the home's Menu button must show. Log text counts only; nothing private printed.
+              gpu_lines() {
+                local data n=""
+                data="$(xcrun simctl get_app_container "$UDID" "$SIM_BUNDLE_ID" data 2>/dev/null || true)"
+                [[ -n "$data" ]] && n="$(cat "$data"/Documents/diagnostics/diagnostics-*.log 2>/dev/null | grep -cF "$1" || true)"
+                echo "${n:-0}"
+              }
+              for theme in Q:quiet/world aura:aura; do
+                [[ "$verdict" == 0 ]] || break
+                id="${theme%%:*}"; path="${theme#*:}"
+                mounted_before="$(gpu_lines '[globe] gpu mounted')"
+                drawn_before="$(gpu_lines '[globe] first picture')"
+                cat > "$OUT/theme-$id.yaml" <<YAML
+          appId: $SIM_BUNDLE_ID
+          ---
+          - openLink: hourwave://settings/appearance
+          - waitForAnimationToEnd: { timeout: 3000 }
+          - tapOn: { id: "theme-$id" }
+          - waitForAnimationToEnd: { timeout: 3000 }
+          - openLink: hourwave://$path
+          - extendedWaitUntil: { visible: "Menu", timeout: 20000 }
+          - swipe: { start: "50%,30%", end: "20%,30%", duration: 400 }
+          - waitForAnimationToEnd: { timeout: 3000 }
+          YAML
+                sed -i '' -e 's/^          //' "$OUT/theme-$id.yaml"
+                if maestro --device "$UDID" test "$OUT/theme-$id.yaml" > "$OUT/maestro-theme-$id.log" 2>&1; then
+                  echo "theme $id: Maestro flow passed (switched, home and Menu shown, globe dragged)"
+                else
+                  fail "Theme $id: the simple home did not show (flow failed)."
+                  grep -E 'FAILED|not found|Unknown' "$OUT/maestro-theme-$id.log" | cut -c1-200 | head -3 || true
+                fi
+                sleep 8
+                if alive; then
+                  echo "theme $id: app is up (pid, status: $(app_entry))"
+                else
+                  fail "The app died on the $id home."
+                  why_gone "theme-$id"
+                  break
+                fi
+                mounted_after="$(gpu_lines '[globe] gpu mounted')"
+                drawn_after="$(gpu_lines '[globe] first picture')"
+                if (( mounted_after > mounted_before && drawn_after > drawn_before )); then
+                  echo "theme $id: GPU globe mounted and drew on its home"
+                else
+                  fail "Theme $id: the GPU globe did not mount and draw on its home (mounted $mounted_before->$mounted_after, drawn $drawn_before->$drawn_after)."
+                fi
+              done
               # Cassette theme (Radio FEAT-30): switch to it, open the landscape deck, tune and open the
               # tape-box menu. The flow's own result is informational (selectors follow the copy);
               # the app dying during it fails the smoke.
