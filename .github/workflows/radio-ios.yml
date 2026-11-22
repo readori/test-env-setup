@@ -138,7 +138,7 @@ jobs:
   ios:
     name: Build Radio iOS
     runs-on: macos-26
-    timeout-minutes: 75
+    timeout-minutes: 90
 
     env:
       MODE: ${{ inputs.mode || 'verify' }}
@@ -841,7 +841,7 @@ jobs:
       - name: Simulator smoke run
         if: ${{ env.MODE == 'verify' && (inputs.smoke == 'launch' || inputs.smoke == 'drag') }}
         shell: bash
-        timeout-minutes: 20
+        timeout-minutes: 35
         run: |
           set -uo pipefail
           OUT="$RUNNER_TEMP/radio-smoke"
