@@ -1037,6 +1037,26 @@ jobs:
           sleep 10
           echo '--- app diagnostics (WARN / ERROR / globe / app lines) ---'
           app_log
+          # The GPU globe must be the one that ran (Radio BUG-1122: build 20 passed this smoke while a
+          # render error had swapped in the SVG globe). Log text checks only; nothing private printed.
+          diag_all() {
+            local data
+            data="$(xcrun simctl get_app_container "$UDID" "$SIM_BUNDLE_ID" data 2>/dev/null || true)"
+            [[ -n "$data" ]] && cat "$data"/Documents/diagnostics/diagnostics-*.log 2>/dev/null || true
+          }
+          DIAG="$(diag_all)"
+          if grep -qF '[globe] gpu globe failed' <<<"$DIAG"; then fail 'The GPU globe failed and the SVG globe was shown (line above).'; fi
+          if grep -qE ' ERROR +.console. ' <<<"$DIAG"; then fail 'The app logged a console error (line above).'; fi
+          if grep -qF '[globe] gpu mounted' <<<"$DIAG" && grep -qF '[globe] first picture' <<<"$DIAG"; then
+            echo 'globe gate: GPU globe mounted and drew'
+          else
+            fail 'The GPU globe never mounted and drew (no gpu mounted / first picture line).'
+          fi
+          if grep -E '.globe. play .*how=auto' <<<"$DIAG" > /dev/null; then
+            echo "globe gate: drag settled and played $(grep -cE '.globe. play .*how=auto' <<<"$DIAG") time(s)"
+          else
+            fail 'Dragging the globe never settled on a station (no play how=auto line).'
+          fi
           if crash_summary; then fail 'A crash report was written for the app (signature above).'; else echo 'crash reports: none'; fi
 
           xcrun simctl shutdown "$UDID" > /dev/null 2>&1 || true
