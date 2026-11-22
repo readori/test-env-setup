@@ -149,6 +149,19 @@ jobs:
           grep -q 'SODESK_SERVICE_E2E' internal/service/*_test.go 2>/dev/null || { echo '::notice::no service e2e test on this ref; skipped.'; exit 0; }
           go test -count=1 -v -run TestServiceE2E ./internal/service 2>&1 | tail -n 80
 
+      # Windows Server images lack the WebDAV redirector; try to add it (it may need a reboot,
+      # in which case the mount test reports it and skips).
+      - name: Enable the WebDAV redirector (Windows)
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $r = Install-WindowsFeature WebDAV-Redirector
+          $r | Format-List Success, RestartNeeded, ExitCode
+          Set-Service WebClient -StartupType Manual -ErrorAction SilentlyContinue
+          Start-Service WebClient -ErrorAction SilentlyContinue
+          Get-Service WebClient -ErrorAction SilentlyContinue | Format-List Name, Status, StartType
+
       # Mounts a remote directory through the OS's own WebDAV client (mount_webdav / WebClient).
       - name: WebDAV mount round trip
         if: always() && runner.os != 'Linux'
