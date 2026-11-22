@@ -6,7 +6,7 @@
 #            (bundle size from governance/budgets.json).
 #   smoke  : (optional, on by default) Playwright Chromium opens the single-file build, a bot plays
 #            desktop + phone viewports; fails on any page/console error.
-#            Screenshots stay on the runner: they are NOT uploaded.
+#            Screenshots stay on the runner: they are NOT uploaded. Runs as 3 parallel shards (matrix).
 #
 # No Steam, Apple or Cloudflare credentials are used by this workflow. Desktop/iOS packaging and
 # playtest deploys are separate workflows, added later (private repo governance/roadmap.md).
@@ -53,9 +53,15 @@ env:
 
 jobs:
   verify:
-    name: Verify game
+    name: Verify game (smoke shard ${{ matrix.shard }}/3)
     runs-on: ubuntu-latest
     timeout-minutes: 80
+    # The smoke suite outgrew one 80-minute job (private T106), so it runs as 3 parallel shards.
+    # Every shard repeats typecheck/tests/build (~3 min); tools/smoke.cjs reads SMOKE_SHARD=i/n.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
 
     steps:
       - name: Validate request and credentials
@@ -203,6 +209,7 @@ jobs:
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
         env:
           CI: 'true'
+          SMOKE_SHARD: ${{ matrix.shard }}/3
         run: |
           set -euo pipefail
           SINGLE=1 npx vite build --logLevel error
