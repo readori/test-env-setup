@@ -32,6 +32,8 @@
 #              stdin (values never printed): APPLE_TEAM_ID (ASC_TEAM_ID), APPLE_SIWA_KEY_ID and
 #              APPLE_SIWA_PRIVATE_KEY (the team's APNS key, checked to be the same team), and a new
 #              random BETTER_AUTH_SECRET only when the Worker has none (a rerun never rotates it).
+#              Uses `wrangler versions secret put`: a new Worker version, NOT deployed; the next
+#              mode deploy ships it (new versions keep the secrets).
 #
 # Name-agnostic: Worker, D1, R2 names and the production custom domain are read from
 # workers/api/wrangler.jsonc of the checked-out ref and masked (never printed).
@@ -567,7 +569,7 @@ jobs:
           fi
           put() {
             local log="$RUNNER_TEMP/secret-put.log"
-            if ! printf '%s' "$2" | ./node_modules/.bin/wrangler secret put "$1" "${cfg[@]}" > "$log" 2>&1; then
+            if ! printf '%s' "$2" | ./node_modules/.bin/wrangler versions secret put "$1" "${cfg[@]}" > "$log" 2>&1; then
               # Plain words only: every token holding a digit or - . / @ : _ (names, hosts, ids) becomes #.
               { grep -oE 'code: [0-9]+' "$log" || true; } | sort -u | head -5
               grep -vE '^\s*$' "$log" | sed -E 's/[^ ]*[-./@:0-9_][^ ]*/#/g' | cut -c1-120 | head -12
