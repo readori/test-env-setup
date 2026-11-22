@@ -28,6 +28,10 @@
 #              SHA-256 checked.
 #   all      : deploy, then snapshot.
 #   rollback : `wrangler rollback` of the API Worker to its previous version (D1 untouched).
+#   secrets  : API-03 Worker secrets for Sign in with Apple, set with `wrangler secret put` from
+#              stdin (values never printed): APPLE_TEAM_ID (ASC_TEAM_ID), APPLE_SIWA_KEY_ID and
+#              APPLE_SIWA_PRIVATE_KEY (the team's APNS key, checked to be the same team), and a new
+#              random BETTER_AUTH_SECRET only when the Worker has none (a rerun never rotates it).
 #
 # Name-agnostic: Worker, D1, R2 names and the production custom domain are read from
 # workers/api/wrangler.jsonc of the checked-out ref and masked (never printed).
@@ -46,11 +50,11 @@ on:
         default: 'main'
         type: string
       mode:
-        description: 'dry-run | d1-check (read-only) | provision (production: create the resources listed in create) | deploy | snapshot | all | rollback'
+        description: 'dry-run | d1-check (read-only) | provision (production: create the resources listed in create) | deploy | snapshot | all | rollback | secrets (Sign in with Apple Worker secrets)'
         required: true
         default: dry-run
         type: choice
-        options: [dry-run, d1-check, provision, deploy, snapshot, all, rollback]
+        options: [dry-run, d1-check, provision, deploy, snapshot, all, rollback, secrets]
       target:
         description: 'staging | production (production writes wait for radio-production approval)'
         required: true
@@ -104,7 +108,7 @@ jobs:
           set -euo pipefail
           [[ "$SOURCE_REF" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]] || { echo '::error::ref must be a branch, tag or SHA (no leading -)'; exit 64; }
           case "$TARGET_ENV" in staging|production) ;; *) echo "::error::Unsupported target: $TARGET_ENV"; exit 64 ;; esac
-          case "$MODE" in dry-run|d1-check|provision|deploy|snapshot|all|rollback) ;; *) echo "::error::Unsupported mode: $MODE"; exit 64 ;; esac
+          case "$MODE" in dry-run|d1-check|provision|deploy|snapshot|all|rollback|secrets) ;; *) echo "::error::Unsupported mode: $MODE"; exit 64 ;; esac
           if [[ "$MODE" == provision ]]; then
             [[ "$TARGET_ENV" == production ]] || { echo '::error::provision is for production only (staging creates missing resources on deploy)'; exit 64; }
             [[ "$CREATE" =~ ^[a-z0-9-]+(,[a-z0-9-]+)*$ ]] || { echo '::error::create must be a comma list of resource names'; exit 64; }
@@ -470,7 +474,7 @@ jobs:
   deploy-staging:
     name: Write (${{ inputs.mode }}, staging)
     needs: validate
-    if: inputs.target == 'staging' && (inputs.mode == 'deploy' || inputs.mode == 'snapshot' || inputs.mode == 'all' || inputs.mode == 'rollback')
+    if: inputs.target == 'staging' && (inputs.mode == 'deploy' || inputs.mode == 'snapshot' || inputs.mode == 'all' || inputs.mode == 'rollback' || inputs.mode == 'secrets')
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -531,7 +535,7 @@ jobs:
           node scripts/provision.mjs --env production --create "$CREATE" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Look up (staging - create) the resources
-        if: inputs.mode == 'deploy' || inputs.mode == 'all' || inputs.mode == 'rollback'
+        if: inputs.mode == 'deploy' || inputs.mode == 'all' || inputs.mode == 'rollback' || inputs.mode == 'secrets'
         shell: bash
         working-directory: source/workers/api
         env:
@@ -540,6 +544,39 @@ jobs:
         run: |
           set -euo pipefail
           node scripts/provision.mjs --env "$TARGET_ENV" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Sign in with Apple Worker secrets (mode secrets; values never printed)
+        if: inputs.mode == 'secrets'
+        shell: bash
+        working-directory: source/workers/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+          SIWA_TEAM: ${{ secrets.ASC_TEAM_ID }}
+          KEY_TEAM: ${{ secrets.APNS_TEAM_ID }}
+          SIWA_KEY_ID: ${{ secrets.APNS_KEY_ID }}
+          SIWA_PRIVATE_KEY: ${{ secrets.APNS_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          [[ -n "$SIWA_TEAM" && -n "$SIWA_KEY_ID" && -n "$SIWA_PRIVATE_KEY" ]] || { echo '::error::a Sign in with Apple source secret is empty'; exit 1; }
+          [[ "$KEY_TEAM" == "$SIWA_TEAM" ]] || { echo '::error::the APNS key belongs to another team than the app; not used'; exit 1; }
+          cfg=(--config wrangler.generated.json --env "$TARGET_ENV")
+          # Names only (never values). A failed listing stops here: guessing "none" would rotate the auth secret.
+          if ! names="$(pnpm exec wrangler secret list "${cfg[@]}" --format json 2>/dev/null)"; then
+            names="$(pnpm exec wrangler secret list "${cfg[@]}" 2>/dev/null)" || { echo '::error::cannot list the Worker secrets'; exit 1; }
+          fi
+          put() {
+            printf '%s' "$2" | pnpm exec wrangler secret put "$1" "${cfg[@]}" > /dev/null 2>&1 || { echo "::error::secret put $1 failed"; exit 1; }
+            echo "- $1: set" | tee -a "$GITHUB_STEP_SUMMARY"
+          }
+          if grep -qw 'BETTER_AUTH_SECRET' <<< "$names"; then
+            echo '- BETTER_AUTH_SECRET: kept (already set)' | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            put BETTER_AUTH_SECRET "$(openssl rand -base64 32)"
+          fi
+          put APPLE_TEAM_ID "$SIWA_TEAM"
+          put APPLE_SIWA_KEY_ID "$SIWA_KEY_ID"
+          put APPLE_SIWA_PRIVATE_KEY "$SIWA_PRIVATE_KEY"
 
       - *d1_helper_step
 
@@ -705,7 +742,7 @@ jobs:
   deploy-production:
     name: Write (${{ inputs.mode }}, production, approved)
     needs: validate
-    if: inputs.target == 'production' && (inputs.mode == 'provision' || inputs.mode == 'deploy' || inputs.mode == 'snapshot' || inputs.mode == 'all' || inputs.mode == 'rollback')
+    if: inputs.target == 'production' && (inputs.mode == 'provision' || inputs.mode == 'deploy' || inputs.mode == 'snapshot' || inputs.mode == 'all' || inputs.mode == 'rollback' || inputs.mode == 'secrets')
     runs-on: ubuntu-latest
     timeout-minutes: 45
     # Literal name: the job does not start until a required reviewer approves (validate checked
