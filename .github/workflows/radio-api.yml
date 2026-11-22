@@ -567,9 +567,10 @@ jobs:
           fi
           put() {
             local log="$RUNNER_TEMP/secret-put.log"
-            if ! printf '%s' "$2" | pnpm exec wrangler secret put "$1" "${cfg[@]}" > "$log" 2>&1; then
-              # Codes and plain words only (names, hosts and ids contain - . / or digits, so they are cut).
-              { grep -oE 'code: [0-9]+|\[ERROR\] [A-Za-z ,]{0,100}' "$log" || echo 'no error code found'; } | sort -u | head -10
+            if ! printf '%s' "$2" | ./node_modules/.bin/wrangler secret put "$1" "${cfg[@]}" > "$log" 2>&1; then
+              # Plain words only: every token holding a digit or - . / @ : _ (names, hosts, ids) becomes #.
+              { grep -oE 'code: [0-9]+' "$log" || true; } | sort -u | head -5
+              grep -vE '^\s*$' "$log" | sed -E 's/[^ ]*[-./@:0-9_][^ ]*/#/g' | cut -c1-120 | head -12
               rm -f "$log"; echo "::error::secret put $1 failed"; exit 1
             fi
             rm -f "$log"
