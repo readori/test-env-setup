@@ -255,7 +255,7 @@ jobs:
           set -euo pipefail
           SDK="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
           IMG="system-images;android-${EMULATOR_API};google_apis;x86_64"
-          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --install emulator platform-tools "$IMG" > "$RUNNER_TEMP/sdk-emu.log" 2>&1 || { tail -n 20 "$RUNNER_TEMP/sdk-emu.log"; exit 1; }
+          { yes || true; } | "$SDK/cmdline-tools/latest/bin/sdkmanager" --install emulator platform-tools "$IMG" > "$RUNNER_TEMP/sdk-emu.log" 2>&1 || { tail -n 20 "$RUNNER_TEMP/sdk-emu.log"; exit 1; }
           echo no | "$SDK/cmdline-tools/latest/bin/avdmanager" create avd -n ci -k "$IMG" -d pixel_6 --force > /dev/null
           "$SDK/emulator/emulator" -avd ci -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot -no-metrics > "$RUNNER_TEMP/emulator.log" 2>&1 &
           ADB="$SDK/platform-tools/adb"
