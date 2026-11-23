@@ -244,7 +244,7 @@ jobs:
           WANT_ID: ${{ matrix.key == 'windows' && needs.prepare.outputs.id_windows || needs.prepare.outputs.id_macos }}
           KEY: ${{ matrix.key }}
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           sha() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; }
           seed=$(printf '%s|%s|%s|%s' "$PAT" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$KEY" | sha | cut -c1-64)
           pw=$(printf '%s|pw' "$seed" | sha | cut -c1-24)
@@ -267,7 +267,7 @@ jobs:
           echo "registered with the public server as ID $id; serving for up to 9 minutes"
           # Serve until the client has had its turn (it signals nothing back), then stop.
           for _ in $(seq 1 540); do kill -0 $pid 2>/dev/null || break; sleep 1; done
-          kill $pid 2>/dev/null; wait $pid 2>/dev/null
+          kill $pid 2>/dev/null || true; wait $pid 2>/dev/null || true
           echo "sessions served: $(grep -c 'session opened' "$d/host.log" || true)"
           grep -E 'session opened' "$d/host.log" | sed -E 's/identity=[^ ]+//' | cut -c1-240 | head -n 10
           n=$(grep -c 'session opened' "$d/host.log" || true)
