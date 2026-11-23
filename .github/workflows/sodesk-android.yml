@@ -354,6 +354,10 @@ jobs:
           # Progress lines of the end-to-end test (its own tag; it never logs URLs or passwords).
           echo '--- HostSessionTest progress (logcat tag SoDeskE2E) ---'
           timeout 30 "$ADB" logcat -d -s SoDeskE2E:I 2>/dev/null | grep -v '^--------' | sed -E 's/^[0-9-]+ [0-9:.]+ +[0-9]+ +[0-9]+ //' | cut -c1-300 | tail -n 40 || true
+          if [[ $rc -ne 0 ]]; then
+            echo '--- window focus at failure ---'
+            timeout 30 "$ADB" shell dumpsys window 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp' | cut -c1-200 | head -n 4 || true
+          fi
           "$ADB" emu kill > /dev/null 2>&1 || true
           if [[ $rc -ne 0 ]]; then
             grep -E 'FAILED|Tests? .*failed|What went wrong|AssertionError|Exception|timed out' "$RUNNER_TEMP/connected.log" | cut -c1-400 | head -n 40
