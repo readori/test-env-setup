@@ -102,6 +102,7 @@ jobs:
           TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.ORACLE_ACCESS_CLIENT_ID }}
           TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.ORACLE_ACCESS_CLIENT_SECRET }}
           YOUXI_TUNNEL_TOKEN: ${{ secrets.YOUXI_TUNNEL_TOKEN }}
+          YOUXI_ADMIN_KEY_HASH: ${{ secrets.YOUXI_ADMIN_KEY_HASH }}
         run: |
           set -uo pipefail
           umask 077
@@ -136,6 +137,10 @@ jobs:
               if [[ $rc -eq 0 ]]; then
                 printf 'TUNNEL_TOKEN=%s\n' "$YOUXI_TUNNEL_TOKEN" | sshv 'umask 077; mkdir -p ~/youxi-rooms; cat > ~/youxi-rooms/tunnel.env; echo token=staged' >> "$d/out" 2>> "$d/err" || rc=$?
               fi
+              # 2b) T095 E10 admin key hash (only the salted hash, never the password): stdin -> 600 file kept in data/; empty secret = /admin stays off
+              if [[ $rc -eq 0 ]]; then
+                { [[ -n "$YOUXI_ADMIN_KEY_HASH" ]] && printf 'YOUXI_ADMIN_KEY_HASH=%s\n' "$YOUXI_ADMIN_KEY_HASH"; true; } | sshv 'umask 077; mkdir -p ~/youxi-rooms/data; cat > ~/youxi-rooms/data/admin.env; echo admin_key=staged' >> "$d/out" 2>> "$d/err" || rc=$?
+              fi
               # 3) build + run
               if [[ $rc -eq 0 ]]; then
                 sshv "$PRE; T=$IMAGE_TAG; cd ~/youxi-rooms/build || exit 4
@@ -149,7 +154,7 @@ jobs:
                   \$D run -d --name youxi-rooms --restart unless-stopped --read-only --tmpfs /tmp \
                     --cpus 1 --memory 512m --pids-limit 256 --security-opt no-new-privileges \
                     --log-opt max-size=5m --log-opt max-file=2 --network youxi-net \
-                    -v ~/youxi-rooms/data/reports:/data/reports -e YOUXI_REPORT_DIR=/data/reports --env-file ~/youxi-rooms/data/pid.env \
+                    -v ~/youxi-rooms/data/reports:/data/reports -e YOUXI_REPORT_DIR=/data/reports --env-file ~/youxi-rooms/data/pid.env --env-file ~/youxi-rooms/data/admin.env \
                     youxi-rooms:\$T >/dev/null && echo rooms=started || { echo rooms=failed; exit 7; }
                   if [ \"\$(\$D inspect -f '{{.State.Running}}' youxi-cloudflared 2>/dev/null)\" = true ]; then echo tunnel=kept
                   else \$D rm -f youxi-cloudflared >/dev/null 2>&1
@@ -160,7 +165,7 @@ jobs:
                   fi
                   rm -f ~/youxi-rooms/tunnel.env; echo token=removed
                   \$D image ls youxi-rooms --format '{{.Tag}}' | grep -vx \"\$T\" | xargs -r -I{} \$D rmi youxi-rooms:{} >/dev/null 2>&1; echo old_images=removed
-                  sleep 8; $STATUS" >> "$d/out" 2>> "$d/err" || rc=$?
+                  sleep 8; echo \"admin_\$(\$D logs youxi-rooms 2>&1 | grep -o 'admin=o[nf]*' | head -1)\"; $STATUS" >> "$d/out" 2>> "$d/err" || rc=$?
               fi ;;
           esac
           show "$d/out"
