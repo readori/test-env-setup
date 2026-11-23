@@ -897,9 +897,10 @@ jobs:
             local data
             data="$(xcrun simctl get_app_container "$UDID" "$SIM_BUNDLE_ID" data 2>/dev/null || true)"
             [[ -n "$data" && -d "$data/Documents/diagnostics" ]] || { echo '(no app diagnostics files)'; return 0; }
-            # Older file first, so the tail is the newest lines.
-            cat "$data"/Documents/diagnostics/diagnostics-previous.log "$data"/Documents/diagnostics/diagnostics-current.log 2>/dev/null \
-              | grep -E ' (WARN|ERROR) |\[globe\]|\[app\] ' | cut -c1-260 | tail -60
+            # Older file first, so the tail is the newest lines. `|| true`: the step runs under
+            # bash -e -o pipefail, and a missing previous file (or no match) must not end the smoke.
+            { cat "$data"/Documents/diagnostics/diagnostics-previous.log "$data"/Documents/diagnostics/diagnostics-current.log 2>/dev/null || true; } \
+              | grep -E ' (WARN|ERROR) |\[globe\]|\[app\] ' | cut -c1-260 | tail -60 || true
           }
 
           # Crash reports written since the step started: exception + frames of the crashed thread.
@@ -1031,8 +1032,8 @@ jobs:
               drag_plays="$(dlog | grep -cE '.globe. play .*how=auto' || true)"
               echo "drag rounds: ${drag_plays:-0} auto play line(s), $(dlog | grep -cF '[globe] motion start' || true) motion start line(s), $(dlog | grep -cF '[globe] cold start turn' || true) cold start turn(s)"
               globe_data_counts D
-              ls -l "$ddir" 2>/dev/null | awk 'NR>1 {print "diagnostics file:", $NF, $5, "bytes"}'
-              dlog | awk '$1 ~ /^20[0-9][0-9]-[0-9][0-9]-/ {print $2, $3}' | sort | uniq -c | sort -rn | head -8 | sed 's/^/diagnostics volume: /'
+              ls -l "$ddir" 2>/dev/null | awk 'NR>1 {print "diagnostics file:", $NF, $5, "bytes"}' || true
+              dlog | awk '$1 ~ /^20[0-9][0-9]-[0-9][0-9]-/ {print $2, $3}' | sort | uniq -c | sort -rn | head -8 | sed 's/^/diagnostics volume: /' || true
               # Rotation (Radio FEAT-21): portrait -> landscape -> portrait with swipes in between.
               if [[ "$verdict" == 0 ]]; then
                 cat > "$OUT/rotate.yaml" <<YAML
