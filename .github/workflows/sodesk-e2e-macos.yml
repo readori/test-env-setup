@@ -1,0 +1,449 @@
+# SoDesk end-to-end tests of the macOS-only parts, on a hosted Apple Silicon runner.
+#
+# Public CI repository -> source readori/SoDesk.
+#
+#   vpn     : the utun VPN client. As root: internal/svc/vpn TestUtun* (a real utun interface:
+#             addresses, routes, packets both ways through the kernel, the whole client side of
+#             `vpn up --route` over a real session, clean-up, clean-up after a killed process).
+#             Then the rds binary itself: `rds host` and `rds <addr> vpn up` on the same Mac (two
+#             utun interfaces, one /30), ping through the tunnel, `rds vpn`, `vpn down`.
+#   desktop : remote desktop. ffmpeg from Homebrew, Screen Recording and Accessibility for the
+#             test binary, then internal/svc/desktop TestMac*: AVFoundation capture of the
+#             runner's screen, which H.264 encoder the host picks (VideoToolbox if this VM has a
+#             hardware encoder, else libx264), frames decoded and compared with a test window on
+#             the screen, pointer move and click sent through the session into that window. Then
+#             the rds binary: `rds <addr> desktop --no-open --json` against `rds host`.
+#
+# No deploy, signing or cloud credentials are used. Nothing is uploaded: no artifacts.
+#
+# Triggers: workflow_dispatch, or a push to main that changes ci-requests/sodesk-e2e-macos.env
+# (how the project's AI engineer requests a run). Only people with push access to this repo can
+# trigger; never pull_request. The request file is plain KEY=VALUE text, parsed with strict
+# patterns and never executed:
+#
+#   REF=<sha>         # readori/SoDesk branch, tag or SHA
+#
+# Safety rules (public repo, public logs): no pull_request triggers; only GitHub-owned actions,
+# pinned to commit SHAs; TARGET_REPO_PAT is used only by the checkout step and not persisted;
+# output is limited to test results and failure tails. Host passwords are made per run and
+# masked; viewer and gateway URLs (they carry an access token) are never printed.
+name: SoDesk E2E macOS
+
+run-name: SoDesk E2E macOS · ${{ github.event_name == 'push' && 'request (ci-requests/sodesk-e2e-macos.env)' || inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'readori/SoDesk branch, tag, or SHA'
+        required: true
+        default: 'main'
+        type: string
+  push:
+    branches: [main]
+    paths: ['ci-requests/sodesk-e2e-macos.env']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sodesk-e2e-macos-${{ inputs.ref || 'request' }}
+  cancel-in-progress: true
+
+env:
+  CGO_ENABLED: '0'
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+  HOMEBREW_NO_INSTALL_CLEANUP: '1'
+  HOMEBREW_NO_ENV_HINTS: '1'
+
+jobs:
+  vpn:
+    name: VPN (utun)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Validate request and credentials
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/sodesk-e2e-macos.env
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == 'push' ]]; then
+            # Download only the request file of this exact commit (public repo, no credentials).
+            REQ="$RUNNER_TEMP/sodesk-e2e-macos-request.env"
+            curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/sodesk-e2e-macos.env at this commit.'; exit 64; }
+            # Plain text, read line by line; never sourced or executed.
+            SOURCE_REF="$(sed -n 's/^REF=//p' "$REQ" | head -n 1 | tr -d '\r')"
+          else
+            SOURCE_REF="$INPUT_REF"
+          fi
+          [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && ${#SOURCE_REF} -le 200 ]] || {
+            echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only, no leading dash).'
+            exit 64
+          }
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || {
+            echo '::error::Missing public CI credential: TARGET_REPO_PAT (it must have read access to readori/SoDesk).'
+            exit 78
+          }
+          echo "SOURCE_REF=$SOURCE_REF" >> "$GITHUB_ENV"
+          echo "Source ref: $SOURCE_REF"
+
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/SoDesk
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: source/go.mod
+          cache: false
+
+      - name: Toolchain and machine
+        working-directory: source
+        run: |
+          set -euo pipefail
+          go version
+          echo "commit: $(git rev-parse --short HEAD)"
+          echo "macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion)) on $(uname -m)"
+          { echo '### SoDesk E2E macOS · VPN (utun)'; echo; echo "- Source: \`readori/SoDesk@$(git rev-parse --short HEAD)\` (ref \`$SOURCE_REF\`)"; echo "- macOS $(sw_vers -productVersion), $(uname -m), $(go version | cut -d' ' -f3)"; } >> "$GITHUB_STEP_SUMMARY"
+
+      # Built as the runner user, run as root: root never writes to the Go caches.
+      - name: Build rds and the VPN test binary
+        working-directory: source
+        run: |
+          set -euo pipefail
+          [[ -f internal/svc/vpn/e2e_darwin_test.go ]] || { echo '::error::no macOS VPN test on this ref (internal/svc/vpn/e2e_darwin_test.go).'; exit 66; }
+          mkdir -p "$RUNNER_TEMP/e2e"
+          go vet ./internal/svc/vpn/
+          go build -trimpath -o "$RUNNER_TEMP/e2e/rds" ./cmd/rds
+          go test -c -o "$RUNNER_TEMP/e2e/vpn.test" ./internal/svc/vpn
+          "$RUNNER_TEMP/e2e/rds" version
+          echo "RDS_BIN=$RUNNER_TEMP/e2e/rds" >> "$GITHUB_ENV"
+
+      - name: utun adapter, client over a session, crash recovery (root)
+        run: |
+          set -o pipefail
+          LOG="$RUNNER_TEMP/e2e/vpn-test.log"
+          sudo env SODESK_VPN_E2E=1 "$RUNNER_TEMP/e2e/vpn.test" -test.v -test.count=1 -test.timeout=5m -test.run '^TestUtun' > "$LOG" 2>&1
+          st=$?
+          cut -c1-2000 "$LOG" | tail -n 200
+          {
+            echo '- `TestUtun*` as root:'
+            grep -E '^(--- |ok|FAIL|PASS)' "$LOG" | cut -c1-200 | sed 's/^/    - /'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # A skip is not a pass here.
+          for t in TestUtunE2E TestUtunClientOverSession TestUtunE2ECrash; do
+            grep -q -- "--- PASS: $t " "$LOG" || { echo "::error::$t did not pass."; st=1; }
+          done
+          exit "$st"
+
+      # The commands a user runs, with both ends on this Mac: the host gets one utun interface,
+      # the client another, with the two addresses of one /30 mirrored. A packet to the host's
+      # tunnel address is routed into the client's interface, crosses the session, is injected
+      # on the host's interface, and the echo reply takes the same way back.
+      - name: rds host + rds vpn up on one Mac
+        if: always() && env.RDS_BIN != ''
+        run: |
+          set -uo pipefail
+          W="$RUNNER_TEMP/vpn-cli"; rm -rf "$W"; mkdir -p "$W/host" "$W/cli"
+          FAILED=0
+          ok()   { printf '   ok    %s\n' "$*"; }
+          fail() { printf '   FAIL  %s\n' "$*"; FAILED=1; }
+          info() { printf '   info  %s\n' "$*"; }
+          PORT=$((20000 + RANDOM % 10000)); TARGET="127.0.0.1:$PORT"
+          PW="$(openssl rand -hex 16)"
+          echo "::add-mask::$PW"
+          host_rds()   { sudo env RDS_CONFIG_DIR="$W/host" "$RDS_BIN" "$@"; }
+          client_rds() { sudo env RDS_CONFIG_DIR="$W/cli" RDS_PASSWORD="$PW" "$RDS_BIN" "$@"; }
+          cleanup() {
+            client_rds stop --all >/dev/null 2>&1 || true
+            sudo pkill -f "$RDS_BIN host --no-signal --listen $TARGET" >/dev/null 2>&1 || true
+            sleep 1
+            sudo rm -rf "$W"
+          }
+          trap cleanup EXIT
+          utuns_before="$(ifconfig -l | tr ' ' '\n' | grep -c '^utun' || true)"
+
+          host_rds host --no-signal --listen "$TARGET" --password "$PW" > "$W/host.log" 2>&1 < /dev/null &
+          for _ in $(seq 1 100); do sudo grep -q 'host ready' "$W/host.log" 2>/dev/null && break; sleep 0.2; done
+          if sudo grep -q 'host ready' "$W/host.log"; then ok 'rds host started as root'; else fail 'rds host did not start'; sudo tail -n 5 "$W/host.log" | cut -c1-300; exit 1; fi
+
+          # Without root the command must say what is missing instead of failing half-way.
+          out="$(RDS_CONFIG_DIR="$W/user" RDS_PASSWORD="$PW" "$RDS_BIN" "$TARGET" vpn up 2>&1)"; code=$?
+          if [[ "$code" -ne 0 ]] && grep -qi 'sudo' <<<"$out"; then ok 'vpn up without root is refused with instructions'; else fail "vpn up without root: exit $code"; head -n 3 <<<"$out" | cut -c1-300; fi
+
+          out="$(client_rds "$TARGET" vpn up -b 2>&1)"; code=$?
+          line="$(grep -m1 '^vpn up: ' <<<"$out" || true)"
+          if [[ "$code" -eq 0 && -n "$line" ]]; then ok "$line"; else fail "vpn up -b: exit $code"; head -n 5 <<<"$out" | cut -c1-300; sudo tail -n 5 "$W/host.log" | cut -c1-300; exit 1; fi
+          grep '^note: ' <<<"$out" | cut -c1-300 | sed 's/^/   info  /' || true
+          DEV="$(sed -nE 's/^vpn up: (utun[0-9]+) .*/\1/p' <<<"$line")"
+          LOCAL="$(sed -nE 's/^vpn up: utun[0-9]+ ([0-9.]+) -> ([0-9.]+).*/\1/p' <<<"$line")"
+          PEER="$(sed -nE 's/^vpn up: utun[0-9]+ ([0-9.]+) -> ([0-9.]+).*/\2/p' <<<"$line")"
+          [[ -n "$DEV" && -n "$LOCAL" && -n "$PEER" ]] || { fail 'could not read the device and addresses from the output'; exit 1; }
+
+          MTU="$(sed -nE 's/.*\(mtu ([0-9]+),.*/\1/p' <<<"$line")"
+          cfg="$(ifconfig "$DEV" 2>&1)"
+          if [[ -n "$MTU" ]] && grep -q "inet $LOCAL --> $PEER" <<<"$cfg" && grep -q "mtu $MTU" <<<"$cfg"; then ok "$DEV is $LOCAL --> $PEER, mtu $MTU"; else fail "$DEV is not configured as reported"; fi
+          sed 's/^/         /' <<<"$cfg" | cut -c1-200
+          HOSTDEV="$(ifconfig | awk -v a="inet $PEER" '/^utun[0-9]+:/ {d=$1; sub(":", "", d)} index($0, a " -->") {print d}' | head -n 1)"
+          if [[ -n "$HOSTDEV" && "$HOSTDEV" != "$DEV" ]]; then ok "the host's end is $HOSTDEV ($PEER)"; else fail "no second utun interface with the host's address $PEER"; fi
+          via="$(route -n get "$PEER" 2>/dev/null | awk '$1 == "interface:" {print $2}')"
+          if [[ "$via" == "$DEV" ]]; then ok "the host's tunnel address is routed through $DEV"; else fail "the host's tunnel address is routed through '$via', not $DEV"; fi
+
+          list="$(client_rds vpn 2>&1)"
+          if grep -q "$DEV $LOCAL -> $PEER" <<<"$list"; then ok 'rds vpn lists the tunnel'; else fail 'rds vpn does not list the tunnel'; head -n 5 <<<"$list" | cut -c1-200; fi
+          out="$(client_rds "$TARGET" vpn up 2>&1)"; code=$?
+          if [[ "$code" -ne 0 ]] && grep -q 'already up' <<<"$out"; then ok 'a second vpn up to the same host is refused'; else fail "second vpn up: exit $code"; head -n 3 <<<"$out" | cut -c1-300; fi
+
+          count() { netstat -I "$1" -n -b 2>/dev/null | awk 'NR == 2 && NF >= 7 {print $(NF-6) " packets in, " $(NF-3) " packets out"}'; }
+          if ping -c 4 -t 15 "$PEER" > "$W/ping.txt" 2>&1; then
+            ok "ping $PEER through the tunnel: $(tail -n 2 "$W/ping.txt" | head -n 1)"
+          else
+            fail "ping $PEER through the tunnel"; tail -n 4 "$W/ping.txt" | cut -c1-200
+            netstat -rn -f inet | grep -E 'Destination|utun' | head -n 20
+          fi
+          info "$DEV (client): $(count "$DEV")"
+          [[ -z "$HOSTDEV" ]] || info "$HOSTDEV (host): $(count "$HOSTDEV")"
+          # A TCP connection through the tunnel, to the host's own tunnel address.
+          ( printf 'through-the-tunnel\n' | nc -l "$PEER" 18077 > /dev/null 2>&1 & ) ; sleep 1
+          if got="$(nc -w 5 "$PEER" 18077 < /dev/null 2>/dev/null)" && [[ "$got" == 'through-the-tunnel' ]]; then ok 'TCP through the tunnel'; else info "TCP through the tunnel: no answer (got '${got:-}')"; fi
+          pkill -f "nc -l $PEER 18077" >/dev/null 2>&1 || true
+
+          out="$(client_rds "$TARGET" vpn down 2>&1)"; code=$?
+          if [[ "$code" -eq 0 ]] && grep -q 'stopped the tunnel' <<<"$out"; then ok 'vpn down'; else fail "vpn down: exit $code"; head -n 3 <<<"$out" | cut -c1-300; fi
+          gone=
+          for _ in $(seq 1 25); do
+            if ! ifconfig "$DEV" >/dev/null 2>&1 && { [[ -z "$HOSTDEV" ]] || ! ifconfig "$HOSTDEV" >/dev/null 2>&1; }; then gone=1; break; fi
+            sleep 0.2
+          done
+          if [[ -n "$gone" ]]; then ok 'both utun interfaces are gone after vpn down'; else fail 'a tunnel interface is still there after vpn down'; ifconfig | grep -A2 '^utun' | cut -c1-200 | tail -n 12; fi
+          if ifconfig | grep -q 'inet 10\.77\.'; then fail 'a 10.77.x.y address is left on this machine'; else ok 'no tunnel address left'; fi
+          if netstat -rn -f inet | grep -q '^10\.77\.'; then fail 'a route to the tunnel network is left'; else ok 'no tunnel route left'; fi
+          utuns_after="$(ifconfig -l | tr ' ' '\n' | grep -c '^utun' || true)"
+          [[ "$utuns_after" == "$utuns_before" ]] && ok "utun interfaces: $utuns_after, as before" || fail "utun interfaces: $utuns_before before, $utuns_after after"
+          if sudo test -d "$W/cli/vpn" && [[ -n "$(sudo ls -A "$W/cli/vpn" 2>/dev/null)" ]]; then fail 'the client left state files'; else ok 'no state files left'; fi
+          stats="$(sudo grep 'vpn: tunnel down' "$W/host.log" | tail -n 1 | grep -oE '(sent|received|refused)=[0-9]+' | tr '\n' ' ')"
+          info "host's count for the tunnel: ${stats:-not logged}"
+
+          # What a macOS host cannot do, said up front.
+          out="$(client_rds "$TARGET" vpn up --route 198.51.100.0/24 2>&1)"; code=$?
+          if [[ "$code" -ne 0 ]] && grep -q 'macOS host cannot forward' <<<"$out"; then ok 'vpn up --route against a macOS host is refused with the reason'; else fail "vpn up --route against a macOS host: exit $code"; head -n 3 <<<"$out" | cut -c1-300; fi
+          client_rds stop --all >/dev/null 2>&1 || true
+          if ifconfig | grep -q 'inet 10\.77\.'; then fail 'the refused tunnel left an address behind'; else ok 'the refused tunnel left nothing behind'; fi
+
+          if [[ "$FAILED" -eq 0 ]]; then
+            echo '- `rds host` + `rds <addr> vpn up` on one Mac (ping through two utun interfaces, list, down, clean-up): PASS' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '- `rds host` + `rds <addr> vpn up` on one Mac: **FAIL**' >> "$GITHUB_STEP_SUMMARY"
+            echo '--- host log (tail) ---'; sudo tail -n 12 "$W/host.log" | cut -c1-300
+          fi
+          exit "$FAILED"
+
+  desktop:
+    name: Remote desktop (AVFoundation, VideoToolbox)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Validate request and credentials
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/sodesk-e2e-macos.env
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == 'push' ]]; then
+            # Download only the request file of this exact commit (public repo, no credentials).
+            REQ="$RUNNER_TEMP/sodesk-e2e-macos-request.env"
+            curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/sodesk-e2e-macos.env at this commit.'; exit 64; }
+            # Plain text, read line by line; never sourced or executed.
+            SOURCE_REF="$(sed -n 's/^REF=//p' "$REQ" | head -n 1 | tr -d '\r')"
+          else
+            SOURCE_REF="$INPUT_REF"
+          fi
+          [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && ${#SOURCE_REF} -le 200 ]] || {
+            echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only, no leading dash).'
+            exit 64
+          }
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || {
+            echo '::error::Missing public CI credential: TARGET_REPO_PAT (it must have read access to readori/SoDesk).'
+            exit 78
+          }
+          echo "SOURCE_REF=$SOURCE_REF" >> "$GITHUB_ENV"
+          echo "Source ref: $SOURCE_REF"
+
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/SoDesk
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: source/go.mod
+          cache: false
+
+      - name: Install ffmpeg (Homebrew)
+        run: |
+          set -euo pipefail
+          command -v ffmpeg >/dev/null || brew install --quiet ffmpeg > "$RUNNER_TEMP/brew-ffmpeg.log" 2>&1 || { tail -n 20 "$RUNNER_TEMP/brew-ffmpeg.log" | cut -c1-300; echo '::error::brew install ffmpeg failed.'; exit 1; }
+          ffmpeg -hide_banner -version | head -n 1
+          echo "encoders of interest: $(ffmpeg -hide_banner -encoders 2>/dev/null | awk '$2 ~ /^(h264_videotoolbox|libx264|libopenh264|libsvtav1|libaom-av1)$/ {print $2}' | tr '\n' ' ')"
+
+      - name: Toolchain and machine
+        working-directory: source
+        run: |
+          set -uo pipefail
+          go version
+          echo "commit: $(git rev-parse --short HEAD)"
+          echo "macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion)) on $(uname -m); SIP: $(csrutil status 2>&1 | head -n 1)"
+          echo "swiftc: $(swiftc --version 2>&1 | head -n 1)"
+          system_profiler SPDisplaysDataType 2>/dev/null | grep -E 'Chipset Model|Type:|Resolution|UI Looks like|Main Display|Online|Virtual' | sed 's/^ */  display: /' | head -n 12
+          { echo '### SoDesk E2E macOS · remote desktop'; echo; echo "- Source: \`readori/SoDesk@$(git rev-parse --short HEAD)\` (ref \`$SOURCE_REF\`)"; echo "- macOS $(sw_vers -productVersion), $(uname -m), $(go version | cut -d' ' -f3), $(ffmpeg -hide_banner -version | head -n 1 | cut -d' ' -f1-3)"; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build rds and the desktop test binary
+        working-directory: source
+        run: |
+          set -euo pipefail
+          [[ -f internal/svc/desktop/desktop_darwin_test.go ]] || { echo '::error::no macOS desktop test on this ref (internal/svc/desktop/desktop_darwin_test.go).'; exit 66; }
+          mkdir -p "$RUNNER_TEMP/e2e"
+          go vet ./internal/svc/desktop/
+          go build -trimpath -o "$RUNNER_TEMP/e2e/rds" ./cmd/rds
+          go test -c -o "$RUNNER_TEMP/e2e/desktop.test" ./internal/svc/desktop
+          "$RUNNER_TEMP/e2e/rds" version
+          echo "RDS_BIN=$RUNNER_TEMP/e2e/rds" >> "$GITHUB_ENV"
+
+      # macOS gives Screen Recording and Accessibility per program, through the TCC database.
+      # The runner image already grants both to the shell the runner starts, and a command run
+      # from it is normally covered by that. On top, the programs under test are granted by
+      # path, by copying an existing granted row (so the columns fit whatever this macOS
+      # version uses). The database can be edited because these images have SIP off; if it
+      # cannot, the tests still run and report which permission is missing.
+      - name: Grant Screen Recording and Accessibility (TCC)
+        run: |
+          set -uo pipefail
+          FFMPEG="$(command -v ffmpeg)"
+          FFREAL="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$FFMPEG")"
+          CLIENTS=("$RUNNER_TEMP/e2e/desktop.test" "$RUNNER_TEMP/e2e/rds" "$FFMPEG" "$FFREAL")
+          for DB in "/Library/Application Support/com.apple.TCC/TCC.db" "$HOME/Library/Application Support/com.apple.TCC/TCC.db"; do
+            scope=system; [[ "$DB" == "$HOME"* ]] && scope=user
+            sudo test -f "$DB" || { echo "$scope TCC database: not present"; continue; }
+            for SERVICE in kTCCServiceScreenCapture kTCCServiceAccessibility kTCCServicePostEvent; do
+              for CLIENT in "${CLIENTS[@]}"; do
+                [[ "$CLIENT" =~ ^[A-Za-z0-9._/@+-]+$ ]] || { echo "skipping a path with unusual characters"; continue; }
+                sudo sqlite3 "$DB" "
+                  CREATE TEMP TABLE t AS SELECT * FROM access WHERE auth_value = 2 ORDER BY (service = '$SERVICE') DESC, (client_type = 1) DESC LIMIT 1;
+                  UPDATE t SET service = '$SERVICE', client = '$CLIENT', client_type = 1, auth_value = 2, csreq = NULL,
+                    indirect_object_identifier_type = 0, indirect_object_identifier = 'UNUSED', indirect_object_code_identity = NULL;
+                  INSERT OR REPLACE INTO access SELECT * FROM t;
+                " 2> "$RUNNER_TEMP/tcc.err" || { echo "$scope TCC database: cannot add $SERVICE ($(head -n 1 "$RUNNER_TEMP/tcc.err" | cut -c1-120))"; break 2; }
+              done
+            done
+            echo "$scope TCC database, granted clients:"
+            sudo sqlite3 "$DB" "SELECT service || ' ' || client FROM access WHERE auth_value = 2 AND service IN ('kTCCServiceScreenCapture','kTCCServiceAccessibility','kTCCServicePostEvent') ORDER BY 1;" 2>/dev/null \
+              | sed -e "s#$RUNNER_TEMP#\$RUNNER_TEMP#g" -e 's/^/  /' | cut -c1-160 | head -n 40
+          done
+          exit 0
+
+      - name: Capture, encode, decode, input (TestMac*)
+        run: |
+          set -o pipefail
+          LOG="$RUNNER_TEMP/e2e/desktop-test.log"
+          SODESK_DESKTOP_E2E=1 "$RUNNER_TEMP/e2e/desktop.test" -test.v -test.count=1 -test.timeout=20m -test.run '^TestMac(CaptureDevices|Encoders|DesktopE2E)$' > "$LOG" 2>&1
+          st=$?
+          cut -c1-2000 "$LOG" | tail -n 250
+          {
+            echo '- `TestMac*`:'
+            grep -E '^\s*(--- |ok|FAIL|PASS)' "$LOG" | cut -c1-200 | sed 's/^ */    - /'
+            echo '- Findings:'
+            grep -E 'RESULT ' "$LOG" | sed -E 's/^.*RESULT /    - /' | cut -c1-400
+          } >> "$GITHUB_STEP_SUMMARY"
+          # A skip is not a pass here.
+          for t in TestMacCaptureDevices TestMacEncoders TestMacDesktopE2E; do
+            grep -q -- "--- PASS: $t " "$LOG" || { echo "::error::$t did not pass."; st=1; }
+          done
+          exit "$st"
+
+      # The user-facing command against a real host process: `rds <addr> desktop` asks the host
+      # what it can capture and encode before it serves the viewer. Its output holds the viewer
+      # URL (with an access token), so only chosen fields are printed.
+      - name: rds host + rds desktop --json on this Mac
+        if: always() && env.RDS_BIN != ''
+        run: |
+          set -uo pipefail
+          W="$RUNNER_TEMP/desktop-cli"; rm -rf "$W"; mkdir -p "$W/host" "$W/cli"
+          PORT=$((20000 + RANDOM % 10000)); TARGET="127.0.0.1:$PORT"
+          PW="$(openssl rand -hex 16)"
+          echo "::add-mask::$PW"
+          RDS_CONFIG_DIR="$W/host" "$RDS_BIN" host --no-signal --listen "$TARGET" --password "$PW" > "$W/host.log" 2>&1 < /dev/null &
+          HOST_PID=$!
+          CLI_PID=
+          cleanup() { [[ -z "$CLI_PID" ]] || kill "$CLI_PID" 2>/dev/null; kill "$HOST_PID" 2>/dev/null; sleep 0.5; rm -rf "$W"; }
+          trap cleanup EXIT
+          for _ in $(seq 1 100); do grep -q 'host ready' "$W/host.log" 2>/dev/null && break; sleep 0.2; done
+          grep -q 'host ready' "$W/host.log" || { echo '::error::rds host did not start.'; tail -n 5 "$W/host.log" | cut -c1-300; exit 1; }
+          RDS_CONFIG_DIR="$W/cli" RDS_PASSWORD="$PW" "$RDS_BIN" "$TARGET" desktop --no-open --json > "$W/desktop.json" 2> "$W/desktop.err" < /dev/null &
+          CLI_PID=$!
+          for _ in $(seq 1 300); do
+            grep -q '^}' "$W/desktop.json" 2>/dev/null && break
+            kill -0 "$CLI_PID" 2>/dev/null || break
+            sleep 0.2
+          done
+          if ! grep -q '^}' "$W/desktop.json" 2>/dev/null; then
+            echo '::error::rds desktop --json printed no result.'
+            sed -E 's#https?://[^ ]+#<url>#g' "$W/desktop.err" | tail -n 5 | cut -c1-400
+            echo '- `rds <addr> desktop --json` against `rds host`: **FAIL**' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          python3 - "$W/desktop.json" <<'PY'
+          import json, os, sys
+          d = json.load(open(sys.argv[1]))
+          url = d.pop("url", "")
+          enc = d.get("encoders") or {}
+          lines = [
+              "viewer URL: %s" % ("served on 127.0.0.1 (not printed)" if url.startswith("http://127.0.0.1:") else "MISSING"),
+              "host OS: %s, screen %sx%s, monitors listed: %d" % (d.get("os"), d.get("screen_width"), d.get("screen_height"), len(d.get("displays") or [])),
+              "encoders: %s" % ", ".join("%s=%s" % kv for kv in sorted(enc.items())),
+              "input: %s %s" % (d.get("input"), (d.get("input_error") or "")[:160]),
+              "warning: %s" % ((d.get("warning") or "none")[:300]),
+              "unsupported controls: %s" % ", ".join(sorted((d.get("unsupported") or {}).keys())),
+          ]
+          print("\n".join("   " + l for l in lines))
+          problems = []
+          if not url.startswith("http://127.0.0.1:"):
+              problems.append("no viewer URL")
+          if d.get("os") != "darwin":
+              problems.append("host OS is %r" % d.get("os"))
+          if not enc.get("h264"):
+              problems.append("no H.264 encoder")
+          if not d.get("screen_width") or not d.get("screen_height"):
+              problems.append("screen size unknown")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("- `rds <addr> desktop --json` against `rds host`: %s\n" % ("PASS" if not problems else "**FAIL** (" + "; ".join(problems) + ")"))
+              for l in lines[1:]:
+                  f.write("    - %s\n" % l)
+          if problems:
+              print("::error::" + "; ".join(problems))
+              sys.exit(1)
+          PY

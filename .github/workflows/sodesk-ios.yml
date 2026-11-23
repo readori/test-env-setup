@@ -6,6 +6,10 @@
 #            -target=ios,iossimulator of mobile/sodeskcore -> mobile/ios/build/Sodeskcore.xcframework)
 #            -> simulator build of mobile/ios/SoDesk.xcodeproj with no signing -> xcodebuild test of
 #            SoDeskTests on an iOS simulator. Also runs the Go tests of internal/mobile on macOS.
+#            Then the end-to-end test: an `rds host` is started on the runner (loopback only, a
+#            random one-run password) and SoDeskTests/GatewayE2ETests runs inside the app on the
+#            simulator: connect form -> connect to the host by address and password -> a command
+#            in the terminal -> the Files tab lists a host directory.
 #
 # No Apple credentials are used: no signing, no Match, no App Store Connect. Nothing is uploaded.
 # TestFlight (Match, the shared Distribution identity) is added later by the maintainer, in the
@@ -19,7 +23,9 @@
 #
 # Safety rules (public repo, public logs): third-party actions pinned to commit SHAs;
 # TARGET_REPO_PAT is used only by the checkout step and not persisted; xcodebuild always -quiet;
-# private source files are never printed beyond compiler errors.
+# private source files are never printed beyond compiler errors. The end-to-end step prints
+# results and failure tails only: never the host password (masked) or a gateway URL (its token
+# is redacted from anything printed).
 name: SoDesk iOS
 
 run-name: SoDesk iOS · ${{ github.event_name == 'push' && 'request (ci-requests/sodesk-ios.env)' || format('{0} · {1}', inputs.mode, inputs.ref) }}
@@ -28,7 +34,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'verify = simulator build + unit tests, no signing (TestFlight comes later)'
+        description: 'verify = simulator build + unit tests + app-to-host end-to-end test, no signing (TestFlight comes later)'
         required: true
         default: 'verify'
         type: choice
@@ -61,7 +67,7 @@ jobs:
   ios:
     name: Build SoDesk iOS
     runs-on: macos-26
-    timeout-minutes: 60
+    timeout-minutes: 75
     defaults:
       run:
         shell: bash
@@ -215,6 +221,7 @@ jobs:
           ')"
           [[ -n "$UDID" ]] || { echo '::error::No iPhone simulator available.'; xcrun simctl list runtimes | head -20; exit 69; }
           echo "Simulator: $UDID"
+          echo "SIM_UDID=$UDID" >> "$GITHUB_ENV"
           RES="$RUNNER_TEMP/SoDeskTests.xcresult"
           set +e
           xcodebuild test -quiet \
@@ -227,6 +234,94 @@ jobs:
           grep -E "Executed [0-9]+ tests?|error:|failed|XCTAssert" "$RUNNER_TEMP/xctest.log" | cut -c1-400 | tail -n 40 || true
           [[ "$st" -eq 0 ]] || { echo '::error::xcodebuild test failed.'; exit 1; }
           echo '- Unit tests (SoDeskTests) on the iOS simulator: PASS' >> "$GITHUB_STEP_SUMMARY"
+
+      # The app on the simulator against a real host: the simulator shares the Mac's network, so
+      # 127.0.0.1 is the runner. The host listens on loopback only, with a password made for this
+      # run; the test gets address, password and directory through TEST_RUNNER_* variables (and a
+      # private file as a fallback), never through the log.
+      - name: End-to-end on the simulator (app to rds host on this Mac)
+        if: steps.layout.outputs.ready == 'true'
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        run: |
+          set -uo pipefail
+          if [[ ! -f mobile/ios/SoDeskTests/GatewayE2ETests.swift ]]; then
+            echo '::notice::no GatewayE2ETests on this ref; skipped.'
+            echo '- End-to-end (app to host): skipped, not on this ref' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          redact() { sed -E 's#(127\.0\.0\.1:[0-9]+/)[A-Za-z0-9_-]{16,}#\1<token>#g' | cut -c1-400; }
+          W="$RUNNER_TEMP/sodesk-ios-e2e"
+          rm -rf "$W"; mkdir -p "$W/host" "$W/cli" "$W/files"
+          CGO_ENABLED=0 go build -trimpath -o "$W/rds" ./cmd/rds || { echo '::error::building rds for the host failed.'; exit 1; }
+          printf 'hello from the host\n' > "$W/files/hello.txt"
+          PORT=$((20000 + RANDOM % 10000)); TARGET="127.0.0.1:$PORT"
+          PW="$(openssl rand -hex 16)"
+          echo "::add-mask::$PW"
+          RDS_CONFIG_DIR="$W/host" "$W/rds" host --no-signal --listen "$TARGET" --password "$PW" > "$W/host.log" 2>&1 < /dev/null &
+          HOST_PID=$!
+          CFG=/tmp/sodesk-ios-e2e.json
+          cleanup() { kill "$HOST_PID" 2>/dev/null || true; rm -f "$CFG"; }
+          trap cleanup EXIT
+          for _ in $(seq 1 100); do grep -q 'host ready' "$W/host.log" 2>/dev/null && break; sleep 0.2; done
+          grep -q 'host ready' "$W/host.log" || { echo '::error::rds host did not start.'; tail -n 5 "$W/host.log" | redact; exit 1; }
+          if RDS_CONFIG_DIR="$W/cli" RDS_PASSWORD="$PW" "$W/rds" "$TARGET" ping -c 1 > "$W/ping.log" 2>&1; then
+            echo "host: rds host on $TARGET answers a client on this Mac"
+          else
+            echo '::error::the host does not answer a client on this Mac.'; tail -n 5 "$W/ping.log" | redact; exit 1
+          fi
+          ( umask 077; E2E_TARGET="$TARGET" E2E_PASSWORD="$PW" E2E_DIR="$W/files" python3 -c '
+          import json, os
+          print(json.dumps({"target": os.environ["E2E_TARGET"], "password": os.environ["E2E_PASSWORD"], "dir": os.environ["E2E_DIR"]}))
+          ' > "$CFG" )
+          RES="$RUNNER_TEMP/SoDeskE2E.xcresult"; rm -rf "$RES"
+          LOG="$RUNNER_TEMP/xce2e.log"
+          TEST_RUNNER_SODESK_E2E_TARGET="$TARGET" TEST_RUNNER_SODESK_E2E_PASSWORD="$PW" TEST_RUNNER_SODESK_E2E_DIR="$W/files" \
+          xcodebuild test -quiet \
+            -project mobile/ios/SoDesk.xcodeproj -scheme SoDesk -configuration Debug \
+            -destination "platform=iOS Simulator,id=$SIM_UDID" \
+            -only-testing:SoDeskTests/GatewayE2ETests \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData-sodesk-test" -resultBundlePath "$RES" \
+            CODE_SIGNING_ALLOWED=NO > "$LOG" 2>&1
+          st=$?
+          # What happened to the one test: Passed, Failed or Skipped (a skip is not a pass).
+          OUTCOME="$(xcrun xcresulttool get test-results tests --path "$RES" 2>/dev/null | python3 -c '
+          import json, sys
+          def walk(n):
+              if n.get("nodeType") == "Test Case" and "testConnectTerminalFiles" in n.get("name", ""):
+                  return n.get("result") or "unknown"
+              for c in n.get("children", []):
+                  r = walk(c)
+                  if r:
+                      return r
+              return None
+          try:
+              d = json.load(sys.stdin)
+          except Exception:
+              d = {}
+          r = None
+          for n in d.get("testNodes", []):
+              r = walk(n)
+              if r:
+                  break
+          print(r or "unknown")
+          ' || true)"
+          if [[ "$OUTCOME" == 'unknown' || -z "$OUTCOME" ]]; then
+            if grep -Eq "testConnectTerminalFiles\]' passed" "$LOG"; then OUTCOME=Passed
+            elif grep -Eq "testConnectTerminalFiles\]' skipped|with 1 test skipped" "$LOG"; then OUTCOME=Skipped
+            elif grep -Eq "Executed 1 test, with 0 failures" "$LOG"; then OUTCOME=Passed
+            fi
+          fi
+          echo "GatewayE2ETests.testConnectTerminalFiles: ${OUTCOME:-unknown} (xcodebuild exit $st)"
+          if [[ "$st" -ne 0 || "$OUTCOME" != 'Passed' ]]; then
+            grep -E "error:|failed|XCTAssert|caught error|timed out|Executed [0-9]+ tests?" "$LOG" | redact | tail -n 40 || true
+            echo '--- host log (warnings and errors) ---'
+            grep -Ei 'warn|error|refus|denied|fail' "$W/host.log" | redact | tail -n 15 || true
+            echo '::error::the end-to-end test on the simulator did not pass.'
+            echo "- End-to-end (app on the simulator to rds host on the Mac): **${OUTCOME:-unknown}**" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          grep -E "Executed [0-9]+ tests?" "$LOG" | tail -n 1 | cut -c1-200 || true
+          echo '- End-to-end (app on the simulator to rds host on the Mac: connect, terminal command, Files listing): PASS' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Summary
         if: success() && steps.layout.outputs.ready == 'true'
