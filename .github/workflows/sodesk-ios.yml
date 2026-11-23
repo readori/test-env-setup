@@ -1,0 +1,237 @@
+# SoDesk iOS app CI (controller app: SwiftUI shell + WKWebView on an in-process Go gateway).
+#
+# Public CI repository -> source readori/SoDesk. Copy this file to .github/workflows/ in the CI repo.
+#
+#   verify : Xcode 26.x + Go from go.mod -> mobile/ios/build-xcframework.sh (gomobile bind
+#            -target=ios,iossimulator of mobile/sodeskcore -> mobile/ios/build/Sodeskcore.xcframework)
+#            -> simulator build of mobile/ios/SoDesk.xcodeproj with no signing -> xcodebuild test of
+#            SoDeskTests on an iOS simulator. Also runs the Go tests of internal/mobile on macOS.
+#
+# No Apple credentials are used: no signing, no Match, no App Store Connect. Nothing is uploaded.
+# TestFlight (Match, the shared Distribution identity) is added later by the maintainer, in the
+# style of the other *-ios.yml workflows.
+#
+# Triggers: workflow_dispatch, or a push to main that changes ci-requests/sodesk-ios.env (how
+# the project's AI engineer requests a run). Never pull_request. The request file is plain
+# KEY=VALUE text, parsed with strict patterns and never executed:
+#
+#   REF=main          # readori/SoDesk branch, tag or SHA
+#
+# Safety rules (public repo, public logs): third-party actions pinned to commit SHAs;
+# TARGET_REPO_PAT is used only by the checkout step and not persisted; xcodebuild always -quiet;
+# private source files are never printed beyond compiler errors.
+name: SoDesk iOS
+
+run-name: SoDesk iOS · ${{ github.event_name == 'push' && 'request (ci-requests/sodesk-ios.env)' || format('{0} · {1}', inputs.mode, inputs.ref) }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'verify = simulator build + unit tests, no signing (TestFlight comes later)'
+        required: true
+        default: 'verify'
+        type: choice
+        options: [verify]
+      ref:
+        description: 'readori/SoDesk branch, tag, or SHA'
+        required: true
+        default: 'main'
+        type: string
+  push:
+    branches: [main]
+    paths: ['ci-requests/sodesk-ios.env']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sodesk-ios-${{ inputs.ref || 'request' }}
+  cancel-in-progress: true
+
+env:
+  PRIVATE_SOURCE_REPOSITORY: readori/SoDesk
+  PRIVATE_SOURCE_PATH: source
+  EXPECTED_BUNDLE_ID: com.readori.sodesk
+  XCODE_MAJOR_WANTED: '26'
+  CI: '1'
+  LANG: en_US.UTF-8
+
+jobs:
+  ios:
+    name: Build SoDesk iOS
+    runs-on: macos-26
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Validate request and credentials
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_MODE: ${{ inputs.mode }}
+          REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/sodesk-ios.env
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == 'push' ]]; then
+            # Download only the request file of this exact commit (public repo, no credentials).
+            REQ="$RUNNER_TEMP/sodesk-ios-request.env"
+            curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/sodesk-ios.env at this commit.'; exit 64; }
+            # Plain text, read line by line; never sourced or executed.
+            SOURCE_REF="$(sed -n 's/^REF=//p' "$REQ" | head -n 1 | tr -d '\r')"
+            MODE=verify
+          else
+            SOURCE_REF="$INPUT_REF"
+            MODE="$INPUT_MODE"
+          fi
+          [[ "$MODE" == 'verify' ]] || { echo "::error::Unsupported mode: $MODE"; exit 64; }
+          [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && ${#SOURCE_REF} -le 200 ]] || {
+            echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only, no leading dash).'
+            exit 64
+          }
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || { echo '::error::Missing secret TARGET_REPO_PAT (read access to readori/SoDesk).'; exit 78; }
+          echo "SOURCE_REF=$SOURCE_REF" >> "$GITHUB_ENV"
+          echo "Trigger: $EVENT_NAME · mode: $MODE · ref: $SOURCE_REF"
+
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/SoDesk
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Verify source layout
+        id: layout
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        run: |
+          set -euo pipefail
+          C="$(git rev-parse HEAD)"
+          echo "SOURCE_SHORT_SHA=${C:0:8}" >> "$GITHUB_ENV"
+          { echo '### SoDesk iOS · verify'; echo; echo "- Source: \`$PRIVATE_SOURCE_REPOSITORY@${C:0:8}\` (ref \`$SOURCE_REF\`)"; } >> "$GITHUB_STEP_SUMMARY"
+          if [[ ! -f mobile/ios/SoDesk.xcodeproj/project.pbxproj ]]; then
+            echo '::notice::mobile/ios is not on this ref: nothing to verify.'
+            echo '- Result: skipped, no iOS app at this ref' >> "$GITHUB_STEP_SUMMARY"
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          for f in go.mod mobile/go.mod mobile/sodeskcore/sodeskcore.go mobile/shared/sodesk-mobile.js mobile/ios/build-xcframework.sh \
+                   mobile/ios/SoDesk.xcodeproj/xcshareddata/xcschemes/SoDesk.xcscheme; do
+            [[ -f "$f" ]] || { echo "::error::$f is missing."; exit 66; }
+          done
+          grep -q "PRODUCT_BUNDLE_IDENTIFIER = $EXPECTED_BUNDLE_ID;" mobile/ios/SoDesk.xcodeproj/project.pbxproj || { echo "::error::bundle ID must be $EXPECTED_BUNDLE_ID"; exit 65; }
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+          echo "Source ${C:0:8} · layout: PASS"
+
+      - name: Select Xcode 26.x
+        if: steps.layout.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          XCODE_APP=''; BEST=''
+          for app in /Applications/Xcode*.app; do
+            [[ -d "$app/Contents/Developer" ]] || continue
+            case "$app" in *[Bb]eta*) continue ;; esac
+            v="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || true)"
+            [[ "${v%%.*}" == "$XCODE_MAJOR_WANTED" ]] || continue
+            if [[ -z "$BEST" ]] || [[ "$(printf '%s\n%s\n' "$BEST" "$v" | sort -V | tail -1)" == "$v" ]]; then BEST="$v"; XCODE_APP="$app"; fi
+          done
+          [[ -n "$XCODE_APP" ]] || { echo "::error::No Xcode ${XCODE_MAJOR_WANTED}.x on this runner."; ls -1 /Applications | grep '^Xcode' || true; exit 69; }
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          xcodebuild -version
+
+      - name: Set up Go (version from go.mod)
+        if: steps.layout.outputs.ready == 'true'
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: ${{ env.PRIVATE_SOURCE_PATH }}/go.mod
+          cache: false
+
+      - name: Go tests of the mobile core (macOS)
+        if: steps.layout.outputs.ready == 'true'
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        run: |
+          set -o pipefail
+          go version
+          go test -count=1 ./internal/mobile 2>&1 | cut -c1-2000 | tail -n 100
+          (cd mobile && go test -count=1 ./... 2>&1 | cut -c1-2000 | tail -n 50)
+
+      - name: gomobile bind (Sodeskcore.xcframework)
+        if: steps.layout.outputs.ready == 'true'
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/gomobile.log"
+          bash mobile/ios/build-xcframework.sh > "$LOG" 2>&1 || { grep -iE 'error|undefined|cannot' "$LOG" | cut -c1-400 | head -n 40; echo '::error::gomobile bind failed.'; exit 1; }
+          XCF=mobile/ios/build/Sodeskcore.xcframework
+          [[ -f "$XCF/Info.plist" ]] || { echo '::error::XCFramework was not produced.'; exit 65; }
+          echo "XCFramework: $(du -sh "$XCF" | cut -f1) · slices: $(ls "$XCF" | grep -v Info.plist | tr '\n' ' ')"
+
+      - name: Build for iOS Simulator (no signing)
+        if: steps.layout.outputs.ready == 'true'
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        run: |
+          set -euo pipefail
+          DD="$RUNNER_TEMP/DerivedData-sodesk"
+          xcodebuild build -quiet \
+            -project mobile/ios/SoDesk.xcodeproj -scheme SoDesk -configuration Debug \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$DD" CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            CODE_SIGNING_ALLOWED=NO
+          APP="$(find "$DD/Build/Products" -maxdepth 2 -type d -name 'SoDesk.app' -print -quit)"
+          [[ -n "$APP" ]] || { echo '::error::Simulator .app was not produced.'; exit 65; }
+          BID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
+          [[ "$BID" == "$EXPECTED_BUNDLE_ID" ]] || { echo "::error::Bundle ID mismatch: $BID"; exit 65; }
+          test -f "$APP/sodesk-mobile.js" || { echo '::error::App bundle has no sodesk-mobile.js (injected script not embedded).'; exit 65; }
+          /usr/libexec/PlistBuddy -c 'Print :NSAppTransportSecurity:NSAllowsLocalNetworking' "$APP/Info.plist" | grep -q true || { echo '::error::ATS local networking exception missing.'; exit 65; }
+          SIZE="$(du -sh "$APP" | cut -f1)"
+          echo "Simulator build OK: SoDesk.app · $SIZE"
+          echo "- Simulator build ($BID): $SIZE" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Unit tests on an iOS simulator
+        if: steps.layout.outputs.ready == 'true'
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        run: |
+          set -euo pipefail
+          # The newest available iPhone simulator on this runner.
+          UDID="$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)["devices"]
+          best = None
+          for rt, devs in d.items():
+              if "iOS" not in rt:
+                  continue
+              ver = tuple(int(x) for x in rt.rsplit("iOS-", 1)[-1].split("-") if x.isdigit())
+              for dev in devs:
+                  if dev.get("isAvailable") and dev["name"].startswith("iPhone"):
+                      if best is None or ver > best[0]:
+                          best = (ver, dev["udid"], dev["name"])
+          print(best[1] if best else "")
+          ')"
+          [[ -n "$UDID" ]] || { echo '::error::No iPhone simulator available.'; xcrun simctl list runtimes | head -20; exit 69; }
+          echo "Simulator: $UDID"
+          RES="$RUNNER_TEMP/SoDeskTests.xcresult"
+          set +e
+          xcodebuild test -quiet \
+            -project mobile/ios/SoDesk.xcodeproj -scheme SoDesk -configuration Debug \
+            -destination "platform=iOS Simulator,id=$UDID" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData-sodesk-test" -resultBundlePath "$RES" \
+            CODE_SIGNING_ALLOWED=NO > "$RUNNER_TEMP/xctest.log" 2>&1
+          st=$?
+          set -e
+          grep -E "Executed [0-9]+ tests?|error:|failed|XCTAssert" "$RUNNER_TEMP/xctest.log" | cut -c1-400 | tail -n 40 || true
+          [[ "$st" -eq 0 ]] || { echo '::error::xcodebuild test failed.'; exit 1; }
+          echo '- Unit tests (SoDeskTests) on the iOS simulator: PASS' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summary
+        if: success() && steps.layout.outputs.ready == 'true'
+        run: |
+          {
+            echo "- Xcode: \`$(xcodebuild -version | head -1)\` · Go: \`$(go version | cut -d' ' -f3)\`"
+            echo '- No signing; nothing uploaded.'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,270 @@
+# SoDesk Android app CI (controller app: native shell + WebView on an in-process Go gateway).
+#
+# Public CI repository -> source readori/SoDesk. Copy this file to .github/workflows/ in the CI repo.
+#
+#   verify : JDK 17 + Android SDK (platform 35, build-tools 35.0.0, NDK r28c) + Go from go.mod ->
+#            mobile/android/build.sh (gomobile bind of mobile/sodeskcore -> app/libs/sodeskcore.aar,
+#            then Gradle): assembleDebug, JVM unit tests, lint, the instrumented test APK; then
+#            (optional, on by default) the instrumented smoke test on an x86_64 emulator using
+#            the runner's KVM. Also runs the Go tests of internal/mobile and mobile/sodeskcore.
+#
+# No signing, no Play credentials, no keystore. Nothing is uploaded: no artifacts. The APK stays
+# on the runner. Release signing is added later by the maintainer, reusing existing secrets.
+#
+# Triggers: workflow_dispatch, or a push to main that changes ci-requests/sodesk-android.env
+# (how the project's AI engineer requests a run). Only people with push access to this repo can
+# trigger; never pull_request. The request file is plain KEY=VALUE text, parsed with strict
+# patterns and never executed:
+#
+#   REF=main          # readori/SoDesk branch, tag or SHA
+#   EMULATOR=true     # optional; true (default) or false
+#
+# Safety rules (public repo, public logs): no pull_request triggers; third-party actions pinned
+# to commit SHAs; TARGET_REPO_PAT is used only by the checkout step and not persisted; build and
+# test output is limited to results and the tail of failures; private files are never printed.
+name: SoDesk Android
+
+run-name: SoDesk Android · ${{ github.event_name == 'push' && 'request (ci-requests/sodesk-android.env)' || format('verify{0} · {1}', inputs.emulator && ' + emulator' || '', inputs.ref) }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'verify = debug build, unit tests, lint (+ emulator smoke test). Signed builds come later.'
+        required: true
+        default: 'verify'
+        type: choice
+        options: [verify]
+      ref:
+        description: 'readori/SoDesk branch, tag, or SHA'
+        required: true
+        default: 'main'
+        type: string
+      emulator:
+        description: 'Also run the instrumented smoke test on an Android emulator (KVM)'
+        required: true
+        default: true
+        type: boolean
+  push:
+    branches: [main]
+    paths: ['ci-requests/sodesk-android.env']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sodesk-android-${{ inputs.ref || 'request' }}
+  cancel-in-progress: true
+
+env:
+  PRIVATE_SOURCE_REPOSITORY: readori/SoDesk
+  PRIVATE_SOURCE_PATH: source
+  ANDROID_PLATFORM: 'platforms;android-35'
+  ANDROID_BUILD_TOOLS: 'build-tools;35.0.0'
+  ANDROID_NDK_VERSION: '28.2.13676358'
+  EMULATOR_API: '34'
+  EXPECTED_APP_ID: com.readori.sodesk
+
+jobs:
+  android:
+    name: Build SoDesk Android
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Validate request and credentials
+        id: request
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_EMULATOR: ${{ inputs.emulator }}
+          REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/sodesk-android.env
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == 'push' ]]; then
+            # Download only the request file of this exact commit (public repo, no credentials).
+            REQ="$RUNNER_TEMP/sodesk-android-request.env"
+            curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/sodesk-android.env at this commit.'; exit 64; }
+            # Plain text, read line by line; never sourced or executed.
+            SOURCE_REF="$(sed -n 's/^REF=//p' "$REQ" | head -n 1 | tr -d '\r')"
+            EMULATOR="$(sed -n 's/^EMULATOR=//p' "$REQ" | head -n 1 | tr -d '\r')"
+            EMULATOR="${EMULATOR:-true}"
+            MODE=verify
+          else
+            SOURCE_REF="$INPUT_REF"
+            EMULATOR="$INPUT_EMULATOR"
+            MODE="$INPUT_MODE"
+          fi
+          [[ "$MODE" == 'verify' ]] || { echo "::error::Unsupported mode: $MODE"; exit 64; }
+          [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && ${#SOURCE_REF} -le 200 ]] || {
+            echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only, no leading dash).'
+            exit 64
+          }
+          [[ "$EMULATOR" == 'true' || "$EMULATOR" == 'false' ]] || { echo '::error::EMULATOR must be true or false.'; exit 64; }
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || {
+            echo '::error::Missing public CI credential: TARGET_REPO_PAT (it must have read access to readori/SoDesk).'
+            exit 78
+          }
+          echo "SOURCE_REF=$SOURCE_REF" >> "$GITHUB_ENV"
+          echo "emulator=$EMULATOR" >> "$GITHUB_OUTPUT"
+          echo "Trigger: $EVENT_NAME · mode: $MODE · ref: $SOURCE_REF · emulator: $EMULATOR"
+
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/SoDesk
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+
+      - name: Detect project layout (fail fast)
+        id: layout
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        run: |
+          set -euo pipefail
+          C="$(git rev-parse HEAD)"
+          { echo '### SoDesk Android · verify'; echo; echo "- Source: \`$PRIVATE_SOURCE_REPOSITORY@${C:0:8}\` (ref \`$SOURCE_REF\`)"; } >> "$GITHUB_STEP_SUMMARY"
+          if [[ ! -f mobile/android/build.sh ]]; then
+            echo '::notice::mobile/android/build.sh is not on this ref: the Android app is not there yet. Nothing to verify.'
+            echo '- Result: skipped, no Android app at this ref' >> "$GITHUB_STEP_SUMMARY"
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          for f in go.mod mobile/go.mod mobile/sodeskcore/sodeskcore.go mobile/shared/sodesk-mobile.js \
+                   mobile/android/gradlew mobile/android/gradle/wrapper/gradle-wrapper.properties mobile/android/app/build.gradle.kts; do
+            [[ -f "$f" ]] || { echo "::error::$f is missing."; exit 66; }
+          done
+          grep -q "applicationId = \"$EXPECTED_APP_ID\"" mobile/android/app/build.gradle.kts || { echo "::error::applicationId must be $EXPECTED_APP_ID"; exit 65; }
+          # The wrapper must download a checksum-pinned Gradle.
+          grep -q '^distributionSha256Sum=' mobile/android/gradle/wrapper/gradle-wrapper.properties || { echo '::error::gradle-wrapper.properties must pin distributionSha256Sum.'; exit 65; }
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+          echo "Source ${C:0:8} · layout: PASS"
+
+      - name: Set up JDK 17
+        if: steps.layout.outputs.ready == 'true'
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Go (version from go.mod)
+        if: steps.layout.outputs.ready == 'true'
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: ${{ env.PRIVATE_SOURCE_PATH }}/go.mod
+          cache: false
+
+      - name: Install Android SDK packages
+        if: steps.layout.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          # ubuntu-latest ships the SDK and its command-line tools; add exactly what the app needs.
+          : "${ANDROID_HOME:=${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [[ -x "$SDKM" ]] || { echo "::error::sdkmanager not found under $ANDROID_HOME"; exit 69; }
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" --install "$ANDROID_PLATFORM" "$ANDROID_BUILD_TOOLS" "ndk;$ANDROID_NDK_VERSION" "platform-tools" > "$RUNNER_TEMP/sdkmanager.log" 2>&1 \
+            || { tail -20 "$RUNNER_TEMP/sdkmanager.log"; echo '::error::sdkmanager failed.'; exit 1; }
+          { echo "ANDROID_HOME=$ANDROID_HOME"; echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"; } >> "$GITHUB_ENV"
+          echo "Android SDK: $ANDROID_HOME · NDK $ANDROID_NDK_VERSION"
+
+      - name: Go tests of the mobile core
+        if: steps.layout.outputs.ready == 'true'
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        run: |
+          set -o pipefail
+          go version
+          go vet ./internal/mobile
+          go test -count=1 ./internal/mobile 2>&1 | cut -c1-2000 | tail -n 200
+          (cd mobile && go vet ./... && go test -count=1 ./... 2>&1 | cut -c1-2000 | tail -n 100)
+          echo '- Go: internal/mobile and mobile/sodeskcore tests PASS' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Node.js 22 (browser test driver)
+        if: steps.layout.outputs.ready == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Headless-browser test of the injected script (phone viewport)
+        if: steps.layout.outputs.ready == 'true'
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        run: |
+          set -o pipefail
+          [[ -f mobile/shared/test/phone_test.mjs ]] || { echo '::notice::no phone_test.mjs on this ref; skipped.'; exit 0; }
+          command -v google-chrome >/dev/null || { echo '::notice::no Chrome on this runner; skipped.'; exit 0; }
+          # Harness and the real gateway page against an in-process host (no screenshots kept).
+          SODESK_BROWSER_TEST=1 go test -count=1 -run TestPhoneBrowser -v ./internal/mobile 2>&1 | cut -c1-400 | tail -n 80
+          echo '- Phone-viewport browser test: PASS' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: gomobile bind + Gradle (debug APK, unit tests, lint, test APK)
+        if: steps.layout.outputs.ready == 'true'
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}/mobile/android
+        env:
+          GRADLE_OPTS: -Dorg.gradle.console=plain
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/android-build.log"
+          if ! bash build.sh assembleDebug testDebugUnitTest lintDebug assembleDebugAndroidTest > "$LOG" 2>&1; then
+            grep -E '^e: |error:|FAILED|What went wrong|Lint found|tests completed' "$LOG" | cut -c1-400 | head -n 60
+            echo '::error::Android build failed.'
+            exit 1
+          fi
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          [[ -f "$APK" ]] || { echo '::error::Debug APK was not produced.'; exit 65; }
+          unzip -l "$APK" | grep -q 'lib/arm64-v8a/libgojni.so' || { echo '::error::APK has no arm64 Go core.'; exit 65; }
+          unzip -l "$APK" | grep -q 'lib/x86_64/libgojni.so' || { echo '::error::APK has no x86_64 Go core.'; exit 65; }
+          unzip -l "$APK" | grep -q 'assets/sodesk-mobile.js' || { echo '::error::APK has no injected script.'; exit 65; }
+          AAPT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/aapt2"
+          PKG="$("$AAPT" dump packagename "$APK")"
+          [[ "$PKG" == "$EXPECTED_APP_ID" ]] || { echo "::error::Package name mismatch: $PKG"; exit 65; }
+          TESTS="$(python3 - <<'PY'
+          import glob, xml.etree.ElementTree as ET
+          t = f = 0
+          for p in glob.glob('app/build/test-results/testDebugUnitTest/*.xml'):
+              r = ET.parse(p).getroot()
+              t += int(r.get('tests', 0)); f += int(r.get('failures', 0)) + int(r.get('errors', 0))
+          print(f'{t} tests, {f} failed')
+          PY
+          )"
+          SIZE="$(du -h "$APK" | cut -f1)"
+          echo "Debug APK: $SIZE · JVM unit tests: $TESTS · lint: PASS"
+          echo "- Debug APK ($PKG): $SIZE · JVM unit tests: $TESTS · lint: PASS" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enable KVM for the emulator
+        if: steps.layout.outputs.ready == 'true' && steps.request.outputs.emulator == 'true'
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules > /dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Instrumented smoke test on an emulator (no uploads)
+        if: steps.layout.outputs.ready == 'true' && steps.request.outputs.emulator == 'true'
+        uses: ReactiveCircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: ${{ env.EMULATOR_API }}
+          arch: x86_64
+          target: google_apis
+          profile: pixel_6
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot
+          working-directory: ${{ env.PRIVATE_SOURCE_PATH }}/mobile/android
+          script: ./gradlew --no-daemon -Dorg.gradle.console=plain connectedDebugAndroidTest > "$RUNNER_TEMP/connected.log" 2>&1 || { grep -E 'FAILED|Tests? .*failed|What went wrong|AssertionError|Exception' "$RUNNER_TEMP/connected.log" | cut -c1-400 | head -n 40; exit 1; }
+
+      - name: Summary
+        if: success() && steps.layout.outputs.ready == 'true'
+        run: |
+          {
+            [[ "${{ steps.request.outputs.emulator }}" == 'true' ]] && echo "- Instrumented smoke test on API $EMULATOR_API x86_64 emulator: PASS"
+            echo "- Java: \`$(java -version 2>&1 | head -1)\` · Go: \`$(go version | cut -d' ' -f3)\`"
+            echo '- No signing; nothing uploaded.'
+          } >> "$GITHUB_STEP_SUMMARY"
