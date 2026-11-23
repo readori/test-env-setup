@@ -246,7 +246,7 @@ jobs:
           Get-Content -LiteralPath $log | ForEach-Object { if ($_.Length -gt 2000) { $_.Substring(0, 2000) } else { $_ } } | Select-Object -Last 220
           $lines = Get-Content -LiteralPath $log | Where-Object { $_ -match 'RESULT|^\s*--- (PASS|FAIL|SKIP)|^(ok|FAIL|PASS)\b' } | ForEach-Object { if ($_.Length -gt 600) { $_.Substring(0, 600) } else { $_ } }
           @('', "#### $Title ($env:MATRIX_OS)", '```') + $lines + '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-          if (Select-String -LiteralPath $log -Pattern '--- SKIP' -Quiet) { Write-Output '::warning::Some tests were SKIPPED (see above): that part was not proven.' }
+          if (Select-String -LiteralPath $log -Pattern '--- SKIP' -Quiet) { Write-Output '::warning::Some tests were SKIPPED (see above): that part was not proven. A RESULT RUNNER LIMIT line means the runner shell covered the test window.' }
           exit $rc
           '@
           Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'gotest.ps1') -Value $helper -Encoding utf8
@@ -288,6 +288,9 @@ jobs:
             Start-Sleep -Seconds 2
             if (-not $p.HasExited -and $p.ProcessName -notin @('explorer', 'dwm', 'winlogon', 'csrss')) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
           }
+          # Close any Start menu / Search flyout that opened (Escape).
+          Add-Type -AssemblyName System.Windows.Forms
+          [System.Windows.Forms.SendKeys]::SendWait('{ESC}')
           Start-Sleep -Seconds 2
           Write-Output 'Windows with titles after:'; Show-Windows
 
