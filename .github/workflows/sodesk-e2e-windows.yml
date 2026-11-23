@@ -277,6 +277,11 @@ jobs:
         run: |
           function Show-Windows { Get-Process | Where-Object { $_.MainWindowTitle } | Select-Object Id, ProcessName, MainWindowTitle | Format-Table -AutoSize | Out-String -Width 200 }
           Write-Output 'Windows with titles:'; Show-Windows
+          # The dialog belongs to WWAHost.exe (Web Account Host), which has no main window of its own.
+          foreach ($p in (Get-Process -Name WWAHost -ErrorAction SilentlyContinue)) {
+            Write-Output "Stopping WWAHost.exe (pid $($p.Id)), the host of the 'Microsoft account' dialog"
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          }
           foreach ($p in (Get-Process | Where-Object { $_.MainWindowTitle -match 'Microsoft account' })) {
             Write-Output "Closing '$($p.MainWindowTitle)' ($($p.ProcessName), pid $($p.Id))"
             [void]$p.CloseMainWindow()
