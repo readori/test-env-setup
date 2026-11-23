@@ -1,0 +1,463 @@
+# SoDesk macOS release binary: universal `rds`, signed with Developer ID and notarized.
+#
+# Public CI repository -> source readori/SoDesk.
+#
+#   release : build rds for darwin/arm64 and darwin/amd64 (CGO_ENABLED=0, the Makefile's release
+#             flags) -> lipo into one universal binary -> codesign with the Developer ID
+#             Application certificate, hardened runtime, secure timestamp, no entitlements ->
+#             zip -> notarize with notarytool (App Store Connect API key) -> verify the
+#             signature, the notarization and Gatekeeper's verdict -> run the signed binary:
+#             `rds version`, `rds --help`, the loopback smoke test (host + client), and a desktop
+#             probe that makes the hardened binary load system frameworks at run time.
+#
+# Nothing is uploaded: no artifacts, no release. The summary reports the SHA-256 of the signed
+# binary and of the notarized zip. A bare executable cannot carry a stapled ticket (stapler
+# only handles bundles, disk images and packages), so Gatekeeper checks the notarization of a
+# downloaded rds online on first run.
+#
+# Secrets used: MACOS_DEVID_P12_BASE64 + MACOS_DEVID_P12_PASSWORD (the Developer ID Application
+# certificate with its key), ASC_KEY_ID + ASC_ISSUER_ID + ASC_PRIVATE_KEY (App Store Connect API
+# key for notarytool), ASC_TEAM_ID (the certificate must belong to this team), TARGET_REPO_PAT
+# (source checkout). The certificate lives in a keychain made for this run and deleted at the
+# end, whatever happens.
+#
+# Triggers: workflow_dispatch, or a push to main that changes ci-requests/sodesk-macos-release.env
+# (how the project's AI engineer requests a run). Only people with push access to this repo can
+# trigger; never pull_request. The request file is plain KEY=VALUE text, parsed with strict
+# patterns and never executed:
+#
+#   REF=<sha>          # readori/SoDesk branch, tag or SHA
+#   VERSION=v1.2.3     # optional: the version to stamp; default `git describe --tags --always`
+#
+# Steps that collect results start with `set +e`: the runner's bash runs with -e, which would
+# end a step at the first failing check instead of reporting it.
+#
+# Safety rules (public repo, public logs): no pull_request triggers; only GitHub-owned actions,
+# pinned to commit SHAs; secrets reach only the steps that need them, through env, and are never
+# echoed; the keychain password and the smoke test's host password are made per run and masked;
+# tool output that could quote a secret is not printed, only chosen fields.
+name: SoDesk macOS release
+
+run-name: SoDesk macOS release · ${{ github.event_name == 'push' && 'request (ci-requests/sodesk-macos-release.env)' || inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'readori/SoDesk branch, tag, or SHA'
+        required: true
+        default: 'main'
+        type: string
+      version:
+        description: 'Version to stamp (empty: git describe --tags --always)'
+        required: false
+        default: ''
+        type: string
+  push:
+    branches: [main]
+    paths: ['ci-requests/sodesk-macos-release.env']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sodesk-macos-release-${{ inputs.ref || 'request' }}
+  cancel-in-progress: true
+
+env:
+  CGO_ENABLED: '0'
+  SIGN_IDENTIFIER: com.readori.sodesk.rds
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+  HOMEBREW_NO_INSTALL_CLEANUP: '1'
+  HOMEBREW_NO_ENV_HINTS: '1'
+
+jobs:
+  release:
+    name: Sign and notarize rds
+    runs-on: macos-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Validate request and credentials
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          MACOS_DEVID_P12_BASE64: ${{ secrets.MACOS_DEVID_P12_BASE64 }}
+          MACOS_DEVID_P12_PASSWORD: ${{ secrets.MACOS_DEVID_P12_PASSWORD }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/sodesk-macos-release.env
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == 'push' ]]; then
+            # Download only the request file of this exact commit (public repo, no credentials).
+            REQ="$RUNNER_TEMP/sodesk-macos-release-request.env"
+            curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/sodesk-macos-release.env at this commit.'; exit 64; }
+            # Plain text, read line by line; never sourced or executed.
+            SOURCE_REF="$(sed -n 's/^REF=//p' "$REQ" | head -n 1 | tr -d '\r')"
+            WANT_VERSION="$(sed -n 's/^VERSION=//p' "$REQ" | head -n 1 | tr -d '\r')"
+          else
+            SOURCE_REF="$INPUT_REF"
+            WANT_VERSION="$INPUT_VERSION"
+          fi
+          [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && ${#SOURCE_REF} -le 200 ]] || {
+            echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only, no leading dash).'
+            exit 64
+          }
+          [[ -z "$WANT_VERSION" || ( "$WANT_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ && ${#WANT_VERSION} -le 64 ) ]] || {
+            echo '::error::version may hold letters, digits and . _ + - only (at most 64 characters).'
+            exit 64
+          }
+          missing=()
+          for name in TARGET_REPO_PAT MACOS_DEVID_P12_BASE64 MACOS_DEVID_P12_PASSWORD ASC_KEY_ID ASC_ISSUER_ID ASC_PRIVATE_KEY ASC_TEAM_ID; do
+            [[ -n "${!name:-}" ]] || missing+=("$name")
+          done
+          if [[ "${#missing[@]}" -gt 0 ]]; then
+            echo "::error::Missing secret(s) in this repository: ${missing[*]}. Signing needs MACOS_DEVID_P12_BASE64 (base64 of the Developer ID Application .p12) and MACOS_DEVID_P12_PASSWORD; notarization needs ASC_KEY_ID, ASC_ISSUER_ID, ASC_PRIVATE_KEY (.p8) and ASC_TEAM_ID; the checkout needs TARGET_REPO_PAT."
+            exit 78
+          fi
+          [[ "$ASC_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] || { echo '::error::ASC_TEAM_ID is not a 10-character Apple team ID.'; exit 78; }
+          echo "SOURCE_REF=$SOURCE_REF" >> "$GITHUB_ENV"
+          echo "WANT_VERSION=$WANT_VERSION" >> "$GITHUB_ENV"
+          echo "Source ref: $SOURCE_REF · version: ${WANT_VERSION:-(git describe)}"
+
+      # Full history and tags: the default version is `git describe --tags --always`.
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/SoDesk
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: source/go.mod
+          cache: false
+
+      # The Makefile's release build (LDFLAGS: -s -w -X …/internal/cli.Version=VERSION, -trimpath,
+      # CGO_ENABLED=0), once per architecture, joined with lipo.
+      - name: Build the universal binary
+        working-directory: source
+        run: |
+          set -euo pipefail
+          VERSION="$WANT_VERSION"
+          [[ -n "$VERSION" ]] || VERSION="$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)"
+          [[ "$VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || { echo "::error::unusable version string from git describe."; exit 65; }
+          grep -q 'internal/cli.Version=' Makefile || { echo '::error::the Makefile no longer sets internal/cli.Version; update this workflow.'; exit 65; }
+          OUT="$RUNNER_TEMP/sodesk-release"; rm -rf "$OUT"; mkdir -p "$OUT"
+          LDFLAGS="-s -w -X github.com/readori/SoDesk/internal/cli.Version=$VERSION"
+          for arch in arm64 amd64; do
+            CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" go build -trimpath -ldflags "$LDFLAGS" -o "$OUT/rds-darwin-$arch" ./cmd/rds
+          done
+          lipo -create -output "$OUT/rds" "$OUT/rds-darwin-arm64" "$OUT/rds-darwin-amd64"
+          chmod 755 "$OUT/rds"
+          ARCHS="$(lipo -archs "$OUT/rds")"
+          [[ "$ARCHS" == *arm64* && "$ARCHS" == *x86_64* ]] || { echo "::error::the binary is not universal: $ARCHS"; exit 65; }
+          GOT="$("$OUT/rds" version)"
+          [[ "$GOT" == "rds $VERSION" ]] || { echo "::error::the binary reports '$GOT', expected 'rds $VERSION'."; exit 65; }
+          # No dynamic libraries beyond the system's: nothing third-party to sign or to validate.
+          LIBS="$(otool -L "$OUT/rds" | awk '$0 !~ /:$/ && $1 !~ /^\/(usr\/lib|System)\// {print $1}' | sort -u | tr '\n' ' ')"
+          [[ -z "$LIBS" ]] || { echo "::error::the binary links non-system libraries: $LIBS"; exit 65; }
+          C="$(git rev-parse HEAD)"
+          {
+            echo "OUT=$OUT"; echo "VERSION=$VERSION"; echo "SOURCE_SHA=$C"
+          } >> "$GITHUB_ENV"
+          echo "built rds $VERSION ($ARCHS), $(du -h "$OUT/rds" | cut -f1), $(go version | cut -d' ' -f3), source ${C:0:8}"
+          {
+            echo '### SoDesk macOS release'; echo
+            echo "- Source: \`readori/SoDesk@${C:0:8}\` (ref \`$SOURCE_REF\`), version \`$VERSION\`, $(go version | cut -d' ' -f3), macOS $(sw_vers -productVersion)"
+            echo "- Universal binary: \`$ARCHS\`, $(du -h "$OUT/rds" | cut -f1), CGO off, system libraries only"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create the signing keychain and import the certificate
+        env:
+          MACOS_DEVID_P12_BASE64: ${{ secrets.MACOS_DEVID_P12_BASE64 }}
+          MACOS_DEVID_P12_PASSWORD: ${{ secrets.MACOS_DEVID_P12_PASSWORD }}
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_NAME="sodesk-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.keychain-db"
+          KEYCHAIN_PATH="$HOME/Library/Keychains/$KEYCHAIN_NAME"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          # The search list as it is now, to put back at the end.
+          ORIGINAL_KEYCHAINS="$(security list-keychains -d user | sed -e 's/^ *"//' -e 's/"$//' | tr '\n' ':')"
+          {
+            echo "KEYCHAIN_NAME=$KEYCHAIN_NAME"; echo "KEYCHAIN_PATH=$KEYCHAIN_PATH"
+            echo "ORIGINAL_KEYCHAINS=$ORIGINAL_KEYCHAINS"
+          } >> "$GITHUB_ENV"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN_NAME"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          # Searched first, the existing ones kept (codesign builds the certificate chain from them).
+          OLD=(); while IFS= read -r k; do [[ -n "$k" ]] && OLD+=("$k"); done < <(tr ':' '\n' <<<"$ORIGINAL_KEYCHAINS")
+          security list-keychains -d user -s "$KEYCHAIN_PATH" ${OLD[@]+"${OLD[@]}"}
+
+          P12="$RUNNER_TEMP/sodesk-devid.p12"
+          trap 'rm -f "$P12"' EXIT
+          ( umask 077; python3 -c '
+          import base64, os, sys
+          raw = "".join(os.environ["MACOS_DEVID_P12_BASE64"].split())
+          try:
+              data = base64.b64decode(raw, validate=True)
+          except Exception:
+              sys.exit("MACOS_DEVID_P12_BASE64 is not base64")
+          if len(data) < 500:
+              sys.exit("MACOS_DEVID_P12_BASE64 is too short to be a .p12")
+          open(sys.argv[1], "wb").write(data)
+          ' "$P12" ) || { echo '::error::MACOS_DEVID_P12_BASE64 could not be decoded (it must be the base64 of the .p12 file).'; exit 78; }
+          security import "$P12" -k "$KEYCHAIN_PATH" -f pkcs12 -P "$MACOS_DEVID_P12_PASSWORD" -T /usr/bin/codesign > /dev/null 2>&1 \
+            || { echo '::error::The .p12 could not be imported: wrong MACOS_DEVID_P12_PASSWORD, or the file is not a PKCS#12 with a certificate and its private key.'; exit 78; }
+          rm -f "$P12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" > /dev/null 2>&1
+
+          # Exactly one usable Developer ID Application identity, of the expected team.
+          IDS="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep 'Developer ID Application' || true)"
+          N="$(grep -c . <<<"$IDS" || true)"
+          if [[ "$N" -ne 1 ]]; then
+            echo "::error::The keychain holds $N valid 'Developer ID Application' signing identities, expected 1. The .p12 must contain the Developer ID Application certificate together with its private key (an 'Apple Distribution' or 'Developer ID Installer' certificate does not sign a command-line tool for distribution)."
+            security find-identity -p codesigning "$KEYCHAIN_PATH" | sed -E 's/^ *[0-9]+\) [0-9A-F]{40} /  identity: /' | grep 'identity:' | cut -c1-120 || true
+            exit 78
+          fi
+          SIGN_HASH="$(awk '{print $2}' <<<"$IDS")"
+          SIGN_NAME="$(sed -E 's/^[^"]*"([^"]*)".*/\1/' <<<"$IDS")"
+          [[ "$SIGN_HASH" =~ ^[0-9A-F]{40}$ ]] || { echo '::error::could not read the identity from the keychain.'; exit 78; }
+          [[ "$SIGN_NAME" == *"($ASC_TEAM_ID)" ]] || { echo '::error::The Developer ID certificate belongs to a different team than ASC_TEAM_ID.'; exit 78; }
+          EXPIRES="$(security find-certificate -c "$SIGN_NAME" -p "$KEYCHAIN_PATH" | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)"
+          echo "SIGN_HASH=$SIGN_HASH" >> "$GITHUB_ENV"
+          # The name (a legal name and the team ID) is public in every signature made with it.
+          echo "signing identity: $SIGN_NAME · certificate valid until ${EXPIRES:-unknown}"
+          echo "- Signing identity: \`$SIGN_NAME\`, certificate valid until ${EXPIRES:-unknown}" >> "$GITHUB_STEP_SUMMARY"
+
+      # Hardened runtime, secure timestamp, and no entitlements: rds is a static Go program. It
+      # generates no code at run time (purego calls system frameworks through fixed trampolines,
+      # so no allow-jit / allow-unsigned-executable-memory), the only libraries it loads are
+      # Apple's own (they pass library validation, so no disable-library-validation), it needs
+      # no DYLD_* variables, and ffmpeg is a separate program it starts, not code it loads.
+      # Screen Recording and Accessibility are permissions the user grants (TCC), not
+      # entitlements. The desktop probe below checks that claim on the signed binary.
+      - name: Sign (Developer ID, hardened runtime, timestamp)
+        run: |
+          set -euo pipefail
+          codesign --force --sign "$SIGN_HASH" --keychain "$KEYCHAIN_PATH" --options runtime --timestamp \
+            --identifier "$SIGN_IDENTIFIER" "$OUT/rds" > "$RUNNER_TEMP/codesign.log" 2>&1 \
+            || { cut -c1-300 "$RUNNER_TEMP/codesign.log" | tail -n 10; echo '::error::codesign failed.'; exit 1; }
+          codesign --verify --strict --verbose=2 "$OUT/rds" 2>&1 | cut -c1-200
+          INFO="$(codesign -dvvv --entitlements - "$OUT/rds" 2>&1)"
+          grep -E '^(Identifier|Format|CodeDirectory|Authority|TeamIdentifier|Timestamp|Runtime Version)=' <<<"$INFO" | cut -c1-200
+          grep -q 'flags=.*runtime' <<<"$INFO" || { echo '::error::the signature does not have the hardened runtime flag.'; exit 1; }
+          grep -q '^Timestamp=' <<<"$INFO" || { echo '::error::the signature has no secure timestamp.'; exit 1; }
+          grep -q '^Authority=Developer ID Application' <<<"$INFO" || { echo '::error::not signed by a Developer ID Application certificate.'; exit 1; }
+          if grep -q '<key>' <<<"$INFO"; then echo '::error::the signature carries entitlements; none are expected.'; exit 1; fi
+          # Both slices are signed (lipo -create before signing; codesign signs each).
+          for arch in arm64 x86_64; do
+            codesign --verify --strict --arch "$arch" "$OUT/rds" || { echo "::error::the $arch slice does not verify."; exit 1; }
+          done
+          [[ "$("$OUT/rds" version)" == "rds $VERSION" ]] || { echo '::error::the signed binary does not run.'; exit 1; }
+          echo '- Signature: Developer ID Application, hardened runtime, secure timestamp, no entitlements, both slices verify (`codesign --verify --strict`)' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notarize
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+        run: |
+          set +e -uo pipefail
+          ASC_DIR="$RUNNER_TEMP/sodesk-asc"; rm -rf "$ASC_DIR"; ( umask 077; mkdir -p "$ASC_DIR" )
+          P8="$ASC_DIR/AuthKey.p8"
+          ( umask 077; python3 -c '
+          import base64, os, sys
+          raw = os.environ["ASC_PRIVATE_KEY"].strip().replace("\\n", "\n")
+          key = raw if "PRIVATE KEY" in raw else base64.b64decode("".join(raw.split())).decode("utf-8").strip()
+          if "BEGIN PRIVATE KEY" not in key:
+              sys.exit("ASC_PRIVATE_KEY is not a .p8 key")
+          open(sys.argv[1], "w").write(key + "\n")
+          ' "$P8" ) || { echo '::error::ASC_PRIVATE_KEY is not a .p8 private key.'; exit 78; }
+
+          ZIP="$OUT/rds-macos-universal.zip"
+          rm -f "$ZIP"
+          ( cd "$OUT" && /usr/bin/zip -q -X "$ZIP" rds ) || { echo '::error::zip failed.'; exit 1; }
+          RESULT="$RUNNER_TEMP/notary-result.json"
+          xcrun notarytool submit "$ZIP" --key "$P8" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" \
+            --wait --timeout 30m --output-format json > "$RESULT" 2> "$RUNNER_TEMP/notary.err"
+          st=$?
+          read -r SUB_ID STATUS < <(python3 -c '
+          import json, re, sys
+          try:
+              d = json.load(open(sys.argv[1]))
+          except Exception:
+              d = {}
+          i, s = str(d.get("id", "")), str(d.get("status", ""))
+          print(i if re.fullmatch(r"[0-9a-fA-F-]{36}", i) else "-", s if re.fullmatch(r"[A-Za-z ]{1,40}", s) else "unknown")
+          ' "$RESULT")
+          echo "notarytool: exit $st, submission ${SUB_ID}, status ${STATUS}"
+          if [[ "$st" -ne 0 || "$STATUS" != 'Accepted' ]]; then
+            # Why: the service's own findings (paths and messages about our file, no credentials).
+            if [[ "$SUB_ID" != '-' ]]; then
+              xcrun notarytool log "$SUB_ID" --key "$P8" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" "$RUNNER_TEMP/notary-log.json" > /dev/null 2>&1
+              python3 -c '
+          import json, sys
+          try:
+              d = json.load(open(sys.argv[1]))
+          except Exception:
+              sys.exit(0)
+          print("  log status:", str(d.get("status"))[:40], "-", str(d.get("statusSummary"))[:200])
+          for it in (d.get("issues") or [])[:20]:
+              print("  issue: %s %s (%s): %s" % (str(it.get("severity"))[:20], str(it.get("path"))[:120], str(it.get("architecture"))[:10], str(it.get("message"))[:300]))
+          ' "$RUNNER_TEMP/notary-log.json"
+            else
+              # No submission: authentication or agreement problems are reported here.
+              grep -Ei 'error|unauthor|401|403|agreement|invalid|expired|not found' "$RUNNER_TEMP/notary.err" | sed -E 's/[A-Za-z0-9+\/=_-]{40,}/<redacted>/g' | cut -c1-300 | tail -n 8
+            fi
+            rm -rf "$ASC_DIR"
+            echo '::error::Notarization did not succeed. Common causes: the API key lacks access (it needs the Developer role or higher), a pending agreement in the Apple Developer account, or the binary was not signed with a Developer ID certificate, hardened runtime and a secure timestamp.'
+            echo "- Notarization: **${STATUS}**" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          rm -rf "$ASC_DIR"
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+          echo "- Notarization: Accepted (submission \`$SUB_ID\`)" >> "$GITHUB_STEP_SUMMARY"
+
+      # What a user's Mac will decide. The ticket is looked up online (nothing can be stapled to
+      # a bare executable), and may take a moment to become visible after acceptance.
+      - name: Verify signature, notarization and Gatekeeper
+        run: |
+          set +e -uo pipefail
+          FAILED=0
+          ok()   { printf '   ok    %s\n' "$*"; }
+          fail() { printf '   FAIL  %s\n' "$*"; FAILED=1; }
+          info() { printf '   info  %s\n' "$*"; }
+          BIN="$OUT/rds"
+          if codesign --verify --strict --verbose=2 "$BIN" > "$RUNNER_TEMP/verify.txt" 2>&1; then ok 'codesign --verify --strict'; else fail 'codesign --verify --strict'; cut -c1-200 "$RUNNER_TEMP/verify.txt" | tail -n 5; fi
+          # The zip holds exactly the binary that was signed.
+          X="$RUNNER_TEMP/unzipped"; rm -rf "$X"; mkdir -p "$X"; /usr/bin/unzip -q "$ZIP" -d "$X"
+          if cmp -s "$X/rds" "$BIN" && codesign --verify --strict "$X/rds" 2>/dev/null; then ok 'the binary in the zip is the signed one and verifies after unpacking'; else fail 'the binary in the zip differs from the signed one'; fi
+
+          NOTARIZED=
+          for _ in 1 2 3 4 5 6; do
+            if codesign --verify --strict --check-notarization -R='notarized' "$BIN" > "$RUNNER_TEMP/notarized.txt" 2>&1; then NOTARIZED=1; break; fi
+            sleep 10
+          done
+          if [[ -n "$NOTARIZED" ]]; then ok "Apple's notarization ticket for this binary is found online (codesign -R=notarized --check-notarization)"; else fail 'no notarization ticket found online for this binary'; cut -c1-200 "$RUNNER_TEMP/notarized.txt" | tail -n 3; fi
+
+          ASSESS="$(spctl --assess --type install -vv "$BIN" 2>&1)"; code=$?
+          SRC="$(sed -n 's/^source=//p' <<<"$ASSESS" | head -n 1)"
+          if [[ "$code" -eq 0 && "$SRC" == *Notarized* ]]; then ok "spctl --assess --type install: accepted, source=$SRC"
+          else info "spctl --assess --type install: exit $code, $(head -n 1 <<<"$ASSESS" | sed -e "s#$BIN#rds#" | cut -c1-160) ${SRC:+source=$SRC} (spctl judges bundles and installers; for a bare tool the ticket check above is the authority)"; fi
+          STAPLE="$(xcrun stapler staple "$BIN" 2>&1 | tail -n 1 | cut -c1-160)"
+          info "stapler on the bare executable: ${STAPLE:-no output} (expected: only bundles, disk images and packages can carry a stapled ticket)"
+
+          # As downloaded: with the quarantine mark a browser sets, the system checks the
+          # notarization before it lets the file run.
+          Q="$RUNNER_TEMP/quarantined"; rm -rf "$Q"; mkdir -p "$Q"; cp "$BIN" "$Q/rds"
+          xattr -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");Safari;$(uuidgen)" "$Q/rds"
+          GOT="$("$Q/rds" version 2>&1)"; code=$?
+          if [[ "$code" -eq 0 && "$GOT" == "rds $VERSION" ]]; then ok 'a quarantined copy (as if downloaded) runs'; else fail "a quarantined copy does not run: exit $code"; head -n 2 <<<"$GOT" | cut -c1-200; fi
+          # Under Rosetta, where the runner has it, the Intel slice runs too.
+          if GOT="$(arch -x86_64 "$BIN" version 2>/dev/null)" && [[ "$GOT" == "rds $VERSION" ]]; then ok 'the x86_64 slice runs (Rosetta)'; else info 'the x86_64 slice was not run (no Rosetta on this runner)'; fi
+
+          SHA_BIN="$(shasum -a 256 "$BIN" | cut -d' ' -f1)"; SHA_ZIP="$(shasum -a 256 "$ZIP" | cut -d' ' -f1)"
+          echo "   sha256 rds                      $SHA_BIN"
+          echo "   sha256 rds-macos-universal.zip  $SHA_ZIP"
+          {
+            if [[ "$FAILED" -eq 0 ]]; then echo '- Verification: signature strict-valid, notarization ticket found online, quarantined copy runs: PASS'; else echo '- Verification: **FAIL** (see the log)'; fi
+            echo '- Not stapled: a bare executable cannot carry a ticket (`stapler` handles bundles, disk images and packages); Gatekeeper looks the ticket up online on first run'
+            echo "- SHA-256 \`rds\` (universal, signed): \`$SHA_BIN\`"
+            echo "- SHA-256 \`rds-macos-universal.zip\` (as notarized): \`$SHA_ZIP\`"
+            echo '- Nothing uploaded.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$FAILED"
+
+      - name: Run the signed binary (help, loopback smoke test)
+        working-directory: source
+        run: |
+          set +e -uo pipefail
+          BIN="$OUT/rds"
+          "$BIN" --help > "$RUNNER_TEMP/help.txt" 2>&1; code=$?
+          if [[ "$code" -eq 0 ]] && grep -q 'vpn' "$RUNNER_TEMP/help.txt" && grep -q 'desktop' "$RUNNER_TEMP/help.txt"; then echo "   ok    rds --help ($(wc -l < "$RUNNER_TEMP/help.txt" | tr -d ' ') lines)"; else echo "::error::rds --help failed (exit $code)."; head -n 5 "$RUNNER_TEMP/help.txt" | cut -c1-200; exit 1; fi
+          [[ -f test/smoke/smoke.sh ]] || { echo '::error::test/smoke/smoke.sh is not on this ref.'; exit 66; }
+          bash test/smoke/smoke.sh "$BIN" > "$RUNNER_TEMP/smoke.txt" 2>&1; code=$?
+          cut -c1-300 "$RUNNER_TEMP/smoke.txt" | tail -n 80
+          if [[ "$code" -eq 0 ]] && ! grep -q '^   FAIL' "$RUNNER_TEMP/smoke.txt"; then
+            echo "- Signed binary: \`rds --help\` and the loopback smoke test (host + client: $(grep -c '^   ok' "$RUNNER_TEMP/smoke.txt") checks): PASS" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '- Signed binary: loopback smoke test **FAIL**' >> "$GITHUB_STEP_SUMMARY"
+            echo '::error::the loopback smoke test failed with the signed binary.'; exit 1
+          fi
+
+      # The one thing the hardened runtime could break: rds loads CoreGraphics and
+      # ApplicationServices at run time (purego) for displays and input. A desktop probe makes
+      # the signed host do exactly that; its JSON holds the viewer URL (with an access token),
+      # so only chosen fields are printed.
+      - name: Run the signed binary (system frameworks under the hardened runtime)
+        run: |
+          set +e -uo pipefail
+          BIN="$OUT/rds"
+          command -v ffmpeg >/dev/null || brew install --quiet ffmpeg > "$RUNNER_TEMP/brew-ffmpeg.log" 2>&1 \
+            || { echo '::warning::ffmpeg could not be installed; the framework check was skipped.'; echo '- Signed binary loading system frameworks: skipped (no ffmpeg)' >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          W="$RUNNER_TEMP/release-probe"; rm -rf "$W"; mkdir -p "$W/host" "$W/cli"
+          PORT=$((20000 + RANDOM % 10000)); TARGET="127.0.0.1:$PORT"
+          PW="$(openssl rand -hex 16)"
+          echo "::add-mask::$PW"
+          RDS_CONFIG_DIR="$W/host" "$BIN" host --no-signal --listen "$TARGET" --password "$PW" > "$W/host.log" 2>&1 < /dev/null &
+          HOST_PID=$!
+          CLI_PID=
+          cleanup() { [[ -z "$CLI_PID" ]] || kill "$CLI_PID" 2>/dev/null; kill "$HOST_PID" 2>/dev/null; sleep 0.5; rm -rf "$W"; }
+          trap cleanup EXIT
+          for _ in $(seq 1 100); do grep -q 'host ready' "$W/host.log" 2>/dev/null && break; sleep 0.2; done
+          grep -q 'host ready' "$W/host.log" || { echo '::error::the signed rds host did not start.'; tail -n 5 "$W/host.log" | cut -c1-300; exit 1; }
+          RDS_CONFIG_DIR="$W/cli" RDS_PASSWORD="$PW" "$BIN" "$TARGET" desktop --no-open --json > "$W/desktop.json" 2> "$W/desktop.err" < /dev/null &
+          CLI_PID=$!
+          for _ in $(seq 1 300); do
+            grep -q '^}' "$W/desktop.json" 2>/dev/null && break
+            kill -0 "$CLI_PID" 2>/dev/null || break
+            sleep 0.2
+          done
+          if ! grep -q '^}' "$W/desktop.json" 2>/dev/null; then
+            echo '::error::the signed binary could not answer a desktop probe (loading system frameworks under the hardened runtime?).'
+            sed -E 's#https?://[^ ]+#<url>#g' "$W/desktop.err" | tail -n 5 | cut -c1-400
+            echo '- Signed binary loading system frameworks (desktop probe): **FAIL**' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          python3 - "$W/desktop.json" <<'PY'
+          import json, os, sys
+          d = json.load(open(sys.argv[1]))
+          d.pop("url", None)
+          enc = d.get("encoders") or {}
+          line = "host OS %s, screen %sx%s, encoders %s, input %s %s" % (
+              d.get("os"), d.get("screen_width"), d.get("screen_height"),
+              ", ".join("%s=%s" % kv for kv in sorted(enc.items())), d.get("input"), (d.get("input_error") or "")[:120])
+          print("   " + line)
+          # The screen size comes from CoreGraphics and the input answer from
+          # ApplicationServices: both were loaded by the hardened binary.
+          bad = not d.get("screen_width") or "load " in (d.get("input_error") or "")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("- Signed binary loading system frameworks under the hardened runtime (desktop probe): %s\n    - %s\n" % ("**FAIL**" if bad else "PASS", line))
+          if bad:
+              print("::error::the signed binary could not use the system frameworks")
+              sys.exit(1)
+          PY
+
+      - name: Remove the signing keychain and key files
+        if: always()
+        run: |
+          set +e
+          if [[ -n "${ORIGINAL_KEYCHAINS:-}" ]]; then
+            OLD=(); while IFS= read -r k; do [[ -n "$k" ]] && OLD+=("$k"); done < <(tr ':' '\n' <<<"$ORIGINAL_KEYCHAINS")
+            [[ "${#OLD[@]}" -gt 0 ]] && security list-keychains -d user -s "${OLD[@]}" >/dev/null 2>&1
+          fi
+          [[ -n "${KEYCHAIN_NAME:-}" ]] && security delete-keychain "$KEYCHAIN_NAME" >/dev/null 2>&1
+          rm -rf "$RUNNER_TEMP/sodesk-asc" "$RUNNER_TEMP/sodesk-devid.p12" "$RUNNER_TEMP/notary-result.json" "$RUNNER_TEMP/notary-log.json" >/dev/null 2>&1
+          true
