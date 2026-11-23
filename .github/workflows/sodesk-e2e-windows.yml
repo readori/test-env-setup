@@ -12,6 +12,11 @@
 #           the screenshot service against a window of known colour, and a desktop session
 #           (ddagrab / gdigrab capture, encoder selection, client-side decode, input over the session)
 #           with a pinned, SHA-256-verified ffmpeg.
+#   unattended : windows-latest. `rds service install --unattended`: the real LocalSystem service shows
+#           and controls the console session through its helper (internal/unattended,
+#           TestUnattendedE2E, SODESK_UNATTENDED_E2E=1): screenshot and desktop frames, input into a
+#           window, Ctrl+Alt+Del on the secure desktop, a UAC prompt where the runner allows one, and
+#           the lock screen. It locks the workstation at the end, so it has a job of its own.
 #
 # No deploy, signing or cloud credentials are used. Nothing is uploaded: no artifacts.
 #
@@ -348,3 +353,156 @@ jobs:
         if: always()
         working-directory: source
         run: '& "$env:RUNNER_TEMP\gotest.ps1" -Title "desktop session" -Pkgs "./internal/svc/desktop/" -Run "TestWinDesktopE2E"'
+
+  # Unattended access (rds service install --unattended): the real service, installed as LocalSystem
+  # in session 0, shows and controls the console session through its helper. The test connects as a
+  # client and checks (a) screenshots and desktop frames of the console, (b) input into a real window,
+  # Ctrl+Alt+Del (SendSAS, with the SoftwareSASGeneration policy set for the test) captured on the
+  # secure desktop and dismissed with Escape injected there, (d) a UAC prompt if the runner can show
+  # one, and (c) locking the workstation and capturing the lock screen. It changes machine policy and
+  # restores it, and LOCKS THE WORKSTATION at the end: it runs in its own job, after nothing else.
+  unattended:
+    name: Unattended access via the service (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      SODESK_UNATTENDED_E2E: '1'
+      CGO_ENABLED: '0'
+
+    steps:
+      - name: Validate request and credentials
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/sodesk-e2e-windows.env
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:EVENT_NAME -eq 'push') {
+            $req = Join-Path $env:RUNNER_TEMP 'sodesk-e2e-request.env'
+            try { Invoke-WebRequest -Uri $env:REQUEST_URL -OutFile $req -MaximumRetryCount 3 -TimeoutSec 30 }
+            catch { Write-Output '::error::Could not read ci-requests/sodesk-e2e-windows.env at this commit.'; exit 64 }
+            $line = Get-Content -LiteralPath $req | Where-Object { $_ -cmatch '^REF=' } | Select-Object -First 1
+            $ref = if ($line) { $line.Substring(4).Trim() } else { '' }
+          } else {
+            $ref = "$env:INPUT_REF"
+          }
+          if ($ref.Length -eq 0 -or $ref.Length -gt 200 -or $ref -cnotmatch '\A[A-Za-z0-9._/][A-Za-z0-9._/-]*\z') {
+            Write-Output '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only, no leading dash).'
+            exit 64
+          }
+          if (-not $env:TARGET_REPO_PAT) {
+            Write-Output '::error::Missing public CI credential: TARGET_REPO_PAT (it must have read access to readori/SoDesk).'
+            exit 78
+          }
+          "SOURCE_REF=$ref" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Output "Source ref: $ref"
+
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/SoDesk
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: source/go.mod
+          cache: false
+
+      - name: Toolchain
+        working-directory: source
+        run: |
+          go version
+          $sha = (git rev-parse --short HEAD)
+          @("### SoDesk Windows E2E · unattended access · windows-latest", "", "- Source: ``readori/SoDesk@$sha`` (ref ``$env:SOURCE_REF``)", "- $(go version)", "- $((Get-CimInstance Win32_OperatingSystem).Caption) $([Environment]::OSVersion.Version), $env:PROCESSOR_ARCHITECTURE") | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Test helper
+        run: |
+          $helper = @'
+          param([string]$Title, [string]$Pkgs, [string]$Run)
+          $log = Join-Path $env:RUNNER_TEMP ('gotest-' + ($Run -replace '[^A-Za-z0-9]', '_') + '.log')
+          & go test -count=1 -v -timeout 15m -run $Run ($Pkgs -split ' ') *> $log
+          $rc = $LASTEXITCODE
+          Get-Content -LiteralPath $log | ForEach-Object { if ($_.Length -gt 2000) { $_.Substring(0, 2000) } else { $_ } } | Select-Object -Last 260
+          $lines = Get-Content -LiteralPath $log | Where-Object { $_ -match 'RESULT|^\s*--- (PASS|FAIL|SKIP)|^(ok|FAIL|PASS)\b' } | ForEach-Object { if ($_.Length -gt 600) { $_.Substring(0, 600) } else { $_ } }
+          @('', "#### $Title", '```') + $lines + '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          if (Select-String -LiteralPath $log -Pattern '--- SKIP' -Quiet) { Write-Output '::warning::Some tests were SKIPPED (see above): that part was not proven. A RESULT RUNNER LIMIT line says what the runner does not allow.' }
+          exit $rc
+          '@
+          Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'gotest.ps1') -Value $helper -Encoding utf8
+
+      # Sessions (the service shows the console session), elevation and the UAC / Ctrl+Alt+Del policy.
+      - name: Session and policy diagnostics
+        continue-on-error: true
+        run: |
+          whoami
+          whoami /groups | Select-String -Pattern 'Mandatory Label|Administrators'
+          query user 2>&1
+          qwinsta 2>&1
+          Get-Process -Id $PID | Select-Object Id, SessionId | Format-Table
+          Get-Process explorer, winlogon, LogonUI -ErrorAction SilentlyContinue | Select-Object Id, ProcessName, SessionId | Format-Table
+          Add-Type -Namespace W -Name K -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint WTSGetActiveConsoleSessionId();'
+          Write-Output "Console session: $([W.K]::WTSGetActiveConsoleSessionId())"
+          $p = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+          Get-ItemProperty -Path $p | Select-Object EnableLUA, ConsentPromptBehaviorAdmin, PromptOnSecureDesktop, FilterAdministratorToken, SoftwareSASGeneration | Format-List
+          Get-CimInstance Win32_VideoController | Format-List Name, CurrentHorizontalResolution, CurrentVerticalResolution
+
+      - name: Close stray first-run windows
+        continue-on-error: true
+        run: |
+          foreach ($p in (Get-Process -Name WWAHost -ErrorAction SilentlyContinue)) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+          foreach ($p in (Get-Process | Where-Object { $_.MainWindowTitle -match 'Microsoft account' })) { [void]$p.CloseMainWindow() }
+          Add-Type -AssemblyName System.Windows.Forms
+          [System.Windows.Forms.SendKeys]::SendWait('{ESC}')
+          Start-Sleep -Seconds 2
+
+      - name: Install ffmpeg (pinned, SHA-256 verified)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Join-Path $env:RUNNER_TEMP 'ffmpeg.zip'
+          Invoke-WebRequest -Uri $env:FFMPEG_URL -OutFile $zip -MaximumRetryCount 3 -RetryIntervalSec 5
+          $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLower()
+          if ($h -ne $env:FFMPEG_SHA256) { throw "ffmpeg archive SHA-256 mismatch: $h" }
+          $dir = Join-Path $env:RUNNER_TEMP 'ffmpeg'
+          Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+          $exe = Get-ChildItem -Path $dir -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          if (-not $exe) { throw 'ffmpeg.exe is not in the archive' }
+          "RDS_FFMPEG=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          & $exe.FullName -hide_banner -version | Select-Object -First 1
+
+      - name: Build and vet
+        working-directory: source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          go build -trimpath -o "$env:RUNNER_TEMP\rds.exe" ./cmd/rds
+          go vet ./internal/unattended/ ./internal/service/ ./internal/inject/ ./internal/svc/desktop/ ./internal/svc/screenshot/
+
+      # The e2e gate is off for this step: here the e2e tests skip.
+      - name: Unit tests (unattended, service, inject)
+        working-directory: source
+        env:
+          SODESK_UNATTENDED_E2E: '0'
+        run: '& "$env:RUNNER_TEMP\gotest.ps1" -Title "unit tests" -Pkgs "./internal/unattended/ ./internal/service/ ./internal/inject/" -Run "."'
+
+      # Installs the service with --unattended (removed again afterwards), then screenshot, desktop,
+      # input, Ctrl+Alt+Del on the secure desktop, UAC prompt, lock screen, all through the service.
+      - name: Unattended access end to end
+        id: e2e
+        working-directory: source
+        run: '& "$env:RUNNER_TEMP\gotest.ps1" -Title "unattended access through the service" -Pkgs "./internal/unattended/" -Run "TestUnattendedE2E"'
+
+      - name: Diagnostics (after a failure)
+        if: failure() && steps.e2e.conclusion == 'failure'
+        continue-on-error: true
+        run: |
+          Get-Service sodesk-ua-e2e -ErrorAction SilentlyContinue | Format-List Name, Status
+          Get-Process rds -ErrorAction SilentlyContinue | Select-Object Id, SessionId, StartTime, Path | Format-Table -AutoSize | Out-String -Width 200
+          try { Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Service Control Manager'; StartTime=(Get-Date).AddMinutes(-30)} -MaxEvents 20 | Select-Object TimeCreated, Id, @{n='Msg';e={ $_.Message.Substring(0, [Math]::Min(300, $_.Message.Length)) }} | Format-List } catch { Write-Output "SCM events: $($_.Exception.Message)" }

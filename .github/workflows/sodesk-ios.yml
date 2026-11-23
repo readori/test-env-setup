@@ -25,13 +25,24 @@
 #                The marketing version (CFBundleShortVersionString) stays whatever the Xcode
 #                project says.
 #
-# Triggers: workflow_dispatch (modes verify, profile, testflight), or a push to main that
+#   metadata   : App Store Connect listing from versioned files in the source repo,
+#                mobile/ios/fastlane/{metadata/<locale>/*.txt, metadata/review_information, age_rating.json}
+#                (fastlane deliver, API key only): name, subtitle, description, keywords, promotional text,
+#                support/marketing/privacy URLs, copyright, categories, age rating, App Review contact and
+#                notes (+ committed screenshots, if any). Refuses to upload while any file still holds a
+#                TODO-REPLACE placeholder (including the website domain). Never submits for review, never
+#                releases, no binary upload. Export compliance and the App Privacy label are NOT set here.
+#   screenshots: Go + gomobile, then the real app on 6.9" / 6.5" iPhone and 13" iPad simulators connected to
+#                an rds host on the runner (GatewayE2ETests/testScreenshots) -> JPEGs -> deliver (screenshots
+#                only, same no-submit flags), locales en-US and zh-Hans.
+#
+# Triggers: workflow_dispatch (modes verify, profile, testflight, metadata, screenshots), or a push to main that
 # changes ci-requests/sodesk-ios.env (how the project's AI engineer requests a run; verify by
 # default). Never pull_request. The request file is plain KEY=VALUE text, parsed with strict
 # patterns and never executed:
 #
 #   REF=main          # readori/SoDesk branch, tag or SHA
-#   MODE=testflight   # optional: verify (default), profile or testflight; profile/testflight
+#   MODE=testflight   # optional: verify (default), profile, testflight, metadata or screenshots; all but verify
 #                     # also need [sodesk-ios-release] in the commit message (never cancelled)
 #   CONFIRM=WRITE     # profile only
 #   BUILD=12          # testflight only, optional (default: latest TestFlight build + 1)
@@ -54,11 +65,11 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'verify = simulator build + tests + end-to-end, no signing; profile = one-time signing setup (needs confirm=WRITE); testflight = signed build + upload'
+        description: 'verify = simulator build + tests + end-to-end, no signing; profile = one-time signing setup (needs confirm=WRITE); testflight = signed build + upload; metadata = App Store listing text/categories/age rating/review info; screenshots = generate in simulators and upload'
         required: true
         default: 'verify'
         type: choice
-        options: [verify, profile, testflight]
+        options: [verify, profile, testflight, metadata, screenshots]
       ref:
         description: 'readori/SoDesk branch, tag, or SHA (not used by profile)'
         required: true
@@ -93,6 +104,7 @@ env:
   PRIVATE_SOURCE_REPOSITORY: readori/SoDesk
   PRIVATE_SOURCE_PATH: source
   EXPECTED_BUNDLE_ID: com.readori.sodesk
+  EXPECTED_APPLE_ID: '6838451962'
   BUNDLE_ID_NAME: SoDesk
   XCODE_MAJOR_WANTED: '26'
   MATCH_GIT_URL: https://github.com/readori/readori-certificates.git
@@ -145,7 +157,7 @@ jobs:
             SOURCE_REF="$INPUT_REF"
             MODE="$INPUT_MODE"
           fi
-          case "$MODE" in verify|profile|testflight) ;; *) echo "::error::Unsupported mode: $MODE"; exit 64 ;; esac
+          case "$MODE" in verify|profile|testflight|metadata|screenshots) ;; *) echo "::error::Unsupported mode: $MODE"; exit 64 ;; esac
           [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && ${#SOURCE_REF} -le 200 ]] || {
             echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only, no leading dash).'
             exit 64
@@ -208,6 +220,84 @@ jobs:
           echo 'ready=true' >> "$GITHUB_OUTPUT"
           echo "Source ${C:0:8} · layout: PASS"
 
+      # metadata mode: the listing files must be complete and free of placeholders before any
+      # credential is touched. Prints file names and problems only, never file contents.
+      - name: Check App Store listing files
+        if: steps.layout.outputs.ready == 'true' && env.MODE == 'metadata'
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}/mobile/ios/fastlane
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, sys
+          root = 'metadata'
+          problems, placeholders, domain_placeholders = [], [], []
+          def read(path):
+              try:
+                  with open(path, encoding='utf-8') as f:
+                      return f.read().strip()
+              except OSError:
+                  problems.append(f'missing file: {path}')
+                  return None
+          limits = {'name': 30, 'subtitle': 30, 'description': 4000, 'keywords': 100, 'promotional_text': 170}
+          for loc in ('en-US', 'zh-Hans'):
+              for field, limit in limits.items():
+                  v = read(f'{root}/{loc}/{field}.txt')
+                  if v is not None and 'TODO-REPLACE' not in v and (not v or len(v) > limit):
+                      problems.append(f'{root}/{loc}/{field}.txt: must be 1..{limit} characters (is {len(v)})')
+              for field in ('support_url', 'marketing_url', 'privacy_url'):
+                  v = read(f'{root}/{loc}/{field}.txt')
+                  if v is not None and 'TODO-REPLACE' not in v and not re.fullmatch(r'https://[^\s/]+(/\S*)?', v):
+                      problems.append(f'{root}/{loc}/{field}.txt: must be one https URL')
+          for field in ('first_name', 'last_name', 'phone_number', 'email_address', 'notes'):
+              v = read(f'{root}/review_information/{field}.txt')
+              if v is not None and not v:
+                  problems.append(f'{root}/review_information/{field}.txt: empty')
+          v = read(f'{root}/copyright.txt')
+          if v is not None and not v:
+              problems.append(f'{root}/copyright.txt: empty')
+          v = read(f'{root}/primary_category.txt')
+          if v is not None and not re.fullmatch(r'[A-Z_]+', v) and 'TODO-REPLACE' not in v:
+              problems.append(f'{root}/primary_category.txt: must be a category id such as UTILITIES')
+          try:
+              ar = json.load(open('age_rating.json'))
+              if not ar or any(not isinstance(x, int) or x < 0 or x > 2 for x in ar.values()):
+                  problems.append('age_rating.json: values must be 0, 1 or 2')
+          except Exception as e:
+              problems.append(f'age_rating.json: not valid JSON ({type(e).__name__})')
+          ec = ''
+          try:
+              for line in open('export-compliance.env', encoding='utf-8'):
+                  if line.startswith('USES_NON_EXEMPT_ENCRYPTION='):
+                      ec = line.split('=', 1)[1].strip()
+          except OSError:
+              pass
+          if ec not in ('', 'YES', 'NO'):
+              problems.append('export-compliance.env: USES_NON_EXEMPT_ENCRYPTION must be empty, YES or NO')
+          for d, _, files in os.walk(root):
+              for fn in files:
+                  p = os.path.join(d, fn)
+                  try:
+                      t = open(p, encoding='utf-8').read()
+                  except Exception:
+                      continue
+                  if 'TODO-REPLACE-DOMAIN' in t:
+                      domain_placeholders.append(p)
+                  if 'TODO-REPLACE' in t:
+                      placeholders.append(p)
+          if domain_placeholders:
+              print('::error::The website domain is still the placeholder in: ' + ', '.join(sorted(domain_placeholders)))
+          rest = sorted(set(placeholders) - set(domain_placeholders))
+          if rest:
+              print('::error::Placeholder text (TODO-REPLACE) is still in: ' + ', '.join(rest))
+          for p in problems:
+              print('::error::' + p)
+          if problems or placeholders:
+              print('::error::Nothing was uploaded. Replace the placeholders / fix the files in mobile/ios/fastlane and run metadata again.')
+              sys.exit(65)
+          print('Listing files: complete, no placeholders.')
+          print('Export compliance config: ' + (ec or 'not set (answer it in App Store Connect)'))
+          PY
+
       - name: Select Xcode 26.x
         if: steps.layout.outputs.ready == 'true' || env.MODE == 'profile'
         run: |
@@ -225,7 +315,7 @@ jobs:
           xcodebuild -version
 
       - name: Set up Go (version from go.mod)
-        if: steps.layout.outputs.ready == 'true'
+        if: steps.layout.outputs.ready == 'true' && env.MODE != 'metadata'
         uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: ${{ env.PRIVATE_SOURCE_PATH }}/go.mod
@@ -241,7 +331,7 @@ jobs:
           (cd mobile && go test -count=1 ./... 2>&1 | cut -c1-2000 | tail -n 50)
 
       - name: gomobile bind (Sodeskcore.xcframework)
-        if: steps.layout.outputs.ready == 'true'
+        if: steps.layout.outputs.ready == 'true' && env.MODE != 'metadata'
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
         run: |
           set -euo pipefail
@@ -352,7 +442,7 @@ jobs:
           xcodebuild test -quiet \
             -project mobile/ios/SoDesk.xcodeproj -scheme SoDesk -configuration Debug \
             -destination "platform=iOS Simulator,id=$SIM_UDID" \
-            -only-testing:SoDeskTests/GatewayE2ETests \
+            -only-testing:SoDeskTests/GatewayE2ETests/testConnectTerminalFiles \
             -derivedDataPath "$RUNNER_TEMP/DerivedData-sodesk-test" -resultBundlePath "$RES" \
             CODE_SIGNING_ALLOWED=NO > "$LOG" 2>&1
           st=$?
@@ -396,7 +486,121 @@ jobs:
           grep -E "Executed [0-9]+ tests?" "$LOG" | tail -n 1 | cut -c1-200 || true
           echo '- End-to-end (app on the simulator to rds host on the Mac: connect, terminal command, Files listing): PASS' >> "$GITHUB_STEP_SUMMARY"
 
-      # ---- profile and testflight: signing material. Created only after all private-source
+      # screenshots mode: the real app on simulators of the App Store sizes, connected to an rds host on
+      # this Mac (loopback, one-run password) like the end-to-end test. GatewayE2ETests/testScreenshots
+      # walks the app to three screens and the script below captures each with `simctl io screenshot`.
+      # Runs before any signing material exists (it executes private-source code).
+      - name: Generate App Store screenshots (simulators, app to rds host on this Mac)
+        if: steps.layout.outputs.ready == 'true' && env.MODE == 'screenshots'
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        run: |
+          set +e -uo pipefail
+          redact() { sed -E 's#(127\.0\.0\.1:[0-9]+/)[A-Za-z0-9_-]{16,}#\1<token>#g' | cut -c1-400; }
+          W="$RUNNER_TEMP/sodesk-shots"; OUT="$RUNNER_TEMP/sodesk-shots-out"
+          rm -rf "$W" "$OUT"; mkdir -p "$W/host" "$W/cli" "$W/files" "$OUT"
+          CGO_ENABLED=0 go build -trimpath -o "$W/rds" ./cmd/rds || { echo '::error::building rds for the host failed.'; exit 1; }
+          printf 'hello from the host\n' > "$W/files/hello.txt"
+          printf 'notes\n' > "$W/files/notes.md"; printf 'a,b,c\n1,2,3\n' > "$W/files/report.csv"; mkdir -p "$W/files/projects" "$W/files/photos"
+          PORT=$((20000 + RANDOM % 10000)); TARGET="127.0.0.1:$PORT"
+          PW="$(openssl rand -hex 16)"
+          echo "::add-mask::$PW"
+          RDS_CONFIG_DIR="$W/host" "$W/rds" host --no-signal --listen "$TARGET" --password "$PW" > "$W/host.log" 2>&1 < /dev/null &
+          HOST_PID=$!
+          SIMS=()
+          cleanup() {
+            kill "$HOST_PID" 2>/dev/null || true
+            for u in ${SIMS[@]+"${SIMS[@]}"}; do xcrun simctl shutdown "$u" >/dev/null 2>&1; xcrun simctl delete "$u" >/dev/null 2>&1; done
+          }
+          trap cleanup EXIT
+          for _ in $(seq 1 100); do grep -q 'host ready' "$W/host.log" 2>/dev/null && break; sleep 0.2; done
+          grep -q 'host ready' "$W/host.log" || { echo '::error::rds host did not start.'; tail -n 5 "$W/host.log" | redact; exit 1; }
+
+          # App Store sizes: key | device names in order of preference | pixel size
+          SETS=(
+            'iphone69|iPhone 17 Pro Max,iPhone 16 Pro Max|1320x2868'
+            'iphone65|iPhone 11 Pro Max,iPhone XS Max|1242x2688'
+            'ipad13|iPad Pro 13-inch (M5),iPad Pro 13-inch (M4)|2064x2752'
+          )
+          DD="$RUNNER_TEMP/DerivedData-sodesk-shots"
+          made=0
+          for set in "${SETS[@]}"; do
+            IFS='|' read -r KEY NAMES SIZE <<< "$set"
+            PICK="$(xcrun simctl list devicetypes -j > "$W/types.json"; xcrun simctl list runtimes -j > "$W/runtimes.json"; python3 - "$W/types.json" "$W/runtimes.json" "$NAMES" <<'PY'
+          import json, sys
+          types = json.load(open(sys.argv[1]))['devicetypes']
+          runtimes = [r for r in json.load(open(sys.argv[2]))['runtimes'] if r.get('isAvailable') and r.get('platform', 'iOS') == 'iOS']
+          def ver(r):
+              return tuple(int(x) for x in r['version'].split('.') if x.isdigit())
+          for name in sys.argv[3].split(','):
+              for t in types:
+                  if t['name'] != name:
+                      continue
+                  ok = [r for r in runtimes if any(d['identifier'] == t['identifier'] for d in r.get('supportedDeviceTypes', []))]
+                  if ok:
+                      best = max(ok, key=ver)
+                      print(t['identifier'], best['identifier'], name.replace(' ', '_'))
+                      raise SystemExit(0)
+          PY
+            )"
+            if [[ -z "$PICK" ]]; then echo "::warning::$KEY: none of [$NAMES] is available on this runner; skipped."; continue; fi
+            read -r TYPE_ID RUNTIME_ID DEVNAME <<< "$PICK"
+            UDID="$(xcrun simctl create "sodesk-shot-$KEY" "$TYPE_ID" "$RUNTIME_ID" 2>/dev/null)"
+            [[ -n "$UDID" ]] || { echo "::warning::$KEY: could not create a simulator; skipped."; continue; }
+            SIMS+=("$UDID")
+            xcrun simctl boot "$UDID" >/dev/null 2>&1
+            xcrun simctl bootstatus "$UDID" -b >/dev/null 2>&1 || { echo "::warning::$KEY: simulator did not boot; skipped."; continue; }
+            xcrun simctl status_bar "$UDID" override --time 9:41 --batteryState charged --batteryLevel 100 --wifiBars 3 --cellularBars 4 --operatorName '' >/dev/null 2>&1
+            echo "$KEY: ${DEVNAME//_/ } ($SIZE)"
+            S="$W/s-$KEY"; rm -rf "$S"; mkdir -p "$S"
+            LOG="$RUNNER_TEMP/xcshots-$KEY.log"
+            TEST_RUNNER_SODESK_E2E_TARGET="$TARGET" TEST_RUNNER_SODESK_E2E_PASSWORD="$PW" TEST_RUNNER_SODESK_E2E_DIR="$W/files" \
+            TEST_RUNNER_SODESK_SHOTS_DIR="$S" \
+            xcodebuild test -quiet \
+              -project mobile/ios/SoDesk.xcodeproj -scheme SoDesk -configuration Debug \
+              -destination "platform=iOS Simulator,id=$UDID" \
+              -only-testing:SoDeskTests/GatewayE2ETests/testScreenshots \
+              -derivedDataPath "$DD" CODE_SIGNING_ALLOWED=NO > "$LOG" 2>&1 &
+            XPID=$!
+            got=0
+            for name in 1-connect 2-terminal 3-files; do
+              for _ in $(seq 1 1200); do
+                [[ -f "$S/$name.ready" ]] && break
+                kill -0 "$XPID" 2>/dev/null || break
+                sleep 0.25
+              done
+              [[ -f "$S/$name.ready" ]] || break
+              xcrun simctl io "$UDID" screenshot --type=png "$S/$name.png" >/dev/null 2>&1
+              touch "$S/$name.done"
+              got=$((got + 1))
+            done
+            wait "$XPID"; st=$?
+            if [[ "$got" -ne 3 ]]; then
+              echo "::warning::$KEY: only $got of 3 screens were captured (xcodebuild exit $st)."
+              grep -E "error:|failed|XCTAssert|caught error|timed out|skipped" "$LOG" | redact | tail -n 15 || true
+              continue
+            fi
+            ok=1
+            for name in 1-connect 2-terminal 3-files; do
+              W_PX="$(sips -g pixelWidth "$S/$name.png" 2>/dev/null | awk '/pixelWidth/{print $2}')"; H_PX="$(sips -g pixelHeight "$S/$name.png" 2>/dev/null | awk '/pixelHeight/{print $2}')"
+              [[ "${W_PX}x${H_PX}" == "$SIZE" ]] || { echo "::warning::$KEY/$name: ${W_PX}x${H_PX}, expected $SIZE; set dropped."; ok=0; break; }
+            done
+            [[ "$ok" -eq 1 ]] || continue
+            for name in 1-connect 2-terminal 3-files; do
+              # JPEG: no alpha channel, which App Store Connect requires.
+              for loc in en-US zh-Hans; do
+                mkdir -p "$OUT/$loc"
+                sips -s format jpeg -s formatOptions 95 "$S/$name.png" --out "$OUT/$loc/$KEY-$name.jpg" >/dev/null 2>&1
+              done
+            done
+            made=$((made + 1))
+            echo "$KEY: 3 screenshots OK"
+          done
+          trap - EXIT; cleanup
+          [[ "$made" -gt 0 ]] || { echo '::error::no screenshot set was produced.'; exit 1; }
+          echo "SHOTS_OUT=$OUT" >> "$GITHUB_ENV"
+          echo "SHOT_SETS=$made" >> "$GITHUB_ENV"
+
+      # ---- profile, testflight, metadata, screenshots: signing material / API key. Created only after all private-source
       # build scripts (gomobile bind above) ran, and removed in the last step. ----
       - name: Install pinned fastlane
         if: env.MODE != 'verify' && (steps.layout.outputs.ready == 'true' || env.MODE == 'profile')
@@ -496,6 +700,88 @@ jobs:
           echo "App Store profile for $EXPECTED_BUNDLE_ID written to Match: PASS"
           echo "- App Store profile for \`$EXPECTED_BUNDLE_ID\` written to the shared Match repo. Next: run mode=testflight." >> "$GITHUB_STEP_SUMMARY"
 
+      # ---- metadata and screenshots modes: App Store Connect listing through fastlane deliver ----
+      # Uses the API key only. Never submits for review, never releases, never uploads a binary, shows no
+      # HTML preview. Only error lines are printed: the review contact details are in the files.
+      - name: Check the App Store Connect app
+        if: env.MODE == 'metadata' || env.MODE == 'screenshots'
+        run: |
+          set -euo pipefail
+          ruby - <<'RUBY'
+          require 'spaceship'
+          require 'json'
+          k = JSON.parse(File.read(ENV.fetch('ASC_API_KEY_JSON')))
+          Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.create(key_id: k['key_id'], issuer_id: k['issuer_id'], key: k['key'])
+          app = Spaceship::ConnectAPI::App.find(ENV.fetch('EXPECTED_BUNDLE_ID'))
+          abort "::error::No App Store Connect app with bundle ID #{ENV['EXPECTED_BUNDLE_ID']} for this API key." unless app
+          abort "::error::App Store Connect app ID #{app.id} is not the expected #{ENV['EXPECTED_APPLE_ID']}." unless app.id.to_s == ENV.fetch('EXPECTED_APPLE_ID')
+          puts "App Store Connect app: #{ENV['EXPECTED_BUNDLE_ID']} (Apple ID #{app.id}): OK"
+          RUBY
+
+      - name: Upload listing text, categories, age rating and review info (deliver)
+        if: env.MODE == 'metadata'
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}/mobile/ios
+        run: |
+          set -euo pipefail
+          D="$RUNNER_TEMP/sodesk-deliver"; rm -rf "$D"; mkdir -p "$D/metadata" "$D/screenshots"
+          cp -R fastlane/metadata/. "$D/metadata/"
+          # Committed screenshots (fastlane/screenshots/<locale>/*.jpg|png), if the repo has any.
+          SHOTS=true
+          if [[ -d fastlane/screenshots ]] && [[ -n "$(find fastlane/screenshots -type f \( -name '*.png' -o -name '*.jpg' \) -print -quit)" ]]; then
+            cp -R fastlane/screenshots/. "$D/screenshots/"; SHOTS=false
+            echo 'Screenshots: using the committed files in mobile/ios/fastlane/screenshots.'
+          else
+            echo 'Screenshots: none committed (run mode=screenshots to generate and upload them).'
+          fi
+          VERSION="$(sed -n 's/.*MARKETING_VERSION = \([0-9][0-9.]*\);.*/\1/p' SoDesk.xcodeproj/project.pbxproj | head -n 1)"
+          [[ -n "$VERSION" ]] || { echo '::error::MARKETING_VERSION not found in the project.'; exit 65; }
+          LOG="$RUNNER_TEMP/deliver-metadata.log"
+          cd "$D"
+          set +e
+          fastlane deliver --api_key_path "$ASC_API_KEY_JSON" --app_identifier "$EXPECTED_BUNDLE_ID" --app_version "$VERSION" \
+            --metadata_path "$D/metadata" --screenshots_path "$D/screenshots" \
+            --app_rating_config_path "$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH/mobile/ios/fastlane/age_rating.json" \
+            --skip_binary_upload true --skip_screenshots "$SHOTS" --skip_metadata false --overwrite_screenshots true \
+            --submit_for_review false --automatic_release false --force true --run_precheck_before_submit false \
+            > "$LOG" 2>&1
+          st=$?
+          set -e
+          if [[ "$st" -ne 0 ]]; then
+            grep -E '\[!\]|rror|nvalid|nable to|annot|ejected|ould not|not found|ITC|ENTITY' "$LOG" | grep -viE '@|phone|password|demo' | cut -c1-300 | sort -u | head -n 30 || true
+            echo "::error::fastlane deliver failed (exit $st). If it says there is no editable version, create version $VERSION in App Store Connect (Prepare for Submission) and rerun."
+            exit 1
+          fi
+          echo "Listing uploaded for version $VERSION: name, subtitle, description, keywords, promotional text, URLs, copyright, categories, age rating, review info."
+          echo "- App Store listing text, categories, age rating and review info uploaded for version \`$VERSION\` (not submitted)." >> "$GITHUB_STEP_SUMMARY"
+          [[ "$SHOTS" == 'true' ]] || echo '- Committed screenshots uploaded.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload generated screenshots (deliver)
+        if: env.MODE == 'screenshots'
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}/mobile/ios
+        run: |
+          set -euo pipefail
+          [[ -d "${SHOTS_OUT:-}" ]] || { echo '::error::No screenshots were generated.'; exit 65; }
+          D="$RUNNER_TEMP/sodesk-deliver"; rm -rf "$D"; mkdir -p "$D/metadata"
+          VERSION="$(sed -n 's/.*MARKETING_VERSION = \([0-9][0-9.]*\);.*/\1/p' SoDesk.xcodeproj/project.pbxproj | head -n 1)"
+          [[ -n "$VERSION" ]] || { echo '::error::MARKETING_VERSION not found in the project.'; exit 65; }
+          LOG="$RUNNER_TEMP/deliver-screenshots.log"
+          cd "$D"
+          set +e
+          fastlane deliver --api_key_path "$ASC_API_KEY_JSON" --app_identifier "$EXPECTED_BUNDLE_ID" --app_version "$VERSION" \
+            --metadata_path "$D/metadata" --screenshots_path "$SHOTS_OUT" \
+            --skip_binary_upload true --skip_metadata true --skip_screenshots false --overwrite_screenshots true \
+            --submit_for_review false --automatic_release false --force true --run_precheck_before_submit false \
+            > "$LOG" 2>&1
+          st=$?
+          set -e
+          if [[ "$st" -ne 0 ]]; then
+            grep -E '\[!\]|rror|nvalid|nable to|nsupported|annot|ejected|ould not|not found' "$LOG" | cut -c1-300 | sort -u | head -n 30 || true
+            echo "::error::fastlane deliver (screenshots) failed (exit $st). If it says there is no editable version, create version $VERSION in App Store Connect and rerun."
+            exit 1
+          fi
+          echo "Screenshots uploaded: $SHOT_SETS size set(s), locales en-US and zh-Hans."
+          echo "- App Store screenshots uploaded ($SHOT_SETS size set(s): 6.9\", 6.5\", iPad 13\" as available) for version \`$VERSION\` (not submitted)." >> "$GITHUB_STEP_SUMMARY"
+
       # ---- testflight mode ----
       - name: Install signing assets with Match (readonly)
         if: env.MODE == 'testflight' && steps.layout.outputs.ready == 'true'
@@ -561,6 +847,16 @@ jobs:
           ARCHIVE="$RUNNER_TEMP/sodesk.xcarchive"; EXPORT_DIR="$RUNNER_TEMP/sodesk-export"; OPTS="$RUNNER_TEMP/sodesk-export.plist"
           rm -rf "$ARCHIVE" "$EXPORT_DIR"; mkdir -p "$EXPORT_DIR"
           # MARKETING_VERSION is deliberately not overridden: the project's value is kept.
+          # Export compliance is the owner's answer (mobile/ios/fastlane/export-compliance.env), never a CI guess:
+          # empty = not set in the build (answer it in App Store Connect), YES/NO = ITSAppUsesNonExemptEncryption.
+          EC_FILE=mobile/ios/fastlane/export-compliance.env
+          EC=''; [[ ! -f "$EC_FILE" ]] || EC="$(sed -n 's/^USES_NON_EXEMPT_ENCRYPTION=//p' "$EC_FILE" | head -n 1 | tr -d '\r \t')"
+          EXTRA=()
+          case "$EC" in
+            YES|NO) EXTRA=("INFOPLIST_KEY_ITSAppUsesNonExemptEncryption=$EC"); echo "Export compliance from export-compliance.env: ITSAppUsesNonExemptEncryption=$EC" ;;
+            '') ;;
+            *) echo '::error::export-compliance.env: USES_NON_EXEMPT_ENCRYPTION must be empty, YES or NO.'; exit 65 ;;
+          esac
           # Full output goes to a log; on failure only the error lines are printed (no secrets in them).
           show_errors() { grep -E 'error:|\*\* (ARCHIVE|EXPORT) FAILED|Error Domain|NSLocalizedDescription|requires a provisioning|No profile|No signing certificate|doesn.t include|Code Sign' "$1" | cut -c1-400 | sort -u | head -n 40 || true; }
           set +e
@@ -569,7 +865,8 @@ jobs:
             -destination 'generic/platform=iOS' -archivePath "$ARCHIVE" \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
             CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="$ASC_TEAM_ID" CODE_SIGN_IDENTITY='Apple Distribution' \
-            PROVISIONING_PROFILE_SPECIFIER="$APPSTORE_PROFILE_NAME" > "$RUNNER_TEMP/sodesk-archive.log" 2>&1
+            PROVISIONING_PROFILE_SPECIFIER="$APPSTORE_PROFILE_NAME" \
+            ${EXTRA[@]+"${EXTRA[@]}"} > "$RUNNER_TEMP/sodesk-archive.log" 2>&1
           st=$?
           set -e
           if [[ "$st" -ne 0 ]]; then show_errors "$RUNNER_TEMP/sodesk-archive.log"; echo "::error::xcodebuild archive failed (exit $st)."; exit 65; fi
@@ -656,6 +953,8 @@ jobs:
             if [[ "$MODE" == 'testflight' ]]; then
               echo "- TestFlight: \`$EXPECTED_BUNDLE_ID\` $APP_VERSION ($BUILD_NUMBER) uploaded; processing in App Store Connect takes a few minutes."
               [[ -z "${EXPORT_COMPLIANCE_PENDING:-}" ]] || echo '- Export compliance: answer the encryption question for this build in App Store Connect (not set by CI).'
+            elif [[ "$MODE" == 'metadata' || "$MODE" == 'screenshots' ]]; then
+              echo '- Nothing was submitted for review or released; the privacy label and export compliance are not set by CI (see mobile/ios/fastlane).'
             elif [[ "$MODE" == 'verify' ]]; then
               echo "- Go: \`$(go version | cut -d' ' -f3)\`"
               echo '- No signing; nothing uploaded.'

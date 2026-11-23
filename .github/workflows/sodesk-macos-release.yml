@@ -10,8 +10,9 @@
 #             `rds version`, `rds --help`, the loopback smoke test (host + client), and a desktop
 #             probe that makes the hardened binary load system frameworks at run time.
 #
-# Nothing is uploaded: no artifacts, no release. The summary reports the SHA-256 of the signed
-# binary and of the notarized zip. A bare executable cannot carry a stapled ticket (stapler
+# By default nothing is uploaded: no artifacts, no release. The summary reports the SHA-256 of
+# the signed binary and of the notarized zip. The exception is the release hand-off below.
+# A bare executable cannot carry a stapled ticket (stapler
 # only handles bundles, disk images and packages), so Gatekeeper checks the notarization of a
 # downloaded rds online on first run.
 #
@@ -20,6 +21,15 @@
 # key for notarytool), ASC_TEAM_ID (the certificate must belong to this team), TARGET_REPO_PAT
 # (source checkout). The certificate lives in a keychain made for this run and deleted at the
 # end, whatever happens.
+#
+# Release hand-off: the SoDesk repository's release workflow (readori/SoDesk, release.yml) starts
+# this workflow with workflow_dispatch (ref=<tag>, version=<tag>, upload=true, correlation=<id>),
+# waits for it, and downloads the artifact `rds-macos-universal` (the signed universal `rds`, the
+# notarized zip and SHA256SUMS-macos, kept 3 days) to put the binary into the release. The Apple
+# secrets stay here, in this repository; the SoDesk repository only holds a token that may start
+# and read runs of this workflow. `upload` defaults to false, so request-file runs and manual runs
+# still upload nothing. The artifact exists only if every step above it passed (signature,
+# notarization, Gatekeeper check, the smoke tests and the framework probe).
 #
 # Triggers: workflow_dispatch, or a push to main that changes ci-requests/sodesk-macos-release.env
 # (how the project's AI engineer requests a run). Only people with push access to this repo can
@@ -38,7 +48,7 @@
 # tool output that could quote a secret is not printed, only chosen fields.
 name: SoDesk macOS release
 
-run-name: SoDesk macOS release · ${{ github.event_name == 'push' && 'request (ci-requests/sodesk-macos-release.env)' || inputs.ref }}
+run-name: SoDesk macOS release · ${{ github.event_name == 'push' && 'request (ci-requests/sodesk-macos-release.env)' || inputs.ref }}${{ inputs.correlation && format(' [{0}]', inputs.correlation) || '' }}
 
 on:
   workflow_dispatch:
@@ -50,6 +60,16 @@ on:
         type: string
       version:
         description: 'Version to stamp (empty: git describe --tags --always)'
+        required: false
+        default: ''
+        type: string
+      upload:
+        description: 'Upload the signed binary as the artifact rds-macos-universal (release hand-off)'
+        required: false
+        default: false
+        type: boolean
+      correlation:
+        description: 'Opaque id shown in the run name, so the caller can find this run (release hand-off)'
         required: false
         default: ''
         type: string
@@ -93,6 +113,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_REF: ${{ inputs.ref }}
           INPUT_VERSION: ${{ inputs.version }}
+          INPUT_CORRELATION: ${{ inputs.correlation }}
           REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/sodesk-macos-release.env
         run: |
           set -euo pipefail
@@ -113,6 +134,10 @@ jobs:
           }
           [[ -z "$WANT_VERSION" || ( "$WANT_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ && ${#WANT_VERSION} -le 64 ) ]] || {
             echo '::error::version may hold letters, digits and . _ + - only (at most 64 characters).'
+            exit 64
+          }
+          [[ "$INPUT_CORRELATION" =~ ^[A-Za-z0-9._-]{0,64}$ ]] || {
+            echo '::error::correlation may hold letters, digits and . _ - only (at most 64 characters).'
             exit 64
           }
           missing=()
@@ -376,7 +401,7 @@ jobs:
             echo '- Not stapled: a bare executable cannot carry a ticket (`stapler` handles bundles, disk images and packages); Gatekeeper looks the ticket up online on first run'
             echo "- SHA-256 \`rds\` (universal, signed): \`$SHA_BIN\`"
             echo "- SHA-256 \`rds-macos-universal.zip\` (as notarized): \`$SHA_ZIP\`"
-            echo '- Nothing uploaded.'
+            echo '- Nothing uploaded unless the release hand-off was requested (upload=true).'
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$FAILED"
 
@@ -449,6 +474,29 @@ jobs:
               print("::error::the signed binary could not use the system frameworks")
               sys.exit(1)
           PY
+
+      # Release hand-off (see the header): only when the caller asked for it, and only reached
+      # when every check above passed. Public repository: the artifact is as public as the
+      # release the binary goes into.
+      - name: Stage the signed binary for the release hand-off
+        if: inputs.upload == true
+        run: |
+          set -euo pipefail
+          H="$RUNNER_TEMP/handoff"; rm -rf "$H"; mkdir -p "$H"
+          cp "$OUT/rds" "$H/rds"
+          cp "$ZIP" "$H/rds-macos-universal.zip"
+          ( cd "$H" && shasum -a 256 rds rds-macos-universal.zip > SHA256SUMS-macos && cat SHA256SUMS-macos )
+          echo "HANDOFF_DIR=$H" >> "$GITHUB_ENV"
+          echo "- Hand-off: artifact \`rds-macos-universal\` uploaded for the release workflow (kept 3 days)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the signed binary (release hand-off)
+        if: inputs.upload == true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rds-macos-universal
+          path: ${{ env.HANDOFF_DIR }}/*
+          retention-days: 3
+          if-no-files-found: error
 
       - name: Remove the signing keychain and key files
         if: always()
