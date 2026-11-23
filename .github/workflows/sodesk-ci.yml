@@ -191,3 +191,16 @@ jobs:
           $env:RDS_WINTUN_DIR = "$env:RUNNER_TEMP\wintun\wintun\bin\amd64"
           go test -count=1 -v -run 'TestWintunE2E' ./internal/svc/vpn/ 2>&1 | Select-Object -Last 80
           if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # Posts real CoreGraphics input events if the runner grants Accessibility; otherwise the
+      # tests skip with the exact permission message (the log still shows display geometry).
+      - name: Input end-to-end (macOS)
+        if: always() && runner.os == 'macOS'
+        working-directory: source
+        env:
+          SODESK_INPUT_E2E: '1'
+          CGO_ENABLED: '0'
+        run: |
+          set -o pipefail
+          [[ -f internal/inject/inject_darwin.go ]] || { echo '::notice::no macOS injector on this ref; skipped.'; exit 0; }
+          go test -v -count=1 -run 'TestMacE2E|TestMacMoveE2E' ./internal/inject/ ./internal/svc/input/ 2>&1 | tail -n 80
