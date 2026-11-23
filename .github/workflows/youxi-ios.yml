@@ -175,6 +175,12 @@ jobs:
           npm run --silent ios:sync > "$RUNNER_TEMP/ios-sync.log" 2>&1 || { grep -iE 'error|fail' "$RUNNER_TEMP/ios-sync.log" | head -20; echo '::error::npm run ios:sync failed.'; exit 1; }
           test -f ios/App/App/public/index.html || { echo '::error::ios:sync did not produce ios/App/App/public/index.html'; exit 66; }
           echo 'Web build synced into ios/App/App/public.'
+          # T113: native plugins must be in the generated packageClassList, or JS calls to them silently fail on device.
+          classes="$(node -e "const c=require('./ios/App/App/capacitor.config.json');console.log((c.packageClassList||[]).join(','))")"
+          echo "Native plugins: ${classes:-none}"
+          for need in PreferencesPlugin SharePlugin AppleSignInPlugin; do
+            [[ ",$classes," == *",$need,"* ]] || { echo "::error::Native plugin $need missing from ios/App/App/capacitor.config.json packageClassList."; exit 66; }
+          done
 
       - name: Build for iOS Simulator (no signing)
         if: ${{ inputs.mode == 'verify' }}
