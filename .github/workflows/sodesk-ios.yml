@@ -561,12 +561,18 @@ jobs:
           ARCHIVE="$RUNNER_TEMP/sodesk.xcarchive"; EXPORT_DIR="$RUNNER_TEMP/sodesk-export"; OPTS="$RUNNER_TEMP/sodesk-export.plist"
           rm -rf "$ARCHIVE" "$EXPORT_DIR"; mkdir -p "$EXPORT_DIR"
           # MARKETING_VERSION is deliberately not overridden: the project's value is kept.
+          # Full output goes to a log; on failure only the error lines are printed (no secrets in them).
+          show_errors() { grep -E 'error:|\*\* (ARCHIVE|EXPORT) FAILED|Error Domain|NSLocalizedDescription|requires a provisioning|No profile|No signing certificate|doesn.t include|Code Sign' "$1" | cut -c1-400 | sort -u | head -n 40 || true; }
+          set +e
           xcodebuild archive -quiet \
             -project mobile/ios/SoDesk.xcodeproj -scheme SoDesk -configuration Release \
             -destination 'generic/platform=iOS' -archivePath "$ARCHIVE" \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
             CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="$ASC_TEAM_ID" CODE_SIGN_IDENTITY='Apple Distribution' \
-            PROVISIONING_PROFILE_SPECIFIER="$APPSTORE_PROFILE_NAME"
+            PROVISIONING_PROFILE_SPECIFIER="$APPSTORE_PROFILE_NAME" > "$RUNNER_TEMP/sodesk-archive.log" 2>&1
+          st=$?
+          set -e
+          if [[ "$st" -ne 0 ]]; then show_errors "$RUNNER_TEMP/sodesk-archive.log"; echo "::error::xcodebuild archive failed (exit $st)."; exit 65; fi
           python3 - "$OPTS" <<'PY'
           import os, plistlib, sys
           plistlib.dump({
@@ -576,7 +582,11 @@ jobs:
               "manageAppVersionAndBuildNumber": False, "uploadSymbols": True,
           }, open(sys.argv[1], "wb"))
           PY
-          xcodebuild -exportArchive -quiet -archivePath "$ARCHIVE" -exportPath "$EXPORT_DIR" -exportOptionsPlist "$OPTS"
+          set +e
+          xcodebuild -exportArchive -quiet -archivePath "$ARCHIVE" -exportPath "$EXPORT_DIR" -exportOptionsPlist "$OPTS" > "$RUNNER_TEMP/sodesk-export.log" 2>&1
+          st=$?
+          set -e
+          if [[ "$st" -ne 0 ]]; then show_errors "$RUNNER_TEMP/sodesk-export.log"; echo "::error::xcodebuild -exportArchive failed (exit $st)."; exit 65; fi
           IPA="$(find "$EXPORT_DIR" -maxdepth 1 -name '*.ipa' -print -quit)"
           [[ -n "$IPA" ]] || { echo '::error::IPA was not exported.'; exit 65; }
           V="$RUNNER_TEMP/sodesk-verify"; rm -rf "$V"; mkdir -p "$V"; unzip -q "$IPA" -d "$V"
@@ -588,8 +598,16 @@ jobs:
           VERSION="$($PB -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")"
           test -f "$APP/sodesk-mobile.js" || { echo '::error::App bundle has no sodesk-mobile.js'; exit 65; }
           # What App Store processing needs (a missing piece is rejected by altool validate or processing).
-          $PB -c 'Print :CFBundleIconName' "$APP/Info.plist" >/dev/null 2>&1 || { echo '::error::Info.plist has no CFBundleIconName (app icon not compiled in).'; exit 65; }
-          test -f "$APP/Assets.car" || { echo '::error::Assets.car is missing (asset catalog not compiled).'; exit 65; }
+          # The icon name may be a top-level key or sit inside CFBundleIcons (Xcode versions differ); a
+          # real problem is reported by altool validate below, so only warn here and show the facts.
+          if $PB -c 'Print :CFBundleIconName' "$APP/Info.plist" >/dev/null 2>&1 \
+             || $PB -c 'Print :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconName' "$APP/Info.plist" >/dev/null 2>&1; then
+            echo 'App icon: icon name present in Info.plist.'
+          else
+            echo '::warning::Info.plist has no icon name key (CFBundleIconName / CFBundleIcons); altool validate decides. Icon-related keys:'
+            plutil -p "$APP/Info.plist" | grep -i icon | cut -c1-200 || true
+          fi
+          test -f "$APP/Assets.car" || { echo '::error::Assets.car is missing (asset catalog not compiled).'; ls "$APP" | head -n 40; exit 65; }
           $PB -c 'Print :MinimumOSVersion' "$APP/Info.plist" >/dev/null 2>&1 || { echo '::error::Info.plist has no MinimumOSVersion.'; exit 65; }
           security cms -D -i "$APP/embedded.mobileprovision" > "$V/prov.plist" 2>/dev/null || { echo '::error::No embedded provisioning profile.'; exit 65; }
           [[ "$($PB -c 'Print :Entitlements:get-task-allow' "$V/prov.plist" 2>/dev/null || echo false)" != 'true' ]] || { echo '::error::Profile is a development profile (get-task-allow).'; exit 65; }
@@ -621,6 +639,7 @@ jobs:
             st=$?
             set -e
             if [[ "$st" -ne 0 ]] || grep -qiE '^[[:space:]]*[*]{3} Error|ERROR ITMS-' "$LOG"; then
+              grep -iE 'error|ITMS-|warning|message|reason|description' "$LOG" | cut -c1-500 | head -n 40 || true
               MSG="$(grep -iE 'error|ITMS-|bundle version|message' "$LOG" | head -20 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
               echo "::error title=altool $action failed::${MSG:-exit $st}"
               exit 1
