@@ -268,6 +268,24 @@ jobs:
           [System.Windows.Forms.Screen]::AllScreens | ForEach-Object { "screen $($_.DeviceName) $($_.Bounds) primary=$($_.Primary)" }
           Write-Output "Cursor: $([System.Windows.Forms.Cursor]::Position)"
 
+      # Runner images can show first-run windows (the windows-11-arm image shows a "Microsoft account"
+      # dialog that sits above every normal window and takes the foreground, so clicks, typing and
+      # screenshots would hit it instead of the test windows). List the windows with titles and close
+      # that one; the tests also check that nothing covers their window and say so if something does.
+      - name: Close stray first-run windows
+        continue-on-error: true
+        run: |
+          function Show-Windows { Get-Process | Where-Object { $_.MainWindowTitle } | Select-Object Id, ProcessName, MainWindowTitle | Format-Table -AutoSize | Out-String -Width 200 }
+          Write-Output 'Windows with titles:'; Show-Windows
+          foreach ($p in (Get-Process | Where-Object { $_.MainWindowTitle -match 'Microsoft account' })) {
+            Write-Output "Closing '$($p.MainWindowTitle)' ($($p.ProcessName), pid $($p.Id))"
+            [void]$p.CloseMainWindow()
+            Start-Sleep -Seconds 2
+            if (-not $p.HasExited -and $p.ProcessName -notin @('explorer', 'dwm', 'winlogon', 'csrss')) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+          }
+          Start-Sleep -Seconds 2
+          Write-Output 'Windows with titles after:'; Show-Windows
+
       - name: Install ffmpeg (pinned, SHA-256 verified)
         run: |
           $ErrorActionPreference = 'Stop'
