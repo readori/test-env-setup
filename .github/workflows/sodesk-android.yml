@@ -257,7 +257,13 @@ jobs:
           IMG="system-images;android-${EMULATOR_API};google_apis;x86_64"
           { yes || true; } | "$SDK/cmdline-tools/latest/bin/sdkmanager" --install emulator platform-tools "$IMG" > "$RUNNER_TEMP/sdk-emu.log" 2>&1 || { tail -n 20 "$RUNNER_TEMP/sdk-emu.log"; exit 1; }
           echo "system image installed"
-          echo no | "$SDK/cmdline-tools/latest/bin/avdmanager" create avd -n ci -k "$IMG" -d pixel_6 --force > /dev/null
+          # One AVD directory for avdmanager and the emulator: the build may
+          # have set ANDROID_USER_HOME/ANDROID_SDK_HOME, which the two read
+          # differently.
+          export ANDROID_AVD_HOME="$RUNNER_TEMP/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo no | "$SDK/cmdline-tools/latest/bin/avdmanager" create avd -n ci -k "$IMG" -d pixel_6 --force > "$RUNNER_TEMP/avd-create.log" 2>&1 || { tail -n 20 "$RUNNER_TEMP/avd-create.log"; exit 1; }
+          echo "AVDs: $("$SDK/emulator/emulator" -list-avds | tr '\n' ' ')"
           "$SDK/emulator/emulator" -avd ci -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot -no-metrics > "$RUNNER_TEMP/emulator.log" 2>&1 &
           ADB="$SDK/platform-tools/adb"
           echo "emulator started; waiting for the device"
