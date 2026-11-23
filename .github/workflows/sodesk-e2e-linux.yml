@@ -1,0 +1,375 @@
+# SoDesk (Go, binary `rds`) Linux end-to-end tests in a real environment.
+#
+# Public CI repository -> source readori/SoDesk. Each target is its own job, so one failure
+# does not hide the others:
+#
+#   signal   : the rendezvous server as a hardened systemd service (rds service install --role
+#              signal --relay --relay-ports 40000-40099) with real systemd: is-active, the
+#              hardening systemd reports, the server key, a host and a client connecting by
+#              9-digit ID through it (directly, then through its relay with direct UDP blocked by
+#              an iptables owner rule), status, logs, restart (key and ID survive), uninstall.
+#              Driver: test/e2e/signal_service.sh.
+#   usbip    : USB/IP with the real kernel: usbip-host, vhci-hcd, dummy_hcd and a configfs
+#              mass-storage gadget backed by a file of random bytes; an rds host exports it, an
+#              rds client imports it over loopback; the disk is read back (sha256) and written
+#              through vhci; detach and session end restore the device. Driver: test/e2e/usbip.sh.
+#   accounts : accounts on the rendezvous server with a real SMTP server (Mailpit in Docker,
+#              STARTTLS and AUTH required, certificate from a throwaway CA): login codes by
+#              mail, a second device approved with the fingerprint comparison, rds account /
+#              rds devices, account-trust login without a password, removal revokes access.
+#              Driver: test/e2e/accounts_mailpit.sh -> go test ./test/e2e (TestAccounts*).
+#   web      : rds web behind a real Cloudflare quick tunnel (cloudflared, pinned release,
+#              SHA-256 verified): page headers (HSTS, CSP), wrong then right gateway password,
+#              the __Host-sodesk Secure cookie, CSRF, a session to an rds host on the runner and
+#              a terminal command over the WebSocket, all through the public URL.
+#              Driver: go test ./test/e2e (TestWebPublicE2E).
+#
+# No deploy, signing or cloud credentials are used; the quick tunnel needs no account. Nothing is
+# uploaded: no artifacts.
+#
+# Triggers: workflow_dispatch, or a push to main that changes ci-requests/sodesk-e2e-linux.env
+# (how the project's AI engineer requests a run). Only people with push access to this repo can
+# trigger; never pull_request. The request file is plain KEY=VALUE text, parsed with strict
+# patterns and never sourced or executed:
+#
+#   REF=<sha>                         # readori/SoDesk branch, tag or SHA
+#   TARGETS=all                       # optional: all (default) or a comma list of
+#                                     # signal,usbip,accounts,web
+#
+# Safety rules (public repo, public logs): no pull_request triggers; only GitHub-owned actions,
+# pinned to commit SHAs; TARGET_REPO_PAT is used only by the checkout step and not persisted.
+# Logs carry results and failure tails only. Passwords (host, gateway, SMTP) are random per run,
+# live in 0600 files or process environments on the runner and are never printed; login codes,
+# session cookies and the tunnel's public host name are never printed either.
+name: SoDesk E2E Linux
+
+run-name: SoDesk E2E Linux · ${{ github.event_name == 'push' && 'request (ci-requests/sodesk-e2e-linux.env)' || inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'readori/SoDesk branch, tag, or SHA'
+        required: true
+        default: 'main'
+        type: string
+      targets:
+        description: 'all, or a comma list of signal,usbip,accounts,web'
+        required: true
+        default: 'all'
+        type: string
+  push:
+    branches: [main]
+    paths: ['ci-requests/sodesk-e2e-linux.env']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sodesk-e2e-linux-${{ inputs.ref || 'request' }}
+  cancel-in-progress: true
+
+jobs:
+  request:
+    name: request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ref: ${{ steps.req.outputs.ref }}
+      targets: ${{ steps.req.outputs.targets }}
+    steps:
+      - name: Validate request and credentials
+        id: req
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_TARGETS: ${{ inputs.targets }}
+          REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/sodesk-e2e-linux.env
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == 'push' ]]; then
+            # Download only the request file of this exact commit (public repo, no credentials).
+            REQ="$RUNNER_TEMP/sodesk-e2e-request.env"
+            curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/sodesk-e2e-linux.env at this commit.'; exit 64; }
+            # Plain text, read line by line; never sourced or executed.
+            SOURCE_REF="$(sed -n 's/^REF=//p' "$REQ" | head -n 1 | tr -d '\r')"
+            TARGETS="$(sed -n 's/^TARGETS=//p' "$REQ" | head -n 1 | tr -d '\r')"
+          else
+            SOURCE_REF="$INPUT_REF"
+            TARGETS="$INPUT_TARGETS"
+          fi
+          TARGETS="${TARGETS:-all}"
+          [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && ${#SOURCE_REF} -le 200 ]] || {
+            echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only, no leading dash).'
+            exit 64
+          }
+          T='(signal|usbip|accounts|web)'
+          [[ "$TARGETS" =~ ^(all|$T(,$T)*)$ ]] || {
+            echo '::error::TARGETS must be all or a comma list of signal,usbip,accounts,web.'
+            exit 64
+          }
+          [[ "$TARGETS" == all ]] && TARGETS='signal,usbip,accounts,web'
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || {
+            echo '::error::Missing public CI credential: TARGET_REPO_PAT (it must have read access to readori/SoDesk).'
+            exit 78
+          }
+          echo "ref=$SOURCE_REF" >> "$GITHUB_OUTPUT"
+          echo "targets=,$TARGETS," >> "$GITHUB_OUTPUT"
+          echo "Source ref: $SOURCE_REF"
+          echo "Targets:    $TARGETS"
+          { echo "### SoDesk E2E Linux"; echo; echo "- Ref: \`$SOURCE_REF\`"; echo "- Targets: $TARGETS"; } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------------------------
+  signal:
+    name: signal service (systemd)
+    needs: request
+    if: contains(needs.request.outputs.targets, ',signal,')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/SoDesk
+          ref: ${{ needs.request.outputs.ref }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Build rds
+        working-directory: source
+        env:
+          GOTOOLCHAIN: auto
+        run: |
+          set -euo pipefail
+          go version
+          echo "commit: $(git rev-parse --short HEAD)"
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/rds" ./cmd/rds
+          echo "RDS_BIN=$RUNNER_TEMP/rds" >> "$GITHUB_ENV"
+          echo "- signal: \`readori/SoDesk@$(git rev-parse --short HEAD)\`, $(go version | cut -d' ' -f3)" >> "$GITHUB_STEP_SUMMARY"
+
+      # Runs as the runner user (host and client); the script uses sudo for the service.
+      - name: Rendezvous server as a systemd service
+        working-directory: source
+        run: |
+          set -o pipefail
+          [[ -f test/e2e/signal_service.sh ]] || { echo '::notice::test/e2e/signal_service.sh is not on this ref; skipped.'; exit 0; }
+          code=0
+          bash test/e2e/signal_service.sh "$RDS_BIN" 2>&1 | cut -c1-400 || code=$?
+          echo "- signal service: $([[ $code == 0 ]] && echo PASS || echo FAIL)" >> "$GITHUB_STEP_SUMMARY"
+          exit $code
+
+      - name: Service journal (failure only)
+        if: failure()
+        run: |
+          sudo journalctl -u sodesk-signal --no-pager -o short-iso -n 60 2>/dev/null | cut -c1-400 || true
+
+  # ---------------------------------------------------------------------------------------------
+  usbip:
+    name: USB/IP (real kernel)
+    needs: request
+    if: contains(needs.request.outputs.targets, ',usbip,')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/SoDesk
+          ref: ${{ needs.request.outputs.ref }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Build rds
+        working-directory: source
+        env:
+          GOTOOLCHAIN: auto
+        run: |
+          set -euo pipefail
+          go version
+          echo "commit: $(git rev-parse --short HEAD)"
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/rds" ./cmd/rds
+          echo "RDS_BIN=$RUNNER_TEMP/rds" >> "$GITHUB_ENV"
+          echo "- usbip: \`readori/SoDesk@$(git rev-parse --short HEAD)\`, kernel $(uname -r)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Kernel modules (linux-modules-extra)
+        run: |
+          set -uo pipefail
+          K="$(uname -r)"
+          echo "kernel: $K"
+          sudo apt-get update -qq >/dev/null 2>&1 || echo '::warning::apt-get update failed'
+          if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "linux-modules-extra-$K" usbutils >/dev/null 2>"$RUNNER_TEMP/apt.err"; then
+            echo "installed linux-modules-extra-$K and usbutils"
+          else
+            echo "::warning::could not install linux-modules-extra-$K"
+            tail -n 5 "$RUNNER_TEMP/apt.err"
+            apt-cache search --names-only "^linux-modules-extra-" 2>/dev/null | grep -F -- "${K%-*}" | head -n 5 || true
+          fi
+          for m in usbip-core usbip-host vhci-hcd dummy_hcd libcomposite usb_f_mass_storage; do
+            printf '  %-20s %s\n' "$m" "$(modinfo -n "$m" 2>/dev/null || echo MISSING)"
+          done
+
+      - name: USB/IP end to end
+        working-directory: source
+        run: |
+          set -o pipefail
+          [[ -f test/e2e/usbip.sh ]] || { echo '::notice::test/e2e/usbip.sh is not on this ref; skipped.'; exit 0; }
+          code=0
+          sudo bash test/e2e/usbip.sh "$RDS_BIN" 2>&1 | cut -c1-400 || code=$?
+          echo "- USB/IP: $([[ $code == 0 ]] && echo PASS || echo FAIL)" >> "$GITHUB_STEP_SUMMARY"
+          exit $code
+
+      - name: Kernel log (failure only)
+        if: failure()
+        run: sudo dmesg 2>/dev/null | grep -i -E 'usb|vhci|usbip|gadget|dummy|scsi|sd[a-z]' | tail -n 60 | cut -c1-300 || true
+
+  # ---------------------------------------------------------------------------------------------
+  accounts:
+    name: accounts (real SMTP)
+    needs: request
+    if: contains(needs.request.outputs.targets, ',accounts,')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/SoDesk
+          ref: ${{ needs.request.outputs.ref }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Build rds
+        working-directory: source
+        env:
+          GOTOOLCHAIN: auto
+        run: |
+          set -euo pipefail
+          go version
+          echo "commit: $(git rev-parse --short HEAD)"
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/rds" ./cmd/rds
+          echo "RDS_BIN=$RUNNER_TEMP/rds" >> "$GITHUB_ENV"
+          echo "- accounts: \`readori/SoDesk@$(git rev-parse --short HEAD)\`, $(docker --version)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Accounts through Mailpit (STARTTLS + AUTH)
+        working-directory: source
+        env:
+          GOTOOLCHAIN: auto
+          MAILPIT_IMAGE: axllent/mailpit:v1.33.1
+        run: |
+          set -o pipefail
+          [[ -f test/e2e/accounts_mailpit.sh ]] || { echo '::notice::test/e2e/accounts_mailpit.sh is not on this ref; skipped.'; exit 0; }
+          code=0
+          bash test/e2e/accounts_mailpit.sh "$RDS_BIN" 2>&1 | cut -c1-400 || code=$?
+          echo "- accounts (Mailpit): $([[ $code == 0 ]] && echo PASS || echo FAIL)" >> "$GITHUB_STEP_SUMMARY"
+          exit $code
+
+      # The same flows against the test's in-process STARTTLS stand-in: tells a product failure
+      # apart from a Mailpit setup problem.
+      - name: Accounts through the in-process SMTP stand-in
+        if: always()
+        working-directory: source
+        env:
+          GOTOOLCHAIN: auto
+          SODESK_ACCOUNTS_E2E: '1'
+        run: |
+          set -o pipefail
+          [[ -f test/e2e/accounts_test.go ]] || { echo '::notice::no accounts e2e test on this ref; skipped.'; exit 0; }
+          SODESK_E2E_RDS="$RDS_BIN" go test -count=1 -v -run 'TestAccountsE2E|TestAccountsSMTPVerifiesTLS' ./test/e2e/ 2>&1 | cut -c1-400 | tail -n 80
+
+  # ---------------------------------------------------------------------------------------------
+  web:
+    name: rds web behind Cloudflare Tunnel
+    needs: request
+    if: contains(needs.request.outputs.targets, ',web,')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      CLOUDFLARED_VERSION: '2026.10.7'
+      # SHA-256 of cloudflared-linux-amd64 of that release. While empty, the download is checked
+      # against the checksum Cloudflare lists in that release's notes (and GitHub's asset digest),
+      # and the step prints the value to pin here.
+      CLOUDFLARED_SHA256: ''
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/SoDesk
+          ref: ${{ needs.request.outputs.ref }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Build rds
+        working-directory: source
+        env:
+          GOTOOLCHAIN: auto
+        run: |
+          set -euo pipefail
+          go version
+          echo "commit: $(git rev-parse --short HEAD)"
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/rds" ./cmd/rds
+          echo "RDS_BIN=$RUNNER_TEMP/rds" >> "$GITHUB_ENV"
+          echo "- web: \`readori/SoDesk@$(git rev-parse --short HEAD)\`, cloudflared $CLOUDFLARED_VERSION" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download cloudflared (pinned release, SHA-256 verified)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$CLOUDFLARED_VERSION" =~ ^20[0-9]{2}\.[0-9]{1,2}\.[0-9]{1,3}$ ]] || { echo '::error::bad CLOUDFLARED_VERSION'; exit 78; }
+          D="$RUNNER_TEMP/cloudflared"
+          mkdir -p "$D"
+          curl -fsSL --retry 3 --max-time 180 -o "$D/cloudflared" \
+            "https://github.com/cloudflare/cloudflared/releases/download/$CLOUDFLARED_VERSION/cloudflared-linux-amd64"
+          actual="$(sha256sum "$D/cloudflared" | cut -d' ' -f1)"
+          if [[ "$CLOUDFLARED_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            expected="$CLOUDFLARED_SHA256"; from='the value pinned in this workflow'
+          else
+            curl -fsSL --retry 3 --max-time 30 -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/repos/cloudflare/cloudflared/releases/tags/$CLOUDFLARED_VERSION" -o "$D/release.json"
+            expected="$(jq -r '.body // ""' "$D/release.json" | grep -oE 'cloudflared-linux-amd64:[[:space:]]*[0-9a-f]{64}' | grep -oE '[0-9a-f]{64}' | head -n 1 || true)"
+            digest="$(jq -r '.assets[] | select(.name == "cloudflared-linux-amd64") | .digest // ""' "$D/release.json" | sed 's/^sha256://')"
+            [[ -n "$expected" ]] || expected="$digest"
+            [[ -z "$digest" || "$digest" == "$expected" ]] || { echo "::error::release notes ($expected) and GitHub asset digest ($digest) disagree"; exit 1; }
+            from='the checksum in the release notes'
+            echo "::warning::CLOUDFLARED_SHA256 is not pinned; checked against $from. Pin it: CLOUDFLARED_SHA256: '$actual'"
+          fi
+          [[ "$actual" == "$expected" ]] || { echo "::error::cloudflared SHA-256 mismatch: got $actual, expected $expected ($from)"; exit 1; }
+          echo "cloudflared-linux-amd64 $CLOUDFLARED_VERSION sha256 $actual matches $from"
+          chmod 755 "$D/cloudflared"
+          "$D/cloudflared" --version
+          echo "CLOUDFLARED_BIN=$D/cloudflared" >> "$GITHUB_ENV"
+
+      - name: rds web through a quick tunnel
+        working-directory: source
+        env:
+          GOTOOLCHAIN: auto
+          SODESK_WEB_E2E: '1'
+        run: |
+          set -o pipefail
+          [[ -f test/e2e/web_test.go ]] || { echo '::notice::no web e2e test on this ref; skipped.'; exit 0; }
+          code=0
+          SODESK_E2E_RDS="$RDS_BIN" SODESK_E2E_CLOUDFLARED="$CLOUDFLARED_BIN" \
+            go test -count=1 -v -timeout 15m -run TestWebPublicE2E ./test/e2e/ 2>&1 | cut -c1-400 | tail -n 120 || code=$?
+          echo "- rds web behind Cloudflare Tunnel: $([[ $code == 0 ]] && echo PASS || echo FAIL)" >> "$GITHUB_STEP_SUMMARY"
+          exit $code
