@@ -173,3 +173,21 @@ jobs:
           ls internal/svc/fs/mount/*dav* >/dev/null 2>&1 || { echo '::notice::no WebDAV mount on this ref; skipped.'; exit 0; }
           T=TestDavE2EDarwin; [[ "$RUNNER_OS" == 'Windows' ]] && T=TestDavE2EWindows
           go test -count=1 -v -run "$T" ./internal/svc/fs/mount/ 2>&1 | tail -n 120
+
+      # Creates a real Wintun adapter (the driver DLL is pinned by SHA-256; rds re-checks it).
+      - name: VPN end-to-end (Wintun)
+        if: always() && runner.os == 'Windows'
+        working-directory: source
+        shell: pwsh
+        env:
+          SODESK_VPN_E2E: '1'
+        run: |
+          if (-not (Test-Path internal/svc/vpn/e2e_windows_test.go)) { Write-Output '::notice::no Wintun test on this ref; skipped.'; exit 0 }
+          $zip = "$env:RUNNER_TEMP\wintun-0.14.1.zip"
+          Invoke-WebRequest -Uri https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile $zip
+          $h = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          if ($h -ne '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51') { throw "wintun-0.14.1.zip SHA-256 mismatch: $h" }
+          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\wintun" -Force
+          $env:RDS_WINTUN_DIR = "$env:RUNNER_TEMP\wintun\wintun\bin\amd64"
+          go test -count=1 -v -run 'TestWintunE2E' ./internal/svc/vpn/ 2>&1 | Select-Object -Last 80
+          if ($LASTEXITCODE -ne 0) { exit 1 }
