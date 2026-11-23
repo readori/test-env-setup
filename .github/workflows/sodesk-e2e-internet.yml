@@ -1,0 +1,343 @@
+# SoDesk (Go, binary `rds`) end-to-end tests over the real internet, through the project's
+# public rendezvous server (rds signal --relay, deployed separately; its address and public key
+# come from the request file).
+#
+#   relay  : one ubuntu runner, host and client find each other by 9-digit ID through the public
+#            server, then connect through its relay with direct UDP between them blocked by an
+#            iptables owner rule; shell -c and a 1 MiB cp round trip through the relay.
+#            Driver: test/e2e/public_signal.sh.
+#   p2p    : hosts on windows-latest and macos-latest, the client on ubuntu-latest: three
+#            machines on different networks connect by ID through the public server (hole
+#            punching, falling back to its relay). Reports which path was used, then ping,
+#            shell -c and a 1 MiB cp round trip.
+#
+# The p2p hosts' identities are derived from TARGET_REPO_PAT plus the run id, so every job
+# derives the same key (and so the same ID) without passing secrets between jobs. The host
+# password is derived the same way and masked. Nothing is uploaded: no artifacts.
+#
+# Triggers: workflow_dispatch, or a push to main that changes ci-requests/sodesk-e2e-internet.env.
+# The request file is plain KEY=VALUE text, parsed with strict patterns and never sourced:
+#
+#   REF=<sha>            # readori/SoDesk branch, tag or SHA
+#   SIGNAL=HOST[:PORT]   # the public rendezvous server
+#   SIGNAL_PIN=KEY       # its public key (base64, public by design)
+#
+# Safety rules (public repo, public logs): no pull_request triggers; only GitHub-owned actions,
+# pinned to commit SHAs; TARGET_REPO_PAT is used by the checkout step and as key-derivation
+# input, never printed or persisted. Logs carry results and failure tails only.
+name: SoDesk E2E Internet
+
+run-name: SoDesk E2E Internet · ${{ github.event_name == 'push' && 'request (ci-requests/sodesk-e2e-internet.env)' || inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'readori/SoDesk branch, tag, or SHA'
+        required: true
+        default: 'main'
+        type: string
+      signal:
+        description: 'public rendezvous server HOST[:PORT]'
+        required: true
+        type: string
+      signal_pin:
+        description: 'its public key'
+        required: true
+        type: string
+  push:
+    branches: [main]
+    paths: ['ci-requests/sodesk-e2e-internet.env']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sodesk-e2e-internet-${{ inputs.ref || 'request' }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: auto
+
+jobs:
+  request:
+    name: request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ref: ${{ steps.req.outputs.ref }}
+      signal: ${{ steps.req.outputs.signal }}
+      pin: ${{ steps.req.outputs.pin }}
+    steps:
+      - name: Validate request and credentials
+        id: req
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_SIGNAL: ${{ inputs.signal }}
+          INPUT_PIN: ${{ inputs.signal_pin }}
+          REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/sodesk-e2e-internet.env
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == 'push' ]]; then
+            REQ="$RUNNER_TEMP/req.env"
+            curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/sodesk-e2e-internet.env at this commit.'; exit 64; }
+            SOURCE_REF="$(sed -n 's/^REF=//p' "$REQ" | head -n 1 | tr -d '\r')"
+            SIGNAL="$(sed -n 's/^SIGNAL=//p' "$REQ" | head -n 1 | tr -d '\r')"
+            PIN="$(sed -n 's/^SIGNAL_PIN=//p' "$REQ" | head -n 1 | tr -d '\r')"
+          else
+            SOURCE_REF="$INPUT_REF"; SIGNAL="$INPUT_SIGNAL"; PIN="$INPUT_PIN"
+          fi
+          [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && ${#SOURCE_REF} -le 200 ]] || { echo '::error::bad REF'; exit 64; }
+          [[ "$SIGNAL" =~ ^[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$ ]] || { echo '::error::SIGNAL must be HOST or HOST:PORT'; exit 64; }
+          [[ "$PIN" =~ ^[A-Za-z0-9+/]{43}=?$ ]] || { echo '::error::SIGNAL_PIN must be the server key (base64)'; exit 64; }
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || { echo '::error::Missing TARGET_REPO_PAT'; exit 78; }
+          { echo "ref=$SOURCE_REF"; echo "signal=$SIGNAL"; echo "pin=$PIN"; } >> "$GITHUB_OUTPUT"
+          echo "Source ref: $SOURCE_REF"; echo "Server:     $SIGNAL"
+          { echo "### SoDesk E2E Internet"; echo; echo "- Ref: \`$SOURCE_REF\`"; echo "- Rendezvous server: \`$SIGNAL\`"; } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------------------------
+  relay:
+    name: relay through the public server
+    needs: request
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/SoDesk
+          ref: ${{ needs.request.outputs.ref }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build rds
+        working-directory: source
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/rds" ./cmd/rds
+          echo "commit $(git rev-parse --short HEAD), $(go version | cut -d' ' -f3)"
+      - name: Host and client by ID, then through the relay
+        working-directory: source
+        env:
+          SIGNAL: ${{ needs.request.outputs.signal }}
+          SIGNAL_PIN: ${{ needs.request.outputs.pin }}
+        run: |
+          set +e
+          [[ -f test/e2e/public_signal.sh ]] || { echo '::notice::test/e2e/public_signal.sh is not on this ref; skipped.'; exit 0; }
+          bash test/e2e/public_signal.sh "$RUNNER_TEMP/rds" 2>&1 | cut -c1-400
+          code=${PIPESTATUS[0]}
+          echo "- relay through the public server: $([[ $code == 0 ]] && echo PASS || echo FAIL)" >> "$GITHUB_STEP_SUMMARY"
+          exit $code
+
+  # ---------------------------------------------------------------------------------------------
+  # Registers the p2p hosts' derived identities once, to learn their IDs (not secret).
+  prepare:
+    name: p2p · register host identities
+    needs: request
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      id_windows: ${{ steps.reg.outputs.id_windows }}
+      id_macos: ${{ steps.reg.outputs.id_macos }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/SoDesk
+          ref: ${{ needs.request.outputs.ref }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build rds and keyseed
+        working-directory: source
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/rds" ./cmd/rds
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/keyseed" ./test/e2e/keyseed
+      - name: Register
+        id: reg
+        env:
+          PAT: ${{ secrets.TARGET_REPO_PAT }}
+          SIGNAL: ${{ needs.request.outputs.signal }}
+          SIGNAL_PIN: ${{ needs.request.outputs.pin }}
+        run: |
+          set -euo pipefail
+          for os in windows macos; do
+            seed=$(printf '%s|%s|%s|%s' "$PAT" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$os" | sha256sum | cut -c1-64)
+            pw=$(printf '%s|pw' "$seed" | sha256sum | cut -c1-24)
+            echo "::add-mask::$pw"
+            d="$RUNNER_TEMP/reg-$os"; mkdir -p "$d"
+            SEED=$seed "$RUNNER_TEMP/keyseed" "$d/id.pem"
+            export RDS_CONFIG_DIR="$d/cfg"
+            "$RUNNER_TEMP/rds" key import "$d/id.pem" --yes >/dev/null
+            "$RUNNER_TEMP/rds" config set signal "$SIGNAL" >/dev/null
+            "$RUNNER_TEMP/rds" config set signal-pin "$SIGNAL_PIN" >/dev/null
+            "$RUNNER_TEMP/rds" host --password "$pw" > "$d/host.log" 2>&1 &
+            pid=$!
+            id=
+            for _ in $(seq 1 60); do
+              id=$(grep -m1 'ID:' "$d/host.log" | tr -dc 0-9 || true)
+              [[ -n "$id" ]] && break
+              sleep 1
+            done
+            kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+            shred -u "$d/id.pem" 2>/dev/null || rm -f "$d/id.pem"
+            [[ -n "$id" ]] || { echo "::error::the $os identity did not register"; grep -v -i password "$d/host.log" | tail -n 20; exit 1; }
+            echo "$os host ID: $id"
+            echo "id_$os=$id" >> "$GITHUB_OUTPUT"
+          done
+
+  host:
+    name: p2p · host on ${{ matrix.os }}
+    needs: [request, prepare]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            key: windows
+          - os: macos-latest
+            key: macos
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/SoDesk
+          ref: ${{ needs.request.outputs.ref }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: source/go.mod
+          cache: false
+      - name: Build rds and keyseed
+        working-directory: source
+        run: |
+          set -euo pipefail
+          ext=; [[ "$RUNNER_OS" == Windows ]] && ext=.exe
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/rds$ext" ./cmd/rds
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/keyseed$ext" ./test/e2e/keyseed
+          echo "EXT=$ext" >> "$GITHUB_ENV"
+      - name: Serve as a host for the client job
+        env:
+          PAT: ${{ secrets.TARGET_REPO_PAT }}
+          SIGNAL: ${{ needs.request.outputs.signal }}
+          SIGNAL_PIN: ${{ needs.request.outputs.pin }}
+          WANT_ID: ${{ matrix.key == 'windows' && needs.prepare.outputs.id_windows || needs.prepare.outputs.id_macos }}
+          KEY: ${{ matrix.key }}
+        run: |
+          set -uo pipefail
+          sha() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; }
+          seed=$(printf '%s|%s|%s|%s' "$PAT" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$KEY" | sha | cut -c1-64)
+          pw=$(printf '%s|pw' "$seed" | sha | cut -c1-24)
+          echo "::add-mask::$pw"
+          d="$RUNNER_TEMP/h"; mkdir -p "$d/files"
+          echo "served by the $KEY host" > "$d/files/hello.txt"
+          SEED=$seed "$RUNNER_TEMP/keyseed$EXT" "$d/id.pem"
+          export RDS_CONFIG_DIR="$d/cfg"
+          R="$RUNNER_TEMP/rds$EXT"
+          "$R" key import "$d/id.pem" --yes >/dev/null && rm -f "$d/id.pem"
+          "$R" config set signal "$SIGNAL" >/dev/null
+          "$R" config set signal-pin "$SIGNAL_PIN" >/dev/null
+          "$R" -v host --password "$pw" > "$d/host.log" 2>&1 &
+          pid=$!
+          id=
+          for _ in $(seq 1 60); do id=$(grep -m1 'ID:' "$d/host.log" | tr -dc 0-9 || true); [[ -n "$id" ]] && break; sleep 1; done
+          if [[ "$id" != "$WANT_ID" ]]; then
+            echo "::error::host registered as '$id', expected $WANT_ID"; grep -v -i password "$d/host.log" | tail -n 20; kill $pid; exit 1
+          fi
+          echo "registered with the public server as ID $id; serving for up to 9 minutes"
+          # Serve until the client has had its turn (it signals nothing back), then stop.
+          for _ in $(seq 1 540); do kill -0 $pid 2>/dev/null || break; sleep 1; done
+          kill $pid 2>/dev/null; wait $pid 2>/dev/null
+          echo "sessions served: $(grep -c 'session opened' "$d/host.log" || true)"
+          grep -E 'session opened' "$d/host.log" | sed -E 's/identity=[^ ]+//' | cut -c1-240 | head -n 10
+          n=$(grep -c 'session opened' "$d/host.log" || true)
+          echo "- p2p host on $KEY: $n sessions" >> "$GITHUB_STEP_SUMMARY"
+          [[ "$n" -gt 0 ]] || { echo '::error::no client reached this host'; exit 1; }
+
+  client:
+    name: p2p · client on ubuntu
+    needs: [request, prepare]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: readori/SoDesk
+          ref: ${{ needs.request.outputs.ref }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build rds
+        working-directory: source
+        run: CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/rds" ./cmd/rds
+      - name: Connect to the Windows and macOS hosts by ID
+        env:
+          PAT: ${{ secrets.TARGET_REPO_PAT }}
+          SIGNAL: ${{ needs.request.outputs.signal }}
+          SIGNAL_PIN: ${{ needs.request.outputs.pin }}
+          ID_WINDOWS: ${{ needs.prepare.outputs.id_windows }}
+          ID_MACOS: ${{ needs.prepare.outputs.id_macos }}
+        run: |
+          set +e
+          R="$RUNNER_TEMP/rds"
+          export RDS_CONFIG_DIR="$RUNNER_TEMP/cli"
+          "$R" config set signal "$SIGNAL" >/dev/null
+          "$R" config set signal-pin "$SIGNAL_PIN" >/dev/null
+          head -c $((1 << 20)) /dev/urandom > "$RUNNER_TEMP/up.bin"
+          failed=0
+          for os in windows macos; do
+            id=$ID_WINDOWS; [[ $os == macos ]] && id=$ID_MACOS
+            seed=$(printf '%s|%s|%s|%s' "$PAT" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$os" | sha256sum | cut -c1-64)
+            pw=$(printf '%s|pw' "$seed" | sha256sum | cut -c1-24)
+            echo "::add-mask::$pw"
+            export RDS_PASSWORD=$pw
+            echo; echo "== $os host (ID $id)"
+            up=
+            for _ in $(seq 1 40); do
+              if "$R" "$id" ping -c 1 > "$RUNNER_TEMP/p.txt" 2>&1; then up=1; break; fi
+              sleep 8
+            done
+            if [[ -z "$up" ]]; then echo "   FAIL  $os host not reachable: $(tail -n 1 "$RUNNER_TEMP/p.txt")"; failed=1; continue; fi
+            "$R" "$id" ping -c 3 > "$RUNNER_TEMP/p.txt" 2>&1
+            path=$(grep -m1 -o 'over [a-z]* path' "$RUNNER_TEMP/p.txt")
+            rtt=$(grep -oE 'time=[0-9.]+ ?ms' "$RUNNER_TEMP/p.txt" | tail -n 1)
+            echo "   ok    connected $path ($rtt)"
+            out=$("$R" "$id" shell -c 'echo internet-ok' 2>&1 | tr -d '\r')
+            if grep -q '^internet-ok$' <<<"$out"; then echo "   ok    shell -c"; else echo "   FAIL  shell -c: $(tail -n 2 <<<"$out")"; failed=1; fi
+            rm -f "$RUNNER_TEMP/back.bin"
+            start=$SECONDS
+            if "$R" "$id" cp "$RUNNER_TEMP/up.bin" :rds-e2e-up.bin > "$RUNNER_TEMP/c.txt" 2>&1 &&
+               "$R" "$id" cp :rds-e2e-up.bin "$RUNNER_TEMP/back.bin" >> "$RUNNER_TEMP/c.txt" 2>&1 &&
+               cmp -s "$RUNNER_TEMP/up.bin" "$RUNNER_TEMP/back.bin"; then
+              echo "   ok    1 MiB up and down, byte-identical ($((SECONDS - start)) s)"
+            else
+              echo "   FAIL  cp round trip: $(tail -n 2 "$RUNNER_TEMP/c.txt")"; failed=1
+            fi
+            echo "- p2p ubuntu → $os: ${path:-no connection} ${rtt}" >> "$GITHUB_STEP_SUMMARY"
+          done
+          exit $failed
