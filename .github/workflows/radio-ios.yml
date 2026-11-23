@@ -897,7 +897,8 @@ jobs:
             local data
             data="$(xcrun simctl get_app_container "$UDID" "$SIM_BUNDLE_ID" data 2>/dev/null || true)"
             [[ -n "$data" && -d "$data/Documents/diagnostics" ]] || { echo '(no app diagnostics files)'; return 0; }
-            cat "$data"/Documents/diagnostics/diagnostics-*.log 2>/dev/null \
+            # Older file first, so the tail is the newest lines.
+            cat "$data"/Documents/diagnostics/diagnostics-previous.log "$data"/Documents/diagnostics/diagnostics-current.log 2>/dev/null \
               | grep -E ' (WARN|ERROR) |\[globe\]|\[app\] ' | cut -c1-260 | tail -60
           }
 
@@ -957,6 +958,14 @@ jobs:
                   break
                 fi
               done
+              # Counted now, before later launches can rotate the 2 x 2 MB diagnostics files away.
+              # Counts and level/tag only; no message text printed.
+              ddir="$(xcrun simctl get_app_container "$UDID" "$SIM_BUNDLE_ID" data 2>/dev/null || true)/Documents/diagnostics"
+              dlog() { cat "$ddir"/diagnostics-previous.log "$ddir"/diagnostics-current.log 2>/dev/null || true; }
+              drag_plays="$(dlog | grep -cE '.globe. play .*how=auto' || true)"
+              echo "drag rounds: ${drag_plays:-0} auto play line(s), $(dlog | grep -cF '[globe] motion start' || true) motion start line(s), $(dlog | grep -cF '[globe] cold start turn' || true) cold start turn(s)"
+              ls -l "$ddir" 2>/dev/null | awk 'NR>1 {print "diagnostics file:", $NF, $5, "bytes"}'
+              dlog | awk '$1 ~ /^20[0-9][0-9]-[0-9][0-9]-/ {print $2, $3}' | sort | uniq -c | sort -rn | head -8 | sed 's/^/diagnostics volume: /'
               # Rotation (Radio FEAT-21): portrait -> landscape -> portrait with swipes in between.
               if [[ "$verdict" == 0 ]]; then
                 cat > "$OUT/rotate.yaml" <<YAML
@@ -1013,6 +1022,10 @@ jobs:
               # (AsyncStorage `hourwave.scheme.v1`, its iOS manifest file) and start it again.
               use_theme() {
                 local data dir
+                # Background the app first, as a user's swipe-away does: that clears the GPU globe's
+                # start marker (legacyGlobe.ts), so the kill is not taken for a crash in the globe.
+                xcrun simctl launch "$UDID" com.apple.Preferences > /dev/null 2>&1 || true
+                sleep 3
                 xcrun simctl terminate "$UDID" "$SIM_BUNDLE_ID" > /dev/null 2>&1 || true
                 sleep 3
                 data="$(xcrun simctl get_app_container "$UDID" "$SIM_BUNDLE_ID" data 2>/dev/null || true)"
@@ -1023,6 +1036,9 @@ jobs:
           p = sys.argv[1]
           d = json.load(open(p)) if os.path.exists(p) else {}
           d["hourwave.scheme.v1"] = sys.argv[2]
+          print("start marker after background:", "present" if "hourwave.globe.starting.v1" in d else "absent")
+          d.pop("hourwave.globe.starting.v1", None)
+          if str(d.get("hourwave.globe.legacy.v2", "")).startswith("auto:"): d.pop("hourwave.globe.legacy.v2")
           json.dump(d, open(p, "w"))' "$dir/manifest.json" "$1" || { echo "use_theme $1: manifest not written"; return 1; }
                 xcrun simctl launch "$UDID" "$SIM_BUNDLE_ID" > /dev/null 2>&1 || { echo "use_theme $1: launch failed"; return 1; }
                 sleep 15
@@ -1066,7 +1082,8 @@ jobs:
               # the card's GPU globe (stage, disc, strip, locate button; no page pill or country
               # switch), drag it once and stay on the page (no jump to the player); the GPU globe
               # must mount and draw there with no new [globe] WARN / ERROR line. Counts only.
-              if [[ "$verdict" == 0 ]]; then
+              # Runs whatever the verdict so far (use_theme restarts the app): its result is always reported.
+              if [[ -n "$UDID" ]]; then
                 mounted_before="$(gpu_lines '[globe] gpu mounted')"
                 drawn_before="$(gpu_lines '[globe] first picture')"
                 bad_before="$(globe_bad_lines)"
@@ -1166,7 +1183,9 @@ jobs:
           else
             fail 'The GPU globe never mounted and drew (no gpu mounted / first picture line).'
           fi
-          if grep -E '.globe. play .*how=auto' <<<"$DIAG" > /dev/null; then
+          if (( ${drag_plays:-0} > 0 )); then
+            echo "globe gate: drag settled and played ${drag_plays} time(s) in the drag rounds"
+          elif grep -E '.globe. play .*how=auto' <<<"$DIAG" > /dev/null; then
             echo "globe gate: drag settled and played $(grep -cE '.globe. play .*how=auto' <<<"$DIAG") time(s)"
           else
             fail 'Dragging the globe never settled on a station (no play how=auto line).'
