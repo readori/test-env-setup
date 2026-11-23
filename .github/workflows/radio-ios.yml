@@ -992,28 +992,49 @@ jobs:
                   fi
                 done
               fi
-              # Q and aura simple homes (Radio FEAT-31): switch to each theme by its swatch id, open its
-              # home and require that the GPU globe mounted and drew again there (a fresh line each);
-              # the home's Menu button must show. Log text counts only; nothing private printed.
+              # Q and aura simple homes (Radio FEAT-31): start the app in each theme and require that
+              # the GPU globe mounted and drew again on its home (a fresh line each); the home's Menu
+              # button must show. Log text counts only; nothing private printed.
               gpu_lines() {
                 local data n=""
                 data="$(xcrun simctl get_app_container "$UDID" "$SIM_BUNDLE_ID" data 2>/dev/null || true)"
                 [[ -n "$data" ]] && n="$(cat "$data"/Documents/diagnostics/diagnostics-*.log 2>/dev/null | grep -cF "$1" || true)"
                 echo "${n:-0}"
               }
-              for theme in Q:quiet/world aura:aura; do
+              # [globe] WARN / ERROR lines so far (counted, not printed).
+              globe_bad_lines() {
+                local data n=""
+                data="$(xcrun simctl get_app_container "$UDID" "$SIM_BUNDLE_ID" data 2>/dev/null || true)"
+                [[ -n "$data" ]] && n="$(cat "$data"/Documents/diagnostics/diagnostics-*.log 2>/dev/null | grep -E ' (WARN|ERROR) ' | grep -cF '[globe]' || true)"
+                echo "${n:-0}"
+              }
+              # The app only honours widget links (+native-intent.tsx sends anything else to /now), so
+              # a theme cannot be opened by a link: stop the app, write the stored theme
+              # (AsyncStorage `hourwave.scheme.v1`, its iOS manifest file) and start it again.
+              use_theme() {
+                local data dir
+                xcrun simctl terminate "$UDID" "$SIM_BUNDLE_ID" > /dev/null 2>&1 || true
+                sleep 3
+                data="$(xcrun simctl get_app_container "$UDID" "$SIM_BUNDLE_ID" data 2>/dev/null || true)"
+                [[ -n "$data" ]] || { echo "use_theme $1: no app data container"; return 1; }
+                dir="$data/Library/Application Support/$SIM_BUNDLE_ID/RCTAsyncLocalStorage_V1"
+                mkdir -p "$dir"
+                python3 -c 'import json, os, sys
+          p = sys.argv[1]
+          d = json.load(open(p)) if os.path.exists(p) else {}
+          d["hourwave.scheme.v1"] = sys.argv[2]
+          json.dump(d, open(p, "w"))' "$dir/manifest.json" "$1" || { echo "use_theme $1: manifest not written"; return 1; }
+                xcrun simctl launch "$UDID" "$SIM_BUNDLE_ID" > /dev/null 2>&1 || { echo "use_theme $1: launch failed"; return 1; }
+                sleep 15
+              }
+              for id in Q aura; do
                 [[ "$verdict" == 0 ]] || break
-                id="${theme%%:*}"; path="${theme#*:}"
                 mounted_before="$(gpu_lines '[globe] gpu mounted')"
                 drawn_before="$(gpu_lines '[globe] first picture')"
+                use_theme "$id" || fail "Theme $id: could not start the app in the theme."
                 cat > "$OUT/theme-$id.yaml" <<YAML
           appId: $SIM_BUNDLE_ID
           ---
-          - openLink: hourwave://settings/appearance
-          - waitForAnimationToEnd: { timeout: 3000 }
-          - tapOn: { id: "theme-$id" }
-          - waitForAnimationToEnd: { timeout: 3000 }
-          - openLink: hourwave://$path
           - extendedWaitUntil: { visible: "Menu", timeout: 20000 }
           - swipe: { start: "50%,30%", end: "20%,30%", duration: 400 }
           - waitForAnimationToEnd: { timeout: 3000 }
@@ -1041,18 +1062,62 @@ jobs:
                   fail "Theme $id: the GPU globe did not mount and draw on its home (mounted $mounted_before->$mounted_after, drawn $drawn_before->$drawn_after)."
                 fi
               done
+              # City atlas explore card (Radio FEAT-37): start in the theme (its home is 探索), require
+              # the card's GPU globe (stage, disc, strip, locate button; no page pill or country
+              # switch), drag it once and stay on the page (no jump to the player); the GPU globe
+              # must mount and draw there with no new [globe] WARN / ERROR line. Counts only.
+              if [[ "$verdict" == 0 ]]; then
+                mounted_before="$(gpu_lines '[globe] gpu mounted')"
+                drawn_before="$(gpu_lines '[globe] first picture')"
+                bad_before="$(globe_bad_lines)"
+                use_theme atlas || fail 'Theme atlas: could not start the app in the theme.'
+                cat > "$OUT/theme-atlas.yaml" <<YAML
+          appId: $SIM_BUNDLE_ID
+          ---
+          - extendedWaitUntil: { visible: { id: "atlas-globe-stage" }, timeout: 20000 }
+          - extendedWaitUntil: { visible: { id: "globe-disc" }, timeout: 20000 }
+          - assertVisible: { id: "locate-button" }
+          - assertNotVisible: { id: "globe-pill" }
+          - assertNotVisible: { id: "globe-country" }
+          - swipe: { start: "65%,33%", end: "35%,33%", duration: 400 }
+          - waitForAnimationToEnd: { timeout: 3000 }
+          - extendedWaitUntil: { visible: { id: "atlas-globe-caption" }, timeout: 10000 }
+          - assertVisible: { id: "atlas-globe-stage" }
+          YAML
+                sed -i '' -e 's/^          //' "$OUT/theme-atlas.yaml"
+                if maestro --device "$UDID" test "$OUT/theme-atlas.yaml" > "$OUT/maestro-theme-atlas.log" 2>&1; then
+                  echo 'theme atlas: Maestro flow passed (explore card, strip, locate button, no pill, globe dragged)'
+                else
+                  fail 'Theme atlas: the explore card globe did not show (flow failed).'
+                  grep -E 'FAILED|not found|Unknown|Assertion' "$OUT/maestro-theme-atlas.log" | cut -c1-200 | head -3 || true
+                fi
+                sleep 8
+                if alive; then
+                  echo "theme atlas: app is up (pid, status: $(app_entry))"
+                else
+                  fail 'The app died on the atlas explore page.'
+                  why_gone theme-atlas
+                fi
+                mounted_after="$(gpu_lines '[globe] gpu mounted')"
+                drawn_after="$(gpu_lines '[globe] first picture')"
+                if (( mounted_after > mounted_before && drawn_after > drawn_before )); then
+                  echo 'theme atlas: GPU globe mounted and drew in the explore card'
+                else
+                  fail "Theme atlas: the GPU globe did not mount and draw in the explore card (mounted $mounted_before->$mounted_after, drawn $drawn_before->$drawn_after)."
+                fi
+                bad_after="$(globe_bad_lines)"
+                if (( bad_after > bad_before )); then
+                  fail "Theme atlas: $((bad_after - bad_before)) new [globe] WARN / ERROR line(s) on the explore page (see the diagnostics below)."
+                fi
+              fi
               # Cassette theme (Radio FEAT-30): switch to it, open the landscape deck, tune and open the
               # tape-box menu. The flow's own result is informational (selectors follow the copy);
               # the app dying during it fails the smoke.
               if [[ "$verdict" == 0 ]]; then
+                use_theme cassette || echo '::warning title=Simulator smoke::Could not start the app in the cassette theme (informational).'
                 cat > "$OUT/cassette.yaml" <<YAML
           appId: $SIM_BUNDLE_ID
           ---
-          - openLink: hourwave://settings/appearance
-          - waitForAnimationToEnd: { timeout: 3000 }
-          - tapOn: { text: "Cassette.*" }
-          - waitForAnimationToEnd: { timeout: 3000 }
-          - openLink: hourwave://cassette
           - extendedWaitUntil: { visible: "Tape box menu", timeout: 20000 }
           - swipe: { start: "30%,40%", end: "8%,40%", duration: 400 }
           - waitForAnimationToEnd: { timeout: 3000 }
