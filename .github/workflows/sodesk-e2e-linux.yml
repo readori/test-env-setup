@@ -9,7 +9,8 @@
 #              9-digit ID through it (directly, then through its relay with direct UDP blocked by
 #              an iptables owner rule), status, logs, restart (key and ID survive), uninstall.
 #              Driver: test/e2e/signal_service.sh.
-#   usbip    : USB/IP with the real kernel: usbip-host, vhci-hcd, dummy_hcd and a configfs
+#   usbip    : USB/IP with the real kernel: usbip-host, vhci-hcd, dummy_hcd (built from the
+#              kernel's upstream source when the runner's kernel does not ship it) and a configfs
 #              mass-storage gadget backed by a file of random bytes; an rds host exports it, an
 #              rds client imports it over loopback; the disk is read back (sha256) and written
 #              through vhci; detach and session end restore the device. Driver: test/e2e/usbip.sh.
@@ -218,6 +219,24 @@ jobs:
           for m in usbip-core usbip-host vhci-hcd dummy_hcd libcomposite usb_f_mass_storage; do
             printf '  %-20s %s\n' "$m" "$(modinfo -n "$m" 2>/dev/null || echo MISSING)"
           done
+          echo "lockdown: $(cat /sys/kernel/security/lockdown 2>/dev/null || echo unknown)"
+
+      # Ubuntu's azure kernels ship no linux-modules-extra and no dummy_hcd (the virtual USB
+      # controller the test plugs its gadget into). Build that one module from the kernel's own
+      # source at this kernel's upstream tag (kernel.org), with the headers and compiler of the
+      # running kernel. A test fixture only; rds itself needs no extra module.
+      - name: Build dummy_hcd if the kernel does not ship it
+        working-directory: source
+        run: |
+          set -uo pipefail
+          if modinfo -n dummy_hcd >/dev/null 2>&1; then echo 'dummy_hcd is shipped; nothing to build'; exit 0; fi
+          [[ -f test/e2e/build_dummy_hcd.sh ]] || { echo '::notice::test/e2e/build_dummy_hcd.sh is not on this ref'; exit 0; }
+          if ko="$(bash test/e2e/build_dummy_hcd.sh "$RUNNER_TEMP/dummy_hcd" 2> >(cut -c1-300 >&2) | tail -n 1)" && [[ -f "$ko" ]]; then
+            echo "DUMMY_HCD_KO=$ko" >> "$GITHUB_ENV"
+            modinfo "$ko" | grep -E '^(vermagic|license|description):'
+          else
+            echo '::warning::could not build dummy_hcd for this kernel; the USB/IP test will report it'
+          fi
 
       - name: USB/IP end to end
         working-directory: source
@@ -225,7 +244,7 @@ jobs:
           set -o pipefail
           [[ -f test/e2e/usbip.sh ]] || { echo '::notice::test/e2e/usbip.sh is not on this ref; skipped.'; exit 0; }
           code=0
-          sudo bash test/e2e/usbip.sh "$RDS_BIN" 2>&1 | cut -c1-400 || code=$?
+          sudo env DUMMY_HCD_KO="${DUMMY_HCD_KO:-}" bash test/e2e/usbip.sh "$RDS_BIN" 2>&1 | cut -c1-400 || code=$?
           echo "- USB/IP: $([[ $code == 0 ]] && echo PASS || echo FAIL)" >> "$GITHUB_STEP_SUMMARY"
           exit $code
 
@@ -304,10 +323,11 @@ jobs:
         shell: bash
     env:
       CLOUDFLARED_VERSION: '2026.10.7'
-      # SHA-256 of cloudflared-linux-amd64 of that release. While empty, the download is checked
-      # against the checksum Cloudflare lists in that release's notes (and GitHub's asset digest),
-      # and the step prints the value to pin here.
-      CLOUDFLARED_SHA256: ''
+      # SHA-256 of cloudflared-linux-amd64 of that release (matches the checksum in Cloudflare's
+      # release notes and the one the binary reports). When the version changes and this is
+      # emptied, the download is checked against the release notes and the step prints the value
+      # to pin here.
+      CLOUDFLARED_SHA256: '1f99fb518b83dec2ba8d870a7cc991d82a77e6196295a3d2754ba17ab9f91872'
     steps:
       - name: Checkout source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
