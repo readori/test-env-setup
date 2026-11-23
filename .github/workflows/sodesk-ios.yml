@@ -243,7 +243,7 @@ jobs:
         if: steps.layout.outputs.ready == 'true'
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           if [[ ! -f mobile/ios/SoDeskTests/GatewayE2ETests.swift ]]; then
             echo '::notice::no GatewayE2ETests on this ref; skipped.'
             echo '- End-to-end (app to host): skipped, not on this ref' >> "$GITHUB_STEP_SUMMARY"
@@ -327,6 +327,6 @@ jobs:
         if: success() && steps.layout.outputs.ready == 'true'
         run: |
           {
-            echo "- Xcode: \`$(xcodebuild -version | head -1)\` · Go: \`$(go version | cut -d' ' -f3)\`"
+            echo "- Xcode: \`$(xcodebuild -version | sed -n 1p)\` · Go: \`$(go version | cut -d' ' -f3)\`"
             echo '- No signing; nothing uploaded.'
           } >> "$GITHUB_STEP_SUMMARY"

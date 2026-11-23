@@ -23,6 +23,9 @@
 #
 #   REF=<sha>         # readori/SoDesk branch, tag or SHA
 #
+# Steps that collect results start with `set +e`: the runner's bash runs with -e, which would
+# end a step at the first failing check instead of reporting it.
+#
 # Safety rules (public repo, public logs): no pull_request triggers; only GitHub-owned actions,
 # pinned to commit SHAs; TARGET_REPO_PAT is used only by the checkout step and not persisted;
 # output is limited to test results and failure tails. Host passwords are made per run and
@@ -134,7 +137,7 @@ jobs:
 
       - name: utun adapter, client over a session, crash recovery (root)
         run: |
-          set -o pipefail
+          set +e -o pipefail
           LOG="$RUNNER_TEMP/e2e/vpn-test.log"
           sudo env SODESK_VPN_E2E=1 "$RUNNER_TEMP/e2e/vpn.test" -test.v -test.count=1 -test.timeout=5m -test.run '^TestUtun' > "$LOG" 2>&1
           st=$?
@@ -156,7 +159,7 @@ jobs:
       - name: rds host + rds vpn up on one Mac
         if: always() && env.RDS_BIN != ''
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           W="$RUNNER_TEMP/vpn-cli"; rm -rf "$W"; mkdir -p "$W/host" "$W/cli"
           FAILED=0
           ok()   { printf '   ok    %s\n' "$*"; }
@@ -314,7 +317,7 @@ jobs:
       - name: Toolchain and machine
         working-directory: source
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           go version
           echo "commit: $(git rev-parse --short HEAD)"
           echo "macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion)) on $(uname -m); SIP: $(csrutil status 2>&1 | head -n 1)"
@@ -342,7 +345,7 @@ jobs:
       # cannot, the tests still run and report which permission is missing.
       - name: Grant Screen Recording and Accessibility (TCC)
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           FFMPEG="$(command -v ffmpeg)"
           FFREAL="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$FFMPEG")"
           CLIENTS=("$RUNNER_TEMP/e2e/desktop.test" "$RUNNER_TEMP/e2e/rds" "$FFMPEG" "$FFREAL")
@@ -368,7 +371,7 @@ jobs:
 
       - name: Capture, encode, decode, input (TestMac*)
         run: |
-          set -o pipefail
+          set +e -o pipefail
           LOG="$RUNNER_TEMP/e2e/desktop-test.log"
           SODESK_DESKTOP_E2E=1 "$RUNNER_TEMP/e2e/desktop.test" -test.v -test.count=1 -test.timeout=20m -test.run '^TestMac(CaptureDevices|Encoders|DesktopE2E)$' > "$LOG" 2>&1
           st=$?
@@ -391,7 +394,7 @@ jobs:
       - name: rds host + rds desktop --json on this Mac
         if: always() && env.RDS_BIN != ''
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           W="$RUNNER_TEMP/desktop-cli"; rm -rf "$W"; mkdir -p "$W/host" "$W/cli"
           PORT=$((20000 + RANDOM % 10000)); TARGET="127.0.0.1:$PORT"
           PW="$(openssl rand -hex 16)"
