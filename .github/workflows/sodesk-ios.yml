@@ -26,11 +26,15 @@
 #                project says.
 #
 # Triggers: workflow_dispatch (modes verify, profile, testflight), or a push to main that
-# changes ci-requests/sodesk-ios.env (how the project's AI engineer requests a run; ALWAYS
-# verify, never signing). Never pull_request. The request file is plain KEY=VALUE text, parsed
-# with strict patterns and never executed:
+# changes ci-requests/sodesk-ios.env (how the project's AI engineer requests a run; verify by
+# default). Never pull_request. The request file is plain KEY=VALUE text, parsed with strict
+# patterns and never executed:
 #
 #   REF=main          # readori/SoDesk branch, tag or SHA
+#   MODE=testflight   # optional: verify (default), profile or testflight; profile/testflight
+#                     # also need [sodesk-ios-release] in the commit message (never cancelled)
+#   CONFIRM=WRITE     # profile only
+#   BUILD=12          # testflight only, optional (default: latest TestFlight build + 1)
 #
 # Secrets: TARGET_REPO_PAT (source checkout + Match repo), and for profile/testflight
 # MATCH_PASSWORD, ASC_ISSUER_ID, ASC_KEY_ID, ASC_PRIVATE_KEY, ASC_TEAM_ID.
@@ -79,9 +83,11 @@ permissions:
 
 # verify runs of the same ref cancel each other; profile and testflight never cancel a running
 # run (an upload or a Match write must not be cut off).
+# A push whose commit message carries [sodesk-ios-release] is a release request (MODE=profile or
+# testflight in the request file) and, like a dispatched release, is never cancelled.
 concurrency:
-  group: ${{ (github.event_name == 'push' || inputs.mode == 'verify') && format('sodesk-ios-{0}', inputs.ref || 'request') || format('sodesk-ios-{0}', inputs.mode) }}
-  cancel-in-progress: ${{ github.event_name == 'push' || inputs.mode == 'verify' }}
+  group: ${{ ((github.event_name == 'push' && contains(github.event.head_commit.message, '[sodesk-ios-release]')) || (github.event_name == 'workflow_dispatch' && inputs.mode != 'verify')) && 'sodesk-ios-release' || format('sodesk-ios-{0}', inputs.ref || 'request') }}
+  cancel-in-progress: ${{ !((github.event_name == 'push' && contains(github.event.head_commit.message, '[sodesk-ios-release]')) || (github.event_name == 'workflow_dispatch' && inputs.mode != 'verify')) }}
 
 env:
   PRIVATE_SOURCE_REPOSITORY: readori/SoDesk
@@ -118,6 +124,7 @@ jobs:
           INPUT_MODE: ${{ inputs.mode }}
           BUILD_NUMBER_INPUT: ${{ inputs.build_number }}
           CONFIRM: ${{ inputs.confirm }}
+          HEAD_MESSAGE: ${{ github.event.head_commit.message }}
           REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/sodesk-ios.env
         run: |
           set -euo pipefail
@@ -127,7 +134,13 @@ jobs:
             curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/sodesk-ios.env at this commit.'; exit 64; }
             # Plain text, read line by line; never sourced or executed.
             SOURCE_REF="$(sed -n 's/^REF=//p' "$REQ" | head -n 1 | tr -d '\r')"
-            MODE=verify
+            # Optional release request: MODE=profile|testflight, CONFIRM=WRITE (profile), BUILD=N.
+            MODE="$(sed -n 's/^MODE=//p' "$REQ" | head -n 1 | tr -d '\r')"; MODE="${MODE:-verify}"
+            CONFIRM="$(sed -n 's/^CONFIRM=//p' "$REQ" | head -n 1 | tr -d '\r')"
+            BUILD_NUMBER_INPUT="$(sed -n 's/^BUILD=//p' "$REQ" | head -n 1 | tr -d '\r')"
+            if [[ "$MODE" != verify && "$HEAD_MESSAGE" != *'[sodesk-ios-release]'* ]]; then
+              echo '::error::a release request (MODE=profile/testflight) needs [sodesk-ios-release] in the commit message, so it is never cancelled.'; exit 64
+            fi
           else
             SOURCE_REF="$INPUT_REF"
             MODE="$INPUT_MODE"
