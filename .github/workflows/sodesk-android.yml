@@ -335,6 +335,9 @@ jobs:
           "$ADB" shell input keyevent 224 > /dev/null 2>&1 || true
           "$ADB" shell wm dismiss-keyguard > /dev/null 2>&1 || true
           "$ADB" shell input keyevent 82 > /dev/null 2>&1 || true
+          # The emulator's own launcher sometimes hangs and its "not responding" dialog takes the
+          # focus from the app under test; hide system error dialogs for the test run.
+          "$ADB" shell settings put global hide_error_dialogs 1 > /dev/null 2>&1 || true
           # The host started in the previous step: address as the emulator sees the runner, password from the private file.
           E2E_PW="$(cat "$RUNNER_TEMP/sodesk-host-password")"
           echo "::add-mask::$E2E_PW"
