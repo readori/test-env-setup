@@ -974,6 +974,16 @@ jobs:
                 xcrun simctl launch "$UDID" "$SIM_BUNDLE_ID" > /dev/null 2>&1 || { echo "use_theme $1: launch failed"; return 1; }
                 sleep 15
               }
+              # Radio BUG-1123: globe data and settle counts so far (cumulative; counts and reason codes
+              # only, no message text).
+              globe_data_counts() {
+                local data log
+                data="$(xcrun simctl get_app_container "$UDID" "$SIM_BUNDLE_ID" data 2>/dev/null || true)"
+                [[ -n "$data" ]] || return 0
+                log="$(cat "$data"/Documents/diagnostics/diagnostics-previous.log "$data"/Documents/diagnostics/diagnostics-current.log 2>/dev/null || true)"
+                echo "$1 data: start $(grep -cF '[globe] data start' <<<"$log" || true), fetched $(grep -cF '[globe] data fetched' <<<"$log" || true), version $(grep -cF '[globe] data version' <<<"$log" || true), failed $(grep -cF 'data failed' <<<"$log" || true) (cumulative)"
+                grep -oE 'settle skip why=[a-z-]+' <<<"$log" | sort | uniq -c | sed "s/^/$1 settle: /" || true
+              }
               # Radio FEAT-38: a fresh install opens 城市电台 (atlas) at 探索. Require that first screen
               # (the explore card's globe stage), then start the app in D for the drag and rotate
               # rounds below: they swipe the D world dial globe and count its auto plays.
@@ -1020,6 +1030,7 @@ jobs:
               dlog() { cat "$ddir"/diagnostics-previous.log "$ddir"/diagnostics-current.log 2>/dev/null || true; }
               drag_plays="$(dlog | grep -cE '.globe. play .*how=auto' || true)"
               echo "drag rounds: ${drag_plays:-0} auto play line(s), $(dlog | grep -cF '[globe] motion start' || true) motion start line(s), $(dlog | grep -cF '[globe] cold start turn' || true) cold start turn(s)"
+              globe_data_counts D
               ls -l "$ddir" 2>/dev/null | awk 'NR>1 {print "diagnostics file:", $NF, $5, "bytes"}'
               dlog | awk '$1 ~ /^20[0-9][0-9]-[0-9][0-9]-/ {print $2, $3}' | sort | uniq -c | sort -rn | head -8 | sed 's/^/diagnostics volume: /'
               # Rotation (Radio FEAT-21): portrait -> landscape -> portrait with swipes in between.
@@ -1088,6 +1099,7 @@ jobs:
                   break
                 fi
                 mounted_after="$(gpu_lines '[globe] gpu mounted')"
+                globe_data_counts "$id"
                 drawn_after="$(gpu_lines '[globe] first picture')"
                 if (( mounted_after > mounted_before && drawn_after > drawn_before )); then
                   echo "theme $id: GPU globe mounted and drew on its home"
