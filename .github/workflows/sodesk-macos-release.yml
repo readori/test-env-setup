@@ -1,4 +1,5 @@
-# RemoHop macOS release binary: universal `remohop`, signed with Developer ID and notarized.
+# RemoHop macOS release: the universal `remohop` CLI and the quick-support app RemoHop.app, both
+# signed with Developer ID and notarized; the app is also stapled.
 #
 # Public CI repository -> source repository: env SOURCE_REPOSITORY.
 #
@@ -9,6 +10,14 @@
 #             signature, the notarization and Gatekeeper's verdict -> run the signed binary:
 #             `remohop version`, `remohop --help`, the loopback smoke test (host + client), and a desktop
 #             probe that makes the hardened binary load system frameworks at run time.
+#   app     : (refs that have packaging/quick/build.sh) build RemoHop.app (cmd/remohop-quick, universal,
+#             LICENSE/NOTICE/THIRD_PARTY_LICENSES.txt in Contents/Resources) -> codesign the bundle
+#             (Developer ID, hardened runtime, timestamp, no entitlements, identifier com.remohop.quick
+#             from Info.plist) -> notarize a ditto zip -> staple the ticket to the bundle -> zip it again
+#             with ditto (RemoHop-macos.zip) -> verify: strict deep signature, stapler validate,
+#             spctl --assess --type execute (Notarized Developer ID), a quarantined copy unpacked from
+#             the zip passes Gatekeeper and runs, the app's UI server answers (quick --no-open), and
+#             LaunchServices starts the bundle (open -n).
 #
 # By default nothing is uploaded: no artifacts, no release. The summary reports the SHA-256 of
 # the signed binary and of the notarized zip. The exception is the release hand-off below.
@@ -25,7 +34,7 @@
 # Release hand-off: the RemoHop repository's release workflow (env SOURCE_REPOSITORY, release.yml) starts
 # this workflow with workflow_dispatch (ref=<tag>, version=<tag>, upload=true, correlation=<id>),
 # waits for it, and downloads the artifact `remohop-macos-universal` (the signed universal `remohop`, the
-# notarized zip and SHA256SUMS-macos, kept 3 days) to put the binary into the release. The Apple
+# notarized zip, RemoHop-macos.zip and SHA256SUMS-macos, kept 3 days) to put them into the release. The Apple
 # secrets stay here, in this repository; the RemoHop repository only holds a token that may start
 # and read runs of this workflow. `upload` defaults to false, so request-file runs and manual runs
 # still upload nothing. The artifact exists only if every step above it passed (signature,
@@ -64,7 +73,7 @@ on:
         default: ''
         type: string
       upload:
-        description: 'Upload the signed binary as the artifact remohop-macos-universal (release hand-off)'
+        description: 'Upload the signed binary and RemoHop-macos.zip as the artifact remohop-macos-universal (release hand-off)'
         required: false
         default: false
         type: boolean
@@ -208,6 +217,40 @@ jobs:
             echo "- Universal binary: \`$ARCHS\`, $(du -h "$OUT/remohop" | cut -f1), CGO off, system libraries only"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # RemoHop.app: packaging/quick/build.sh with TARGETS=macos (the same release flags, the
+      # bundle laid out by packaging/quick/gen, the license texts inside). Refs from before the
+      # quick-support packaging have no build.sh; they still get the CLI, and APP stays empty.
+      - name: Build RemoHop.app (quick support, universal)
+        working-directory: source
+        run: |
+          set -euo pipefail
+          if [[ ! -f packaging/quick/build.sh ]]; then
+            echo '::notice::packaging/quick/build.sh is not on this ref; RemoHop.app is skipped.'
+            echo '- RemoHop.app: skipped (packaging/quick/build.sh is not on this ref)' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          Q="$RUNNER_TEMP/remohop-quick"; rm -rf "$Q"
+          VERSION="$VERSION" OUT="$Q" TARGETS=macos sh packaging/quick/build.sh > "$RUNNER_TEMP/quick-build.log" 2>&1 \
+            || { cut -c1-300 "$RUNNER_TEMP/quick-build.log" | tail -n 20; echo '::error::building RemoHop.app failed.'; exit 65; }
+          APP="$Q/macos/RemoHop.app"
+          BIN="$APP/Contents/MacOS/RemoHop"
+          [[ -x "$BIN" ]] || { echo '::error::RemoHop.app has no Contents/MacOS/RemoHop.'; exit 65; }
+          ARCHS="$(lipo -archs "$BIN")"
+          [[ "$ARCHS" == *arm64* && "$ARCHS" == *x86_64* ]] || { echo "::error::RemoHop.app is not universal: $ARCHS"; exit 65; }
+          BID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")"
+          [[ "$BID" == com.remohop.quick ]] || { echo "::error::unexpected bundle identifier '$BID' (privacy permissions are tied to com.remohop.quick)."; exit 65; }
+          BVER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
+          for f in LICENSE NOTICE THIRD_PARTY_LICENSES.txt RemoHop.icns; do
+            [[ -s "$APP/Contents/Resources/$f" ]] || { echo "::error::RemoHop.app lacks Contents/Resources/$f."; exit 65; }
+          done
+          GOT="$("$BIN" version)"
+          [[ "$GOT" == "remohop $VERSION" ]] || { echo "::error::RemoHop.app reports '$GOT', expected 'remohop $VERSION'."; exit 65; }
+          LIBS="$(otool -L "$BIN" | awk '$0 !~ /:$/ && $1 !~ /^\/(usr\/lib|System)\// {print $1}' | sort -u | tr '\n' ' ')"
+          [[ -z "$LIBS" ]] || { echo "::error::RemoHop.app links non-system libraries: $LIBS"; exit 65; }
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          echo "built RemoHop.app $BID $BVER ($ARCHS), $(du -sh "$APP" | cut -f1)"
+          echo "- RemoHop.app: \`$BID\` $BVER, \`$ARCHS\`, $(du -sh "$APP" | cut -f1), licenses in Contents/Resources" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Create the signing keychain and import the certificate
         env:
           MACOS_DEVID_P12_BASE64: ${{ secrets.MACOS_DEVID_P12_BASE64 }}
@@ -295,6 +338,35 @@ jobs:
           [[ "$("$OUT/remohop" version)" == "remohop $VERSION" ]] || { echo '::error::the signed binary does not run.'; exit 1; }
           echo '- Signature: Developer ID Application, hardened runtime, secure timestamp, no entitlements, both slices verify (`codesign --verify --strict`)' >> "$GITHUB_STEP_SUMMARY"
 
+      # The bundle is signed as a whole (main program + sealed Info.plist and resources), once, with
+      # the same rules as the CLI: hardened runtime, timestamp, no entitlements. It is the same
+      # program as remohop plus the quick-support page: it is not sandboxed, it starts only Apple's
+      # own tools (osascript for the approval dialog, open, defaults) and a browser, and the Screen
+      # Recording and Accessibility prompts are TCC permissions, not entitlements. The identifier
+      # comes from Info.plist (com.remohop.quick); TCC remembers it together with the team, so it
+      # must not change between releases.
+      - name: Sign RemoHop.app (Developer ID, hardened runtime, timestamp)
+        if: env.APP != ''
+        run: |
+          set -euo pipefail
+          codesign --force --sign "$SIGN_HASH" --keychain "$KEYCHAIN_PATH" --options runtime --timestamp \
+            "$APP" > "$RUNNER_TEMP/codesign-app.log" 2>&1 \
+            || { cut -c1-300 "$RUNNER_TEMP/codesign-app.log" | tail -n 10; echo '::error::codesign of RemoHop.app failed.'; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | sed -e "s#$RUNNER_TEMP#\$RUNNER_TEMP#g" | cut -c1-200
+          INFO="$(codesign -dvvv --entitlements - "$APP" 2>&1)"
+          grep -E '^(Identifier|Format|CodeDirectory|Authority|TeamIdentifier|Timestamp|Runtime Version|Sealed Resources)' <<<"$INFO" | cut -c1-200
+          grep -q '^Identifier=com.remohop.quick$' <<<"$INFO" || { echo '::error::the app is not signed as com.remohop.quick.'; exit 1; }
+          grep -q 'flags=.*runtime' <<<"$INFO" || { echo '::error::the app signature does not have the hardened runtime flag.'; exit 1; }
+          grep -q '^Timestamp=' <<<"$INFO" || { echo '::error::the app signature has no secure timestamp.'; exit 1; }
+          grep -q '^Authority=Developer ID Application' <<<"$INFO" || { echo '::error::the app is not signed by a Developer ID Application certificate.'; exit 1; }
+          grep -q '^Sealed Resources' <<<"$INFO" || { echo '::error::the app signature does not seal its resources.'; exit 1; }
+          if grep -q '<key>' <<<"$INFO"; then echo '::error::the app signature carries entitlements; none are expected.'; exit 1; fi
+          for arch in arm64 x86_64; do
+            codesign --verify --strict --arch "$arch" "$APP" || { echo "::error::the $arch slice of the app does not verify."; exit 1; }
+          done
+          [[ "$("$APP/Contents/MacOS/RemoHop" version)" == "remohop $VERSION" ]] || { echo '::error::the signed app does not run.'; exit 1; }
+          echo '- RemoHop.app signature: Developer ID Application, hardened runtime, secure timestamp, no entitlements, resources sealed, both slices verify' >> "$GITHUB_STEP_SUMMARY"
+
       - name: Notarize
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
@@ -313,14 +385,15 @@ jobs:
           open(sys.argv[1], "w").write(key + "\n")
           ' "$P8" ) || { echo '::error::ASC_PRIVATE_KEY is not a .p8 private key.'; exit 78; }
 
-          ZIP="$OUT/remohop-macos-universal.zip"
-          rm -f "$ZIP"
-          ( cd "$OUT" && /usr/bin/zip -q -X "$ZIP" remohop ) || { echo '::error::zip failed.'; exit 1; }
-          RESULT="$RUNNER_TEMP/notary-result.json"
-          xcrun notarytool submit "$ZIP" --key "$P8" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" \
-            --wait --timeout 30m --output-format json > "$RESULT" 2> "$RUNNER_TEMP/notary.err"
-          st=$?
-          read -r SUB_ID STATUS < <(python3 -c '
+          # notarize ZIP LABEL: submit, wait, print only chosen fields; on failure print the
+          # service's findings about the file and fail the step.
+          notarize() {
+            local zip="$1" label="$2" st SUB_ID STATUS
+            local RESULT="$RUNNER_TEMP/notary-result.json"
+            xcrun notarytool submit "$zip" --key "$P8" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" \
+              --wait --timeout 30m --output-format json > "$RESULT" 2> "$RUNNER_TEMP/notary.err"
+            st=$?
+            read -r SUB_ID STATUS < <(python3 -c '
           import json, re, sys
           try:
               d = json.load(open(sys.argv[1]))
@@ -329,12 +402,12 @@ jobs:
           i, s = str(d.get("id", "")), str(d.get("status", ""))
           print(i if re.fullmatch(r"[0-9a-fA-F-]{36}", i) else "-", s if re.fullmatch(r"[A-Za-z ]{1,40}", s) else "unknown")
           ' "$RESULT")
-          echo "notarytool: exit $st, submission ${SUB_ID}, status ${STATUS}"
-          if [[ "$st" -ne 0 || "$STATUS" != 'Accepted' ]]; then
-            # Why: the service's own findings (paths and messages about our file, no credentials).
-            if [[ "$SUB_ID" != '-' ]]; then
-              xcrun notarytool log "$SUB_ID" --key "$P8" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" "$RUNNER_TEMP/notary-log.json" > /dev/null 2>&1
-              python3 -c '
+            echo "notarytool ($label): exit $st, submission ${SUB_ID}, status ${STATUS}"
+            if [[ "$st" -ne 0 || "$STATUS" != 'Accepted' ]]; then
+              # Why: the service's own findings (paths and messages about our file, no credentials).
+              if [[ "$SUB_ID" != '-' ]]; then
+                xcrun notarytool log "$SUB_ID" --key "$P8" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" "$RUNNER_TEMP/notary-log.json" > /dev/null 2>&1
+                python3 -c '
           import json, sys
           try:
               d = json.load(open(sys.argv[1]))
@@ -344,18 +417,33 @@ jobs:
           for it in (d.get("issues") or [])[:20]:
               print("  issue: %s %s (%s): %s" % (str(it.get("severity"))[:20], str(it.get("path"))[:120], str(it.get("architecture"))[:10], str(it.get("message"))[:300]))
           ' "$RUNNER_TEMP/notary-log.json"
-            else
-              # No submission: authentication or agreement problems are reported here.
-              grep -Ei 'error|unauthor|401|403|agreement|invalid|expired|not found' "$RUNNER_TEMP/notary.err" | sed -E 's/[A-Za-z0-9+\/=_-]{40,}/<redacted>/g' | cut -c1-300 | tail -n 8
+              else
+                # No submission: authentication or agreement problems are reported here.
+                grep -Ei 'error|unauthor|401|403|agreement|invalid|expired|not found' "$RUNNER_TEMP/notary.err" | sed -E 's/[A-Za-z0-9+\/=_-]{40,}/<redacted>/g' | cut -c1-300 | tail -n 8
+              fi
+              rm -rf "$ASC_DIR"
+              echo "::error::Notarization of $label did not succeed. Common causes: the API key lacks access (it needs the Developer role or higher), a pending agreement in the Apple Developer account, or the code was not signed with a Developer ID certificate, hardened runtime and a secure timestamp."
+              echo "- Notarization ($label): **${STATUS}**" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
             fi
-            rm -rf "$ASC_DIR"
-            echo '::error::Notarization did not succeed. Common causes: the API key lacks access (it needs the Developer role or higher), a pending agreement in the Apple Developer account, or the binary was not signed with a Developer ID certificate, hardened runtime and a secure timestamp.'
-            echo "- Notarization: **${STATUS}**" >> "$GITHUB_STEP_SUMMARY"
-            exit 1
+            echo "- Notarization ($label): Accepted (submission \`$SUB_ID\`)" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          ZIP="$OUT/remohop-macos-universal.zip"
+          rm -f "$ZIP"
+          ( cd "$OUT" && /usr/bin/zip -q -X "$ZIP" remohop ) || { echo '::error::zip failed.'; exit 1; }
+          notarize "$ZIP" remohop
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+
+          # The app is submitted as a ditto zip of the signed bundle (what Apple's tools expect);
+          # the ticket is stapled to the bundle in the next step.
+          if [[ -n "${APP:-}" ]]; then
+            AZ="$RUNNER_TEMP/RemoHop-notarize.zip"; rm -f "$AZ"
+            /usr/bin/ditto -c -k --keepParent "$APP" "$AZ" || { echo '::error::ditto failed.'; exit 1; }
+            notarize "$AZ" RemoHop.app
+            rm -f "$AZ"
           fi
           rm -rf "$ASC_DIR"
-          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
-          echo "- Notarization: Accepted (submission \`$SUB_ID\`)" >> "$GITHUB_STEP_SUMMARY"
 
       # What a user's Mac will decide. The ticket is looked up online (nothing can be stapled to
       # a bare executable), and may take a moment to become visible after acceptance.
@@ -404,6 +492,92 @@ jobs:
             echo "- SHA-256 \`remohop\` (universal, signed): \`$SHA_BIN\`"
             echo "- SHA-256 \`remohop-macos-universal.zip\` (as notarized): \`$SHA_ZIP\`"
             echo '- Nothing uploaded unless the release hand-off was requested (upload=true).'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$FAILED"
+
+      # A bundle can carry its ticket, so Gatekeeper's first-run check passes offline. The zip that
+      # is released is made after stapling, with ditto, so the ticket is inside it. Then the checks a
+      # user's Mac makes: on a copy unpacked from that zip and marked as downloaded.
+      - name: Staple and verify RemoHop.app (Gatekeeper, launch, UI server)
+        if: env.APP != ''
+        run: |
+          set +e -uo pipefail
+          FAILED=0
+          ok()   { printf '   ok    %s\n' "$*"; }
+          fail() { printf '   FAIL  %s\n' "$*"; FAILED=1; }
+          STAPLED=
+          for _ in 1 2 3 4 5 6; do
+            if xcrun stapler staple "$APP" > "$RUNNER_TEMP/staple.txt" 2>&1; then STAPLED=1; break; fi
+            sleep 10
+          done
+          if [[ -n "$STAPLED" ]]; then ok 'stapler staple RemoHop.app'; else fail 'stapler staple RemoHop.app'; tail -n 3 "$RUNNER_TEMP/staple.txt" | cut -c1-200; fi
+          if xcrun stapler validate "$APP" > /dev/null 2>&1; then ok 'stapler validate: the ticket is in the bundle'; else fail 'stapler validate'; fi
+          if codesign --verify --deep --strict "$APP" > /dev/null 2>&1; then ok 'codesign --verify --deep --strict after stapling'; else fail 'codesign --verify --deep --strict after stapling'; fi
+          AZIP="$OUT/RemoHop-macos.zip"; rm -f "$AZIP"
+          /usr/bin/ditto -c -k --keepParent "$APP" "$AZIP" || fail 'ditto -c -k --keepParent'
+          echo "AZIP=$AZIP" >> "$GITHUB_ENV"
+
+          # As downloaded: unpacked from the released zip, with the quarantine mark a browser sets.
+          Q="$RUNNER_TEMP/app-quarantined"; rm -rf "$Q"; mkdir -p "$Q"
+          /usr/bin/ditto -x -k "$AZIP" "$Q"
+          QAPP="$Q/RemoHop.app"
+          xattr -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");Safari;$(uuidgen)" "$AZIP"
+          find "$QAPP" -exec xattr -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");Safari;$(uuidgen)" {} \; 2>/dev/null
+          if cmp -s "$QAPP/Contents/MacOS/RemoHop" "$APP/Contents/MacOS/RemoHop" && codesign --verify --deep --strict "$QAPP" 2>/dev/null; then ok 'the app in RemoHop-macos.zip is the signed one and verifies after unpacking'; else fail 'the app in RemoHop-macos.zip differs or does not verify'; fi
+          if xcrun stapler validate "$QAPP" > /dev/null 2>&1; then ok 'the unpacked app carries the stapled ticket'; else fail 'the unpacked app has no stapled ticket'; fi
+          ASSESS="$(spctl --assess --type execute -vv "$QAPP" 2>&1)"; code=$?
+          SRC="$(sed -n 's/^source=//p' <<<"$ASSESS" | head -n 1)"
+          if [[ "$code" -eq 0 && "$SRC" == *Notarized* ]]; then ok "spctl --assess --type execute (quarantined copy): accepted, source=$SRC"
+          else fail "spctl --assess --type execute: exit $code, $(head -n 1 <<<"$ASSESS" | sed -e "s#$Q/##" | cut -c1-160) ${SRC:+source=$SRC}"; fi
+          GOT="$("$QAPP/Contents/MacOS/RemoHop" version 2>&1)"; code=$?
+          if [[ "$code" -eq 0 && "$GOT" == "remohop $VERSION" ]]; then ok 'the quarantined app program runs'; else fail "the quarantined app program does not run: exit $code"; head -n 2 <<<"$GOT" | cut -c1-200; fi
+
+          # The hardened app serves its window: `quick --no-open` prints the page address (with its
+          # access token, so it is not printed here) and the page must answer.
+          W="$RUNNER_TEMP/quick-probe"; rm -rf "$W"; mkdir -p "$W/cfg"
+          REMOHOP_CONFIG_DIR="$W/cfg" "$APP/Contents/MacOS/RemoHop" quick --no-open --lang en > "$W/out.txt" 2> "$W/err.txt" < /dev/null &
+          QPID=$!
+          URL=
+          for _ in $(seq 1 100); do
+            URL="$(sed -n 's/^RemoHop quick support: \(http:\/\/127\.0\.0\.1:[0-9]*\/[^ ]*\)$/\1/p' "$W/out.txt" 2>/dev/null | head -n 1)"
+            [[ -n "$URL" ]] && break
+            sleep 0.2
+          done
+          if [[ -n "$URL" ]]; then
+            echo "::add-mask::$URL"
+            CODE="$(curl -s -o "$W/page.html" -w '%{http_code}' --max-time 10 "$URL")"
+            if [[ "$CODE" == 200 ]] && grep -qi 'remohop' "$W/page.html"; then ok 'quick --no-open: the window page answers on 127.0.0.1 (HTTP 200)'; else fail "quick --no-open: the page answered HTTP $CODE"; fi
+          else
+            fail 'quick --no-open printed no page address'; sed -E 's#https?://[^ ]+#<url>#g' "$W/err.txt" | tail -n 5 | cut -c1-300
+          fi
+          kill "$QPID" 2>/dev/null; wait "$QPID" 2>/dev/null
+
+          # LaunchServices starts the signed bundle the way a double-click does (no quarantine on this
+          # copy: the first-run confirmation would wait for a click). The window opens in the default
+          # browser; the process is then stopped.
+          open -n "$APP" > "$W/open.txt" 2>&1; code=$?
+          PIDS=
+          for _ in $(seq 1 50); do
+            PIDS="$(pgrep -f "$APP/Contents/MacOS/RemoHop" | tr '\n' ' ')"
+            [[ -n "$PIDS" ]] && break
+            sleep 0.2
+          done
+          if [[ "$code" -eq 0 && -n "$PIDS" ]]; then
+            sleep 3
+            if pgrep -f "$APP/Contents/MacOS/RemoHop" > /dev/null; then ok 'open -n RemoHop.app: LaunchServices started the app and it keeps running'; else fail 'open -n RemoHop.app: the app exited at once'; fi
+          else
+            fail "open -n RemoHop.app: exit $code, no process"; cut -c1-200 "$W/open.txt" | tail -n 3
+          fi
+          pkill -f "$APP/Contents/MacOS/RemoHop" 2>/dev/null
+          LOG="$HOME/Library/Application Support/remohop/quick.log"
+          [[ -f "$LOG" ]] && grep -E 'opening the window|no page connected|could not' "$LOG" | sed -E 's#https?://[^ ]+#<url>#g' | tail -n 4 | cut -c1-200 | sed 's/^/   log   /'
+          rm -rf "$W"
+
+          SHA_APPZIP="$(shasum -a 256 "$AZIP" | cut -d' ' -f1)"
+          echo "   sha256 RemoHop-macos.zip            $SHA_APPZIP"
+          {
+            if [[ "$FAILED" -eq 0 ]]; then echo '- RemoHop.app verification: stapled, deep strict signature, Gatekeeper accepts the quarantined copy from the zip (Notarized Developer ID), it runs, its UI server answers, LaunchServices starts it: PASS'; else echo '- RemoHop.app verification: **FAIL** (see the log)'; fi
+            echo "- SHA-256 \`RemoHop-macos.zip\` (stapled app, ditto): \`$SHA_APPZIP\`"
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$FAILED"
 
@@ -487,7 +661,9 @@ jobs:
           H="$RUNNER_TEMP/handoff"; rm -rf "$H"; mkdir -p "$H"
           cp "$OUT/remohop" "$H/remohop"
           cp "$ZIP" "$H/remohop-macos-universal.zip"
-          ( cd "$H" && shasum -a 256 remohop remohop-macos-universal.zip > SHA256SUMS-macos && cat SHA256SUMS-macos )
+          FILES=(remohop remohop-macos-universal.zip)
+          if [[ -n "${AZIP:-}" ]]; then cp "$AZIP" "$H/RemoHop-macos.zip"; FILES+=(RemoHop-macos.zip); fi
+          ( cd "$H" && shasum -a 256 "${FILES[@]}" > SHA256SUMS-macos && cat SHA256SUMS-macos )
           echo "HANDOFF_DIR=$H" >> "$GITHUB_ENV"
           echo "- Hand-off: artifact \`remohop-macos-universal\` uploaded for the release workflow (kept 3 days)" >> "$GITHUB_STEP_SUMMARY"
 
@@ -509,5 +685,5 @@ jobs:
             [[ "${#OLD[@]}" -gt 0 ]] && security list-keychains -d user -s "${OLD[@]}" >/dev/null 2>&1
           fi
           [[ -n "${KEYCHAIN_NAME:-}" ]] && security delete-keychain "$KEYCHAIN_NAME" >/dev/null 2>&1
-          rm -rf "$RUNNER_TEMP/remohop-asc" "$RUNNER_TEMP/remohop-devid.p12" "$RUNNER_TEMP/notary-result.json" "$RUNNER_TEMP/notary-log.json" >/dev/null 2>&1
+          rm -rf "$RUNNER_TEMP/remohop-asc" "$RUNNER_TEMP/remohop-devid.p12" "$RUNNER_TEMP/notary-result.json" "$RUNNER_TEMP/notary-log.json" "$RUNNER_TEMP/RemoHop-notarize.zip" >/dev/null 2>&1
           true
