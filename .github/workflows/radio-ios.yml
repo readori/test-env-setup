@@ -1159,12 +1159,24 @@ jobs:
           - waitForAnimationToEnd: { timeout: 3000 }
           - scrollUntilVisible: { element: { id: "atlas-globe-caption" }, direction: DOWN, timeout: 10000 }
           - assertVisible: { id: "atlas-globe-stage" }
+          - scrollUntilVisible: { element: { id: "locate-button" }, direction: UP, visibilityPercentage: 100, timeout: 10000 }
+          - tapOn: { id: "locate-button" }
+          - waitForAnimationToEnd: { timeout: 5000 }
+          - assertNotVisible: { id: "drill-up" }
+          - assertNotVisible: { id: "locate-nearby" }
+          - assertVisible: { id: "atlas-globe-stage" }
+          - tapOn: { id: "atlas-tab-prefs" }
+          - tapOn: { id: "atlas-prefs-display" }
+          - extendedWaitUntil: { visible: { id: "atlas-display-theme" }, timeout: 10000 }
+          - swipe: { start: "1%,50%", end: "85%,50%", duration: 300 }
+          - extendedWaitUntil: { visible: { id: "atlas-prefs-display" }, timeout: 10000 }
+          - assertNotVisible: { id: "atlas-display-theme" }
           YAML
                 sed -i '' -e 's/^          //' "$OUT/theme-atlas.yaml"
                 if maestro --device "$UDID" test "$OUT/theme-atlas.yaml" > "$OUT/maestro-theme-atlas.log" 2>&1; then
-                  echo 'theme atlas: Maestro flow passed (explore card, strip, locate button, no pill, globe dragged)'
+                  echo 'theme atlas: Maestro flow passed (explore card, strip, locate button, no pill, globe dragged, locate keeps the card, edge swipe back)'
                 else
-                  fail 'Theme atlas: the explore card globe did not show (flow failed).'
+                  fail 'Theme atlas: the explore card flow failed (globe, locate in the card, or edge swipe back).'
                   grep -E 'FAILED|not found|Unknown|Assertion' "$OUT/maestro-theme-atlas.log" | cut -c1-200 | head -3 || true
                 fi
                 sleep 8
