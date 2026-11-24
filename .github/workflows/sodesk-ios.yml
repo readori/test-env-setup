@@ -101,14 +101,14 @@ concurrency:
   cancel-in-progress: ${{ !((github.event_name == 'push' && contains(github.event.head_commit.message, '[sodesk-ios-release]')) || (github.event_name == 'workflow_dispatch' && inputs.mode != 'verify')) }}
 
 env:
-  # Private source repository. Change to readori/RemoHop once the GitHub repository is renamed.
-  SOURCE_REPOSITORY: readori/SoDesk
+  # Source repository (public since the open-source release).
+  SOURCE_REPOSITORY: readori/RemoHop
   PRIVATE_SOURCE_PATH: source
   # Same identifier as the Android app. Replaces com.readori.sodesk (the old App Store record).
   EXPECTED_BUNDLE_ID: com.remohop.app
   # Apple ID of the App Store Connect record for com.remohop.app; empty = not checked yet.
   # Fill in once the record exists.
-  EXPECTED_APPLE_ID: ''
+  EXPECTED_APPLE_ID: '6838609056'
   BUNDLE_ID_NAME: RemoHop
   XCODE_MAJOR_WANTED: '26'
   MATCH_GIT_URL: https://github.com/readori/readori-certificates.git

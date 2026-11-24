@@ -40,8 +40,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Private source repository. Change to readori/RemoHop once the GitHub repository is renamed.
-  SOURCE_REPOSITORY: readori/SoDesk
+  # Source repository (public since the open-source release).
+  SOURCE_REPOSITORY: readori/RemoHop
 
 jobs:
   test:

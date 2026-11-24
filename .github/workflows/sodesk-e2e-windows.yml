@@ -52,8 +52,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Private source repository. Change to readori/RemoHop once the GitHub repository is renamed.
-  SOURCE_REPOSITORY: readori/SoDesk
+  # Source repository (public since the open-source release).
+  SOURCE_REPOSITORY: readori/RemoHop
   # ffmpeg 9.1 "essentials" build by gyan.dev (x64; it runs on Windows 11 ARM under emulation).
   # GitHub's archive of the same release is the stable URL; the SHA-256 is checked before use.
   FFMPEG_URL: https://github.com/GyanD/codexffmpeg/releases/download/9.1/ffmpeg-9.1-essentials_build.zip
