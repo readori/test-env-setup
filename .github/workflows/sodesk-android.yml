@@ -257,6 +257,19 @@ jobs:
             grep -E '^e: |error:|FAILED|Lint found|tests completed' "$LOG" | cut -c1-400 | head -n 60
             # The cause follows the "What went wrong" line (build output only: no secrets in it).
             grep -E -A12 'What went wrong' "$LOG" | cut -c1-400 | head -n 50
+            # Lint's own findings (errors only) from its XML report: id, message, file:line.
+            for r in app/build/reports/lint-results-debug.xml; do
+              [[ -f "$r" ]] || continue
+              python3 - "$r" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          for i in ET.parse(sys.argv[1]).getroot().iter('issue'):
+              if i.get('severity') not in ('Error', 'Fatal'):
+                  continue
+              loc = i.find('location')
+              where = '' if loc is None else '%s:%s' % (loc.get('file', '').split('/source/', 1)[-1], loc.get('line', '?'))
+              print('lint %s [%s] %s: %s' % (i.get('severity'), i.get('id'), where, i.get('message', '')[:300]))
+          PY
+            done
             echo '::error::Android build failed.'
             exit 1
           fi
