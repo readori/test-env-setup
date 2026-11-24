@@ -252,10 +252,15 @@ jobs:
                   v = read(f'{root}/{loc}/{field}.txt')
                   if v is not None and 'TODO-REPLACE' not in v and not re.fullmatch(r'https://[^\s/]+(/\S*)?', v):
                       problems.append(f'{root}/{loc}/{field}.txt: must be one https URL')
+          # Review contact name, phone and the notes (demo host) are personal or secret: they may be
+          # left out of the repo and filled in App Store Connect; deliver leaves missing files alone.
           for field in ('first_name', 'last_name', 'phone_number', 'email_address', 'notes'):
-              v = read(f'{root}/review_information/{field}.txt')
+              p = f'{root}/review_information/{field}.txt'
+              if not os.path.exists(p):
+                  continue
+              v = read(p)
               if v is not None and not v:
-                  problems.append(f'{root}/review_information/{field}.txt: empty')
+                  problems.append(f'{p}: empty')
           v = read(f'{root}/copyright.txt')
           if v is not None and not v:
               problems.append(f'{root}/copyright.txt: empty')
