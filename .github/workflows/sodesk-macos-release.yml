@@ -581,6 +581,63 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$FAILED"
 
+      # The usual Mac download: a disk image with the stapled app and an Applications link, so the
+      # user drags RemoHop into Applications. The image itself is signed, notarized and stapled, so
+      # Gatekeeper accepts it offline when it is opened.
+      - name: Build, sign, notarize and staple RemoHop-macos.dmg
+        if: env.APP != ''
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set +e -uo pipefail
+          FAILED=0
+          ok()   { printf '   ok    %s\n' "$*"; }
+          fail() { printf '   FAIL  %s\n' "$*"; FAILED=1; }
+          P8="$RUNNER_TEMP/remohop-asc/AuthKey.p8"
+          [[ -s "$P8" ]] || { echo '::error::the notary key from the Notarize step is gone.'; exit 1; }
+          STAGE="$RUNNER_TEMP/dmg-stage"; rm -rf "$STAGE"; mkdir -p "$STAGE"
+          /usr/bin/ditto "$APP" "$STAGE/RemoHop.app" || fail 'ditto RemoHop.app into the image folder'
+          ln -s /Applications "$STAGE/Applications"
+          DMG="$OUT/RemoHop-macos.dmg"; rm -f "$DMG"
+          if hdiutil create -volname RemoHop -srcfolder "$STAGE" -ov -format UDZO -fs HFS+ "$DMG" > "$RUNNER_TEMP/hdiutil.txt" 2>&1; then ok 'hdiutil create (UDZO)'; else fail 'hdiutil create'; tail -n 3 "$RUNNER_TEMP/hdiutil.txt" | cut -c1-200; exit 1; fi
+          if codesign --force --sign "$SIGN_HASH" --keychain "$KEYCHAIN_PATH" --timestamp "$DMG" > "$RUNNER_TEMP/codesign-dmg.log" 2>&1; then ok 'codesign the disk image (Developer ID, timestamp)'; else fail 'codesign the disk image'; tail -n 3 "$RUNNER_TEMP/codesign-dmg.log" | cut -c1-200; exit 1; fi
+          RESULT="$RUNNER_TEMP/notary-dmg.json"
+          xcrun notarytool submit "$DMG" --key "$P8" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" \
+            --wait --timeout 30m --output-format json > "$RESULT" 2> "$RUNNER_TEMP/notary-dmg.err"
+          STATUS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status",""))' "$RESULT" 2>/dev/null)"
+          if [[ "$STATUS" == "Accepted" ]]; then ok 'notarytool: RemoHop-macos.dmg Accepted'; else fail "notarytool: RemoHop-macos.dmg status '${STATUS:-none}'"; grep -Ei 'error|invalid|401|403' "$RUNNER_TEMP/notary-dmg.err" | sed -E 's/[A-Za-z0-9+\/=_-]{40,}/<redacted>/g' | cut -c1-300 | tail -n 5; exit 1; fi
+          STAPLED=
+          for _ in 1 2 3 4 5 6; do
+            if xcrun stapler staple "$DMG" > "$RUNNER_TEMP/staple-dmg.txt" 2>&1; then STAPLED=1; break; fi
+            sleep 10
+          done
+          if [[ -n "$STAPLED" ]]; then ok 'stapler staple RemoHop-macos.dmg'; else fail 'stapler staple RemoHop-macos.dmg'; tail -n 3 "$RUNNER_TEMP/staple-dmg.txt" | cut -c1-200; fi
+          if xcrun stapler validate "$DMG" > /dev/null 2>&1; then ok 'stapler validate: the ticket is in the disk image'; else fail 'stapler validate RemoHop-macos.dmg'; fi
+          # As downloaded: quarantined, then opened the way Finder opens it.
+          xattr -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");Safari;$(uuidgen)" "$DMG"
+          ASSESS="$(spctl --assess --type open --context context:primary-signature -vv "$DMG" 2>&1)"; code=$?
+          SRC="$(sed -n 's/^source=//p' <<<"$ASSESS" | head -n 1)"
+          if [[ "$code" -eq 0 && "$SRC" == *Notarized* ]]; then ok "spctl --assess --type open (quarantined dmg): accepted, source=$SRC"; else fail "spctl --assess --type open: exit $code ${SRC:+source=$SRC}"; fi
+          xattr -d com.apple.quarantine "$DMG" 2>/dev/null
+          MNT="$RUNNER_TEMP/dmg-mnt"; rm -rf "$MNT"; mkdir -p "$MNT"
+          if hdiutil attach -nobrowse -readonly -mountpoint "$MNT" "$DMG" > /dev/null 2>&1; then
+            if cmp -s "$MNT/RemoHop.app/Contents/MacOS/RemoHop" "$APP/Contents/MacOS/RemoHop" && codesign --verify --deep --strict "$MNT/RemoHop.app" 2>/dev/null && xcrun stapler validate "$MNT/RemoHop.app" > /dev/null 2>&1; then ok 'the app in the image is the signed, stapled one'; else fail 'the app in the image differs or does not verify'; fi
+            [[ -L "$MNT/Applications" ]] && ok 'the image has the Applications link' || fail 'no Applications link in the image'
+            hdiutil detach "$MNT" > /dev/null 2>&1 || hdiutil detach -force "$MNT" > /dev/null 2>&1
+          else
+            fail 'hdiutil attach RemoHop-macos.dmg'
+          fi
+          rm -rf "$STAGE"
+          echo "DMG=$DMG" >> "$GITHUB_ENV"
+          SHA_DMG="$(shasum -a 256 "$DMG" | cut -d' ' -f1)"
+          echo "   sha256 RemoHop-macos.dmg            $SHA_DMG"
+          {
+            if [[ "$FAILED" -eq 0 ]]; then echo '- RemoHop-macos.dmg: signed, notarized, stapled, Gatekeeper accepts the quarantined image, holds the stapled app: PASS'; else echo '- RemoHop-macos.dmg: **FAIL** (see the log)'; fi
+            echo "- SHA-256 \`RemoHop-macos.dmg\`: \`$SHA_DMG\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$FAILED"
+
       - name: Run the signed binary (help, loopback smoke test)
         working-directory: source
         run: |
@@ -663,6 +720,7 @@ jobs:
           cp "$ZIP" "$H/remohop-macos-universal.zip"
           FILES=(remohop remohop-macos-universal.zip)
           if [[ -n "${AZIP:-}" ]]; then cp "$AZIP" "$H/RemoHop-macos.zip"; FILES+=(RemoHop-macos.zip); fi
+          if [[ -n "${DMG:-}" ]]; then cp "$DMG" "$H/RemoHop-macos.dmg"; FILES+=(RemoHop-macos.dmg); fi
           ( cd "$H" && shasum -a 256 "${FILES[@]}" > SHA256SUMS-macos && cat SHA256SUMS-macos )
           echo "HANDOFF_DIR=$H" >> "$GITHUB_ENV"
           echo "- Hand-off: artifact \`remohop-macos-universal\` uploaded for the release workflow (kept 3 days)" >> "$GITHUB_STEP_SUMMARY"
@@ -685,5 +743,5 @@ jobs:
             [[ "${#OLD[@]}" -gt 0 ]] && security list-keychains -d user -s "${OLD[@]}" >/dev/null 2>&1
           fi
           [[ -n "${KEYCHAIN_NAME:-}" ]] && security delete-keychain "$KEYCHAIN_NAME" >/dev/null 2>&1
-          rm -rf "$RUNNER_TEMP/remohop-asc" "$RUNNER_TEMP/remohop-devid.p12" "$RUNNER_TEMP/notary-result.json" "$RUNNER_TEMP/notary-log.json" "$RUNNER_TEMP/RemoHop-notarize.zip" >/dev/null 2>&1
+          rm -rf "$RUNNER_TEMP/remohop-asc" "$RUNNER_TEMP/remohop-devid.p12" "$RUNNER_TEMP/notary-result.json" "$RUNNER_TEMP/notary-log.json" "$RUNNER_TEMP/RemoHop-notarize.zip" "$RUNNER_TEMP/notary-dmg.json" >/dev/null 2>&1
           true
