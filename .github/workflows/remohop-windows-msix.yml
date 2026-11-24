@@ -30,6 +30,9 @@
 #   IDENTITY_NAME=...                # optional: Partner Center Package/Identity/Name (default: a CI test name)
 #   PUBLISHER=CN=...                 # optional: Package/Identity/Publisher (default: CN=RemoHop CI Test)
 #   PUBLISHER_DISPLAY_NAME=...       # optional: Package/Properties/PublisherDisplayName (default: RemoHop CI)
+#   VIRTUALIZED=1                    # optional comparison run: the test packages keep MSIX's AppData
+#                                    # virtualization (build.ps1 -Virtualized); the install checks then
+#                                    # report what breaks, and the job does not fail on them
 #
 # Safety rules (public repo, public logs): no pull_request triggers; only GitHub-owned actions,
 # pinned to commit SHAs; everything else is plain PowerShell and bash; TARGET_REPO_PAT is used only
@@ -131,10 +134,13 @@ jobs:
             }
             $ref = Get-Value 'REF'; $ver = Get-Value 'VERSION'
             $idn = Get-Value 'IDENTITY_NAME'; $pub = Get-Value 'PUBLISHER'; $pdn = Get-Value 'PUBLISHER_DISPLAY_NAME'
+            $virt = Get-Value 'VIRTUALIZED'
           } else {
             $ref = "$env:INPUT_REF"; $ver = "$env:INPUT_VERSION"
             $idn = "$env:INPUT_IDENTITY_NAME"; $pub = "$env:INPUT_PUBLISHER"; $pdn = "$env:INPUT_PUBLISHER_DISPLAY_NAME"
+            $virt = ''
           }
+          if ($virt -cnotmatch '\A[01]?\z') { Write-Output '::error::VIRTUALIZED is 0 or 1.'; exit 64 }
           if ($ref.Length -eq 0 -or $ref.Length -gt 200 -or $ref -cnotmatch '\A[A-Za-z0-9._/][A-Za-z0-9._/-]*\z') {
             Write-Output '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only, no leading dash).'; exit 64
           }
@@ -147,7 +153,7 @@ jobs:
           if (-not $pdn) { $pdn = 'RemoHop CI' }
           if ($pdn -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9 .-]{0,63}\z') { Write-Output '::error::publisher_display_name: letters, digits, space . - only.'; exit 64 }
           if (-not $env:TARGET_REPO_PAT) { Write-Output '::error::Missing public CI credential: TARGET_REPO_PAT.'; exit 78 }
-          @("SOURCE_REF=$ref", "VERSION=$ver", "MSIX_IDENTITY_NAME=$idn", "MSIX_PUBLISHER=$pub", "MSIX_PUBLISHER_DISPLAY_NAME=$pdn") |
+          @("SOURCE_REF=$ref", "VERSION=$ver", "MSIX_VIRTUALIZED=$virt", "MSIX_IDENTITY_NAME=$idn", "MSIX_PUBLISHER=$pub", "MSIX_PUBLISHER_DISPLAY_NAME=$pdn") |
             Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Output "Source ref: $ref · version $ver · identity $idn · publisher $pub ($pdn)"
 
@@ -209,7 +215,9 @@ jobs:
           Export-Certificate -Cert $cert -FilePath $cer | Out-Null
           Import-Certificate -FilePath $cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
           @("TEST_CERT_THUMBPRINT=$($cert.Thumbprint)", "TEST_PFX=$pfx", "TEST_CER=$cer") | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          ./packaging/windows/msix/build.ps1 -Version $env:VERSION -Out dist/msix-test -CertPfx $pfx -CertPassword $pw
+          $extra = @{}
+          if ($env:MSIX_VIRTUALIZED -eq '1') { $extra['Virtualized'] = $true; Write-Output '::notice::comparison run: the test packages keep AppData virtualization' }
+          ./packaging/windows/msix/build.ps1 -Version $env:VERSION -Out dist/msix-test -CertPfx $pfx -CertPassword $pw @extra
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       # What is inside the packages (an .msix is a zip): the manifest as filled in, the files, the
@@ -303,7 +311,7 @@ jobs:
             if ($pkg.Architecture.ToString() -eq $(if ($env:ARCH -eq 'x64') { 'X64' } else { 'Arm64' })) { ok "$label`: installed $($pkg.PackageFullName)" } else { fail "$label`: installed architecture $($pkg.Architecture)" }
             $m = Get-AppxPackageManifest -Package $pkg
             $caps = @($m.Package.Capabilities.ChildNodes | Where-Object { $_.NodeType -eq 'Element' } | ForEach-Object { $_.GetAttribute('Name') })
-            if ($caps -contains 'runFullTrust' -and $caps -contains 'unvirtualizedResources') { ok "$label`: capabilities $($caps -join ', ')" } else { fail "$label`: capabilities $($caps -join ', ')" }
+            if ($caps -contains 'runFullTrust' -and ($env:MSIX_VIRTUALIZED -eq '1' -or $caps -contains 'unvirtualizedResources')) { ok "$label`: capabilities $($caps -join ', ')" } else { fail "$label`: capabilities $($caps -join ', ')" }
             $exe = Join-Path $pkg.InstallLocation 'RemoHop.exe'
             if (Test-Path -LiteralPath $exe) { ok "$label`: RemoHop.exe in the install location" } else { fail "$label`: no RemoHop.exe in the install location" }
 
@@ -363,6 +371,10 @@ jobs:
           Test-Install "dist/msix-test/RemoHop_${ver}_$env:ARCH.msix" "msix ($env:ARCH)"
           Test-Install "dist/msix-test/RemoHop_$ver.msixbundle" 'msixbundle'
           $res = if ($failed -eq 0) { 'PASS' } else { '**FAIL** (see the log)' }
+          if ($env:MSIX_VIRTUALIZED -eq '1') {
+            "- Comparison run with AppData virtualization ON: $res (failures here are what the manifest's unvirtualized setting avoids)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            exit 0
+          }
           @("- Install from .msix and from .msixbundle, start through the AppUserModelID, state in the real %APPDATA%, window page answers, Edge app window opens the page, uninstall: $res") |
             Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           exit $failed
