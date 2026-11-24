@@ -1168,10 +1168,10 @@ jobs:
           - assertVisible: { id: "atlas-globe-stage" }
           - tapOn: { id: "atlas-tab-prefs" }
           - tapOn: { id: "atlas-prefs-display" }
-          - extendedWaitUntil: { visible: { id: "atlas-display-theme" }, timeout: 10000 }
+          - extendedWaitUntil: { visible: { id: "atlas-display-filter" }, timeout: 10000 }
           - swipe: { start: "1%,50%", end: "85%,50%", duration: 300 }
           - extendedWaitUntil: { visible: { id: "atlas-prefs-display" }, timeout: 10000 }
-          - assertNotVisible: { id: "atlas-display-theme" }
+          - assertNotVisible: { id: "atlas-display-filter" }
           YAML
                 sed -i '' -e 's/^          //' "$OUT/theme-atlas.yaml"
                 if maestro --device "$UDID" test "$OUT/theme-atlas.yaml" > "$OUT/maestro-theme-atlas.log" 2>&1; then
