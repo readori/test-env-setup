@@ -1,0 +1,387 @@
+# RemoHop quick support as an MSIX package (Microsoft Store): build, install, start.
+#
+# Public CI repository -> source repository: env SOURCE_REPOSITORY.
+#
+#   msix : windows-latest (x64) and windows-11-arm (arm64), one job each.
+#          RemoHop.exe for amd64 and arm64 (packaging/quick/build.sh, TARGETS=windows) ->
+#          packaging/windows/msix/build.ps1: the logos (packaging/quick/gen -msix-assets),
+#          resources.pri (makepri), AppxManifest.xml, makeappx pack per architecture and one
+#          .msixbundle. Built twice: unsigned, as it would be uploaded to Partner Center (the Store
+#          signs submissions), and signed with a self-signed test certificate made in this run
+#          (subject = the manifest's Publisher, trusted in LocalMachine\TrustedPeople, removed at
+#          the end). Then, for the runner's own architecture: Add-AppxPackage of the .msix, checks
+#          of the installed manifest (runFullTrust, unvirtualized AppData), a start through the
+#          package's AppUserModelID (as the Start menu does) and what the app must do from inside
+#          the package: write its state to the real %APPDATA%\remohop, serve its window page on
+#          127.0.0.1, and get Microsoft Edge (outside the package) to open that page in an app
+#          window. Then the same install from the .msixbundle. Everything is removed afterwards.
+#
+# By default nothing is uploaded. With workflow_dispatch and upload=true the x64 job uploads the
+# UNSIGNED Store build (both .msix and the .msixbundle) as the artifact remohop-msix-store
+# (7 days), for a manual Partner Center submission; give the Partner Center identity values then.
+#
+# Triggers: workflow_dispatch, or a push to main that changes ci-requests/remohop-windows-msix.env
+# (how the project's AI engineer requests a run). Only people with push access to this repo can
+# trigger; never pull_request. The request file is plain KEY=VALUE text, parsed with strict
+# patterns and never executed:
+#
+#   REF=<sha>                        # source repository branch, tag or SHA
+#   VERSION=v1.2.3                   # optional, default v0.0.1 (the package version is 1.2.3.0)
+#   IDENTITY_NAME=...                # optional: Partner Center Package/Identity/Name (default: a CI test name)
+#   PUBLISHER=CN=...                 # optional: Package/Identity/Publisher (default: CN=RemoHop CI Test)
+#   PUBLISHER_DISPLAY_NAME=...       # optional: Package/Properties/PublisherDisplayName (default: RemoHop CI)
+#
+# Safety rules (public repo, public logs): no pull_request triggers; only GitHub-owned actions,
+# pinned to commit SHAs; everything else is plain PowerShell and bash; TARGET_REPO_PAT is used only
+# by the checkout step and not persisted; the test certificate's password is made per run and
+# masked, the certificate is deleted at the end; the window page's address (it holds an access
+# token) is masked and never printed.
+name: RemoHop Windows MSIX
+
+run-name: RemoHop Windows MSIX · ${{ github.event_name == 'push' && 'request (ci-requests/remohop-windows-msix.env)' || inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Source repository branch, tag, or SHA'
+        required: true
+        default: 'main'
+        type: string
+      version:
+        description: 'Version, e.g. v1.2.3 (empty: v0.0.1)'
+        required: false
+        default: ''
+        type: string
+      identity_name:
+        description: 'Partner Center Package/Identity/Name (empty: CI test value)'
+        required: false
+        default: ''
+        type: string
+      publisher:
+        description: 'Partner Center Package/Identity/Publisher, CN=... (empty: CI test value)'
+        required: false
+        default: ''
+        type: string
+      publisher_display_name:
+        description: 'Partner Center Package/Properties/PublisherDisplayName (empty: CI test value)'
+        required: false
+        default: ''
+        type: string
+      upload:
+        description: 'Upload the unsigned Store build as the artifact remohop-msix-store'
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches: [main]
+    paths: ['ci-requests/remohop-windows-msix.env']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remohop-windows-msix-${{ inputs.ref || 'request' }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_REPOSITORY: readori/RemoHop
+  CGO_ENABLED: '0'
+
+jobs:
+  msix:
+    name: MSIX build + install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            arch: x64
+          - os: windows-11-arm
+            arch: arm64
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Validate request and credentials
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_IDENTITY_NAME: ${{ inputs.identity_name }}
+          INPUT_PUBLISHER: ${{ inputs.publisher }}
+          INPUT_PUBLISHER_DISPLAY_NAME: ${{ inputs.publisher_display_name }}
+          REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/remohop-windows-msix.env
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:EVENT_NAME -eq 'push') {
+            # Download only the request file of this exact commit (public repo, no credentials).
+            $req = Join-Path $env:RUNNER_TEMP 'remohop-msix-request.env'
+            try { Invoke-WebRequest -Uri $env:REQUEST_URL -OutFile $req -MaximumRetryCount 3 -TimeoutSec 30 }
+            catch { Write-Output '::error::Could not read ci-requests/remohop-windows-msix.env at this commit.'; exit 64 }
+            # Plain text, read line by line; never sourced or executed.
+            $lines = Get-Content -LiteralPath $req
+            function Get-Value([string] $key) {
+              $line = $lines | Where-Object { $_ -cmatch "^$key=" } | Select-Object -First 1
+              if ($line) { return $line.Substring($key.Length + 1).Trim() } else { return '' }
+            }
+            $ref = Get-Value 'REF'; $ver = Get-Value 'VERSION'
+            $idn = Get-Value 'IDENTITY_NAME'; $pub = Get-Value 'PUBLISHER'; $pdn = Get-Value 'PUBLISHER_DISPLAY_NAME'
+          } else {
+            $ref = "$env:INPUT_REF"; $ver = "$env:INPUT_VERSION"
+            $idn = "$env:INPUT_IDENTITY_NAME"; $pub = "$env:INPUT_PUBLISHER"; $pdn = "$env:INPUT_PUBLISHER_DISPLAY_NAME"
+          }
+          if ($ref.Length -eq 0 -or $ref.Length -gt 200 -or $ref -cnotmatch '\A[A-Za-z0-9._/][A-Za-z0-9._/-]*\z') {
+            Write-Output '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only, no leading dash).'; exit 64
+          }
+          if (-not $ver) { $ver = 'v0.0.1' }
+          if ($ver -cnotmatch '\Av?\d{1,5}\.\d{1,5}\.\d{1,5}(-[0-9A-Za-z.]{1,40})?\z') { Write-Output '::error::version must look like v1.2.3.'; exit 64 }
+          if (-not $idn) { $idn = 'RemoHop.CITest' }
+          if ($idn -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9.-]{2,49}\z') { Write-Output '::error::identity_name: letters, digits, . and - only (3 to 50).'; exit 64 }
+          if (-not $pub) { $pub = 'CN=RemoHop CI Test' }
+          if ($pub -cnotmatch '\ACN=[A-Za-z0-9 .-]{1,100}\z') { Write-Output '::error::publisher must be CN=<letters, digits, space . ->.'; exit 64 }
+          if (-not $pdn) { $pdn = 'RemoHop CI' }
+          if ($pdn -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9 .-]{0,63}\z') { Write-Output '::error::publisher_display_name: letters, digits, space . - only.'; exit 64 }
+          if (-not $env:TARGET_REPO_PAT) { Write-Output '::error::Missing public CI credential: TARGET_REPO_PAT.'; exit 78 }
+          @("SOURCE_REF=$ref", "VERSION=$ver", "MSIX_IDENTITY_NAME=$idn", "MSIX_PUBLISHER=$pub", "MSIX_PUBLISHER_DISPLAY_NAME=$pdn") |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Output "Source ref: $ref · version $ver · identity $idn · publisher $pub ($pdn)"
+
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: source/go.mod
+          cache: false
+
+      - name: Build RemoHop.exe (amd64, arm64)
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -f packaging/windows/msix/build.ps1 ]] || { echo '::error::packaging/windows/msix/build.ps1 is not on this ref.'; exit 66; }
+          TARGETS=windows VERSION="$VERSION" sh packaging/quick/build.sh 2>&1 | tail -n 8
+          bash packaging/third_party_licenses.sh > dist/THIRD_PARTY_LICENSES.txt
+          sha="$(git rev-parse --short HEAD)"
+          {
+            echo "### RemoHop Windows MSIX · ${{ matrix.os }}"; echo
+            echo "- Source: \`$SOURCE_REPOSITORY@$sha\` (ref \`$SOURCE_REF\`), version \`$VERSION\`, $(go version | cut -d' ' -f3)"
+            echo "- Identity: \`$MSIX_IDENTITY_NAME\`, publisher \`$MSIX_PUBLISHER\` (\`$MSIX_PUBLISHER_DISPLAY_NAME\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # As it would be uploaded to Partner Center: unsigned.
+      - name: Build the MSIX packages and bundle (unsigned, Store)
+        working-directory: source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./packaging/windows/msix/build.ps1 -Version $env:VERSION -Out dist/msix-store
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $os = Get-CimInstance Win32_OperatingSystem
+          "- Windows: $($os.Caption) $([Environment]::OSVersion.Version), $env:PROCESSOR_ARCHITECTURE" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          Get-ChildItem dist/msix-store | ForEach-Object { "- Store build: ``$($_.Name)``, $([math]::Round($_.Length / 1MB, 1)) MB" } | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Make a test certificate and build signed packages
+        working-directory: source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pw = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(24))
+          Write-Output "::add-mask::$pw"
+          # Code signing (EKU 1.3.6.1.5.5.7.3.3), not a CA; the subject must equal the manifest's Publisher.
+          $cert = New-SelfSignedCertificate -Type Custom -Subject $env:MSIX_PUBLISHER -KeyUsage DigitalSignature `
+            -FriendlyName 'RemoHop MSIX CI test (delete me)' -CertStoreLocation Cert:\CurrentUser\My `
+            -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3', '2.5.29.19={text}') -NotAfter (Get-Date).AddDays(1)
+          $pfx = Join-Path $env:RUNNER_TEMP 'remohop-msix-test.pfx'
+          $cer = Join-Path $env:RUNNER_TEMP 'remohop-msix-test.cer'
+          Export-PfxCertificate -Cert $cert -FilePath $pfx -Password (ConvertTo-SecureString $pw -AsPlainText -Force) | Out-Null
+          Export-Certificate -Cert $cert -FilePath $cer | Out-Null
+          Import-Certificate -FilePath $cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
+          @("TEST_CERT_THUMBPRINT=$($cert.Thumbprint)", "TEST_PFX=$pfx", "TEST_CER=$cer") | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          ./packaging/windows/msix/build.ps1 -Version $env:VERSION -Out dist/msix-test -CertPfx $pfx -CertPassword $pw
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # What is inside the packages (an .msix is a zip): the manifest as filled in, the files, the
+      # signature only in the test build, and the bundle holding both architectures.
+      - name: Inspect the packages
+        working-directory: source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $failed = 0
+          function ok([string] $m) { Write-Output "   ok    $m" }
+          function fail([string] $m) { Write-Output "   FAIL  $m"; $script:failed = 1 }
+          $want = @('RemoHop.exe', 'LICENSE', 'NOTICE', 'THIRD_PARTY_LICENSES.txt', 'AppxManifest.xml', 'resources.pri', 'AppxBlockMap.xml',
+            'Assets/StoreLogo.scale-100.png', 'Assets/Square44x44Logo.scale-100.png', 'Assets/Square150x150Logo.scale-200.png',
+            'Assets/Wide310x150Logo.scale-100.png', 'Assets/Square310x310Logo.scale-100.png', 'Assets/Square44x44Logo.targetsize-256_altform-unplated.png')
+          foreach ($kind in 'store', 'test') {
+            foreach ($f in Get-ChildItem "dist/msix-$kind/*.msix") {
+              $z = [IO.Compression.ZipFile]::OpenRead($f.FullName)
+              try {
+                $names = $z.Entries | ForEach-Object { $_.FullName }
+                $missing = $want | Where-Object { $names -notcontains $_ }
+                if ($missing) { fail "$kind/$($f.Name): missing $($missing -join ', ')" } else { ok "$kind/$($f.Name): $($names.Count) files, all expected ones present" }
+                $signed = $names -contains 'AppxSignature.p7x'
+                if (($kind -eq 'test') -eq $signed) { ok "$kind/$($f.Name): signed=$signed" } else { fail "$kind/$($f.Name): signed=$signed" }
+                $sr = New-Object IO.StreamReader ($z.GetEntry('AppxManifest.xml').Open())
+                [xml] $m = $sr.ReadToEnd(); $sr.Close()
+                $id = $m.Package.Identity
+                $arch = if ($f.Name -match '_(x64|arm64)\.msix$') { $Matches[1] } else { '?' }
+                if ($id.Name -eq $env:MSIX_IDENTITY_NAME -and $id.Publisher -eq $env:MSIX_PUBLISHER -and $id.ProcessorArchitecture -eq $arch -and $id.Version -match '^\d+\.\d+\.\d+\.0$') {
+                  ok "$kind/$($f.Name): Identity $($id.Name) $($id.Version) $($id.ProcessorArchitecture)"
+                } else { fail "$kind/$($f.Name): Identity $($id.Name) $($id.Publisher) $($id.Version) $($id.ProcessorArchitecture)" }
+                # The program inside matches the architecture (PE machine: x64 0x8664, arm64 0xAA64).
+                $es = $z.GetEntry('RemoHop.exe').Open(); $buf = New-Object byte[] 4096; [void]$es.Read($buf, 0, 4096); $es.Close()
+                $pe = [BitConverter]::ToInt32($buf, 0x3c); $machine = [BitConverter]::ToUInt16($buf, $pe + 4)
+                $wantMachine = if ($arch -eq 'x64') { 0x8664 } else { 0xAA64 }
+                if ($machine -eq $wantMachine) { ok "$kind/$($f.Name): RemoHop.exe is $arch" } else { fail "$kind/$($f.Name): RemoHop.exe machine 0x$('{0:X}' -f $machine)" }
+              } finally { $z.Dispose() }
+            }
+            $b = Get-ChildItem "dist/msix-$kind/*.msixbundle" | Select-Object -First 1
+            if (-not $b) { fail "$kind`: no .msixbundle"; continue }
+            $z = [IO.Compression.ZipFile]::OpenRead($b.FullName)
+            try {
+              $inner = $z.Entries | Where-Object { $_.FullName -like '*.msix' } | ForEach-Object { $_.FullName }
+              if ($inner.Count -eq 2) { ok "$kind/$($b.Name): holds $($inner -join ', ')" } else { fail "$kind/$($b.Name): holds $($inner -join ', ')" }
+            } finally { $z.Dispose() }
+          }
+          exit $failed
+
+      - name: Install, start and check the package (${{ matrix.arch }})
+        working-directory: source
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $failed = 0
+          function ok([string] $m) { Write-Output "   ok    $m" }
+          function fail([string] $m) { Write-Output "   FAIL  $m"; $script:failed = 1 }
+          function info([string] $m) { Write-Output "   info  $m" }
+          Add-Type -TypeDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+          [ComImport, Guid("2e941141-7f97-4756-ba1d-9decde894a3d"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+          interface IApplicationActivationManager {
+            [PreserveSig] int ActivateApplication([MarshalAs(UnmanagedType.LPWStr)] string appUserModelId, [MarshalAs(UnmanagedType.LPWStr)] string arguments, int options, out uint processId);
+            [PreserveSig] int ActivateForFile([MarshalAs(UnmanagedType.LPWStr)] string appUserModelId, IntPtr itemArray, [MarshalAs(UnmanagedType.LPWStr)] string verb, out uint processId);
+            [PreserveSig] int ActivateForProtocol([MarshalAs(UnmanagedType.LPWStr)] string appUserModelId, IntPtr itemArray, out uint processId);
+          }
+          [ComImport, Guid("45BA127D-10A8-46EA-8AB7-56EA9078943C")]
+          class ApplicationActivationManager {}
+          public static class PackagedApp {
+            // Starts a packaged app the way the Start menu does; returns its process id.
+            public static uint Start(string aumid) {
+              var m = (IApplicationActivationManager)new ApplicationActivationManager();
+              uint pid;
+              int hr = m.ActivateApplication(aumid, null, 0, out pid);
+              if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+              return pid;
+            }
+          }
+          '@
+          $ver = (Get-ChildItem 'dist/msix-test/*.msixbundle' | Select-Object -First 1).BaseName -replace '^RemoHop_', ''
+          $cfg = Join-Path $env:APPDATA 'remohop'
+
+          function Test-Install([string] $path, [string] $label) {
+            Get-AppxPackage -Name $env:MSIX_IDENTITY_NAME | Remove-AppxPackage -ErrorAction SilentlyContinue
+            Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $cfg 'quick.url'), (Join-Path $cfg 'quick.log')
+            try { Add-AppxPackage -Path $path -ErrorAction Stop; ok "$label`: Add-AppxPackage" }
+            catch { fail "$label`: Add-AppxPackage: $($_.Exception.Message.Split("`n")[0])"; return }
+            $pkg = Get-AppxPackage -Name $env:MSIX_IDENTITY_NAME
+            if (-not $pkg) { fail "$label`: not installed"; return }
+            if ($pkg.Architecture.ToString() -eq $(if ($env:ARCH -eq 'x64') { 'X64' } else { 'Arm64' })) { ok "$label`: installed $($pkg.PackageFullName)" } else { fail "$label`: installed architecture $($pkg.Architecture)" }
+            $m = Get-AppxPackageManifest -Package $pkg
+            $caps = @($m.Package.Capabilities.ChildNodes | Where-Object { $_.NodeType -eq 'Element' } | ForEach-Object { $_.GetAttribute('Name') })
+            if ($caps -contains 'runFullTrust' -and $caps -contains 'unvirtualizedResources') { ok "$label`: capabilities $($caps -join ', ')" } else { fail "$label`: capabilities $($caps -join ', ')" }
+            $exe = Join-Path $pkg.InstallLocation 'RemoHop.exe'
+            if (Test-Path -LiteralPath $exe) { ok "$label`: RemoHop.exe in the install location" } else { fail "$label`: no RemoHop.exe in the install location" }
+
+            # Start it as the Start menu would: no arguments, so it runs `remohop quick`.
+            $aumid = "$($pkg.PackageFamilyName)!RemoHop"
+            try { $appPid = [PackagedApp]::Start($aumid); ok "$label`: started through its AppUserModelID (pid $appPid)" }
+            catch { fail "$label`: activation failed: $($_.Exception.Message)"; return }
+            $proc = $null
+            for ($i = 0; $i -lt 50 -and -not $proc; $i++) {
+              Start-Sleep -Milliseconds 200
+              $proc = Get-Process -Id $appPid -ErrorAction SilentlyContinue
+            }
+            if ($proc -and $proc.Path -like "$($pkg.InstallLocation)*") { ok "$label`: RemoHop.exe runs from the package" } else { fail "$label`: no RemoHop.exe process from the package" }
+
+            # State in the real %APPDATA%\remohop (writes are not virtualized), where Edge and the CLI see it.
+            $url = $null
+            for ($i = 0; $i -lt 100 -and -not $url; $i++) {
+              Start-Sleep -Milliseconds 300
+              $f = Join-Path $cfg 'quick.url'
+              if (Test-Path -LiteralPath $f) { $url = (Get-Content -Raw -LiteralPath $f).Trim() }
+            }
+            $virt = Join-Path $env:LOCALAPPDATA "Packages\$($pkg.PackageFamilyName)\LocalCache\Roaming\remohop"
+            if ($url) {
+              Write-Output "::add-mask::$url"
+              ok "$label`: quick.url written to the real %APPDATA%\remohop"
+              try {
+                $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10
+                if ($r.StatusCode -eq 200 -and $r.Content -match 'RemoHop') { ok "$label`: the window page answers on 127.0.0.1 (HTTP 200)" } else { fail "$label`: the page answered HTTP $($r.StatusCode)" }
+              } catch { fail "$label`: the page does not answer: $($_.Exception.Message.Split("`n")[0])" }
+            } elseif (Test-Path -LiteralPath (Join-Path $virt 'quick.url')) {
+              fail "$label`: quick.url went to the virtualized $virt (FileSystemWriteVirtualization is not off)"
+            } else { fail "$label`: no quick.url after 30 s" }
+
+            # The window: RemoHop.exe starts Microsoft Edge in app mode on a redirect file in
+            # %APPDATA%\remohop\run and waits up to 20 s for the page to report in. If Edge, which
+            # is outside the package, could not read the file, quick.log says "no page connected".
+            Start-Sleep -Seconds 25
+            $log = Join-Path $cfg 'quick.log'
+            $lines = if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log } else { @() }
+            $lines | Where-Object { $_ -match 'opening the window|no page connected|could not|error' } | Select-Object -Last 6 |
+              ForEach-Object { '   log   ' + (($_ -replace 'https?://\S+', '<url>') -replace '(.{200}).*', '$1') }
+            $edge = $lines | Where-Object { $_ -match 'opening the window' -and $_ -match 'msedge' }
+            $nopage = $lines | Where-Object { $_ -match 'no page connected' }
+            if ($edge -and -not $nopage) { ok "$label`: the page opened in an Edge app window (the page reported in)" }
+            elseif (-not $edge) { fail "$label`: Edge was not started (no Edge on this runner?)" }
+            else { fail "$label`: Edge started but the page did not report in" }
+            $apps = Get-CimInstance Win32_Process -Filter "Name = 'msedge.exe'" | Where-Object { $_.CommandLine -match '--app=' }
+            info "$label`: Edge processes in app mode: $(@($apps).Count)"
+
+            Get-Process -Id $appPid -ErrorAction SilentlyContinue | Stop-Process -Force
+            $apps | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+            Start-Sleep -Seconds 1
+            try { Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction Stop; ok "$label`: Remove-AppxPackage" }
+            catch { fail "$label`: Remove-AppxPackage: $($_.Exception.Message.Split("`n")[0])" }
+          }
+
+          Test-Install "dist/msix-test/RemoHop_${ver}_$env:ARCH.msix" "msix ($env:ARCH)"
+          Test-Install "dist/msix-test/RemoHop_$ver.msixbundle" 'msixbundle'
+          $res = if ($failed -eq 0) { 'PASS' } else { '**FAIL** (see the log)' }
+          @("- Install from .msix and from .msixbundle, start through the AppUserModelID, state in the real %APPDATA%, window page answers, Edge app window opens the page, uninstall: $res") |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          exit $failed
+
+      - name: Upload the unsigned Store build
+        if: inputs.upload == true && matrix.arch == 'x64'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: remohop-msix-store
+          path: source/dist/msix-store/*
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Remove the test certificate and the package
+        if: always()
+        run: |
+          if ($env:MSIX_IDENTITY_NAME) { Get-AppxPackage -Name $env:MSIX_IDENTITY_NAME | Remove-AppxPackage -ErrorAction SilentlyContinue }
+          if ($env:TEST_CERT_THUMBPRINT) {
+            Get-ChildItem Cert:\LocalMachine\TrustedPeople, Cert:\CurrentUser\My | Where-Object { $_.Thumbprint -eq $env:TEST_CERT_THUMBPRINT } | Remove-Item -ErrorAction SilentlyContinue
+          }
+          Remove-Item -Force -ErrorAction SilentlyContinue $env:TEST_PFX, $env:TEST_CER
+          exit 0
