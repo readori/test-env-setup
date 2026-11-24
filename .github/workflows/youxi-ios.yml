@@ -274,8 +274,17 @@ jobs:
           if found
             puts "Bundle ID already registered: #{id}"
           else
-            Spaceship::ConnectAPI::BundleId.create(name: ENV.fetch('BUNDLE_ID_NAME'), identifier: id, platform: 'IOS')
+            found = Spaceship::ConnectAPI::BundleId.create(name: ENV.fetch('BUNDLE_ID_NAME'), identifier: id, platform: 'IOS')
             puts "Bundle ID registered: #{id}"
+          end
+          # Private repo T118 (owner approved 2026-11-23): Associated Domains for invite Universal Links.
+          ad = Spaceship::ConnectAPI::BundleIdCapability::Type::ASSOCIATED_DOMAINS
+          have = found.get_capabilities.map(&:capability_type)
+          if have.include?(ad)
+            puts 'Associated Domains: already enabled'
+          else
+            found.update_capability(ad, enabled: true)
+            puts 'Associated Domains: enabled'
           end
           RUBY
 
