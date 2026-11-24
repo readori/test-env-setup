@@ -1,0 +1,443 @@
+# RemoHop as a snap (https://snapcraft.io): build, inspect, install, test; optionally upload to the
+# Snap Store's edge channel.
+#
+# Public CI repository -> source repository: env SOURCE_REPOSITORY. The recipe is
+# packaging/snap/snapcraft.yaml there (see packaging/snap/README.md): it repackages the signed
+# release archives remohop_linux_{amd64,arm64}.tar.gz, it compiles nothing.
+#
+#   request : parses the request; with MODE=upload it fails at once when SNAPCRAFT_STORE_CREDENTIALS
+#             is missing.
+#   snap    : ubuntu-24.04 (amd64) and ubuntu-24.04-arm (arm64), one job each (core24 = Ubuntu
+#             24.04, as destructive mode needs).
+#             1. packaging/snap/bump.sh VERSION --verify require: SHA256SUMS of the release, its
+#                cosign signature (pinned cosign from scripts/install-cosign.sh) and the hash pinned
+#                in snapcraft.yaml (rewritten when VERSION differs from what the ref pins).
+#             2. snapcraft pack --destructive-mode (snapcraft from the Snap Store, latest/stable).
+#             3. Inspect: meta/snap.yaml (version, classic, core24, apps), desktop file and icon,
+#                licence files, and bin/remohop byte-identical to the binary in the signed archive.
+#             4. snap install --dangerous --classic; remohop version; remohop help;
+#                test/smoke/smoke.sh /snap/bin/remohop (loopback host --no-signal + client: info,
+#                shell, jobs, cp, sync, forward, ...); remohop.quick --no-open serves its page; the
+#                desktop file snapd installed; what a remote shell's environment and
+#                `remohop service print` look like from the snap (reported, not asserted, for the
+#                release binary).
+#             5. When the ref has internal/snapenv: the same snap with bin/remohop built from the ref
+#                (snap pack of the unpacked tree): no SNAP_* variables in remote shells, the
+#                systemd unit runs /snap/remohop/current/bin/remohop, a real
+#                `service install --system`, and after installing another revision a restart runs
+#                the new one. That snap is never uploaded.
+#             The release snap is kept as the artifact remohop-snap-<arch> (1 day).
+#   upload  : only with MODE=upload: snapcraft upload --release=edge for both snaps, with the
+#             secret SNAPCRAFT_STORE_CREDENTIALS (from `snapcraft export-login`).
+#
+# Triggers: workflow_dispatch, or a push to main that changes ci-requests/remohop-snap.env (how the
+# project's AI engineer requests a run). Only people with push access to this repo can trigger;
+# never pull_request. The request file is plain KEY=VALUE text, parsed with strict patterns and
+# never sourced or executed:
+#
+#   REF=<branch|tag|sha>    # source repository ref holding packaging/snap (default main)
+#   VERSION=v1.2.3          # optional: the release to package (default: the one snapcraft.yaml pins)
+#   MODE=build              # build (default) or upload (also uploads to the edge channel)
+#
+# Safety rules (public repo, public logs): no pull_request triggers; only GitHub-owned actions,
+# pinned to commit SHAs; everything else is plain bash; TARGET_REPO_PAT (optional now that the
+# source is public) is used only by the checkout step and not persisted; SNAPCRAFT_STORE_CREDENTIALS
+# is passed only to the upload job's upload step and never printed.
+name: RemoHop Snap
+
+run-name: RemoHop Snap · ${{ github.event_name == 'push' && 'request (ci-requests/remohop-snap.env)' || format('{0} {1} {2}', inputs.ref, inputs.version, inputs.mode) }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Source repository branch, tag, or SHA (holds packaging/snap)'
+        required: true
+        default: 'main'
+        type: string
+      version:
+        description: 'Release to package, e.g. v1.2.3 (empty: the one snapcraft.yaml pins)'
+        required: false
+        default: ''
+        type: string
+      mode:
+        description: 'build, or upload (also uploads to the edge channel)'
+        required: true
+        default: 'build'
+        type: choice
+        options: [build, upload]
+  push:
+    branches: [main]
+    paths: ['ci-requests/remohop-snap.env']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remohop-snap
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: readori/RemoHop
+
+jobs:
+  request:
+    name: request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ref: ${{ steps.req.outputs.ref }}
+      version: ${{ steps.req.outputs.version }}
+      mode: ${{ steps.req.outputs.mode }}
+    steps:
+      - name: Validate request and credentials
+        id: req
+        env:
+          HAVE_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS != '' }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_MODE: ${{ inputs.mode }}
+          REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/remohop-snap.env
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == 'push' ]]; then
+            # Download only the request file of this exact commit (public repo, no credentials).
+            REQ="$RUNNER_TEMP/remohop-snap-request.env"
+            curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/remohop-snap.env at this commit.'; exit 64; }
+            # Plain text, read line by line; never sourced or executed.
+            SOURCE_REF="$(sed -n 's/^REF=//p' "$REQ" | head -n 1 | tr -d '\r')"
+            VERSION="$(sed -n 's/^VERSION=//p' "$REQ" | head -n 1 | tr -d '\r')"
+            MODE="$(sed -n 's/^MODE=//p' "$REQ" | head -n 1 | tr -d '\r')"
+          else
+            SOURCE_REF="$INPUT_REF"
+            VERSION="$INPUT_VERSION"
+            MODE="$INPUT_MODE"
+          fi
+          SOURCE_REF="${SOURCE_REF:-main}"
+          MODE="${MODE:-build}"
+          [[ "$SOURCE_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && ${#SOURCE_REF} -le 200 ]] || {
+            echo '::error::REF must be a branch, tag, or SHA (letters, digits, . _ / - only, no leading dash).'
+            exit 64
+          }
+          [[ -z "$VERSION" || "$VERSION" =~ ^v[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}(-[0-9A-Za-z.]{1,40})?$ ]] || {
+            echo '::error::VERSION must look like v1.2.3 (or be empty for the one snapcraft.yaml pins).'
+            exit 64
+          }
+          [[ "$MODE" =~ ^(build|upload)$ ]] || { echo '::error::MODE must be build or upload.'; exit 64; }
+          if [[ "$MODE" == upload && "$HAVE_STORE_CREDENTIALS" != true ]]; then
+            echo '::error::MODE=upload needs the repository secret SNAPCRAFT_STORE_CREDENTIALS, which is not set.'
+            echo 'To create it, on any machine with snapcraft, logged in as the owner of the snap name "remohop":'
+            echo '  snapcraft export-login --snaps=remohop --acls=package_access,package_push,package_update,package_release --expires=YYYY-MM-DD remohop-ci.cred'
+            echo 'then add the content of remohop-ci.cred as the secret SNAPCRAFT_STORE_CREDENTIALS of this repository'
+            echo '(Settings, Secrets and variables, Actions) and delete the file. See packaging/snap/README.md.'
+            exit 78
+          fi
+          {
+            echo "ref=$SOURCE_REF"
+            echo "version=$VERSION"
+            echo "mode=$MODE"
+          } >> "$GITHUB_OUTPUT"
+          echo "Source ref: $SOURCE_REF · version ${VERSION:-(pinned in snapcraft.yaml)} · mode $MODE"
+          { echo "### RemoHop Snap"; echo; echo "- Ref: \`$SOURCE_REF\`, version ${VERSION:-pinned in snapcraft.yaml}, mode \`$MODE\`"; } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------------------------
+  snap:
+    name: snap (${{ matrix.arch }})
+    needs: request
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    defaults:
+      run:
+        shell: bash
+    env:
+      SOURCE_REF: ${{ needs.request.outputs.ref }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT || github.token }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Pin and verify the release (bump.sh, cosign)
+        working-directory: source
+        env:
+          REQ_VERSION: ${{ needs.request.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ -f packaging/snap/snapcraft.yaml && -x packaging/snap/bump.sh ]] || { echo '::error::packaging/snap is not on this ref.'; exit 66; }
+          cmp packaging/snap/gui/icon.svg internal/quick/assets/icon.svg || { echo '::error::packaging/snap/gui/icon.svg differs from internal/quick/assets/icon.svg'; exit 1; }
+          pinned="$(sed -nE 's/^      VERSION=(v[^ ]+)$/\1/p' packaging/snap/snapcraft.yaml)"
+          VERSION="${REQ_VERSION:-$pinned}"
+          COSIGN="$(bash scripts/install-cosign.sh "$RUNNER_TEMP/tools")"
+          COSIGN="$COSIGN" packaging/snap/bump.sh "$VERSION" --verify require
+          if ! git diff --quiet -- packaging/snap/snapcraft.yaml; then
+            echo "::notice::snapcraft.yaml at $SOURCE_REF pins $pinned; this run packages $VERSION (rewritten by bump.sh)"
+            git diff -- packaging/snap/snapcraft.yaml
+          fi
+          sums="$(sed -nE 's/^      SUMS_SHA256=([0-9a-f]{64})$/\1/p' packaging/snap/snapcraft.yaml)"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "SUMS_SHA256=$sums" >> "$GITHUB_ENV"
+          echo "- $ARCH: packaging \`$VERSION\` from \`$SOURCE_REPOSITORY@$(git rev-parse --short HEAD)\` (ref \`$SOURCE_REF\`); SHA256SUMS \`$sums\`, cosign signature verified" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install snapcraft
+        run: |
+          set -euo pipefail
+          command -v snap >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q snapd; }
+          command -v unsquashfs >/dev/null || sudo apt-get install -y -q squashfs-tools
+          command -v desktop-file-validate >/dev/null || sudo apt-get install -y -q desktop-file-utils >/dev/null
+          sudo snap install snapcraft --classic --channel=latest/stable
+          snap list snapcraft snapd core24 2>/dev/null || snap list
+          echo "- $ARCH: $(snapcraft --version), $(lsb_release -ds), $(uname -m)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build the snap (snapcraft pack --destructive-mode)
+        working-directory: source/packaging/snap
+        run: |
+          set -euo pipefail
+          sudo snapcraft pack --destructive-mode --verbosity=brief
+          sudo chown -R "$(id -u):$(id -g)" .
+          ls -l ./*.snap
+          snap_file="$(ls ./*.snap)"
+          [[ "$(echo "$snap_file" | wc -l)" == 1 ]] || { echo '::error::expected exactly one .snap'; exit 1; }
+          mkdir -p "$RUNNER_TEMP/out"
+          mv "$snap_file" "$RUNNER_TEMP/out/"
+          echo "SNAP_FILE=$RUNNER_TEMP/out/$(basename "$snap_file")" >> "$GITHUB_ENV"
+
+      - name: Inspect the snap
+        run: |
+          set -euo pipefail
+          failed=0
+          ok()   { printf '   ok    %s\n' "$*"; }
+          fail() { printf '   FAIL  %s\n' "$*"; failed=1; }
+          root="$RUNNER_TEMP/snaproot"
+          sudo rm -rf "$root"
+          unsquashfs -q -d "$root" "$SNAP_FILE"
+          (cd "$root" && find . -type f -o -type l | sort | sed 's/^/         /')
+          y="$root/meta/snap.yaml"
+          sed 's/^/   yaml  /' "$y"
+          want_version="${VERSION#v}"
+          grep -qx "name: remohop" "$y" && ok "name remohop" || fail "name"
+          grep -qx "version: '\{0,1\}$want_version'\{0,1\}" "$y" && ok "version $want_version" || fail "version (want $want_version)"
+          grep -qx "confinement: classic" "$y" && ok "classic confinement" || fail "confinement"
+          grep -qx "grade: stable" "$y" && ok "grade stable" || fail "grade"
+          grep -qx "base: core24" "$y" && ok "base core24" || fail "base"
+          grep -qx -- "- $ARCH" "$y" && ok "architecture $ARCH" || fail "architecture"
+          grep -qx "  remohop:" "$y" && grep -qx "    command: bin/remohop" "$y" && ok "app remohop" || fail "app remohop"
+          grep -qx "  quick:" "$y" && grep -qx "    command: bin/remohop quick" "$y" && ok "app quick" || fail "app quick"
+          [[ -f "$root/meta/gui/icon.svg" ]] && ok "meta/gui/icon.svg" || fail "no meta/gui/icon.svg"
+          d="$root/meta/gui/quick.desktop"
+          if [[ -f "$d" ]]; then
+            sed 's/^/   desk  /' "$d"
+            grep -qx 'Exec=remohop.quick' "$d" && ok "desktop Exec=remohop.quick" || fail "desktop Exec line"
+            grep -qx 'Icon=${SNAP}/meta/gui/icon.svg' "$d" && ok "desktop Icon" || fail "desktop Icon line"
+            desktop-file-validate "$d" && ok "desktop-file-validate" || fail "desktop-file-validate"
+          else
+            fail "no meta/gui/quick.desktop"
+          fi
+          for f in LICENSE NOTICE THIRD_PARTY_LICENSES.txt; do
+            [[ -s "$root/usr/share/doc/remohop/$f" ]] && ok "usr/share/doc/remohop/$f" || fail "missing $f"
+          done
+          # bin/remohop must be the binary of the signed release archive, byte for byte.
+          rel="$RUNNER_TEMP/release"; mkdir -p "$rel"
+          base="https://github.com/$SOURCE_REPOSITORY/releases/download/$VERSION"
+          curl -fsSL --retry 3 -o "$rel/SHA256SUMS" "$base/SHA256SUMS"
+          curl -fsSL --retry 3 -o "$rel/remohop_linux_$ARCH.tar.gz" "$base/remohop_linux_$ARCH.tar.gz"
+          echo "$SUMS_SHA256  $rel/SHA256SUMS" | sha256sum --strict -c - >/dev/null && ok "SHA256SUMS matches the pinned hash" || fail "SHA256SUMS hash"
+          (cd "$rel" && sha256sum --ignore-missing --strict -c SHA256SUMS) && ok "release archive checksum" || fail "release archive checksum"
+          tar -xzf "$rel/remohop_linux_$ARCH.tar.gz" -C "$rel" remohop LICENSE
+          a="$(sha256sum < "$rel/remohop" | cut -d' ' -f1)"; b="$(sha256sum < "$root/bin/remohop" | cut -d' ' -f1)"
+          [[ "$a" == "$b" ]] && ok "bin/remohop is the release binary ($b)" || fail "bin/remohop $b != release $a"
+          cmp -s "$rel/LICENSE" "$root/usr/share/doc/remohop/LICENSE" && ok "LICENSE is the release's" || fail "LICENSE differs"
+          [[ -x "$root/bin/remohop" ]] && ok "bin/remohop is executable" || fail "bin/remohop not executable"
+          size="$(stat -c %s "$SNAP_FILE")"
+          echo "- $ARCH: \`$(basename "$SNAP_FILE")\`, $((size / 1024)) KiB ($(awk "BEGIN{printf \"%.1f\", $size/1048576}") MiB); bin/remohop = release binary: $([[ "$a" == "$b" ]] && echo yes || echo **NO**)" >> "$GITHUB_STEP_SUMMARY"
+          echo "SNAP_ROOT=$root" >> "$GITHUB_ENV"
+          exit $failed
+
+      - name: Install the snap and run the smoke test
+        working-directory: source
+        run: |
+          set -euo pipefail
+          sudo snap install --dangerous --classic "$SNAP_FILE"
+          snap list remohop
+          got="$(/snap/bin/remohop version)"
+          [[ "$got" == "remohop $VERSION" ]] || { echo "::error::remohop version printed '$got', want 'remohop $VERSION'"; exit 1; }
+          echo "   ok    remohop version: $got"
+          /snap/bin/remohop help > "$RUNNER_TEMP/help.txt"
+          head -n 5 "$RUNNER_TEMP/help.txt"
+          echo "   ok    remohop help ($(wc -l < "$RUNNER_TEMP/help.txt") lines)"
+          bash test/smoke/smoke.sh /snap/bin/remohop
+          echo "- $ARCH: installed (\`snap install --dangerous --classic\`), \`remohop version\` = \`$got\`, test/smoke/smoke.sh through /snap/bin/remohop: PASS" >> "$GITHUB_STEP_SUMMARY"
+
+      # One copy of the checks, run for the release binary here and for the dev binary below.
+      - name: Write the snap check script
+        env:
+          CHECKS: |
+            set -uo pipefail
+            mode=$1  # release: environment and unit path are reported; dev: asserted
+            failed=0
+            ok()   { printf '   ok    %s\n' "$*"; }
+            fail() { printf '   FAIL  %s\n' "$*"; failed=1; }
+            info() { printf '   info  %s\n' "$*"; }
+            want() { if [[ "$mode" == dev ]]; then fail "$*"; else info "$* (expected for releases before snap support)"; fi; }
+            w="$(mktemp -d)"; port=$((20000 + RANDOM % 10000)); pw="snap-$RANDOM$RANDOM"
+            rh() { REMOHOP_CONFIG_DIR="$w/cli" /snap/bin/remohop "$@"; }
+            REMOHOP_CONFIG_DIR="$w/host" /snap/bin/remohop host --no-signal --listen "127.0.0.1:$port" --password "$pw" > "$w/host.log" 2>&1 < /dev/null &
+            hpid=$!
+            for _ in $(seq 1 50); do grep -q 'host ready' "$w/host.log" 2>/dev/null && break; sleep 0.2; done
+            if grep -q 'host ready' "$w/host.log"; then ok "host (from the snap) ready"; else fail "host did not start"; cat "$w/host.log"; fi
+            REMOHOP_PASSWORD="$pw" rh "127.0.0.1:$port" pair --name s > /dev/null 2>&1 || fail "pair"
+            rh s info > "$w/info.txt" 2>&1 && ok "info from a client: $(head -n 1 "$w/info.txt")" || fail "info"
+            # What a remote shell gets: the user's environment, without snapd's variables.
+            rh s shell -c 'env' 2> /dev/null | tr -d '\r' > "$w/env.txt"
+            [[ -s "$w/env.txt" ]] && ok "remote shell ran env" || fail "remote shell env"
+            if grep -qE '^SNAP(_[A-Z_]+)?=' "$w/env.txt"; then
+              want "remote shell sees snapd variables: $(grep -oE '^SNAP(_[A-Z_]+)?' "$w/env.txt" | tr '\n' ' ')"
+            else ok "no SNAP_* variables in the remote shell"; fi
+            grep -q "^HOME=$HOME\$" "$w/env.txt" && ok "remote shell HOME is the real home" || fail "HOME in the remote shell: $(grep '^HOME=' "$w/env.txt")"
+            xrd="$(sed -n 's/^XDG_RUNTIME_DIR=//p' "$w/env.txt")"
+            if [[ "$xrd" == "${XDG_RUNTIME_DIR:-}" ]]; then ok "XDG_RUNTIME_DIR untouched (${xrd:-unset})"; else fail "XDG_RUNTIME_DIR in the remote shell is '$xrd', the runner's '${XDG_RUNTIME_DIR:-}'"; fi
+            kill "$hpid" 2> /dev/null; wait "$hpid" 2> /dev/null
+            # The unit `service install` would write.
+            unit="$(/snap/bin/remohop service print --user | grep '^ExecStart=')"
+            if [[ "$unit" == 'ExecStart=/snap/remohop/current/bin/remohop host' ]]; then ok "service unit: $unit"
+            else want "service unit runs a revision path: $unit"; fi
+            # Quick support: the desktop app's command serves its page.
+            REMOHOP_CONFIG_DIR="$w/quick" /snap/bin/remohop.quick --no-open > "$w/quick.log" 2>&1 < /dev/null &
+            qpid=$!
+            url=
+            for _ in $(seq 1 100); do [[ -s "$w/quick/quick.url" ]] && { url="$(tr -d '\r\n' < "$w/quick/quick.url")"; break; }; sleep 0.2; done
+            if [[ -n "$url" ]]; then
+              echo "::add-mask::$url"
+              curl -fsS --max-time 10 "$url" | grep -q RemoHop && ok "remohop.quick serves its page on 127.0.0.1" || fail "remohop.quick page does not answer"
+            else fail "remohop.quick wrote no quick.url"; sed 's/^/         /' "$w/quick.log" | head -n 10; fi
+            kill "$qpid" 2> /dev/null; wait "$qpid" 2> /dev/null
+            # The launcher entry snapd installs from meta/gui.
+            d="$(ls /var/lib/snapd/desktop/applications/remohop_*.desktop 2> /dev/null | head -n 1)"
+            if [[ -n "$d" ]]; then
+              ok "desktop entry $(basename "$d"): $(grep '^Exec=' "$d")"
+              grep -q '^Exec=.*/snap/bin/remohop\.quick' "$d" || fail "desktop Exec does not run /snap/bin/remohop.quick"
+              grep -q '^Icon=/snap/remohop/[^/]*/meta/gui/icon.svg' "$d" && ok "$(grep '^Icon=' "$d")" || fail "desktop Icon: $(grep '^Icon=' "$d")"
+            else fail "snapd installed no desktop entry for remohop"; fi
+            rm -rf "$w"
+            exit $failed
+        run: printf '%s\n' "$CHECKS" > "$RUNNER_TEMP/snap-checks.sh"
+
+      - name: Snap-specific checks (release binary)
+        run: bash "$RUNNER_TEMP/snap-checks.sh" release
+
+      - name: Upload the snap (1 day)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: remohop-snap-${{ matrix.arch }}
+          path: ${{ env.SNAP_FILE }}
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Set up Go (dev binary)
+        if: hashFiles('source/internal/snapenv/snapenv.go') != ''
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: source/go.mod
+          cache: false
+
+      - name: Same snap with remohop built from the ref (snap support in the binary)
+        if: hashFiles('source/internal/snapenv/snapenv.go') != ''
+        working-directory: source
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse --short HEAD)"
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/readori/RemoHop/internal/cli.Version=$VERSION-dev+$sha" -o "$RUNNER_TEMP/remohop-dev" ./cmd/remohop
+          dev="$RUNNER_TEMP/devroot"
+          sudo rm -rf "$dev"; sudo cp -a "$SNAP_ROOT" "$dev"
+          sudo install -m 0755 "$RUNNER_TEMP/remohop-dev" "$dev/bin/remohop"
+          mkdir -p "$RUNNER_TEMP/dev"
+          sudo snap pack "$dev" "$RUNNER_TEMP/dev" > /dev/null
+          devsnap="$(ls "$RUNNER_TEMP"/dev/*.snap)"
+          sudo snap install --dangerous --classic "$devsnap"
+          snap list remohop
+          /snap/bin/remohop version
+          failed=0
+          bash "$RUNNER_TEMP/snap-checks.sh" dev || failed=1
+          ok()   { printf '   ok    %s\n' "$*"; }
+          fail() { printf '   FAIL  %s\n' "$*"; failed=1; }
+          # A real system service from the snap, then a refresh to another revision.
+          sudo /snap/bin/remohop service install --system --no-signal > "$RUNNER_TEMP/svc.txt" 2>&1 || { fail "service install --system"; cat "$RUNNER_TEMP/svc.txt"; }
+          sleep 2
+          systemctl is-active --quiet remohop && ok "remohop.service active" || { fail "remohop.service not active"; sudo journalctl -u remohop -n 20 --no-pager; }
+          start="$(systemctl show -p ExecStart --value remohop | grep -o 'path=[^ ;]*' | head -n 1)"
+          [[ "$start" == 'path=/snap/remohop/current/bin/remohop' ]] && ok "unit ExecStart $start" || fail "unit ExecStart $start"
+          before="$(sudo readlink "/proc/$(systemctl show -p MainPID --value remohop)/exe")"
+          ok "service runs $before"
+          sudo snap install --dangerous --classic "$devsnap" > /dev/null   # a new revision
+          sudo systemctl restart remohop; sleep 2
+          after="$(sudo readlink "/proc/$(systemctl show -p MainPID --value remohop)/exe")"
+          cur="$(readlink /snap/remohop/current)"
+          [[ "$after" == "/snap/remohop/$cur/bin/remohop" && "$after" != "$before" ]] && ok "after a refresh and restart the service runs $after" || fail "after refresh: runs $after, current is $cur"
+          sudo /snap/bin/remohop service uninstall > /dev/null 2>&1 && ok "service uninstall" || fail "service uninstall"
+          res=PASS; [[ "$failed" == 0 ]] || res='**FAIL**'
+          echo "- $ARCH: dev binary ($VERSION-dev+$sha) in the same snap: no SNAP_* in remote shells, unit runs /snap/remohop/current/bin/remohop, system service survives a refresh: $res" >> "$GITHUB_STEP_SUMMARY"
+          exit $failed
+
+      - name: Clean up
+        if: always()
+        run: |
+          sudo /snap/bin/remohop service uninstall > /dev/null 2>&1 || true
+          sudo snap remove --purge remohop > /dev/null 2>&1 || true
+          exit 0
+
+  # ---------------------------------------------------------------------------------------------
+  upload:
+    name: upload to the edge channel
+    needs: [request, snap]
+    if: needs.request.outputs.mode == 'upload'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Download the snaps
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: remohop-snap-*
+          path: snaps
+          merge-multiple: true
+
+      - name: Install snapcraft
+        run: |
+          set -euo pipefail
+          sudo snap install snapcraft --classic --channel=latest/stable
+          snapcraft --version
+          ls -l snaps
+
+      - name: snapcraft upload --release=edge
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SNAPCRAFT_STORE_CREDENTIALS:-}" ]]; then
+            echo '::error::SNAPCRAFT_STORE_CREDENTIALS is not set. Create it with `snapcraft export-login --snaps=remohop --acls=package_access,package_push,package_update,package_release remohop-ci.cred` and store the file content as that repository secret (see packaging/snap/README.md).'
+            exit 78
+          fi
+          n=0
+          for f in snaps/*.snap; do
+            echo "== $f"
+            snapcraft upload --release=edge "$f" 2>&1 | tee -a "$RUNNER_TEMP/upload.log"
+            n=$((n + 1))
+          done
+          [[ "$n" == 2 ]] || { echo "::error::expected 2 snaps, uploaded $n"; exit 1; }
+          { echo "### Snap Store upload"; echo; sed -n 's/^/    /p' "$RUNNER_TEMP/upload.log" | tail -n 20; } >> "$GITHUB_STEP_SUMMARY"
