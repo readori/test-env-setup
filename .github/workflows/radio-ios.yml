@@ -824,6 +824,34 @@ jobs:
           fi
 
           echo "JS bundle: embedded ($(du -k "$APP_PATH/main.jsbundle" | awk '{print $1}') KiB)"
+          # App icons (Radio FEAT-43), informational: alternate icon names in Info.plist and the
+          # appearances (light / dark / tinted) compiled into Assets.car for each AppIcon* set.
+          plutil -extract CFBundleIcons.CFBundleAlternateIcons json -o - "$APP_PATH/Info.plist" 2>/dev/null \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); print("app icons: alternates in Info.plist: " + (", ".join(sorted(d)) or "none"))' \
+            || echo 'app icons: alternates in Info.plist: none'
+          if [[ -f "$APP_PATH/Assets.car" ]]; then
+            xcrun --sdk iphonesimulator assetutil --info "$APP_PATH/Assets.car" 2>/dev/null > "$RUNNER_TEMP/radio-assets.json" || true
+            python3 - "$RUNNER_TEMP/radio-assets.json" <<'PY' || echo 'app icons: Assets.car not readable'
+          import json, sys
+          try:
+              rows = json.load(open(sys.argv[1]))
+          except Exception:
+              print("app icons: Assets.car not readable"); sys.exit(0)
+          sets = {}
+          for r in rows if isinstance(rows, list) else []:
+              name = r.get("Name") or ""
+              if not name.startswith("AppIcon"):
+                  continue
+              look = r.get("Appearance") or "light"
+              look = "dark" if "Dark" in look else ("tinted" if "Tint" in look else ("light" if look in ("light", "UIAppearanceAny", "NSAppearanceNameSystem") else look))
+              sets.setdefault(name, set()).add(look)
+          for name in sorted(sets):
+              print("app icons: %s -> %s" % (name, ", ".join(sorted(sets[name]))))
+          if not sets:
+              print("app icons: no AppIcon renditions found")
+          PY
+            rm -f "$RUNNER_TEMP/radio-assets.json"
+          fi
           echo 'Simulator build: PASS'
           if [[ "$SMOKE" == 'launch' || "$SMOKE" == 'drag' || "$SMOKE" == 'screenshots' ]]; then
             # Kept for the smoke step below (the runner is discarded afterwards).
@@ -1126,9 +1154,9 @@ jobs:
           - assertVisible: { id: "locate-button" }
           - assertNotVisible: { id: "globe-pill" }
           - assertNotVisible: { id: "globe-country" }
-          - swipe: { start: "65%,33%", end: "35%,33%", duration: 400 }
+          - swipe: { from: { id: "globe-disc" }, direction: LEFT, duration: 400 }
           - waitForAnimationToEnd: { timeout: 3000 }
-          - extendedWaitUntil: { visible: { id: "atlas-globe-caption" }, timeout: 10000 }
+          - scrollUntilVisible: { element: { id: "atlas-globe-caption" }, direction: DOWN, timeout: 10000 }
           - assertVisible: { id: "atlas-globe-stage" }
           YAML
                 sed -i '' -e 's/^          //' "$OUT/theme-atlas.yaml"
