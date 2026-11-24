@@ -21,7 +21,8 @@
 #   VERSION_CODE=1001        # optional; default 1000 + this workflow's run number (monotonic)
 #   TRACK=internal           # upload only: internal (default) | alpha | beta
 #   STATUS=draft             # upload only: draft (default) | completed
-#   ARTIFACT=none            # none (default) | encrypted: keep the AAB as a 1-day artifact,
+#   ARTIFACT=none            # none (default) | plain: keep the signed AAB as a 1-day artifact
+#                            # (for the first, hand-made upload in Play Console) | encrypted: the same,
 #                            # AES-256 encrypted (openssl enc -aes-256-cbc -pbkdf2 -iter 200000)
 #                            # with the upload keystore password, so the public artifact is useless
 #                            # without that password. Decrypt:
@@ -112,7 +113,7 @@ jobs:
           [[ "$VCODE" =~ ^[1-9][0-9]{0,8}$ ]] || { echo '::error::VERSION_CODE must be a positive integer'; exit 64; }
           [[ "$TRACK" =~ ^(internal|alpha|beta)$ ]] || { echo '::error::TRACK must be internal, alpha or beta'; exit 64; }
           [[ "$STATUS" =~ ^(draft|completed)$ ]] || { echo '::error::STATUS must be draft or completed'; exit 64; }
-          [[ "$ARTIFACT" =~ ^(none|encrypted)$ ]] || { echo '::error::ARTIFACT must be none or encrypted'; exit 64; }
+          [[ "$ARTIFACT" =~ ^(none|plain|encrypted)$ ]] || { echo '::error::ARTIFACT must be none, plain or encrypted'; exit 64; }
           [[ "$HAVE_PAT" == true ]] || { echo '::error::Missing secret TARGET_REPO_PAT.'; exit 78; }
           [[ "$HAVE_KEYSTORE" == true ]] || { echo '::error::Missing one of the ANDROID_UPLOAD_* secrets.'; exit 78; }
           [[ "$MODE" != upload || "$HAVE_PLAY" == true ]] || { echo '::error::Missing secret PLAY_SERVICE_ACCOUNT_JSON.'; exit 78; }
@@ -280,6 +281,15 @@ jobs:
         with:
           name: remohop-android-aab-encrypted
           path: ${{ runner.temp }}/out/
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Keep the signed bundle (1 day)
+        if: env.ARTIFACT == 'plain'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: remohop-android-${{ env.VNAME }}-${{ env.VCODE }}-aab
+          path: ${{ env.AAB }}
           retention-days: 1
           if-no-files-found: error
 
