@@ -492,8 +492,14 @@ jobs:
           # An edit left open on failure is deleted, so nothing half-done is kept.
           trap '[[ "$COMMITTED" == true ]] || call DELETE "$API/edits/$EDIT" > /dev/null 2>&1 || true' EXIT
           SUMMARY="$RUNNER_TEMP/shots-summary.md"; : > "$SUMMARY"
+          # The store listing languages Play has for the app (all must exist before anything changes).
+          if ! LANGS="$(call GET "$API/edits/$EDIT/listings")"; then echo "$LANGS"; echo '::error::Could not read the store listings.'; exit 1; fi
+          LANGS="$(python3 -c 'import json,sys;print(" ".join(sorted(l.get("language","") for l in json.loads(sys.argv[1]).get("listings",[]))))' "$LANGS")"
+          echo "Play store listings: ${LANGS:-none}"
           for LOC in en-US zh-CN; do
-            call GET "$API/edits/$EDIT/listings/$LOC" > /dev/null || { echo "::error::The Play listing $LOC does not exist (add the language in Play Console first)."; exit 1; }
+            [[ " $LANGS " == *" $LOC "* ]] || { echo "::error::Play has no $LOC store listing (listings: ${LANGS:-none}). Add that language to the main store listing in Play Console (or fix the code here), then rerun."; exit 1; }
+          done
+          for LOC in en-US zh-CN; do
             call DELETE "$API/edits/$EDIT/listings/$LOC/phoneScreenshots" > /dev/null || { echo "::error::Could not delete the $LOC phone screenshots."; exit 1; }
             n=0
             for f in $(ls "$SHOTS_DIR/$LOC" | sort); do
