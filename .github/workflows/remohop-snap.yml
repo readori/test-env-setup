@@ -243,7 +243,9 @@ jobs:
             sed 's/^/   desk  /' "$d"
             grep -qx 'Exec=remohop.quick' "$d" && ok "desktop Exec=remohop.quick" || fail "desktop Exec line"
             grep -qx 'Icon=${SNAP}/meta/gui/icon.svg' "$d" && ok "desktop Icon" || fail "desktop Icon line"
-            desktop-file-validate "$d" && ok "desktop-file-validate" || fail "desktop-file-validate"
+            # snapd replaces ${SNAP} when it installs the entry; validate it as it will be.
+            sed 's#\${SNAP}#/snap/remohop/current#' "$d" > "$RUNNER_TEMP/remohop_quick.desktop"
+            desktop-file-validate "$RUNNER_TEMP/remohop_quick.desktop" && ok "desktop-file-validate" || fail "desktop-file-validate"
           else
             fail "no meta/gui/quick.desktop"
           fi
@@ -331,6 +333,7 @@ jobs:
               ok "desktop entry $(basename "$d"): $(grep '^Exec=' "$d")"
               grep -q '^Exec=.*/snap/bin/remohop\.quick' "$d" || fail "desktop Exec does not run /snap/bin/remohop.quick"
               grep -q '^Icon=/snap/remohop/[^/]*/meta/gui/icon.svg' "$d" && ok "$(grep '^Icon=' "$d")" || fail "desktop Icon: $(grep '^Icon=' "$d")"
+              if command -v desktop-file-validate > /dev/null; then desktop-file-validate "$d" && ok "desktop-file-validate (installed entry)" || fail "desktop-file-validate (installed entry)"; fi
             else fail "snapd installed no desktop entry for remohop"; fi
             rm -rf "$w"
             exit $failed
