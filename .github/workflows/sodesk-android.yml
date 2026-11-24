@@ -12,9 +12,19 @@
 #            the emulator): pair, terminal, files + download hand-over, clipboard bridge,
 #            desktop tab, rotation, recreate, background. Also runs the Go tests of
 #            internal/mobile and mobile/remohopcore.
+#   screenshots (request key SCREENSHOTS=true|only): Google Play phone screenshots of the real app on a
+#            1080x1920 (9:16) emulator, connected to a second `remohop host` on the runner that has a
+#            demo home directory (/home/demo, files with made-up content). StoreScreenshotsTest runs
+#            once per store language (en -> en-US, zh -> zh-CN; the app's own language setting),
+#            with a clean status bar (System UI demo mode: 9:41, full battery and signal). The PNGs
+#            (opaque RGB, no alpha) are checked for Play's size and aspect rules and kept as the
+#            7-day artifact remohop-play-screenshots (<locale>/<n>-<screen>.png). The Play upload is
+#            done by sodesk-android-release.yml MODE=screenshots, which takes this run's artifact.
+#            true = after the instrumented tests, only = instead of them.
 #
-# No signing, no Play credentials, no keystore. Nothing is uploaded: no artifacts. The APK stays
-# on the runner. Release signing is added later by the maintainer, reusing existing secrets.
+# No signing, no Play credentials, no keystore. The APK stays on the runner; the only artifact is
+# the screenshots of SCREENSHOTS mode (pictures of the app's screens with the demo host's files,
+# no secrets: the host password is never typed into a field that is captured).
 #
 # Triggers: workflow_dispatch, or a push to main that changes ci-requests/sodesk-android.env
 # (how the project's AI engineer requests a run). Only people with push access to this repo can
@@ -23,6 +33,7 @@
 #
 #   REF=main          # source repository branch, tag or SHA
 #   EMULATOR=true     # optional; true (default) or false
+#   SCREENSHOTS=false # optional; false (default), true (instrumented tests, then screenshots) or only
 #
 # Safety rules (public repo, public logs): no pull_request triggers; third-party actions pinned
 # to commit SHAs; TARGET_REPO_PAT is used only by the checkout step and not persisted; build and
@@ -53,6 +64,12 @@ on:
         required: true
         default: true
         type: boolean
+      screenshots:
+        description: 'Google Play phone screenshots (en-US, zh-CN) as a 7-day artifact: false, true (after the tests) or only (instead of them)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true', 'only']
   push:
     branches: [main]
     paths: ['ci-requests/sodesk-android.env']
@@ -76,12 +93,15 @@ env:
   # The host the emulator test connects to (10.0.2.2 is the runner's loopback as the emulator sees it).
   E2E_HOST_PORT: '21118'
   E2E_FILE_NAME: remohop-e2e.txt
+  # The screenshots host (SCREENSHOTS mode): its own port, password and demo home directory.
+  SHOTS_HOST_PORT: '21119'
+  SHOTS_HOME: /home/demo
 
 jobs:
   android:
     name: Build RemoHop Android
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 80
     defaults:
       run:
         shell: bash
@@ -95,6 +115,7 @@ jobs:
           INPUT_REF: ${{ inputs.ref }}
           INPUT_MODE: ${{ inputs.mode }}
           INPUT_EMULATOR: ${{ inputs.emulator }}
+          INPUT_SCREENSHOTS: ${{ inputs.screenshots }}
           REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/sodesk-android.env
         run: |
           set -euo pipefail
@@ -106,25 +127,33 @@ jobs:
             SOURCE_REF="$(sed -n 's/^REF=//p' "$REQ" | head -n 1 | tr -d '\r')"
             EMULATOR="$(sed -n 's/^EMULATOR=//p' "$REQ" | head -n 1 | tr -d '\r')"
             EMULATOR="${EMULATOR:-true}"
+            SCREENSHOTS="$(sed -n 's/^SCREENSHOTS=//p' "$REQ" | head -n 1 | tr -d '\r')"
             MODE=verify
           else
             SOURCE_REF="$INPUT_REF"
             EMULATOR="$INPUT_EMULATOR"
+            SCREENSHOTS="$INPUT_SCREENSHOTS"
             MODE="$INPUT_MODE"
           fi
+          SCREENSHOTS="${SCREENSHOTS:-false}"
           [[ "$MODE" == 'verify' ]] || { echo "::error::Unsupported mode: $MODE"; exit 64; }
           [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && ${#SOURCE_REF} -le 200 ]] || {
             echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only, no leading dash).'
             exit 64
           }
           [[ "$EMULATOR" == 'true' || "$EMULATOR" == 'false' ]] || { echo '::error::EMULATOR must be true or false.'; exit 64; }
+          [[ "$SCREENSHOTS" =~ ^(false|true|only)$ ]] || { echo '::error::SCREENSHOTS must be false, true or only.'; exit 64; }
           [[ -n "${TARGET_REPO_PAT:-}" ]] || {
             echo '::error::Missing public CI credential: TARGET_REPO_PAT (it must have read access to the source repository, env SOURCE_REPOSITORY).'
             exit 78
           }
+          # tests: the instrumented tests; device: an emulator (and the hosts) for the tests and/or the screenshots.
+          TESTS=false; [[ "$EMULATOR" == 'true' && "$SCREENSHOTS" != 'only' ]] && TESTS=true
+          SHOTS=false; [[ "$SCREENSHOTS" != 'false' ]] && SHOTS=true
+          DEVICE=false; [[ "$TESTS" == 'true' || "$SHOTS" == 'true' ]] && DEVICE=true
           echo "SOURCE_REF=$SOURCE_REF" >> "$GITHUB_ENV"
-          echo "emulator=$EMULATOR" >> "$GITHUB_OUTPUT"
-          echo "Trigger: $EVENT_NAME · mode: $MODE · ref: $SOURCE_REF · emulator: $EMULATOR"
+          { echo "emulator=$TESTS"; echo "screenshots=$SHOTS"; echo "device=$DEVICE"; } >> "$GITHUB_OUTPUT"
+          echo "Trigger: $EVENT_NAME · mode: $MODE · ref: $SOURCE_REF · instrumented tests: $TESTS · screenshots: $SCREENSHOTS"
 
       - name: Checkout source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -253,7 +282,7 @@ jobs:
           echo "- Debug APK ($PKG): $SIZE · JVM unit tests: $TESTS · lint: PASS" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Enable KVM for the emulator
-        if: steps.layout.outputs.ready == 'true' && steps.request.outputs.emulator == 'true'
+        if: steps.layout.outputs.ready == 'true' && steps.request.outputs.device == 'true'
         run: |
           set -euo pipefail
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules > /dev/null
@@ -262,7 +291,7 @@ jobs:
           ls -l /dev/kvm
 
       - name: Build remohop and start a host for the emulator test
-        if: steps.layout.outputs.ready == 'true' && steps.request.outputs.emulator == 'true'
+        if: steps.layout.outputs.ready == 'true' && steps.request.outputs.device == 'true'
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
         run: |
           set -euo pipefail
@@ -302,10 +331,12 @@ jobs:
           fi
           echo "remohop host is up on UDP $E2E_HOST_PORT (pid $(cat "$RUNNER_TEMP/remohop-host.pid")), fixed password set, test file prepared"
 
-      - name: Instrumented tests on an emulator (smoke + real host end to end, no uploads)
-        if: steps.layout.outputs.ready == 'true' && steps.request.outputs.emulator == 'true'
-        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}/mobile/android
-        timeout-minutes: 25
+      - name: Start an Android emulator
+        if: steps.layout.outputs.ready == 'true' && steps.request.outputs.device == 'true'
+        timeout-minutes: 15
+        env:
+          # Play phone screenshots must be at most 2:1; the classic Pixel profile is 1080x1920 (9:16).
+          AVD_DEVICE: ${{ steps.request.outputs.screenshots == 'true' && 'pixel' || 'pixel_6' }}
         run: |
           set -euo pipefail
           SDK="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
@@ -316,10 +347,12 @@ jobs:
           # have set ANDROID_USER_HOME/ANDROID_SDK_HOME, which the two read
           # differently.
           export ANDROID_AVD_HOME="$RUNNER_TEMP/avd"
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
           mkdir -p "$ANDROID_AVD_HOME"
-          echo no | "$SDK/cmdline-tools/latest/bin/avdmanager" create avd -n ci -k "$IMG" -d pixel_6 --force > "$RUNNER_TEMP/avd-create.log" 2>&1 || { tail -n 20 "$RUNNER_TEMP/avd-create.log"; exit 1; }
-          echo "AVDs: $("$SDK/emulator/emulator" -list-avds | tr '\n' ' ')"
-          "$SDK/emulator/emulator" -avd ci -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot -no-metrics > "$RUNNER_TEMP/emulator.log" 2>&1 &
+          echo no | "$SDK/cmdline-tools/latest/bin/avdmanager" create avd -n ci -k "$IMG" -d "$AVD_DEVICE" --force > "$RUNNER_TEMP/avd-create.log" 2>&1 || { tail -n 20 "$RUNNER_TEMP/avd-create.log"; exit 1; }
+          echo "AVDs: $("$SDK/emulator/emulator" -list-avds | tr '\n' ' ') (device profile $AVD_DEVICE)"
+          # Its own session, so it outlives this step (the tests and the screenshots are later steps).
+          setsid nohup "$SDK/emulator/emulator" -avd ci -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot -no-metrics > "$RUNNER_TEMP/emulator.log" 2>&1 < /dev/null &
           ADB="$SDK/platform-tools/adb"
           echo "emulator started; waiting for the device"
           timeout 300 "$ADB" wait-for-device || { echo '::error::no device after 5 min'; tail -n 40 "$RUNNER_TEMP/emulator.log"; exit 1; }
@@ -339,7 +372,17 @@ jobs:
           # The emulator's own launcher sometimes hangs and its "not responding" dialog takes the
           # focus from the app under test; hide system error dialogs for the test run.
           "$ADB" shell settings put global hide_error_dialogs 1 > /dev/null 2>&1 || true
-          # The host started in the previous step: address as the emulator sees the runner, password from the private file.
+          echo "screen: $(timeout 10 "$ADB" shell wm size 2>/dev/null | tr -d '\r' | tail -n 1)"
+
+      - name: Instrumented tests on an emulator (smoke + real host end to end, no uploads)
+        if: steps.layout.outputs.ready == 'true' && steps.request.outputs.emulator == 'true'
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}/mobile/android
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          ADB="$SDK/platform-tools/adb"
+          # The host started in an earlier step: address as the emulator sees the runner, password from the private file.
           E2E_PW="$(cat "$RUNNER_TEMP/remohop-host-password")"
           echo "::add-mask::$E2E_PW"
           kill -0 "$(cat "$RUNNER_TEMP/remohop-host.pid")" 2>/dev/null || { echo '::error::remohop host is not running.'; exit 1; }
@@ -362,7 +405,6 @@ jobs:
             echo '--- window focus at failure ---'
             timeout 30 "$ADB" shell dumpsys window 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp' | cut -c1-200 | head -n 4 || true
           fi
-          "$ADB" emu kill > /dev/null 2>&1 || true
           if [[ $rc -ne 0 ]]; then
             grep -E 'FAILED|Tests? .*failed|What went wrong|AssertionError|Exception|timed out' "$RUNNER_TEMP/connected.log" | cut -c1-400 | head -n 40
             exit 1
@@ -383,8 +425,177 @@ jobs:
           sys.exit(0 if ran == 1 and skipped == 0 and failed == 0 else 1)
           PY
 
+      # SCREENSHOTS mode. A second remohop host whose home is a demo directory (made-up files), so the
+      # terminal and the Files tab show something meaningful; the app connects to it with a per-run
+      # password (typed into the form after the connect screen was captured). StoreScreenshotsTest
+      # captures each screen with UiAutomation into the app's external files directory; the PNGs are
+      # pulled, checked against Play's rules and kept as an artifact for sodesk-android-release.yml.
+      - name: Google Play screenshots (en-US, zh-CN) on the emulator
+        if: steps.layout.outputs.ready == 'true' && steps.request.outputs.screenshots == 'true'
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}/mobile/android
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          ADB="$SDK/platform-tools/adb"
+          APP_APK=app/build/outputs/apk/debug/app-debug.apk
+          TEST_APK=app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+          REMOHOP="$RUNNER_TEMP/remohop"
+          [[ -f "$APP_APK" && -f "$TEST_APK" && -x "$REMOHOP" ]] || { echo '::error::debug APK, test APK or remohop binary missing.'; exit 65; }
+          grep -rq 'class StoreScreenshotsTest' app/src/androidTest || { echo '::error::StoreScreenshotsTest is not on this ref.'; exit 66; }
+
+          # The demo home directory: the files the terminal and the Files tab show (made-up content).
+          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 755 "$SHOTS_HOME"
+          D="$SHOTS_HOME/Documents"
+          mkdir -p "$D/Invoices" "$D/Photos" "$D/Projects"
+          printf 'RemoHop demo files\n' > "$D/README.txt"
+          printf '# Weekly sync\n\n- Ship 1.0 to the store\n- New screenshots\n' > "$D/meeting-notes.md"
+          printf 'month,orders,revenue\nJul,182,9310\nAug,205,10422\nSep,231,11870\n' > "$D/sales-q3.csv"
+          head -c 48213 /dev/urandom > "$D/budget-2026.xlsx"
+          head -c 1843307 /dev/urandom > "$D/presentation.pdf"
+          head -c 7340032 /dev/urandom > "$D/backup-2026-11.tar.gz"
+          STAMPS=('2026-11-03 09:12' '2026-11-21 18:40' '2026-11-12 11:05' '2026-11-23 16:27' '2026-11-02 08:55' '2026-11-19 10:31' '2026-11-23 09:41' '2026-11-17 14:08' '2026-10-28 13:22')
+          i=0
+          for f in "$D"/*; do touch -d "${STAMPS[$((i % ${#STAMPS[@]}))]}" "$f"; i=$((i + 1)); done
+          # A login shell reads ~/.bash_profile: a short prompt and coloured ls.
+          printf '%s\n' "PS1='\\[\\e[1;32m\\]demo@remohop\\[\\e[0m\\]:\\[\\e[1;34m\\]\\w\\[\\e[0m\\]\\\$ '" "alias ls='ls --color=auto'" > "$SHOTS_HOME/.bash_profile"
+
+          # The screenshots host: own config, port and random password (masked, 0600 file, never echoed).
+          HCFG="$RUNNER_TEMP/remohop-shots-config"
+          rm -rf "$HCFG"; mkdir -p "$HCFG"; chmod 700 "$HCFG"
+          umask 077
+          PWFILE="$RUNNER_TEMP/remohop-shots-password"
+          openssl rand -hex 16 > "$PWFILE"
+          echo "::add-mask::$(cat "$PWFILE")"
+          PW="$(cat "$PWFILE")"
+          printf '%s\n%s\n' "$PW" "$PW" | REMOHOP_CONFIG_DIR="$HCFG" SHELL=/bin/bash "$REMOHOP" host passwd > /dev/null
+          HLOG="$RUNNER_TEMP/remohop-shots-host.log"
+          HOME="$SHOTS_HOME" SHELL=/bin/bash REMOHOP_CONFIG_DIR="$HCFG" setsid nohup "$REMOHOP" host --no-signal --listen "0.0.0.0:$SHOTS_HOST_PORT" > "$HLOG" 2>&1 < /dev/null &
+          SHOTS_PID=$!
+          cleanup() {
+            kill "$SHOTS_PID" 2>/dev/null || true
+            shred -u "$PWFILE" 2>/dev/null || rm -f "$PWFILE"
+          }
+          trap cleanup EXIT
+          for _ in $(seq 1 60); do
+            grep -q 'RemoHop host ready' "$HLOG" 2>/dev/null && break
+            kill -0 "$SHOTS_PID" 2>/dev/null || break
+            sleep 0.5
+          done
+          grep -q 'RemoHop host ready' "$HLOG" 2>/dev/null || { sed -E 's/^( *Password: ).*/\1<hidden>/' "$HLOG" | cut -c1-300 | tail -n 20; echo '::error::the screenshots host did not start.'; exit 1; }
+          echo "screenshots host up on UDP $SHOTS_HOST_PORT (home $SHOTS_HOME)"
+
+          # A clean status bar (System UI demo mode) and gesture navigation (a thin bar, no buttons).
+          "$ADB" shell settings put global sysui_demo_allowed 1 > /dev/null 2>&1 || true
+          demo() { "$ADB" shell am broadcast -a com.android.systemui.demo -e command "$@" > /dev/null 2>&1 || true; }
+          demo enter
+          demo clock -e hhmm 0941
+          demo battery -e level 100 -e plugged false -e powersave false
+          demo network -e wifi show -e level 4 -e fully true
+          demo network -e mobile show -e datatype none -e level 4 -e fully true
+          demo notifications -e visible false
+          demo status -e bluetooth hide -e alarm hide -e volume hide -e location hide -e mute hide -e speakerphone hide -e zen hide -e sync hide -e tty hide -e eri hide
+          "$ADB" shell cmd overlay enable-exclusive --category com.android.internal.systemui.navbar.gestural > /dev/null 2>&1 || true
+          echo "screen: $(timeout 10 "$ADB" shell wm size 2>/dev/null | tr -d '\r' | tail -n 1)"
+
+          "$ADB" install -r -t -g "$APP_APK" > "$RUNNER_TEMP/shots-install.log" 2>&1 \
+            && "$ADB" install -r -t "$TEST_APK" >> "$RUNNER_TEMP/shots-install.log" 2>&1 \
+            || { tail -n 10 "$RUNNER_TEMP/shots-install.log"; echo '::error::installing the APKs failed.'; exit 1; }
+
+          W="$RUNNER_TEMP/remohop-shots"; OUT="$RUNNER_TEMP/remohop-play-screenshots"
+          rm -rf "$W" "$OUT"; mkdir -p "$W" "$OUT"
+          DEVDIR="/sdcard/Android/data/$EXPECTED_APP_ID/files/store-shots"
+          for L in en zh; do
+            [[ "$L" == zh ]] && LOC=zh-CN || LOC=en-US
+            "$ADB" logcat -c > /dev/null 2>&1 || true
+            rc=0
+            timeout 600 "$ADB" shell am instrument -w \
+              -e class com.remohop.app.StoreScreenshotsTest -e remohop_shots 1 -e remohop_shots_lang "$L" \
+              -e remohop_host "10.0.2.2:$SHOTS_HOST_PORT" -e remohop_password "$PW" \
+              -e remohop_dir "$D" -e remohop_file README.txt \
+              "$EXPECTED_APP_ID.test/androidx.test.runner.AndroidJUnitRunner" > "$W/instrument-$L.log" 2>&1 || rc=$?
+            echo "--- $LOC: StoreScreenshotsTest progress (logcat tag RemoHopShots) ---"
+            timeout 30 "$ADB" logcat -d -s RemoHopShots:I 2>/dev/null | grep -v '^--------' | sed -E 's/^[0-9-]+ [0-9:.]+ +[0-9]+ +[0-9]+ //' | cut -c1-300 | tail -n 30 || true
+            if [[ $rc -ne 0 ]] || ! grep -q '^OK (1 test)' "$W/instrument-$L.log"; then
+              grep -E 'FAILURES|AssertionError|Exception|Error|Tests run|OK \(|Process crashed' "$W/instrument-$L.log" | cut -c1-400 | head -n 20 || true
+              echo '--- window focus ---'
+              timeout 30 "$ADB" shell dumpsys window 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp' | cut -c1-200 | head -n 4 || true
+              echo "::error::StoreScreenshotsTest ($LOC) failed (exit $rc)."
+              exit 1
+            fi
+            if ! "$ADB" pull "$DEVDIR/$L" "$W/" > /dev/null 2>&1; then
+              # Fallback: read the app's own directory as the app (debuggable build).
+              mkdir -p "$W/$L"
+              "$ADB" exec-out run-as "$EXPECTED_APP_ID" tar -cf - -C "$DEVDIR" "$L" | tar -xf - -C "$W" || { echo "::error::could not pull the $LOC screenshots."; exit 1; }
+            fi
+            mkdir -p "$OUT/$LOC"
+            cp "$W/$L/"*.png "$OUT/$LOC/"
+            echo "$LOC: $(ls "$OUT/$LOC" | tr '\n' ' ')"
+          done
+
+          # The test marks its bitmaps opaque, so the PNGs should be RGB; if one still has an alpha
+          # channel, flatten it (Pillow, installed only then).
+          ALPHA="$(python3 -c 'import sys;print(" ".join(p for p in sys.argv[1:] if open(p,"rb").read(26)[25] in (4, 6)))' "$OUT"/*/*.png)"
+          if [[ -n "$ALPHA" ]]; then
+            echo "flattening the alpha channel of: $ALPHA"
+            python3 -m pip install --quiet --disable-pip-version-check pillow > /dev/null 2>&1 || { echo '::error::pip install pillow failed.'; exit 1; }
+            python3 -c 'import sys
+          from PIL import Image
+          for p in sys.argv[1:]: Image.open(p).convert("RGB").save(p, optimize=True)' $ALPHA
+          fi
+
+          # Play's rules for phone screenshots: PNG or JPEG, each side 320-3840 px, at most 2:1, 8 MB;
+          # here also exactly 9:16 and opaque (RGB, no alpha channel); at least 2 and at most 8 per
+          # language, the same screens in both languages.
+          python3 - "$OUT" <<'PY'
+          import os, struct, sys
+          out = sys.argv[1]
+          sets, bad = {}, 0
+          for loc in ('en-US', 'zh-CN'):
+              names = sorted(n for n in os.listdir(os.path.join(out, loc)) if n.endswith('.png'))
+              sets[loc] = names
+              for n in names:
+                  b = open(os.path.join(out, loc, n), 'rb').read()
+                  if b[:8] != b'\x89PNG\r\n\x1a\n' or b[12:16] != b'IHDR':
+                      print(f'{loc}/{n}: not a PNG'); bad += 1; continue
+                  w, h, depth, ctype = struct.unpack('>IIBB', b[16:26])
+                  ok = (320 <= min(w, h) and max(w, h) <= 3840 and max(w, h) <= 2 * min(w, h)
+                        and w * 16 == h * 9 and depth == 8 and ctype == 2 and len(b) <= 8 * 1024 * 1024)
+                  kind = {2: 'RGB', 6: 'RGBA'}.get(ctype, f'colour type {ctype}')
+                  print(f'{loc}/{n}: {w}x{h} {kind} {depth}-bit, {len(b) // 1024} KB: {"OK" if ok else "REJECTED"}')
+                  bad += 0 if ok else 1
+              missing = {'1-connect.png', '2-terminal.png', '3-files.png', '5-settings.png'} - set(names)
+              if missing:
+                  print(f'{loc}: missing {sorted(missing)}'); bad += 1
+              if not 2 <= len(names) <= 8:
+                  print(f'{loc}: {len(names)} screenshots (Play takes 2 to 8)'); bad += 1
+          if sets['en-US'] != sets['zh-CN']:
+              print('the two languages have different screens'); bad += 1
+          sys.exit(1 if bad else 0)
+          PY
+          N="$(ls "$OUT/en-US" | wc -l)"
+          SIZE="$(python3 -c 'import struct,sys;b=open(sys.argv[1],"rb").read(26);print("%dx%d"%struct.unpack(">II",b[16:24]))' "$OUT/en-US/1-connect.png")"
+          echo "Play screenshots: $N per language (en-US, zh-CN), $SIZE"
+          echo "- Play phone screenshots: $N per language (en-US, zh-CN), $SIZE PNG, kept as the 7-day artifact \`remohop-play-screenshots\` (upload: sodesk-android-release.yml MODE=screenshots SHOTS_RUN_ID=${GITHUB_RUN_ID})" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the Play screenshots (7 days)
+        if: steps.layout.outputs.ready == 'true' && steps.request.outputs.screenshots == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: remohop-play-screenshots
+          path: ${{ runner.temp }}/remohop-play-screenshots/
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Stop the emulator
+        if: always() && steps.layout.outputs.ready == 'true' && steps.request.outputs.device == 'true'
+        run: |
+          SDK="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          timeout 30 "$SDK/platform-tools/adb" emu kill > /dev/null 2>&1 || true
+          echo 'emulator stopped'
+
       - name: Stop the RemoHop host
-        if: always() && steps.layout.outputs.ready == 'true' && steps.request.outputs.emulator == 'true'
+        if: always() && steps.layout.outputs.ready == 'true' && steps.request.outputs.device == 'true'
         run: |
           if [[ -f "$RUNNER_TEMP/remohop-host.pid" ]]; then
             PID="$(cat "$RUNNER_TEMP/remohop-host.pid")"
@@ -410,5 +621,5 @@ jobs:
           {
             [[ "${{ steps.request.outputs.emulator }}" == 'true' ]] && echo "- Instrumented tests on API $EMULATOR_API x86_64 emulator (smoke + real host: pair, terminal, files, download, clipboard, desktop, rotate, recreate, background): PASS"
             echo "- Java: \`$(java -version 2>&1 | head -1)\` · Go: \`$(go version | cut -d' ' -f3)\`"
-            echo '- No signing; nothing uploaded.'
+            if [[ "${{ steps.request.outputs.screenshots }}" == 'true' ]]; then echo '- No signing; artifact: the Play screenshots only.'; else echo '- No signing; nothing uploaded.'; fi
           } >> "$GITHUB_STEP_SUMMARY"

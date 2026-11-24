@@ -11,16 +11,24 @@
 #            API with the service account, as a draft release (status DRAFT by default: an app that
 #            has never been published only accepts drafts). Google requires the very first bundle
 #            of a new app to be uploaded by hand in Play Console; use ARTIFACT=encrypted for that.
+#   screenshots : the store listing's phone screenshots only (no build, no bundle, tracks and releases
+#            untouched). Takes the artifact remohop-play-screenshots of a successful
+#            sodesk-android.yml run on main with SCREENSHOTS=true|only (en-US/*.png, zh-CN/*.png),
+#            checks it against Play's rules, then in one Play edit, per language: deletes the listing's
+#            phone screenshots, uploads the new ones in file-name order, and commits the edit. The
+#            images' Play URLs go to the job summary.
 #
 # Request file ci-requests/sodesk-android-release.env (plain KEY=VALUE, parsed with strict patterns,
 # never executed); a push to main that changes it starts a run:
 #
-#   REF=main                 # source branch, tag or SHA
-#   MODE=build               # build | upload
+#   REF=main                 # source branch, tag or SHA (build and upload)
+#   MODE=build               # build | upload | screenshots
+#   SHOTS_RUN_ID=latest      # screenshots only: the sodesk-android.yml run whose artifact to upload
+#                            # (its numeric id), or latest (default): the newest such artifact
 #   VERSION_NAME=0.1.0       # optional; default 0.1.0
 #   VERSION_CODE=1001        # optional; default 1000 + this workflow's run number (monotonic)
 #   TRACK=internal           # upload only: internal (default) | alpha | beta
-#   STATUS=draft             # upload only: draft (default) | completed
+#   STATUS=draft             # upload only: draft (default) | completed (only the track's release status)
 #   ARTIFACT=none            # none (default) | plain: keep the signed AAB as a 1-day artifact
 #                            # (for the first, hand-made upload in Play Console) | encrypted: the same,
 #                            # AES-256 encrypted (openssl enc -aes-256-cbc -pbkdf2 -iter 200000)
@@ -30,7 +38,8 @@
 #
 # Secrets (repository secrets of this CI repo): TARGET_REPO_PAT (read the source),
 # ANDROID_UPLOAD_KEYSTORE_BASE64, ANDROID_UPLOAD_KEYSTORE_PASSWORD, ANDROID_UPLOAD_KEY_ALIAS,
-# ANDROID_UPLOAD_KEY_PASSWORD, PLAY_SERVICE_ACCOUNT_JSON (upload only).
+# ANDROID_UPLOAD_KEY_PASSWORD, PLAY_SERVICE_ACCOUNT_JSON (upload and screenshots). The screenshots job
+# reads the other run's artifact with this run's GITHUB_TOKEN (actions: read, this repository only).
 #
 # Safety rules (public repo, public logs): no pull_request triggers; third-party actions pinned to
 # commit SHAs; the keystore is written to a 0600 file under RUNNER_TEMP and deleted at the end;
@@ -49,11 +58,16 @@ on:
         default: 'main'
         type: string
       mode:
-        description: 'build = signed AAB only; upload = also upload to a Play track'
+        description: 'build = signed AAB only; upload = also upload to a Play track; screenshots = store listing phone screenshots from a sodesk-android.yml run'
         required: true
         default: 'build'
         type: choice
-        options: [build, upload]
+        options: [build, upload, screenshots]
+      shots_run_id:
+        description: 'screenshots only: sodesk-android.yml run id whose remohop-play-screenshots artifact to upload, or latest'
+        required: false
+        default: 'latest'
+        type: string
   push:
     branches: [main]
     paths: ['ci-requests/sodesk-android-release.env']
@@ -74,8 +88,38 @@ env:
   EXPECTED_APP_ID: com.remohop.app
 
 jobs:
+  # Which job runs: the request's MODE (strictly parsed; the jobs validate the rest themselves).
+  request:
+    name: Read the request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+    steps:
+      - name: Mode
+        id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_MODE: ${{ inputs.mode }}
+          REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/sodesk-android-release.env
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == 'push' ]]; then
+            REQ="$RUNNER_TEMP/request.env"
+            curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/sodesk-android-release.env at this commit.'; exit 64; }
+            MODE="$(sed -n 's/^MODE=//p' "$REQ" | head -n 1 | tr -d '\r')"
+          else
+            MODE="$INPUT_MODE"
+          fi
+          MODE="${MODE:-build}"
+          [[ "$MODE" =~ ^(build|upload|screenshots)$ ]] || { echo '::error::MODE must be build, upload or screenshots.'; exit 64; }
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE"
+
   release:
     name: Signed AAB
+    needs: request
+    if: needs.request.outputs.mode != 'screenshots'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     defaults:
@@ -296,3 +340,195 @@ jobs:
       - name: Remove the keystore
         if: always()
         run: rm -f "$RUNNER_TEMP/upload.jks" "$RUNNER_TEMP/sa.json" "$RUNNER_TEMP/sa.pem"
+
+  # MODE=screenshots: the store listing's phone screenshots from a sodesk-android.yml run's artifact.
+  # No source checkout and no build here: this job runs no project code, it only moves checked images.
+  screenshots:
+    name: Play listing screenshots
+    needs: request
+    if: needs.request.outputs.mode == 'screenshots'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Validate request and credentials
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_SHOTS_RUN_ID: ${{ inputs.shots_run_id }}
+          REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/sodesk-android-release.env
+          HAVE_PLAY: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON != '' }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == 'push' ]]; then
+            REQ="$RUNNER_TEMP/request.env"
+            curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/sodesk-android-release.env at this commit.'; exit 64; }
+            RUN_ID="$(sed -n 's/^SHOTS_RUN_ID=//p' "$REQ" | head -n 1 | tr -d '\r')"
+          else
+            RUN_ID="$INPUT_SHOTS_RUN_ID"
+          fi
+          RUN_ID="${RUN_ID:-latest}"
+          [[ "$RUN_ID" == latest || "$RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]] || { echo '::error::SHOTS_RUN_ID must be latest or a run id (digits).'; exit 64; }
+          [[ "$HAVE_PLAY" == true ]] || { echo '::error::Missing secret PLAY_SERVICE_ACCOUNT_JSON.'; exit 78; }
+          echo "SHOTS_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+          echo "screenshots from: $RUN_ID"
+
+      - name: Fetch the screenshots artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ARTIFACT_NAME: remohop-play-screenshots
+          SOURCE_WORKFLOW: .github/workflows/sodesk-android.yml
+        run: |
+          set -euo pipefail
+          API="https://api.github.com/repos/$REPO"
+          gh_get() { curl -fsSL --retry 3 --max-time 60 -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "$@"; }
+          W="$RUNNER_TEMP/shots-dl"; rm -rf "$W"; mkdir -p "$W"
+          if [[ "$SHOTS_RUN_ID" == latest ]]; then
+            gh_get "$API/actions/artifacts?name=$ARTIFACT_NAME&per_page=30" -o "$W/list.json"
+          else
+            gh_get "$API/actions/runs/$SHOTS_RUN_ID/artifacts?name=$ARTIFACT_NAME&per_page=30" -o "$W/list.json"
+          fi
+          # The newest unexpired artifact of that name from a run on main.
+          read -r ART_ID RUN_ID URL < <(python3 - "$W/list.json" <<'PY'
+          import json, sys
+          arts = [a for a in json.load(open(sys.argv[1])).get('artifacts', [])
+                  if not a.get('expired') and (a.get('workflow_run') or {}).get('head_branch') == 'main']
+          arts.sort(key=lambda a: a.get('created_at', ''), reverse=True)
+          if arts:
+              a = arts[0]
+              print(a['id'], a['workflow_run']['id'], a['archive_download_url'])
+          PY
+          ) || true
+          [[ -n "${ART_ID:-}" ]] || { echo "::error::No unexpired $ARTIFACT_NAME artifact found (run $SHOTS_RUN_ID). Run sodesk-android.yml with SCREENSHOTS=true or only first."; exit 66; }
+          # It must come from a successful run of the Android workflow on main of this repository.
+          gh_get "$API/actions/runs/$RUN_ID" -o "$W/run.json"
+          python3 - "$W/run.json" "$SOURCE_WORKFLOW" "$REPO" <<'PY'
+          import json, sys
+          r = json.load(open(sys.argv[1]))
+          ok = (r.get('path') == sys.argv[2] and r.get('head_branch') == 'main' and r.get('conclusion') == 'success'
+                and r.get('event') in ('push', 'workflow_dispatch') and (r.get('repository') or {}).get('full_name') == sys.argv[3])
+          print('source run %s: %s on %s, %s, %s (%s)' % (r.get('id'), r.get('path'), r.get('head_branch'), r.get('event'), r.get('conclusion'), r.get('html_url')))
+          sys.exit(0 if ok else 1)
+          PY
+          gh_get "$URL" -o "$W/shots.zip"
+          # Extract only the expected names (no paths of the archive's own choosing).
+          OUT="$RUNNER_TEMP/shots"; rm -rf "$OUT"; mkdir -p "$OUT"
+          python3 - "$W/shots.zip" "$OUT" <<'PY'
+          import os, re, struct, sys, zipfile
+          z = zipfile.ZipFile(sys.argv[1]); out = sys.argv[2]
+          names = [n for n in z.namelist() if not n.endswith('/')]
+          bad = [n for n in names if not re.fullmatch(r'(en-US|zh-CN)/[1-8]-[a-z]{2,20}\.png', n)]
+          if bad:
+              print('unexpected files in the artifact:', bad[:5]); sys.exit(1)
+          for n in names:
+              b = z.read(n)
+              os.makedirs(os.path.join(out, os.path.dirname(n)), exist_ok=True)
+              open(os.path.join(out, n), 'wb').write(b)
+          # Play's rules for phone screenshots (PNG here): each side 320-3840 px, at most 2:1, 8 MB, 2-8 per language.
+          err = 0
+          for loc in ('en-US', 'zh-CN'):
+              d = os.path.join(out, loc)
+              files = sorted(os.listdir(d)) if os.path.isdir(d) else []
+              if not 2 <= len(files) <= 8:
+                  print(f'{loc}: {len(files)} screenshots (Play takes 2 to 8)'); err += 1
+              for f in files:
+                  b = open(os.path.join(d, f), 'rb').read()
+                  if b[:8] != b'\x89PNG\r\n\x1a\n':
+                      print(f'{loc}/{f}: not a PNG'); err += 1; continue
+                  w, h, depth, ctype = struct.unpack('>IIBB', b[16:26])
+                  ok = 320 <= min(w, h) and max(w, h) <= 3840 and max(w, h) <= 2 * min(w, h) and len(b) <= 8 * 1024 * 1024 and ctype in (0, 2)
+                  print(f'{loc}/{f}: {w}x{h}, {len(b) // 1024} KB: {"OK" if ok else "REJECTED"}')
+                  err += 0 if ok else 1
+          sys.exit(1 if err else 0)
+          PY
+          rm -f "$W/shots.zip"
+          echo "SHOTS_DIR=$OUT" >> "$GITHUB_ENV"
+          echo "SHOTS_SOURCE_RUN=$RUN_ID" >> "$GITHUB_ENV"
+
+      - name: Replace the Play listing's phone screenshots (en-US, zh-CN)
+        env:
+          PLAY_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          umask 077
+          SA="$RUNNER_TEMP/sa.json"; printf '%s' "$PLAY_JSON" > "$SA"
+          KEY="$RUNNER_TEMP/sa.pem"
+          EMAIL="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));open(sys.argv[2],"w").write(d["private_key"]);print(d["client_email"])' "$SA" "$KEY")"
+          b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          NOW="$(date +%s)"
+          HDR="$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)"
+          CLAIMS="$(printf '{"iss":"%s","scope":"https://www.googleapis.com/auth/androidpublisher","aud":"https://oauth2.googleapis.com/token","iat":%s,"exp":%s}' "$EMAIL" "$NOW" "$((NOW + 1800))" | b64url)"
+          SIG="$(printf '%s.%s' "$HDR" "$CLAIMS" | openssl dgst -sha256 -sign "$KEY" -binary | b64url)"
+          rm -f "$KEY" "$SA"
+          TOKEN="$(curl -fsS --max-time 30 https://oauth2.googleapis.com/token \
+            --data-urlencode 'grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer' \
+            --data-urlencode "assertion=$HDR.$CLAIMS.$SIG" | python3 -c 'import json,sys;print(json.load(sys.stdin)["access_token"])')" \
+            || { echo '::error::Could not get a Google access token (service account key or clock).'; exit 1; }
+          echo "::add-mask::$TOKEN"
+          API="https://androidpublisher.googleapis.com/androidpublisher/v3/applications/$EXPECTED_APP_ID"
+          UPLOAD="https://androidpublisher.googleapis.com/upload/androidpublisher/v3/applications/$EXPECTED_APP_ID"
+          call() { # method url [curl args...]; prints the body, fails with Google's message
+            local m="$1" u="$2"; shift 2
+            local out code
+            out="$(curl -sS --max-time 300 -X "$m" -H "Authorization: Bearer $TOKEN" -w '\n%{http_code}' "$u" "$@")"
+            code="${out##*$'\n'}"; out="${out%$'\n'*}"
+            if [[ "$code" != 2* ]]; then
+              python3 -c 'import json,sys
+          try: e=json.loads(sys.argv[1])["error"]; print("Play API %s: %s" % (e.get("code"), e.get("message","")[:400]))
+          except Exception: print("Play API HTTP", sys.argv[2])' "$out" "$code"
+              return 1
+            fi
+            printf '%s' "$out"
+          }
+          EDIT="$(call POST "$API/edits" -H 'Content-Type: application/json' -d '{}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')" \
+            || { echo '::error::Could not open a Play edit (the service account needs access to the app).'; exit 1; }
+          COMMITTED=false
+          # An edit left open on failure is deleted, so nothing half-done is kept.
+          trap '[[ "$COMMITTED" == true ]] || call DELETE "$API/edits/$EDIT" > /dev/null 2>&1 || true' EXIT
+          SUMMARY="$RUNNER_TEMP/shots-summary.md"; : > "$SUMMARY"
+          for LOC in en-US zh-CN; do
+            call GET "$API/edits/$EDIT/listings/$LOC" > /dev/null || { echo "::error::The Play listing $LOC does not exist (add the language in Play Console first)."; exit 1; }
+            call DELETE "$API/edits/$EDIT/listings/$LOC/phoneScreenshots" > /dev/null || { echo "::error::Could not delete the $LOC phone screenshots."; exit 1; }
+            n=0
+            for f in $(ls "$SHOTS_DIR/$LOC" | sort); do
+              R="$(call POST "$UPLOAD/edits/$EDIT/listings/$LOC/phoneScreenshots?uploadType=media" -H 'Content-Type: image/png' --data-binary "@$SHOTS_DIR/$LOC/$f")" \
+                || { echo "::error::Upload of $LOC/$f failed."; exit 1; }
+              n=$((n + 1))
+              echo "$LOC/$f uploaded"
+            done
+            # What the listing now holds, as Play reports it.
+            call GET "$API/edits/$EDIT/listings/$LOC/phoneScreenshots" | python3 -c 'import json,sys
+          imgs=json.load(sys.stdin).get("images",[])
+          loc=sys.argv[1]; want=int(sys.argv[2])
+          print("%s: %d phone screenshots in the edit" % (loc, len(imgs)))
+          with open(sys.argv[3],"a") as s:
+              s.write("- %s: %d phone screenshots: %s\n" % (loc, len(imgs), " ".join("[%d](%s)" % (i+1, im.get("url","")) for i, im in enumerate(imgs))))
+          for i, im in enumerate(imgs): print("  %d. %s" % (i+1, im.get("url","")))
+          sys.exit(0 if len(imgs)==want else 1)' "$LOC" "$n" "$SUMMARY" || { echo "::error::The $LOC listing does not hold the $n uploaded screenshots."; exit 1; }
+          done
+          if ! OUT="$(call POST "$API/edits/$EDIT:commit")"; then
+            echo "$OUT"
+            # Apps under managed publishing / with rejected updates need this flag; retry once with it.
+            if grep -q 'changesNotSentForReview' <<<"$OUT"; then
+              call POST "$API/edits/$EDIT:commit?changesNotSentForReview=true" > /dev/null || { echo '::error::Commit of the Play edit failed.'; exit 1; }
+              echo '::notice::Committed with changesNotSentForReview=true: send the changes for review in Play Console.'
+            else
+              echo '::error::Commit of the Play edit failed.'; exit 1
+            fi
+          fi
+          COMMITTED=true
+          echo "Play edit committed: phone screenshots replaced for en-US and zh-CN."
+          { echo '### RemoHop Play listing screenshots'; echo
+            echo "- From run [$SHOTS_SOURCE_RUN](https://github.com/${GITHUB_REPOSITORY}/actions/runs/$SHOTS_SOURCE_RUN) (artifact remohop-play-screenshots)"
+            cat "$SUMMARY"
+            echo '- Tracks and releases unchanged; listing text unchanged.'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove credentials
+        if: always()
+        run: rm -f "$RUNNER_TEMP/sa.json" "$RUNNER_TEMP/sa.pem"
