@@ -25,6 +25,8 @@
 #   MODE=build               # build | upload | screenshots
 #   SHOTS_RUN_ID=latest      # screenshots only: the sodesk-android.yml run whose artifact to upload
 #                            # (its numeric id), or latest (default): the newest such artifact
+#   SHOTS_LANGS=en-US,zh-CN  # screenshots only: which listings to replace (default both; each must
+#                            # already exist on Play)
 #   VERSION_NAME=0.1.0       # optional; default 0.1.0
 #   VERSION_CODE=1001        # optional; default 1000 + this workflow's run number (monotonic)
 #   TRACK=internal           # upload only: internal (default) | alpha | beta
@@ -369,14 +371,18 @@ jobs:
             REQ="$RUNNER_TEMP/request.env"
             curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/sodesk-android-release.env at this commit.'; exit 64; }
             RUN_ID="$(sed -n 's/^SHOTS_RUN_ID=//p' "$REQ" | head -n 1 | tr -d '\r')"
+            LANGS="$(sed -n 's/^SHOTS_LANGS=//p' "$REQ" | head -n 1 | tr -d '\r')"
           else
-            RUN_ID="$INPUT_SHOTS_RUN_ID"
+            RUN_ID="$INPUT_SHOTS_RUN_ID"; LANGS=''
           fi
           RUN_ID="${RUN_ID:-latest}"
+          LANGS="${LANGS:-en-US,zh-CN}"
+          [[ "$LANGS" =~ ^(en-US|zh-CN)(,(en-US|zh-CN))?$ ]] || { echo '::error::SHOTS_LANGS must be en-US, zh-CN or en-US,zh-CN.'; exit 64; }
+          echo "SHOTS_LANGS=${LANGS//,/ }" >> "$GITHUB_ENV"
           [[ "$RUN_ID" == latest || "$RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]] || { echo '::error::SHOTS_RUN_ID must be latest or a run id (digits).'; exit 64; }
           [[ "$HAVE_PLAY" == true ]] || { echo '::error::Missing secret PLAY_SERVICE_ACCOUNT_JSON.'; exit 78; }
           echo "SHOTS_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
-          echo "screenshots from: $RUN_ID"
+          echo "screenshots from: $RUN_ID · listings: $LANGS"
 
       - name: Fetch the screenshots artifact
         env:
@@ -451,7 +457,7 @@ jobs:
           echo "SHOTS_DIR=$OUT" >> "$GITHUB_ENV"
           echo "SHOTS_SOURCE_RUN=$RUN_ID" >> "$GITHUB_ENV"
 
-      - name: Replace the Play listing's phone screenshots (en-US, zh-CN)
+      - name: Replace the Play listing's phone screenshots
         env:
           PLAY_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
         run: |
@@ -496,10 +502,10 @@ jobs:
           if ! LANGS="$(call GET "$API/edits/$EDIT/listings")"; then echo "$LANGS"; echo '::error::Could not read the store listings.'; exit 1; fi
           LANGS="$(python3 -c 'import json,sys;print(" ".join(sorted(l.get("language","") for l in json.loads(sys.argv[1]).get("listings",[]))))' "$LANGS")"
           echo "Play store listings: ${LANGS:-none}"
-          for LOC in en-US zh-CN; do
+          for LOC in $SHOTS_LANGS; do
             [[ " $LANGS " == *" $LOC "* ]] || { echo "::error::Play has no $LOC store listing (listings: ${LANGS:-none}). Add that language to the main store listing in Play Console (or fix the code here), then rerun."; exit 1; }
           done
-          for LOC in en-US zh-CN; do
+          for LOC in $SHOTS_LANGS; do
             call DELETE "$API/edits/$EDIT/listings/$LOC/phoneScreenshots" > /dev/null || { echo "::error::Could not delete the $LOC phone screenshots."; exit 1; }
             n=0
             for f in $(ls "$SHOTS_DIR/$LOC" | sort); do
@@ -529,7 +535,7 @@ jobs:
             fi
           fi
           COMMITTED=true
-          echo "Play edit committed: phone screenshots replaced for en-US and zh-CN."
+          echo "Play edit committed: phone screenshots replaced for $SHOTS_LANGS."
           { echo '### RemoHop Play listing screenshots'; echo
             echo "- From run [$SHOTS_SOURCE_RUN](https://github.com/${GITHUB_REPOSITORY}/actions/runs/$SHOTS_SOURCE_RUN) (artifact remohop-play-screenshots)"
             cat "$SUMMARY"
