@@ -589,13 +589,24 @@ jobs:
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
         run: |
           set +e -uo pipefail
           FAILED=0
           ok()   { printf '   ok    %s\n' "$*"; }
           fail() { printf '   FAIL  %s\n' "$*"; FAILED=1; }
-          P8="$RUNNER_TEMP/remohop-asc/AuthKey.p8"
-          [[ -s "$P8" ]] || { echo '::error::the notary key from the Notarize step is gone.'; exit 1; }
+          # The Notarize step removes its key file when it ends, so this step writes its own.
+          ASC_DIR="$RUNNER_TEMP/remohop-asc-dmg"; rm -rf "$ASC_DIR"; ( umask 077; mkdir -p "$ASC_DIR" )
+          trap 'rm -rf "$ASC_DIR"' EXIT
+          P8="$ASC_DIR/AuthKey.p8"
+          ( umask 077; python3 -c '
+          import base64, os, sys
+          raw = os.environ["ASC_PRIVATE_KEY"].strip().replace("\\n", "\n")
+          key = raw if "PRIVATE KEY" in raw else base64.b64decode("".join(raw.split())).decode("utf-8").strip()
+          if "BEGIN PRIVATE KEY" not in key:
+              sys.exit("ASC_PRIVATE_KEY is not a .p8 key")
+          open(sys.argv[1], "w").write(key + "\n")
+          ' "$P8" ) || { echo '::error::ASC_PRIVATE_KEY is not a .p8 private key.'; exit 1; }
           STAGE="$RUNNER_TEMP/dmg-stage"; rm -rf "$STAGE"; mkdir -p "$STAGE"
           /usr/bin/ditto "$APP" "$STAGE/RemoHop.app" || fail 'ditto RemoHop.app into the image folder'
           ln -s /Applications "$STAGE/Applications"
@@ -743,5 +754,5 @@ jobs:
             [[ "${#OLD[@]}" -gt 0 ]] && security list-keychains -d user -s "${OLD[@]}" >/dev/null 2>&1
           fi
           [[ -n "${KEYCHAIN_NAME:-}" ]] && security delete-keychain "$KEYCHAIN_NAME" >/dev/null 2>&1
-          rm -rf "$RUNNER_TEMP/remohop-asc" "$RUNNER_TEMP/remohop-devid.p12" "$RUNNER_TEMP/notary-result.json" "$RUNNER_TEMP/notary-log.json" "$RUNNER_TEMP/RemoHop-notarize.zip" "$RUNNER_TEMP/notary-dmg.json" >/dev/null 2>&1
+          rm -rf "$RUNNER_TEMP/remohop-asc" "$RUNNER_TEMP/remohop-devid.p12" "$RUNNER_TEMP/notary-result.json" "$RUNNER_TEMP/notary-log.json" "$RUNNER_TEMP/RemoHop-notarize.zip" "$RUNNER_TEMP/notary-dmg.json" "$RUNNER_TEMP/remohop-asc-dmg" >/dev/null 2>&1
           true
