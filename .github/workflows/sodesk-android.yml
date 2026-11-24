@@ -457,8 +457,12 @@ jobs:
           STAMPS=('2026-11-03 09:12' '2026-11-21 18:40' '2026-11-12 11:05' '2026-11-23 16:27' '2026-11-02 08:55' '2026-11-19 10:31' '2026-11-23 09:41' '2026-11-17 14:08' '2026-10-28 13:22')
           i=0
           for f in "$D"/*; do touch -d "${STAMPS[$((i % ${#STAMPS[@]}))]}" "$f"; i=$((i + 1)); done
-          # A login shell reads ~/.bash_profile: a short prompt and coloured ls.
-          printf '%s\n' "PS1='\\[\\e[1;32m\\]demo@remohop\\[\\e[0m\\]:\\[\\e[1;34m\\]\\w\\[\\e[0m\\]\\\$ '" "alias ls='ls --color=auto'" > "$SHOTS_HOME/.bash_profile"
+          # A login shell reads ~/.bash_profile: a short prompt, and an ls that fits a phone-wide
+          # terminal (coloured, human sizes, no owner/group columns, short dates).
+          printf '%s\n' "PS1='\\[\\e[1;32m\\]demo@remohop\\[\\e[0m\\]:\\[\\e[1;34m\\]\\w\\[\\e[0m\\]\\\$ '" \
+            "alias ls=\"ls --color=auto -h -gG --time-style='+%b %d'\"" > "$SHOTS_HOME/.bash_profile"
+          # /home's default ACL would add a '+' to every mode string.
+          setfacl -R -b "$SHOTS_HOME" 2>/dev/null || true
 
           # The screenshots host: own config, port and random password (masked, 0600 file, never echoed).
           HCFG="$RUNNER_TEMP/remohop-shots-config"
