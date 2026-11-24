@@ -13,7 +13,7 @@
 #
 #   verify mode uses no Apple credentials: no signing, no Match, no App Store Connect.
 #
-#   profile    : ONE-TIME setup. Registers the bundle ID com.readori.sodesk with the App Store
+#   profile    : ONE-TIME setup. Registers the bundle ID com.remohop.app with the App Store
 #                Connect API if it is missing, then writes an App Store provisioning profile for
 #                it to the shared Match repo (readori/readori-certificates), signed by the
 #                EXISTING shared Apple Distribution identity (never creates certificates, never
@@ -104,10 +104,11 @@ env:
   # Private source repository. Change to readori/RemoHop once the GitHub repository is renamed.
   SOURCE_REPOSITORY: readori/SoDesk
   PRIVATE_SOURCE_PATH: source
-  # The bundle ID keeps the pre-rename name: the App Store record was created with it and it
-  # cannot change. The app itself is RemoHop (display name, project, scheme, targets).
-  EXPECTED_BUNDLE_ID: com.readori.sodesk
-  EXPECTED_APPLE_ID: '6838451962'
+  # Same identifier as the Android app. Replaces com.readori.sodesk (the old App Store record).
+  EXPECTED_BUNDLE_ID: com.remohop.app
+  # Apple ID of the App Store Connect record for com.remohop.app; empty = not checked yet.
+  # Fill in once the record exists.
+  EXPECTED_APPLE_ID: ''
   BUNDLE_ID_NAME: RemoHop
   XCODE_MAJOR_WANTED: '26'
   MATCH_GIT_URL: https://github.com/readori/readori-certificates.git
@@ -660,7 +661,7 @@ jobs:
           echo "::add-mask::$MATCH_AUTH"
           echo "MATCH_AUTH=$MATCH_AUTH" >> "$GITHUB_ENV"
 
-      # ---- profile mode: one-time bundle ID + App Store profile for com.readori.sodesk only ----
+      # ---- profile mode: one-time bundle ID + App Store profile for com.remohop.app only ----
       - name: Register bundle ID if missing (App Store Connect API)
         if: env.MODE == 'profile'
         run: |
@@ -717,7 +718,8 @@ jobs:
           Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.create(key_id: k['key_id'], issuer_id: k['issuer_id'], key: k['key'])
           app = Spaceship::ConnectAPI::App.find(ENV.fetch('EXPECTED_BUNDLE_ID'))
           abort "::error::No App Store Connect app with bundle ID #{ENV['EXPECTED_BUNDLE_ID']} for this API key." unless app
-          abort "::error::App Store Connect app ID #{app.id} is not the expected #{ENV['EXPECTED_APPLE_ID']}." unless app.id.to_s == ENV.fetch('EXPECTED_APPLE_ID')
+          want = ENV.fetch('EXPECTED_APPLE_ID', '')
+          abort "::error::App Store Connect app ID #{app.id} is not the expected #{want}." unless want.empty? || app.id.to_s == want
           puts "App Store Connect app: #{ENV['EXPECTED_BUNDLE_ID']} (Apple ID #{app.id}): OK"
           RUBY
 
