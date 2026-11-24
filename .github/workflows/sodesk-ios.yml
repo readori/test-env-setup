@@ -566,6 +566,14 @@ jobs:
             # (TEST_RUNNER_REMOHOP_SHOTS_LANG), so the zh-Hans page shows Chinese screens.
             for LANGCODE in en zh; do
               [[ "$LANGCODE" == zh ]] && LOC=zh-Hans || LOC=en-US
+              # The simulator's system language; the app follows it (its default).
+              if [[ "$LANGCODE" == zh ]]; then SYSLANGS=(zh-Hans en); SYSLOCALE=zh_CN; else SYSLANGS=(en); SYSLOCALE=en_US; fi
+              xcrun simctl spawn "$UDID" defaults write -g AppleLanguages -array "${SYSLANGS[@]}" >/dev/null 2>&1
+              xcrun simctl spawn "$UDID" defaults write -g AppleLocale "$SYSLOCALE" >/dev/null 2>&1
+              xcrun simctl shutdown "$UDID" >/dev/null 2>&1
+              xcrun simctl boot "$UDID" >/dev/null 2>&1
+              xcrun simctl bootstatus "$UDID" -b >/dev/null 2>&1 || { echo "::warning::$KEY/$LANGCODE: simulator did not reboot."; setok=0; break; }
+              xcrun simctl status_bar "$UDID" override --time 9:41 --batteryState charged --batteryLevel 100 --wifiBars 3 --cellularBars 4 --operatorName '' >/dev/null 2>&1
               S="$W/s-$KEY-$LANGCODE"; rm -rf "$S"; mkdir -p "$S"
               LOG="$RUNNER_TEMP/xcshots-$KEY-$LANGCODE.log"
               TEST_RUNNER_REMOHOP_E2E_TARGET="$TARGET" TEST_RUNNER_REMOHOP_E2E_PASSWORD="$PW" TEST_RUNNER_REMOHOP_E2E_DIR="$W/files" \
@@ -592,6 +600,7 @@ jobs:
               if [[ "$got" -ne 3 ]]; then
                 echo "::warning::$KEY/$LANGCODE: only $got of 3 screens were captured (xcodebuild exit $st)."
                 grep -E "error:|failed|XCTAssert|caught error|timed out|skipped" "$LOG" | redact | tail -n 15 || true
+                echo "--- xcodebuild log (tail) ---"; tail -n 40 "$LOG" | redact || true
                 setok=0; break
               fi
               for name in 1-connect 2-terminal 3-files; do
