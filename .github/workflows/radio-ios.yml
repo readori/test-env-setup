@@ -1154,6 +1154,7 @@ jobs:
           - assertVisible: { id: "locate-button" }
           - assertNotVisible: { id: "globe-pill" }
           - assertNotVisible: { id: "globe-country" }
+          - scrollUntilVisible: { element: { id: "globe-disc" }, direction: DOWN, visibilityPercentage: 100, centerElement: true, timeout: 10000 }
           - swipe: { from: { id: "globe-disc" }, direction: LEFT, duration: 400 }
           - waitForAnimationToEnd: { timeout: 3000 }
           - scrollUntilVisible: { element: { id: "atlas-globe-caption" }, direction: DOWN, timeout: 10000 }
