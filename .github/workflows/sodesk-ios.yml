@@ -750,7 +750,6 @@ jobs:
           set +e
           fastlane deliver --api_key_path "$ASC_API_KEY_JSON" --app_identifier "$EXPECTED_BUNDLE_ID" --app_version "$VERSION" \
             --metadata_path "$D/metadata" --screenshots_path "$D/screenshots" \
-            --app_rating_config_path "$GITHUB_WORKSPACE/$PRIVATE_SOURCE_PATH/mobile/ios/fastlane/age_rating.json" \
             --skip_binary_upload true --skip_screenshots "$SHOTS" --skip_metadata false --overwrite_screenshots true \
             --submit_for_review false --automatic_release false --force true --run_precheck_before_submit false \
             > "$LOG" 2>&1
@@ -761,8 +760,10 @@ jobs:
             echo "::error::fastlane deliver failed (exit $st). If it says there is no editable version, create version $VERSION in App Store Connect (Prepare for Submission) and rerun."
             exit 1
           fi
-          echo "Listing uploaded for version $VERSION: name, subtitle, description, keywords, promotional text, URLs, copyright, categories, age rating, review info."
-          echo "- App Store listing text, categories, age rating and review info uploaded for version \`$VERSION\` (not submitted)." >> "$GITHUB_STEP_SUMMARY"
+          # The age rating is answered in App Store Connect: Apple's current questionnaire has
+          # questions the API (and fastlane's age_rating.json) does not cover yet.
+          echo "Listing uploaded for version $VERSION: name, subtitle, description, keywords, promotional text, URLs, copyright, categories (age rating and review contact: in App Store Connect)."
+          echo "- App Store listing text and categories uploaded for version \`$VERSION\` (not submitted). Age rating and review contact: App Store Connect." >> "$GITHUB_STEP_SUMMARY"
           [[ "$SHOTS" == 'true' ]] || echo '- Committed screenshots uploaded.' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload generated screenshots (deliver)
