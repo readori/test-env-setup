@@ -283,7 +283,7 @@ jobs:
           if have.include?(ad)
             puts 'Associated Domains: already enabled'
           else
-            found.update_capability(ad, enabled: true)
+            found.create_capability(ad)
             puts 'Associated Domains: enabled'
           end
           RUBY
