@@ -560,49 +560,54 @@ jobs:
             xcrun simctl bootstatus "$UDID" -b >/dev/null 2>&1 || { echo "::warning::$KEY: simulator did not boot; skipped."; continue; }
             xcrun simctl status_bar "$UDID" override --time 9:41 --batteryState charged --batteryLevel 100 --wifiBars 3 --cellularBars 4 --operatorName '' >/dev/null 2>&1
             echo "$KEY: ${DEVNAME//_/ } ($SIZE)"
-            S="$W/s-$KEY"; rm -rf "$S"; mkdir -p "$S"
-            LOG="$RUNNER_TEMP/xcshots-$KEY.log"
-            TEST_RUNNER_REMOHOP_E2E_TARGET="$TARGET" TEST_RUNNER_REMOHOP_E2E_PASSWORD="$PW" TEST_RUNNER_REMOHOP_E2E_DIR="$W/files" \
-            TEST_RUNNER_REMOHOP_SHOTS_DIR="$S" \
-            xcodebuild test -quiet \
-              -project mobile/ios/RemoHop.xcodeproj -scheme RemoHop -configuration Debug \
-              -destination "platform=iOS Simulator,id=$UDID" \
-              -only-testing:RemoHopTests/GatewayE2ETests/testScreenshots \
-              -derivedDataPath "$DD" CODE_SIGNING_ALLOWED=NO > "$LOG" 2>&1 &
-            XPID=$!
-            got=0
-            for name in 1-connect 2-terminal 3-files; do
-              for _ in $(seq 1 1200); do
-                [[ -f "$S/$name.ready" ]] && break
-                kill -0 "$XPID" 2>/dev/null || break
-                sleep 0.25
+            setok=1
+            # One pass per store language: the app is switched to that language
+            # (TEST_RUNNER_REMOHOP_SHOTS_LANG), so the zh-Hans page shows Chinese screens.
+            for LANGCODE in en zh; do
+              [[ "$LANGCODE" == zh ]] && LOC=zh-Hans || LOC=en-US
+              S="$W/s-$KEY-$LANGCODE"; rm -rf "$S"; mkdir -p "$S"
+              LOG="$RUNNER_TEMP/xcshots-$KEY-$LANGCODE.log"
+              TEST_RUNNER_REMOHOP_E2E_TARGET="$TARGET" TEST_RUNNER_REMOHOP_E2E_PASSWORD="$PW" TEST_RUNNER_REMOHOP_E2E_DIR="$W/files" \
+              TEST_RUNNER_REMOHOP_SHOTS_DIR="$S" TEST_RUNNER_REMOHOP_SHOTS_LANG="$LANGCODE" \
+              xcodebuild test -quiet \
+                -project mobile/ios/RemoHop.xcodeproj -scheme RemoHop -configuration Debug \
+                -destination "platform=iOS Simulator,id=$UDID" \
+                -only-testing:RemoHopTests/GatewayE2ETests/testScreenshots \
+                -derivedDataPath "$DD" CODE_SIGNING_ALLOWED=NO > "$LOG" 2>&1 &
+              XPID=$!
+              got=0
+              for name in 1-connect 2-terminal 3-files; do
+                for _ in $(seq 1 1200); do
+                  [[ -f "$S/$name.ready" ]] && break
+                  kill -0 "$XPID" 2>/dev/null || break
+                  sleep 0.25
+                done
+                [[ -f "$S/$name.ready" ]] || break
+                xcrun simctl io "$UDID" screenshot --type=png "$S/$name.png" >/dev/null 2>&1
+                touch "$S/$name.done"
+                got=$((got + 1))
               done
-              [[ -f "$S/$name.ready" ]] || break
-              xcrun simctl io "$UDID" screenshot --type=png "$S/$name.png" >/dev/null 2>&1
-              touch "$S/$name.done"
-              got=$((got + 1))
-            done
-            wait "$XPID"; st=$?
-            if [[ "$got" -ne 3 ]]; then
-              echo "::warning::$KEY: only $got of 3 screens were captured (xcodebuild exit $st)."
-              grep -E "error:|failed|XCTAssert|caught error|timed out|skipped" "$LOG" | redact | tail -n 15 || true
-              continue
-            fi
-            ok=1
-            for name in 1-connect 2-terminal 3-files; do
-              W_PX="$(sips -g pixelWidth "$S/$name.png" 2>/dev/null | awk '/pixelWidth/{print $2}')"; H_PX="$(sips -g pixelHeight "$S/$name.png" 2>/dev/null | awk '/pixelHeight/{print $2}')"
-              [[ "${W_PX}x${H_PX}" == "$SIZE" ]] || { echo "::warning::$KEY/$name: ${W_PX}x${H_PX}, expected $SIZE; set dropped."; ok=0; break; }
-            done
-            [[ "$ok" -eq 1 ]] || continue
-            for name in 1-connect 2-terminal 3-files; do
-              # JPEG: no alpha channel, which App Store Connect requires.
-              for loc in en-US zh-Hans; do
-                mkdir -p "$OUT/$loc"
-                sips -s format jpeg -s formatOptions 95 "$S/$name.png" --out "$OUT/$loc/$KEY-$name.jpg" >/dev/null 2>&1
+              wait "$XPID"; st=$?
+              if [[ "$got" -ne 3 ]]; then
+                echo "::warning::$KEY/$LANGCODE: only $got of 3 screens were captured (xcodebuild exit $st)."
+                grep -E "error:|failed|XCTAssert|caught error|timed out|skipped" "$LOG" | redact | tail -n 15 || true
+                setok=0; break
+              fi
+              for name in 1-connect 2-terminal 3-files; do
+                W_PX="$(sips -g pixelWidth "$S/$name.png" 2>/dev/null | awk '/pixelWidth/{print $2}')"; H_PX="$(sips -g pixelHeight "$S/$name.png" 2>/dev/null | awk '/pixelHeight/{print $2}')"
+                [[ "${W_PX}x${H_PX}" == "$SIZE" ]] || { echo "::warning::$KEY/$LANGCODE/$name: ${W_PX}x${H_PX}, expected $SIZE; set dropped."; setok=0; break; }
+              done
+              [[ "$setok" -eq 1 ]] || break
+              mkdir -p "$W/out-$KEY/$LOC"
+              for name in 1-connect 2-terminal 3-files; do
+                # JPEG: no alpha channel, which App Store Connect requires.
+                sips -s format jpeg -s formatOptions 95 "$S/$name.png" --out "$W/out-$KEY/$LOC/$KEY-$name.jpg" >/dev/null 2>&1
               done
             done
+            [[ "$setok" -eq 1 ]] || continue
+            for LOC in en-US zh-Hans; do mkdir -p "$OUT/$LOC"; cp "$W/out-$KEY/$LOC/"*.jpg "$OUT/$LOC/"; done
             made=$((made + 1))
-            echo "$KEY: 3 screenshots OK"
+            echo "$KEY: 3 screenshots OK (en-US and zh-Hans)"
           done
           trap - EXIT; cleanup
           [[ "$made" -gt 0 ]] || { echo '::error::no screenshot set was produced.'; exit 1; }
