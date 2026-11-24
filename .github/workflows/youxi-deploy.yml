@@ -7,7 +7,9 @@
 #   deploy : copy dist/ + noindex headers, `wrangler deploy --dry-run` (no credentials), then
 #            `wrangler deploy`, then GET the page and one asset (HTTP 200, X-Robots-Tag present).
 #
-# The site has no Worker script: it only serves the built files. Anyone with the link can play
+# The site serves the built files. If the private repo has site/worker.js (private repo T123), it is attached as
+# the Worker script, run first only for "/" (it adds per-invite <title>/og tags for ?room= links and otherwise
+# returns the static file unchanged); without that file the Worker is static-assets-only as before. Anyone with the link can play
 # (owner decision 2026-11-08, private repo ADR-0011); pages send X-Robots-Tag: noindex.
 #
 # Triggers: workflow_dispatch (a human clicks Run), or a push to main that changes
@@ -139,6 +141,15 @@ jobs:
           SITE="$RUNNER_TEMP/site"
           mkdir -p "$SITE/public"
           cp -R "$PRIVATE_SOURCE_PATH/dist/." "$SITE/public/"
+          # T123: optional Worker script (invite link previews). Only "/" runs the script first; everything else is static.
+          WORKER_MAIN=''
+          ASSETS_CFG='{ "directory": "./public" }'
+          if [[ -f "$PRIVATE_SOURCE_PATH/site/worker.js" ]]; then
+            cp "$PRIVATE_SOURCE_PATH/site/worker.js" "$SITE/worker.js"
+            WORKER_MAIN='"main": "./worker.js",'
+            ASSETS_CFG='{ "directory": "./public", "binding": "ASSETS", "run_worker_first": ["/"] }'
+            echo 'site worker: attached (site/worker.js)'
+          fi
           # Vite puts every built file under /assets/ with a content hash in its name, so those can be cached
           # for a year; index.html keeps the platform default (revalidate every time) and picks up new hashes.
           printf '/*\n  X-Robots-Tag: noindex, nofollow\n/assets/*\n  Cache-Control: public, max-age=31536000, immutable\n' > "$SITE/public/_headers"
@@ -159,11 +170,12 @@ jobs:
           cat > "$SITE/wrangler.jsonc" <<EOF
           {
             "name": "${WORKER_NAME}",
+            ${WORKER_MAIN}
             "compatibility_date": "2026-10-01",
             "workers_dev": true,
             "preview_urls": false,
             "routes": [{ "pattern": "${PUBLIC_DOMAIN}", "custom_domain": true }],
-            "assets": { "directory": "./public" }
+            "assets": ${ASSETS_CFG}
           }
           EOF
           echo "SITE=$SITE" >> "$GITHUB_ENV"
@@ -228,7 +240,7 @@ jobs:
           echo "- noindex header: $robots" >> "$GITHUB_STEP_SUMMARY"
           [[ "$robots" == yes ]] || echo '::warning::X-Robots-Tag noindex header is missing on /.'
           for p in /.well-known/apple-app-site-association /apple-app-site-association; do
-            h="$(curl -s -D - -o /dev/null --max-time 20 "https://${PUBLIC_DOMAIN}${p}" | tr -d '\r' | grep -iE '^HTTP/|^content-type:' | tr '\n' ' ')"
+            h="$(curl -s -D - -o /dev/null --max-time 20 "https://${PUBLIC_DOMAIN}${p}" | tr -d '\r' | grep -iE '^HTTP/|^content-type:' | tr '\n' ' ' || true)"
             echo "${p}: ${h}"
             echo "- ${p}: ${h}" >> "$GITHUB_STEP_SUMMARY"
           done
