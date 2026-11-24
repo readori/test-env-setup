@@ -1,0 +1,217 @@
+# RemoHop NAT lab (test/natlab/natlab.sh) on GitHub-hosted runners, one job per mode.
+#
+# Why: the source repository's CI job "NAT traversal end to end" ran `natlab.sh all` and the hosted
+# runner lost communication with GitHub. This workflow runs each mode on its own runner and records
+# the root network namespace's state (routes, policy rules, systemd-resolved per-link DNS, /etc/hosts,
+# /etc/resolv.conf) before and after, so the mode that changes host-global state is identified, and
+# proves a fix: every job must pass and leave the root namespace exactly as it found it.
+#
+#   cone, symmetric, permissive, relay, wsrelay, tailnet, mesh, vpn : `natlab.sh <mode>`
+#   all                                                             : `natlab.sh all` (the CI job)
+#
+# Each lab run prints a heartbeat every 10 s (time, whether github.com resolves, systemd-resolved's
+# per-link DNS servers) from a background loop, and is bounded by `timeout 600` (all: 1500), so a step that
+# breaks the runner still leaves a trail in the streamed log. After the lab the job prints the
+# difference to the "before" state, fails on any difference, and then puts systemd-resolved's
+# per-link settings back so the runner can still report.
+#
+# Triggers: workflow_dispatch, or a push to main that changes ci-requests/remohop-natlab-bisect.env
+# (how the project's AI engineer requests a run). Only people with push access to this repo can
+# trigger; never pull_request. The request file is plain KEY=VALUE text, parsed with strict
+# patterns and never sourced or executed:
+#
+#   REF=<sha>                    # source repository branch, tag or SHA
+#   MODES=...                    # optional: comma list of cone,symmetric,permissive,relay,wsrelay,
+#                                # tailnet,mesh,vpn,all (default: every mode but all, one job each)
+#
+# Safety rules (public repo, public logs): no pull_request triggers; only GitHub-owned actions,
+# pinned to commit SHAs; the source repository is public and checked out without credentials.
+# No secrets are used, nothing is uploaded.
+name: RemoHop NAT lab bisect
+
+run-name: RemoHop NAT lab bisect · ${{ github.event_name == 'push' && 'request (ci-requests/remohop-natlab-bisect.env)' || inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Source repository branch, tag, or SHA'
+        required: true
+        default: 'main'
+        type: string
+      modes:
+        description: 'Comma list of cone,symmetric,permissive,relay,wsrelay,tailnet,mesh,vpn,all (empty: all modes, one job each)'
+        required: false
+        default: ''
+        type: string
+  push:
+    branches: [main]
+    paths: ['ci-requests/remohop-natlab-bisect.env']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remohop-natlab-bisect-${{ inputs.ref || 'request' }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_REPOSITORY: readori/RemoHop
+
+jobs:
+  request:
+    name: request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ref: ${{ steps.req.outputs.ref }}
+      modes: ${{ steps.req.outputs.modes }}
+    steps:
+      - name: Validate request
+        id: req
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_MODES: ${{ inputs.modes }}
+          REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/remohop-natlab-bisect.env
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == 'push' ]]; then
+            # Download only the request file of this exact commit (public repo, no credentials).
+            REQ="$RUNNER_TEMP/remohop-natlab-request.env"
+            curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/remohop-natlab-bisect.env at this commit.'; exit 64; }
+            # Plain text, read line by line; never sourced or executed.
+            SOURCE_REF="$(sed -n 's/^REF=//p' "$REQ" | head -n 1 | tr -d '\r')"
+            MODES="$(sed -n 's/^MODES=//p' "$REQ" | head -n 1 | tr -d '\r')"
+          else
+            SOURCE_REF="$INPUT_REF"
+            MODES="$INPUT_MODES"
+          fi
+          MODES="${MODES:-cone,symmetric,permissive,relay,wsrelay,tailnet,mesh,vpn}"
+          [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && ${#SOURCE_REF} -le 200 ]] || {
+            echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only, no leading dash).'
+            exit 64
+          }
+          M='(cone|symmetric|permissive|relay|wsrelay|tailnet|mesh|vpn|all)'
+          [[ "$MODES" =~ ^$M(,$M)*$ ]] || {
+            echo '::error::MODES must be a comma list of cone,symmetric,permissive,relay,wsrelay,tailnet,mesh,vpn,all.'
+            exit 64
+          }
+          # Only validated words go into the JSON matrix.
+          JSON="[\"${MODES//,/\",\"}\"]"
+          echo "ref=$SOURCE_REF" >> "$GITHUB_OUTPUT"
+          echo "modes=$JSON" >> "$GITHUB_OUTPUT"
+          echo "Source ref: $SOURCE_REF"
+          echo "Modes:      $MODES"
+          { echo "### RemoHop NAT lab bisect"; echo; echo "- Ref: \`$SOURCE_REF\`"; echo "- Modes: $MODES"; } >> "$GITHUB_STEP_SUMMARY"
+
+  natlab:
+    name: natlab ${{ matrix.mode }}
+    needs: request
+    runs-on: ubuntu-latest
+    # One mode: 15 minutes, the lab itself at most 600 s; all modes in one run: 30 and 1500 s.
+    timeout-minutes: ${{ matrix.mode == 'all' && 30 || 15 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: ${{ fromJSON(needs.request.outputs.modes) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ needs.request.outputs.ref }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: source/go.mod
+          cache: false
+
+      - name: Install lab dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq iproute2 iptables nftables fuse3 curl python3 >/dev/null
+          echo "source: $(git -C source rev-parse HEAD) · $(go version) · $(uname -r) · $(lsb_release -ds)"
+
+      - name: Build the binary (outside the timed lab run)
+        working-directory: source
+        run: CGO_ENABLED=0 go build -o /dev/null ./cmd/remohop
+
+      - name: Root namespace state (before)
+        run: |
+          cat > "$RUNNER_TEMP/rootstate.sh" <<'EOF'
+          # Host-global state the lab must not touch, in a form that compares.
+          echo '## ip -o link (names)'; ip -o link show | awk '{print $2}' | sed 's/@.*//' | sort
+          echo '## ip route'; ip route show table all | grep -v '^local\|^broadcast\|^multicast\|^ff00\|^fe80\|proto ra' | sort
+          echo '## ip rule'; ip rule
+          echo '## resolvectl dns'; resolvectl dns 2>&1 || true
+          echo '## resolvectl domain'; resolvectl domain 2>&1 || true
+          echo '## resolvectl default-route'; resolvectl default-route 2>&1 || true
+          echo '## /etc/hosts'; cat /etc/hosts
+          echo '## /etc/resolv.conf'; ls -l /etc/resolv.conf; grep -v '^#' /etc/resolv.conf
+          echo '## /etc/netns'; ls -la /etc/netns 2>&1 || true
+          EOF
+          bash "$RUNNER_TEMP/rootstate.sh" | tee "$RUNNER_TEMP/before.txt"
+          echo '## resolvectl status (full, for reference)'; resolvectl status --no-pager 2>&1 | head -60 || true
+          # What to restore if the lab changes systemd-resolved's per-link settings.
+          resolvectl dns > "$RUNNER_TEMP/dns.before" 2>/dev/null || true
+          resolvectl domain > "$RUNNER_TEMP/domain.before" 2>/dev/null || true
+          resolvectl default-route > "$RUNNER_TEMP/defroute.before" 2>/dev/null || true
+
+      - name: Run the NAT lab (${{ matrix.mode }})
+        working-directory: source
+        env:
+          MODE: ${{ matrix.mode }}
+          LAB_TIMEOUT: ${{ matrix.mode == 'all' && '1500' || '600' }}
+        run: |
+          set -uo pipefail
+          # Heartbeat: shows when name resolution on the runner breaks, even if this step's end is lost.
+          ( while sleep 10; do
+              if r=$(timeout 5 getent ahostsv4 github.com 2>/dev/null | head -n 1 | cut -d' ' -f1) && [[ -n "$r" ]]; then dns="github.com=$r"; else dns='github.com=UNRESOLVABLE'; fi
+              echo "heartbeat $(date -u +%T) $dns | resolved: $(resolvectl dns 2>/dev/null | tr '\n' ';')"
+            done ) &
+          HB=$!
+          code=0
+          sudo env "PATH=$PATH" "HOME=$HOME" timeout "$LAB_TIMEOUT" test/natlab/natlab.sh "$MODE" || code=$?
+          kill "$HB" 2>/dev/null || true
+          echo "natlab.sh $MODE exited with $code"
+          [[ "$code" != 124 ]] || echo "::error::natlab.sh $MODE did not finish within $LAB_TIMEOUT s"
+          exit "$code"
+
+      - name: Root namespace state (after) and difference
+        if: always()
+        env:
+          MODE: ${{ matrix.mode }}
+        run: |
+          bash "$RUNNER_TEMP/rootstate.sh" > "$RUNNER_TEMP/after.txt"
+          if diff -u "$RUNNER_TEMP/before.txt" "$RUNNER_TEMP/after.txt"; then
+            echo "root namespace unchanged by natlab.sh $MODE"
+            echo "- \`$MODE\`: root namespace unchanged" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::natlab.sh $MODE changed the root network namespace or shared files (diff above)"
+            echo "- \`$MODE\`: **root namespace changed**" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Restore systemd-resolved per-link settings (so the runner can report)
+        if: always()
+        run: |
+          # Lines look like "Link 2 (eth0): 168.63.129.16"; give each link back what it had.
+          restore() { # file resolvectl-verb
+            sed -n 's/^Link \([0-9]*\) ([^)]*):\(.*\)$/\1 \2/p' "$1" | while read -r idx vals; do
+              # shellcheck disable=SC2086
+              sudo resolvectl "$2" "$idx" ${vals:-''} || true
+            done
+          }
+          for f in dns domain; do [[ -s "$RUNNER_TEMP/$f.before" ]] && restore "$RUNNER_TEMP/$f.before" "$f"; done
+          [[ -s "$RUNNER_TEMP/defroute.before" ]] && restore "$RUNNER_TEMP/defroute.before" default-route
+          resolvectl dns 2>&1 || true
+          timeout 10 getent ahostsv4 github.com | head -n 1 || echo 'github.com still unresolvable'
