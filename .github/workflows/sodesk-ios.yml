@@ -121,7 +121,7 @@ jobs:
   ios:
     name: Build RemoHop iOS
     runs-on: macos-26
-    timeout-minutes: 75
+    timeout-minutes: 150
     defaults:
       run:
         shell: bash
@@ -526,8 +526,9 @@ jobs:
 
           # App Store sizes: key | device names in order of preference | pixel size
           SETS=(
+            # App Store Connect needs only the largest iPhone (6.9") and iPad (13") sets;
+            # it scales them down for the smaller sizes.
             'iphone69|iPhone 17 Pro Max,iPhone 16 Pro Max|1320x2868'
-            'iphone65|iPhone 11 Pro Max,iPhone XS Max|1242x2688'
             'ipad13|iPad Pro 13-inch (M5),iPad Pro 13-inch (M4)|2064x2752'
           )
           DD="$RUNNER_TEMP/DerivedData-remohop-shots"
