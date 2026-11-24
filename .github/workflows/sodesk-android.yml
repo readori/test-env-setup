@@ -732,6 +732,14 @@ jobs:
             && "$ADB" install -r -t "$TEST_APK" >> "$W/install.log" 2>&1 \
             || { tail -n 10 "$W/install.log"; echo '::error::installing the APKs failed.'; exit 1; }
           "$ADB" shell input keyevent KEYCODE_HOME > /dev/null 2>&1 || true
+          # The emulator's own notifications ("Serial console enabled", the physical keyboard) are not
+          # part of the demo: snooze what can be snoozed (keys hold '|', hence the inner quotes).
+          SN=0
+          while read -r k; do
+            [[ -n "$k" && "$k" != *"|$EXPECTED_APP_ID|"* ]] || continue
+            "$ADB" shell -n "cmd notification snooze --for 3600000 '$k'" > /dev/null 2>&1 && SN=$((SN + 1)) || true
+          done < <("$ADB" shell -n cmd notification list 2>/dev/null | tr -d '\r')
+          echo "snoozed $SN other notification(s); still posted: $("$ADB" shell -n cmd notification list 2>/dev/null | tr -d '\r' | grep -c . || true)"
           sleep 2
           "$ADB" logcat -c > /dev/null 2>&1 || true
 
@@ -746,7 +754,7 @@ jobs:
           timeout 170 "$ADB" shell am instrument -w \
             -e class com.remohop.app.FgsDemoTest -e remohop_fgs_demo 1 \
             -e remohop_host "10.0.2.2:$FGS_HOST_PORT" -e remohop_password "$PW" \
-            -e remohop_dir "$D" -e remohop_file README.txt \
+            -e remohop_dir "'~/Documents'" -e remohop_file README.txt \
             "$EXPECTED_APP_ID.test/androidx.test.runner.AndroidJUnitRunner" > "$W/instrument.log" 2>&1 || rc=$?
           unset PW
           sleep 1
@@ -778,23 +786,46 @@ jobs:
             DUR="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$VIDEO")"
             SIZE="$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "$VIDEO")"
             UP0="$(head -n 1 "$W/screenrecord.log" | awk '{print $1}')"
-            # Steps on the video's timeline: "stage <name> uptime=<ms>" minus the recording's start.
+            # The steps on the raw recording's timeline ("stage <name> uptime=<ms>" minus its start),
+            # then the published cut: from just after the first step (the home screen) to the end.
+            sed -nE 's/.*stage ([a-z-]+) uptime=([0-9]+).*/\1 \2/p' "$W/progress.log" > "$W/stages.txt"
+            python3 - "$W/stages.txt" "$UP0" "$DUR" > "$W/plan.txt" <<'PY'
+          import sys
+          rows = [l.split() for l in open(sys.argv[1]) if l.strip()]
+          up0, dur = float(sys.argv[2]), float(sys.argv[3])
+          t = [max(0.0, int(u) / 1000 - up0) for _, u in rows]
+          start = min(t[0] + 0.5, dur) if t else 0.0
+          print('start %.2f' % start)
+          for i, (name, _) in enumerate(rows):
+              # A representative frame: halfway to the next step (or 2 s on for the last).
+              mid = (t[i] + t[i + 1]) / 2 if i + 1 < len(t) else t[i] + 2
+              print('%s %.1f %.2f' % (name, max(0.0, t[i] - start), min(max(mid - start, 0.0), dur - start - 0.5)))
+          PY
+            START="$(sed -n 's/^start //p' "$W/plan.txt")"
+            RAW="$OUT/remohop-fgs-demo-raw.mp4"
+            mv "$VIDEO" "$RAW"
+            # Re-encoded at a constant 30 fps (H.264 high, yuv420p, faststart): what video sites expect.
+            if ! ffmpeg -nostdin -v error -y -ss "$START" -i "$RAW" -c:v libx264 -preset slow -crf 18 -r 30 -pix_fmt yuv420p -movflags +faststart -an "$VIDEO"; then
+              echo '::warning::the cut failed; publishing the raw recording.'; cp "$RAW" "$VIDEO"; START=0
+            fi
+            INFO="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height,avg_frame_rate,nb_frames -show_entries format=duration,size -of default=noprint_wrappers=1 "$VIDEO" | tr '\n' ' ')"
+            echo "published video (cut at ${START}s of the raw recording): $INFO"
+            DUR="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$VIDEO")"
+            SIZE="$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "$VIDEO")"
             : > "$OUT/chapters.txt"
             n=0
-            while read -r name up; do
+            while read -r name t ft; do
               n=$((n + 1))
-              t="$(python3 -c 'import sys; print("%.1f" % max(0.0, int(sys.argv[1]) / 1000 - float(sys.argv[2])))' "$up" "$UP0")"
               printf '%5ss  %s\n' "$t" "$name" >> "$OUT/chapters.txt"
-              # The frame a little after the step began (what it shows once on screen).
-              ft="$(python3 -c 'import sys; print("%.2f" % min(float(sys.argv[1]) + 1.2, float(sys.argv[2]) - 0.1))' "$t" "$DUR")"
               f="$OUT/frames/$(printf '%02d' "$n")-$name.png"
-              ffmpeg -nostdin -v error -y -ss "$ft" -i "$VIDEO" -frames:v 1 "$f" || continue
+              ffmpeg -nostdin -v error -y -ss "$ft" -i "$VIDEO" -frames:v 1 "$f" || true
+              [[ -s "$f" ]] || { echo "frame ${ft}s ($name): none"; continue; }
               if command -v tesseract > /dev/null; then
-                TXT="$(tesseract "$f" - --psm 11 2>/dev/null | tr -s ' \n\r\t' ' ' | cut -c1-360)"
+                TXT="$({ tesseract "$f" - --psm 11 2>/dev/null || true; } | tr -s ' \n\r\t' ' ' | cut -c1-360)"
                 echo "frame ${ft}s ($name): ${TXT}"
               fi
-            done < <(sed -nE 's/.*stage ([a-z-]+) uptime=([0-9]+).*/\1 \2/p' "$W/progress.log")
-            echo '--- steps on the video timeline ---'
+            done < <(grep -v '^start ' "$W/plan.txt")
+            echo '--- steps on the published video timeline ---'
             cat "$OUT/chapters.txt"
             ffmpeg -nostdin -v error -y -i "$VIDEO" -vf 'fps=1/2,scale=216:-1,tile=8x3' -frames:v 1 "$OUT/contact-sheet.png" || true
             ffmpeg -nostdin -v error -y -i "$VIDEO" -vf 'fps=8,scale=360:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=128[p];[b][p]paletteuse' "$OUT/remohop-fgs-demo-preview.gif" || true
