@@ -1,0 +1,288 @@
+# RemoHop Android release: a signed App Bundle (AAB) for Google Play, optionally uploaded to a
+# Play testing track.
+#
+# Public CI repository -> source repository: env SOURCE_REPOSITORY.
+#
+#   build  : JDK 17 + Android SDK + Go from go.mod -> mobile/android/build.sh bundleRelease, signed
+#            with the upload key (Play App Signing re-signs for users). Checks the bundle's
+#            signature, package name and both Go core ABIs. Nothing leaves the runner unless
+#            ARTIFACT=encrypted (see below).
+#   upload : build, then upload the bundle to the Play track TRACK through the Android Publisher
+#            API with the service account, as a draft release (status DRAFT by default: an app that
+#            has never been published only accepts drafts). Google requires the very first bundle
+#            of a new app to be uploaded by hand in Play Console; use ARTIFACT=encrypted for that.
+#
+# Request file ci-requests/sodesk-android-release.env (plain KEY=VALUE, parsed with strict patterns,
+# never executed); a push to main that changes it starts a run:
+#
+#   REF=main                 # source branch, tag or SHA
+#   MODE=build               # build | upload
+#   VERSION_NAME=0.1.0       # optional; default 0.1.0
+#   VERSION_CODE=1001        # optional; default 1000 + this workflow's run number (monotonic)
+#   TRACK=internal           # upload only: internal (default) | alpha | beta
+#   STATUS=draft             # upload only: draft (default) | completed
+#   ARTIFACT=none            # none (default) | encrypted: keep the AAB as a 1-day artifact,
+#                            # AES-256 encrypted (openssl enc -aes-256-cbc -pbkdf2 -iter 200000)
+#                            # with the upload keystore password, so the public artifact is useless
+#                            # without that password. Decrypt:
+#                            #   openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in remohop.aab.enc -out remohop.aab
+#
+# Secrets (repository secrets of this CI repo): TARGET_REPO_PAT (read the source),
+# ANDROID_UPLOAD_KEYSTORE_BASE64, ANDROID_UPLOAD_KEYSTORE_PASSWORD, ANDROID_UPLOAD_KEY_ALIAS,
+# ANDROID_UPLOAD_KEY_PASSWORD, PLAY_SERVICE_ACCOUNT_JSON (upload only).
+#
+# Safety rules (public repo, public logs): no pull_request triggers; third-party actions pinned to
+# commit SHAs; the keystore is written to a 0600 file under RUNNER_TEMP and deleted at the end;
+# passwords reach Gradle through environment variables, never the command line or the log; the
+# service account key is only read by openssl to sign the OAuth assertion; access tokens are masked.
+name: RemoHop Android release
+
+run-name: RemoHop Android release · ${{ github.event_name == 'push' && 'request (ci-requests/sodesk-android-release.env)' || inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Source repository branch, tag, or SHA'
+        required: true
+        default: 'main'
+        type: string
+      mode:
+        description: 'build = signed AAB only; upload = also upload to a Play track'
+        required: true
+        default: 'build'
+        type: choice
+        options: [build, upload]
+  push:
+    branches: [main]
+    paths: ['ci-requests/sodesk-android-release.env']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remohop-android-release
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: readori/SoDesk
+  PRIVATE_SOURCE_PATH: source
+  ANDROID_PLATFORM: 'platforms;android-35'
+  ANDROID_BUILD_TOOLS: 'build-tools;35.0.0'
+  ANDROID_NDK_VERSION: '28.2.13676358'
+  EXPECTED_APP_ID: com.readori.remohop
+
+jobs:
+  release:
+    name: Signed AAB
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Validate request and credentials
+        id: request
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_MODE: ${{ inputs.mode }}
+          RUN_NUMBER: ${{ github.run_number }}
+          REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/sodesk-android-release.env
+          HAVE_PAT: ${{ secrets.TARGET_REPO_PAT != '' }}
+          HAVE_KEYSTORE: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_BASE64 != '' && secrets.ANDROID_UPLOAD_KEYSTORE_PASSWORD != '' && secrets.ANDROID_UPLOAD_KEY_ALIAS != '' && secrets.ANDROID_UPLOAD_KEY_PASSWORD != '' }}
+          HAVE_PLAY: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON != '' }}
+        run: |
+          set -euo pipefail
+          get() { sed -n "s/^$1=//p" "$REQ" | head -n 1 | tr -d '\r'; }
+          if [[ "$EVENT_NAME" == 'push' ]]; then
+            REQ="$RUNNER_TEMP/request.env"
+            curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/sodesk-android-release.env at this commit.'; exit 64; }
+            SOURCE_REF="$(get REF)"; MODE="$(get MODE)"; VNAME="$(get VERSION_NAME)"; VCODE="$(get VERSION_CODE)"
+            TRACK="$(get TRACK)"; STATUS="$(get STATUS)"; ARTIFACT="$(get ARTIFACT)"
+          else
+            SOURCE_REF="$INPUT_REF"; MODE="$INPUT_MODE"; VNAME=''; VCODE=''; TRACK=''; STATUS=''; ARTIFACT=''
+          fi
+          MODE="${MODE:-build}"; VNAME="${VNAME:-0.1.0}"; VCODE="${VCODE:-$((1000 + RUN_NUMBER))}"
+          TRACK="${TRACK:-internal}"; STATUS="${STATUS:-draft}"; ARTIFACT="${ARTIFACT:-none}"
+          [[ "$MODE" == build || "$MODE" == upload ]] || { echo '::error::MODE must be build or upload.'; exit 64; }
+          [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && ${#SOURCE_REF} -le 200 ]] || { echo '::error::bad REF'; exit 64; }
+          [[ "$VNAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo '::error::VERSION_NAME must be X.Y.Z'; exit 64; }
+          [[ "$VCODE" =~ ^[1-9][0-9]{0,8}$ ]] || { echo '::error::VERSION_CODE must be a positive integer'; exit 64; }
+          [[ "$TRACK" =~ ^(internal|alpha|beta)$ ]] || { echo '::error::TRACK must be internal, alpha or beta'; exit 64; }
+          [[ "$STATUS" =~ ^(draft|completed)$ ]] || { echo '::error::STATUS must be draft or completed'; exit 64; }
+          [[ "$ARTIFACT" =~ ^(none|encrypted)$ ]] || { echo '::error::ARTIFACT must be none or encrypted'; exit 64; }
+          [[ "$HAVE_PAT" == true ]] || { echo '::error::Missing secret TARGET_REPO_PAT.'; exit 78; }
+          [[ "$HAVE_KEYSTORE" == true ]] || { echo '::error::Missing one of the ANDROID_UPLOAD_* secrets.'; exit 78; }
+          [[ "$MODE" != upload || "$HAVE_PLAY" == true ]] || { echo '::error::Missing secret PLAY_SERVICE_ACCOUNT_JSON.'; exit 78; }
+          { echo "SOURCE_REF=$SOURCE_REF"; echo "MODE=$MODE"; echo "VNAME=$VNAME"; echo "VCODE=$VCODE"
+            echo "TRACK=$TRACK"; echo "STATUS=$STATUS"; echo "ARTIFACT=$ARTIFACT"; } >> "$GITHUB_ENV"
+          echo "mode=$MODE · ref=$SOURCE_REF · version $VNAME ($VCODE) · track=$TRACK/$STATUS · artifact=$ARTIFACT"
+
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check layout
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        run: |
+          set -euo pipefail
+          for f in mobile/android/build.sh mobile/android/app/build.gradle.kts mobile/android/gradle/wrapper/gradle-wrapper.properties; do
+            [[ -f "$f" ]] || { echo "::error::$f is missing."; exit 66; }
+          done
+          grep -q "applicationId = \"$EXPECTED_APP_ID\"" mobile/android/app/build.gradle.kts || { echo "::error::applicationId must be $EXPECTED_APP_ID"; exit 65; }
+          grep -q '^distributionSha256Sum=' mobile/android/gradle/wrapper/gradle-wrapper.properties || { echo '::error::Gradle wrapper must pin distributionSha256Sum.'; exit 65; }
+          C="$(git rev-parse HEAD)"
+          { echo '### RemoHop Android release'; echo; echo "- Source: \`$SOURCE_REPOSITORY@${C:0:8}\` (ref \`$SOURCE_REF\`)"; echo "- Version: $VNAME ($VCODE)"; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: ${{ env.PRIVATE_SOURCE_PATH }}/go.mod
+          cache: false
+
+      - name: Install Android SDK packages
+        run: |
+          set -euo pipefail
+          : "${ANDROID_HOME:=${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [[ -x "$SDKM" ]] || { echo "::error::sdkmanager not found under $ANDROID_HOME"; exit 69; }
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" --install "$ANDROID_PLATFORM" "$ANDROID_BUILD_TOOLS" "ndk;$ANDROID_NDK_VERSION" > "$RUNNER_TEMP/sdkmanager.log" 2>&1 \
+            || { tail -20 "$RUNNER_TEMP/sdkmanager.log"; echo '::error::sdkmanager failed.'; exit 1; }
+          { echo "ANDROID_HOME=$ANDROID_HOME"; echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"; } >> "$GITHUB_ENV"
+
+      - name: Write the upload keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          KS="$RUNNER_TEMP/upload.jks"
+          printf '%s' "$KEYSTORE_B64" | tr -d ' \r\n' | base64 -d > "$KS"
+          [[ -s "$KS" ]] || { echo '::error::ANDROID_UPLOAD_KEYSTORE_BASE64 decoded to nothing.'; exit 65; }
+          echo "KS=$KS" >> "$GITHUB_ENV"
+
+      - name: gomobile bind + Gradle bundleRelease (signed with the upload key)
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}/mobile/android
+        env:
+          GRADLE_OPTS: -Dorg.gradle.console=plain
+          SIGN_STORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_PASSWORD }}
+          SIGN_KEY_ALIAS: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
+          SIGN_KEY_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Android Gradle Plugin's injected signing properties. The values come from the
+          # environment (masked secrets); the runner is ephemeral and the command line is not logged.
+          SIGN=("-Pandroid.injected.signing.store.file=$KS"
+                "-Pandroid.injected.signing.store.password=$SIGN_STORE_PASSWORD"
+                "-Pandroid.injected.signing.key.alias=$SIGN_KEY_ALIAS"
+                "-Pandroid.injected.signing.key.password=$SIGN_KEY_PASSWORD")
+          LOG="$RUNNER_TEMP/android-release.log"
+          if ! bash build.sh bundleRelease "${SIGN[@]}" "-Premohop.versionCode=$VCODE" "-Premohop.versionName=$VNAME" > "$LOG" 2>&1; then
+            grep -E '^e: |error:|FAILED|R8|What went wrong' "$LOG" | grep -viE 'password|keystore' | cut -c1-400 | head -n 60
+            grep -E -A12 'What went wrong' "$LOG" | grep -viE 'password' | cut -c1-400 | head -n 40
+            echo '::error::Release build failed.'
+            exit 1
+          fi
+          AAB="$PWD/app/build/outputs/bundle/release/app-release.aab"
+          [[ -f "$AAB" ]] || { echo '::error::app-release.aab was not produced.'; exit 65; }
+          echo "AAB=$AAB" >> "$GITHUB_ENV"
+
+      - name: Check the bundle
+        run: |
+          set -euo pipefail
+          unzip -l "$AAB" | grep -q 'base/lib/arm64-v8a/libgojni.so' || { echo '::error::AAB has no arm64 Go core.'; exit 65; }
+          unzip -l "$AAB" | grep -q 'base/lib/x86_64/libgojni.so' || { echo '::error::AAB has no x86_64 Go core.'; exit 65; }
+          unzip -l "$AAB" | grep -q 'base/assets/remohop-mobile.js' || { echo '::error::AAB has no injected script.'; exit 65; }
+          # Signed with a real key (not the debug key) and the signature verifies.
+          OUT="$(jarsigner -verify -verbose:summary -certs "$AAB" 2>&1 || true)"
+          grep -q 'jar verified' <<<"$OUT" || { echo "$OUT" | tail -5; echo '::error::AAB signature does not verify.'; exit 65; }
+          if grep -q 'CN=Android Debug' <<<"$OUT"; then echo '::error::AAB is signed with the debug key.'; exit 65; fi
+          SIGNER="$(grep -m1 -oE 'X\.509, [^]]+' <<<"$OUT" | cut -c1-120 || true)"
+          SIZE="$(du -h "$AAB" | cut -f1)"
+          SHA="$(sha256sum "$AAB" | cut -c1-16)"
+          echo "AAB $SIZE · sha256 $SHA… · signer: $SIGNER"
+          echo "- Signed AAB: $SIZE · sha256 \`$SHA…\` · signer: $SIGNER" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload to Google Play
+        if: env.MODE == 'upload'
+        env:
+          PLAY_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          umask 077
+          SA="$RUNNER_TEMP/sa.json"; printf '%s' "$PLAY_JSON" > "$SA"
+          KEY="$RUNNER_TEMP/sa.pem"
+          EMAIL="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));open(sys.argv[2],"w").write(d["private_key"]);print(d["client_email"])' "$SA" "$KEY")"
+          b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          NOW="$(date +%s)"
+          HDR="$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)"
+          CLAIMS="$(printf '{"iss":"%s","scope":"https://www.googleapis.com/auth/androidpublisher","aud":"https://oauth2.googleapis.com/token","iat":%s,"exp":%s}' "$EMAIL" "$NOW" "$((NOW + 1800))" | b64url)"
+          SIG="$(printf '%s.%s' "$HDR" "$CLAIMS" | openssl dgst -sha256 -sign "$KEY" -binary | b64url)"
+          rm -f "$KEY" "$SA"
+          TOKEN="$(curl -fsS --max-time 30 https://oauth2.googleapis.com/token \
+            --data-urlencode 'grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer' \
+            --data-urlencode "assertion=$HDR.$CLAIMS.$SIG" | python3 -c 'import json,sys;print(json.load(sys.stdin)["access_token"])')" \
+            || { echo '::error::Could not get a Google access token (service account key or clock).'; exit 1; }
+          echo "::add-mask::$TOKEN"
+          API="https://androidpublisher.googleapis.com/androidpublisher/v3/applications/$EXPECTED_APP_ID"
+          call() { # method url [curl args...]; prints the body, fails with Google's message
+            local m="$1" u="$2"; shift 2
+            local out code
+            out="$(curl -sS --max-time 600 -X "$m" -H "Authorization: Bearer $TOKEN" -w '\n%{http_code}' "$u" "$@")"
+            code="${out##*$'\n'}"; out="${out%$'\n'*}"
+            if [[ "$code" != 2* ]]; then
+              python3 -c 'import json,sys
+          try: e=json.loads(sys.argv[1])["error"]; print("Play API %s: %s" % (e.get("code"), e.get("message","")[:400]))
+          except Exception: print("Play API HTTP", sys.argv[2])' "$out" "$code"
+              return 1
+            fi
+            printf '%s' "$out"
+          }
+          EDIT="$(call POST "$API/edits" -H 'Content-Type: application/json' -d '{}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')" \
+            || { echo '::error::Could not open a Play edit. A new app needs its first bundle uploaded by hand in Play Console (use ARTIFACT=encrypted), and the service account needs access to the app.'; exit 1; }
+          UP="$(call POST "https://androidpublisher.googleapis.com/upload/androidpublisher/v3/applications/$EXPECTED_APP_ID/edits/$EDIT/bundles?uploadType=media" \
+            -H 'Content-Type: application/octet-stream' --data-binary "@$AAB" | python3 -c 'import json,sys;print(json.load(sys.stdin)["versionCode"])')" \
+            || { echo '::error::Bundle upload failed.'; exit 1; }
+          BODY="$(printf '{"track":"%s","releases":[{"name":"%s (%s)","versionCodes":["%s"],"status":"%s"}]}' "$TRACK" "$VNAME" "$UP" "$UP" "$STATUS")"
+          call PUT "$API/edits/$EDIT/tracks/$TRACK" -H 'Content-Type: application/json' -d "$BODY" > /dev/null || { echo '::error::Track update failed.'; exit 1; }
+          call POST "$API/edits/$EDIT:commit" > /dev/null || { echo '::error::Commit of the Play edit failed.'; exit 1; }
+          echo "Uploaded version code $UP to track $TRACK ($STATUS)."
+          echo "- Play: version code $UP uploaded to **$TRACK** as $STATUS" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Encrypt the bundle for a hand upload
+        if: env.ARTIFACT == 'encrypted'
+        env:
+          PASS: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          PASS="$PASS" openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:PASS -in "$AAB" -out "$RUNNER_TEMP/out/remohop-$VNAME-$VCODE.aab.enc"
+          echo "- Encrypted AAB kept as a 1-day artifact (decrypt with the upload keystore password)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the encrypted bundle (1 day)
+        if: env.ARTIFACT == 'encrypted'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: remohop-android-aab-encrypted
+          path: ${{ runner.temp }}/out/
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Remove the keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/upload.jks" "$RUNNER_TEMP/sa.json" "$RUNNER_TEMP/sa.pem"
