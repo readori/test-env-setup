@@ -1,13 +1,13 @@
-# SoDesk iOS app CI (controller app: SwiftUI shell + WKWebView on an in-process Go gateway).
+# RemoHop iOS app CI (controller app: SwiftUI shell + WKWebView on an in-process Go gateway).
 #
-# Public CI repository -> source readori/SoDesk. Copy this file to .github/workflows/ in the CI repo.
+# Public CI repository -> source repository: env SOURCE_REPOSITORY. Copy this file to .github/workflows/ in the CI repo.
 #
 #   verify : Xcode 26.x + Go from go.mod -> mobile/ios/build-xcframework.sh (gomobile bind
-#            -target=ios,iossimulator of mobile/sodeskcore -> mobile/ios/build/Sodeskcore.xcframework)
-#            -> simulator build of mobile/ios/SoDesk.xcodeproj with no signing -> xcodebuild test of
-#            SoDeskTests on an iOS simulator. Also runs the Go tests of internal/mobile on macOS.
-#            Then the end-to-end test: an `rds host` is started on the runner (loopback only, a
-#            random one-run password) and SoDeskTests/GatewayE2ETests runs inside the app on the
+#            -target=ios,iossimulator of mobile/remohopcore -> mobile/ios/build/Remohopcore.xcframework)
+#            -> simulator build of mobile/ios/RemoHop.xcodeproj with no signing -> xcodebuild test of
+#            RemoHopTests on an iOS simulator. Also runs the Go tests of internal/mobile on macOS.
+#            Then the end-to-end test: a `remohop host` is started on the runner (loopback only, a
+#            random one-run password) and RemoHopTests/GatewayE2ETests runs inside the app on the
 #            simulator: connect form -> connect to the host by address and password -> a command
 #            in the terminal -> the Files tab lists a host directory.
 #
@@ -19,7 +19,7 @@
 #                EXISTING shared Apple Distribution identity (never creates certificates, never
 #                touches other apps' profiles). Needs confirm=WRITE. No source checkout.
 #   testflight : Xcode 26.x + Go -> gomobile xcframework (as verify) -> Match (readonly) -> signed
-#                archive of the SoDesk scheme (generic iOS device, manual signing, Apple
+#                archive of the RemoHop scheme (generic iOS device, manual signing, Apple
 #                Distribution + the Match profile) -> IPA -> altool validate -> altool upload.
 #                CFBundleVersion = build_number input, or (empty) latest TestFlight build + 1.
 #                The marketing version (CFBundleShortVersionString) stays whatever the Xcode
@@ -33,7 +33,7 @@
 #                TODO-REPLACE placeholder (including the website domain). Never submits for review, never
 #                releases, no binary upload. Export compliance and the App Privacy label are NOT set here.
 #   screenshots: Go + gomobile, then the real app on 6.9" / 6.5" iPhone and 13" iPad simulators connected to
-#                an rds host on the runner (GatewayE2ETests/testScreenshots) -> JPEGs -> deliver (screenshots
+#                a remohop host on the runner (GatewayE2ETests/testScreenshots) -> JPEGs -> deliver (screenshots
 #                only, same no-submit flags), locales en-US and zh-Hans.
 #
 # Triggers: workflow_dispatch (modes verify, profile, testflight, metadata, screenshots), or a push to main that
@@ -41,7 +41,7 @@
 # default). Never pull_request. The request file is plain KEY=VALUE text, parsed with strict
 # patterns and never executed:
 #
-#   REF=main          # readori/SoDesk branch, tag or SHA
+#   REF=main          # source repository branch, tag or SHA
 #   MODE=testflight   # optional: verify (default), profile, testflight, metadata or screenshots; all but verify
 #                     # also need [sodesk-ios-release] in the commit message (never cancelled)
 #   CONFIRM=WRITE     # profile only
@@ -57,9 +57,9 @@
 # material is created only after the private-source build scripts (gomobile bind) ran, and is
 # removed at the end. The end-to-end step prints results and failure tails only: never the host
 # password (masked) or a gateway URL (its token is redacted from anything printed).
-name: SoDesk iOS
+name: RemoHop iOS
 
-run-name: SoDesk iOS · ${{ github.event_name == 'push' && 'request (ci-requests/sodesk-ios.env)' || format('{0} · {1}{2}', inputs.mode, inputs.ref, inputs.build_number && format(' · build {0}', inputs.build_number) || '') }}
+run-name: RemoHop iOS · ${{ github.event_name == 'push' && 'request (ci-requests/sodesk-ios.env)' || format('{0} · {1}{2}', inputs.mode, inputs.ref, inputs.build_number && format(' · build {0}', inputs.build_number) || '') }}
 
 on:
   workflow_dispatch:
@@ -71,7 +71,7 @@ on:
         type: choice
         options: [verify, profile, testflight, metadata, screenshots]
       ref:
-        description: 'readori/SoDesk branch, tag, or SHA (not used by profile)'
+        description: 'Source repository branch, tag, or SHA (not used by profile)'
         required: true
         default: 'main'
         type: string
@@ -97,15 +97,18 @@ permissions:
 # A push whose commit message carries [sodesk-ios-release] is a release request (MODE=profile or
 # testflight in the request file) and, like a dispatched release, is never cancelled.
 concurrency:
-  group: ${{ ((github.event_name == 'push' && contains(github.event.head_commit.message, '[sodesk-ios-release]')) || (github.event_name == 'workflow_dispatch' && inputs.mode != 'verify')) && 'sodesk-ios-release' || format('sodesk-ios-{0}', inputs.ref || 'request') }}
+  group: ${{ ((github.event_name == 'push' && contains(github.event.head_commit.message, '[sodesk-ios-release]')) || (github.event_name == 'workflow_dispatch' && inputs.mode != 'verify')) && 'remohop-ios-release' || format('remohop-ios-{0}', inputs.ref || 'request') }}
   cancel-in-progress: ${{ !((github.event_name == 'push' && contains(github.event.head_commit.message, '[sodesk-ios-release]')) || (github.event_name == 'workflow_dispatch' && inputs.mode != 'verify')) }}
 
 env:
-  PRIVATE_SOURCE_REPOSITORY: readori/SoDesk
+  # Private source repository. Change to readori/RemoHop once the GitHub repository is renamed.
+  SOURCE_REPOSITORY: readori/SoDesk
   PRIVATE_SOURCE_PATH: source
+  # The bundle ID keeps the pre-rename name: the App Store record was created with it and it
+  # cannot change. The app itself is RemoHop (display name, project, scheme, targets).
   EXPECTED_BUNDLE_ID: com.readori.sodesk
   EXPECTED_APPLE_ID: '6838451962'
-  BUNDLE_ID_NAME: SoDesk
+  BUNDLE_ID_NAME: RemoHop
   XCODE_MAJOR_WANTED: '26'
   MATCH_GIT_URL: https://github.com/readori/readori-certificates.git
   MATCH_GIT_BRANCH: main
@@ -115,7 +118,7 @@ env:
 
 jobs:
   ios:
-    name: Build SoDesk iOS
+    name: Build RemoHop iOS
     runs-on: macos-26
     timeout-minutes: 75
     defaults:
@@ -142,7 +145,7 @@ jobs:
           set -euo pipefail
           if [[ "$EVENT_NAME" == 'push' ]]; then
             # Download only the request file of this exact commit (public repo, no credentials).
-            REQ="$RUNNER_TEMP/sodesk-ios-request.env"
+            REQ="$RUNNER_TEMP/remohop-ios-request.env"
             curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/sodesk-ios.env at this commit.'; exit 64; }
             # Plain text, read line by line; never sourced or executed.
             SOURCE_REF="$(sed -n 's/^REF=//p' "$REQ" | head -n 1 | tr -d '\r')"
@@ -162,7 +165,7 @@ jobs:
             echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only, no leading dash).'
             exit 64
           }
-          [[ -n "${TARGET_REPO_PAT:-}" ]] || { echo '::error::Missing secret TARGET_REPO_PAT (read access to readori/SoDesk).'; exit 78; }
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || { echo '::error::Missing secret TARGET_REPO_PAT (read access to the source repository, env SOURCE_REPOSITORY).'; exit 78; }
           if [[ -n "$BUILD_NUMBER_INPUT" ]]; then
             [[ "$MODE" == 'testflight' ]] || { echo '::error::build_number is only used by testflight mode.'; exit 64; }
             [[ "$BUILD_NUMBER_INPUT" =~ ^[1-9][0-9]{0,8}$ ]] || { echo '::error::build_number must be a whole number.'; exit 64; }
@@ -188,7 +191,7 @@ jobs:
         if: env.MODE != 'profile'
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: readori/SoDesk
+          repository: ${{ env.SOURCE_REPOSITORY }}
           ref: ${{ env.SOURCE_REF }}
           token: ${{ secrets.TARGET_REPO_PAT }}
           path: ${{ env.PRIVATE_SOURCE_PATH }}
@@ -204,19 +207,19 @@ jobs:
           set -euo pipefail
           C="$(git rev-parse HEAD)"
           echo "SOURCE_SHORT_SHA=${C:0:8}" >> "$GITHUB_ENV"
-          { echo "### SoDesk iOS · $MODE"; echo; echo "- Source: \`$PRIVATE_SOURCE_REPOSITORY@${C:0:8}\` (ref \`$SOURCE_REF\`)"; } >> "$GITHUB_STEP_SUMMARY"
-          if [[ ! -f mobile/ios/SoDesk.xcodeproj/project.pbxproj ]]; then
+          { echo "### RemoHop iOS · $MODE"; echo; echo "- Source: \`$SOURCE_REPOSITORY@${C:0:8}\` (ref \`$SOURCE_REF\`)"; } >> "$GITHUB_STEP_SUMMARY"
+          if [[ ! -f mobile/ios/RemoHop.xcodeproj/project.pbxproj ]]; then
             [[ "$MODE" == 'verify' ]] || { echo '::error::mobile/ios is not on this ref; nothing to build.'; exit 66; }
             echo '::notice::mobile/ios is not on this ref: nothing to verify.'
             echo '- Result: skipped, no iOS app at this ref' >> "$GITHUB_STEP_SUMMARY"
             echo 'ready=false' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          for f in go.mod mobile/go.mod mobile/sodeskcore/sodeskcore.go mobile/shared/sodesk-mobile.js mobile/ios/build-xcframework.sh \
-                   mobile/ios/SoDesk.xcodeproj/xcshareddata/xcschemes/SoDesk.xcscheme; do
+          for f in go.mod mobile/go.mod mobile/remohopcore/remohopcore.go mobile/shared/remohop-mobile.js mobile/ios/build-xcframework.sh \
+                   mobile/ios/RemoHop.xcodeproj/xcshareddata/xcschemes/RemoHop.xcscheme; do
             [[ -f "$f" ]] || { echo "::error::$f is missing."; exit 66; }
           done
-          grep -q "PRODUCT_BUNDLE_IDENTIFIER = $EXPECTED_BUNDLE_ID;" mobile/ios/SoDesk.xcodeproj/project.pbxproj || { echo "::error::bundle ID must be $EXPECTED_BUNDLE_ID"; exit 65; }
+          grep -q "PRODUCT_BUNDLE_IDENTIFIER = $EXPECTED_BUNDLE_ID;" mobile/ios/RemoHop.xcodeproj/project.pbxproj || { echo "::error::bundle ID must be $EXPECTED_BUNDLE_ID"; exit 65; }
           echo 'ready=true' >> "$GITHUB_OUTPUT"
           echo "Source ${C:0:8} · layout: PASS"
 
@@ -330,14 +333,14 @@ jobs:
           go test -count=1 ./internal/mobile 2>&1 | cut -c1-2000 | tail -n 100
           (cd mobile && go test -count=1 ./... 2>&1 | cut -c1-2000 | tail -n 50)
 
-      - name: gomobile bind (Sodeskcore.xcframework)
+      - name: gomobile bind (Remohopcore.xcframework)
         if: steps.layout.outputs.ready == 'true' && env.MODE != 'metadata'
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
         run: |
           set -euo pipefail
           LOG="$RUNNER_TEMP/gomobile.log"
           bash mobile/ios/build-xcframework.sh > "$LOG" 2>&1 || { grep -iE 'error|undefined|cannot' "$LOG" | cut -c1-400 | head -n 40; echo '::error::gomobile bind failed.'; exit 1; }
-          XCF=mobile/ios/build/Sodeskcore.xcframework
+          XCF=mobile/ios/build/Remohopcore.xcframework
           [[ -f "$XCF/Info.plist" ]] || { echo '::error::XCFramework was not produced.'; exit 65; }
           echo "XCFramework: $(du -sh "$XCF" | cut -f1) · slices: $(ls "$XCF" | grep -v Info.plist | tr '\n' ' ')"
 
@@ -346,20 +349,20 @@ jobs:
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
         run: |
           set -euo pipefail
-          DD="$RUNNER_TEMP/DerivedData-sodesk"
+          DD="$RUNNER_TEMP/DerivedData-remohop"
           xcodebuild build -quiet \
-            -project mobile/ios/SoDesk.xcodeproj -scheme SoDesk -configuration Debug \
+            -project mobile/ios/RemoHop.xcodeproj -scheme RemoHop -configuration Debug \
             -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath "$DD" CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
             CODE_SIGNING_ALLOWED=NO
-          APP="$(find "$DD/Build/Products" -maxdepth 2 -type d -name 'SoDesk.app' -print -quit)"
+          APP="$(find "$DD/Build/Products" -maxdepth 2 -type d -name 'RemoHop.app' -print -quit)"
           [[ -n "$APP" ]] || { echo '::error::Simulator .app was not produced.'; exit 65; }
           BID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
           [[ "$BID" == "$EXPECTED_BUNDLE_ID" ]] || { echo "::error::Bundle ID mismatch: $BID"; exit 65; }
-          test -f "$APP/sodesk-mobile.js" || { echo '::error::App bundle has no sodesk-mobile.js (injected script not embedded).'; exit 65; }
+          test -f "$APP/remohop-mobile.js" || { echo '::error::App bundle has no remohop-mobile.js (injected script not embedded).'; exit 65; }
           /usr/libexec/PlistBuddy -c 'Print :NSAppTransportSecurity:NSAllowsLocalNetworking' "$APP/Info.plist" | grep -q true || { echo '::error::ATS local networking exception missing.'; exit 65; }
           SIZE="$(du -sh "$APP" | cut -f1)"
-          echo "Simulator build OK: SoDesk.app · $SIZE"
+          echo "Simulator build OK: RemoHop.app · $SIZE"
           echo "- Simulator build ($BID): $SIZE" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Unit tests on an iOS simulator
@@ -385,50 +388,50 @@ jobs:
           [[ -n "$UDID" ]] || { echo '::error::No iPhone simulator available.'; xcrun simctl list runtimes | head -20; exit 69; }
           echo "Simulator: $UDID"
           echo "SIM_UDID=$UDID" >> "$GITHUB_ENV"
-          RES="$RUNNER_TEMP/SoDeskTests.xcresult"
+          RES="$RUNNER_TEMP/RemoHopTests.xcresult"
           set +e
           xcodebuild test -quiet \
-            -project mobile/ios/SoDesk.xcodeproj -scheme SoDesk -configuration Debug \
+            -project mobile/ios/RemoHop.xcodeproj -scheme RemoHop -configuration Debug \
             -destination "platform=iOS Simulator,id=$UDID" \
-            -derivedDataPath "$RUNNER_TEMP/DerivedData-sodesk-test" -resultBundlePath "$RES" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData-remohop-test" -resultBundlePath "$RES" \
             CODE_SIGNING_ALLOWED=NO > "$RUNNER_TEMP/xctest.log" 2>&1
           st=$?
           set -e
           grep -E "Executed [0-9]+ tests?|error:|failed|XCTAssert" "$RUNNER_TEMP/xctest.log" | cut -c1-400 | tail -n 40 || true
           [[ "$st" -eq 0 ]] || { echo '::error::xcodebuild test failed.'; exit 1; }
-          echo '- Unit tests (SoDeskTests) on the iOS simulator: PASS' >> "$GITHUB_STEP_SUMMARY"
+          echo '- Unit tests (RemoHopTests) on the iOS simulator: PASS' >> "$GITHUB_STEP_SUMMARY"
 
       # The app on the simulator against a real host: the simulator shares the Mac's network, so
       # 127.0.0.1 is the runner. The host listens on loopback only, with a password made for this
       # run; the test gets address, password and directory through TEST_RUNNER_* variables (and a
       # private file as a fallback), never through the log.
-      - name: End-to-end on the simulator (app to rds host on this Mac)
+      - name: End-to-end on the simulator (app to remohop host on this Mac)
         if: steps.layout.outputs.ready == 'true' && env.MODE == 'verify'
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
         run: |
           set +e -uo pipefail
-          if [[ ! -f mobile/ios/SoDeskTests/GatewayE2ETests.swift ]]; then
+          if [[ ! -f mobile/ios/RemoHopTests/GatewayE2ETests.swift ]]; then
             echo '::notice::no GatewayE2ETests on this ref; skipped.'
             echo '- End-to-end (app to host): skipped, not on this ref' >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           redact() { sed -E 's#(127\.0\.0\.1:[0-9]+/)[A-Za-z0-9_-]{16,}#\1<token>#g' | cut -c1-400; }
-          W="$RUNNER_TEMP/sodesk-ios-e2e"
+          W="$RUNNER_TEMP/remohop-ios-e2e"
           rm -rf "$W"; mkdir -p "$W/host" "$W/cli" "$W/files"
-          CGO_ENABLED=0 go build -trimpath -o "$W/rds" ./cmd/rds || { echo '::error::building rds for the host failed.'; exit 1; }
+          CGO_ENABLED=0 go build -trimpath -o "$W/remohop" ./cmd/remohop || { echo '::error::building remohop for the host failed.'; exit 1; }
           printf 'hello from the host\n' > "$W/files/hello.txt"
           PORT=$((20000 + RANDOM % 10000)); TARGET="127.0.0.1:$PORT"
           PW="$(openssl rand -hex 16)"
           echo "::add-mask::$PW"
-          RDS_CONFIG_DIR="$W/host" "$W/rds" host --no-signal --listen "$TARGET" --password "$PW" > "$W/host.log" 2>&1 < /dev/null &
+          REMOHOP_CONFIG_DIR="$W/host" "$W/remohop" host --no-signal --listen "$TARGET" --password "$PW" > "$W/host.log" 2>&1 < /dev/null &
           HOST_PID=$!
-          CFG=/tmp/sodesk-ios-e2e.json
+          CFG=/tmp/remohop-ios-e2e.json
           cleanup() { kill "$HOST_PID" 2>/dev/null || true; rm -f "$CFG"; }
           trap cleanup EXIT
           for _ in $(seq 1 100); do grep -q 'host ready' "$W/host.log" 2>/dev/null && break; sleep 0.2; done
-          grep -q 'host ready' "$W/host.log" || { echo '::error::rds host did not start.'; tail -n 5 "$W/host.log" | redact; exit 1; }
-          if RDS_CONFIG_DIR="$W/cli" RDS_PASSWORD="$PW" "$W/rds" "$TARGET" ping -c 1 > "$W/ping.log" 2>&1; then
-            echo "host: rds host on $TARGET answers a client on this Mac"
+          grep -q 'host ready' "$W/host.log" || { echo '::error::remohop host did not start.'; tail -n 5 "$W/host.log" | redact; exit 1; }
+          if REMOHOP_CONFIG_DIR="$W/cli" REMOHOP_PASSWORD="$PW" "$W/remohop" "$TARGET" ping -c 1 > "$W/ping.log" 2>&1; then
+            echo "host: remohop host on $TARGET answers a client on this Mac"
           else
             echo '::error::the host does not answer a client on this Mac.'; tail -n 5 "$W/ping.log" | redact; exit 1
           fi
@@ -436,14 +439,14 @@ jobs:
           import json, os
           print(json.dumps({"target": os.environ["E2E_TARGET"], "password": os.environ["E2E_PASSWORD"], "dir": os.environ["E2E_DIR"]}))
           ' > "$CFG" )
-          RES="$RUNNER_TEMP/SoDeskE2E.xcresult"; rm -rf "$RES"
+          RES="$RUNNER_TEMP/RemoHopE2E.xcresult"; rm -rf "$RES"
           LOG="$RUNNER_TEMP/xce2e.log"
-          TEST_RUNNER_SODESK_E2E_TARGET="$TARGET" TEST_RUNNER_SODESK_E2E_PASSWORD="$PW" TEST_RUNNER_SODESK_E2E_DIR="$W/files" \
+          TEST_RUNNER_REMOHOP_E2E_TARGET="$TARGET" TEST_RUNNER_REMOHOP_E2E_PASSWORD="$PW" TEST_RUNNER_REMOHOP_E2E_DIR="$W/files" \
           xcodebuild test -quiet \
-            -project mobile/ios/SoDesk.xcodeproj -scheme SoDesk -configuration Debug \
+            -project mobile/ios/RemoHop.xcodeproj -scheme RemoHop -configuration Debug \
             -destination "platform=iOS Simulator,id=$SIM_UDID" \
-            -only-testing:SoDeskTests/GatewayE2ETests/testConnectTerminalFiles \
-            -derivedDataPath "$RUNNER_TEMP/DerivedData-sodesk-test" -resultBundlePath "$RES" \
+            -only-testing:RemoHopTests/GatewayE2ETests/testConnectTerminalFiles \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData-remohop-test" -resultBundlePath "$RES" \
             CODE_SIGNING_ALLOWED=NO > "$LOG" 2>&1
           st=$?
           # What happened to the one test: Passed, Failed or Skipped (a skip is not a pass).
@@ -480,31 +483,31 @@ jobs:
             echo '--- host log (warnings and errors) ---'
             grep -Ei 'warn|error|refus|denied|fail' "$W/host.log" | redact | tail -n 15 || true
             echo '::error::the end-to-end test on the simulator did not pass.'
-            echo "- End-to-end (app on the simulator to rds host on the Mac): **${OUTCOME:-unknown}**" >> "$GITHUB_STEP_SUMMARY"
+            echo "- End-to-end (app on the simulator to remohop host on the Mac): **${OUTCOME:-unknown}**" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
           grep -E "Executed [0-9]+ tests?" "$LOG" | tail -n 1 | cut -c1-200 || true
-          echo '- End-to-end (app on the simulator to rds host on the Mac: connect, terminal command, Files listing): PASS' >> "$GITHUB_STEP_SUMMARY"
+          echo '- End-to-end (app on the simulator to remohop host on the Mac: connect, terminal command, Files listing): PASS' >> "$GITHUB_STEP_SUMMARY"
 
-      # screenshots mode: the real app on simulators of the App Store sizes, connected to an rds host on
+      # screenshots mode: the real app on simulators of the App Store sizes, connected to a remohop host on
       # this Mac (loopback, one-run password) like the end-to-end test. GatewayE2ETests/testScreenshots
       # walks the app to three screens and the script below captures each with `simctl io screenshot`.
       # Runs before any signing material exists (it executes private-source code).
-      - name: Generate App Store screenshots (simulators, app to rds host on this Mac)
+      - name: Generate App Store screenshots (simulators, app to remohop host on this Mac)
         if: steps.layout.outputs.ready == 'true' && env.MODE == 'screenshots'
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
         run: |
           set +e -uo pipefail
           redact() { sed -E 's#(127\.0\.0\.1:[0-9]+/)[A-Za-z0-9_-]{16,}#\1<token>#g' | cut -c1-400; }
-          W="$RUNNER_TEMP/sodesk-shots"; OUT="$RUNNER_TEMP/sodesk-shots-out"
+          W="$RUNNER_TEMP/remohop-shots"; OUT="$RUNNER_TEMP/remohop-shots-out"
           rm -rf "$W" "$OUT"; mkdir -p "$W/host" "$W/cli" "$W/files" "$OUT"
-          CGO_ENABLED=0 go build -trimpath -o "$W/rds" ./cmd/rds || { echo '::error::building rds for the host failed.'; exit 1; }
+          CGO_ENABLED=0 go build -trimpath -o "$W/remohop" ./cmd/remohop || { echo '::error::building remohop for the host failed.'; exit 1; }
           printf 'hello from the host\n' > "$W/files/hello.txt"
           printf 'notes\n' > "$W/files/notes.md"; printf 'a,b,c\n1,2,3\n' > "$W/files/report.csv"; mkdir -p "$W/files/projects" "$W/files/photos"
           PORT=$((20000 + RANDOM % 10000)); TARGET="127.0.0.1:$PORT"
           PW="$(openssl rand -hex 16)"
           echo "::add-mask::$PW"
-          RDS_CONFIG_DIR="$W/host" "$W/rds" host --no-signal --listen "$TARGET" --password "$PW" > "$W/host.log" 2>&1 < /dev/null &
+          REMOHOP_CONFIG_DIR="$W/host" "$W/remohop" host --no-signal --listen "$TARGET" --password "$PW" > "$W/host.log" 2>&1 < /dev/null &
           HOST_PID=$!
           SIMS=()
           cleanup() {
@@ -513,7 +516,7 @@ jobs:
           }
           trap cleanup EXIT
           for _ in $(seq 1 100); do grep -q 'host ready' "$W/host.log" 2>/dev/null && break; sleep 0.2; done
-          grep -q 'host ready' "$W/host.log" || { echo '::error::rds host did not start.'; tail -n 5 "$W/host.log" | redact; exit 1; }
+          grep -q 'host ready' "$W/host.log" || { echo '::error::remohop host did not start.'; tail -n 5 "$W/host.log" | redact; exit 1; }
 
           # App Store sizes: key | device names in order of preference | pixel size
           SETS=(
@@ -521,7 +524,7 @@ jobs:
             'iphone65|iPhone 11 Pro Max,iPhone XS Max|1242x2688'
             'ipad13|iPad Pro 13-inch (M5),iPad Pro 13-inch (M4)|2064x2752'
           )
-          DD="$RUNNER_TEMP/DerivedData-sodesk-shots"
+          DD="$RUNNER_TEMP/DerivedData-remohop-shots"
           made=0
           for set in "${SETS[@]}"; do
             IFS='|' read -r KEY NAMES SIZE <<< "$set"
@@ -544,7 +547,7 @@ jobs:
             )"
             if [[ -z "$PICK" ]]; then echo "::warning::$KEY: none of [$NAMES] is available on this runner; skipped."; continue; fi
             read -r TYPE_ID RUNTIME_ID DEVNAME <<< "$PICK"
-            UDID="$(xcrun simctl create "sodesk-shot-$KEY" "$TYPE_ID" "$RUNTIME_ID" 2>/dev/null)"
+            UDID="$(xcrun simctl create "remohop-shot-$KEY" "$TYPE_ID" "$RUNTIME_ID" 2>/dev/null)"
             [[ -n "$UDID" ]] || { echo "::warning::$KEY: could not create a simulator; skipped."; continue; }
             SIMS+=("$UDID")
             xcrun simctl boot "$UDID" >/dev/null 2>&1
@@ -553,12 +556,12 @@ jobs:
             echo "$KEY: ${DEVNAME//_/ } ($SIZE)"
             S="$W/s-$KEY"; rm -rf "$S"; mkdir -p "$S"
             LOG="$RUNNER_TEMP/xcshots-$KEY.log"
-            TEST_RUNNER_SODESK_E2E_TARGET="$TARGET" TEST_RUNNER_SODESK_E2E_PASSWORD="$PW" TEST_RUNNER_SODESK_E2E_DIR="$W/files" \
-            TEST_RUNNER_SODESK_SHOTS_DIR="$S" \
+            TEST_RUNNER_REMOHOP_E2E_TARGET="$TARGET" TEST_RUNNER_REMOHOP_E2E_PASSWORD="$PW" TEST_RUNNER_REMOHOP_E2E_DIR="$W/files" \
+            TEST_RUNNER_REMOHOP_SHOTS_DIR="$S" \
             xcodebuild test -quiet \
-              -project mobile/ios/SoDesk.xcodeproj -scheme SoDesk -configuration Debug \
+              -project mobile/ios/RemoHop.xcodeproj -scheme RemoHop -configuration Debug \
               -destination "platform=iOS Simulator,id=$UDID" \
-              -only-testing:SoDeskTests/GatewayE2ETests/testScreenshots \
+              -only-testing:RemoHopTests/GatewayE2ETests/testScreenshots \
               -derivedDataPath "$DD" CODE_SIGNING_ALLOWED=NO > "$LOG" 2>&1 &
             XPID=$!
             got=0
@@ -619,7 +622,7 @@ jobs:
           TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
         run: |
           set -euo pipefail
-          KEYCHAIN_NAME="sodesk-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.keychain-db"
+          KEYCHAIN_NAME="remohop-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.keychain-db"
           KEYCHAIN_PATH="$HOME/Library/Keychains/$KEYCHAIN_NAME"
           KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
           echo "::add-mask::$KEYCHAIN_PASSWORD"
@@ -635,7 +638,7 @@ jobs:
             echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD"
           } >> "$GITHUB_ENV"
 
-          ASC_DIR="$RUNNER_TEMP/sodesk-asc"; mkdir -p "$ASC_DIR" "$HOME/.appstoreconnect/private_keys"
+          ASC_DIR="$RUNNER_TEMP/remohop-asc"; mkdir -p "$ASC_DIR" "$HOME/.appstoreconnect/private_keys"
           python3 - "$ASC_DIR" <<'PY'
           import base64, json, os, sys
           from pathlib import Path
@@ -696,7 +699,7 @@ jobs:
             || { echo '::error::No shared Distribution identity in Match; refusing to create a certificate.'; exit 78; }
           MATCH_READONLY=false fastlane match appstore --app_identifier "$EXPECTED_BUNDLE_ID" \
             --readonly false --force --generate_apple_certs false --skip_confirmation true "${COMMON[@]}" > "$RUNNER_TEMP/match-write.log" 2>&1 \
-            || { grep -iE 'error|could not|not found' "$RUNNER_TEMP/match-write.log" | head -10; echo '::error::Match could not write the SoDesk profile.'; exit 65; }
+            || { grep -iE 'error|could not|not found' "$RUNNER_TEMP/match-write.log" | head -10; echo '::error::Match could not write the RemoHop profile.'; exit 65; }
           echo "App Store profile for $EXPECTED_BUNDLE_ID written to Match: PASS"
           echo "- App Store profile for \`$EXPECTED_BUNDLE_ID\` written to the shared Match repo. Next: run mode=testflight." >> "$GITHUB_STEP_SUMMARY"
 
@@ -723,7 +726,7 @@ jobs:
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}/mobile/ios
         run: |
           set -euo pipefail
-          D="$RUNNER_TEMP/sodesk-deliver"; rm -rf "$D"; mkdir -p "$D/metadata" "$D/screenshots"
+          D="$RUNNER_TEMP/remohop-deliver"; rm -rf "$D"; mkdir -p "$D/metadata" "$D/screenshots"
           cp -R fastlane/metadata/. "$D/metadata/"
           # Committed screenshots (fastlane/screenshots/<locale>/*.jpg|png), if the repo has any.
           SHOTS=true
@@ -733,7 +736,7 @@ jobs:
           else
             echo 'Screenshots: none committed (run mode=screenshots to generate and upload them).'
           fi
-          VERSION="$(sed -n 's/.*MARKETING_VERSION = \([0-9][0-9.]*\);.*/\1/p' SoDesk.xcodeproj/project.pbxproj | head -n 1)"
+          VERSION="$(sed -n 's/.*MARKETING_VERSION = \([0-9][0-9.]*\);.*/\1/p' RemoHop.xcodeproj/project.pbxproj | head -n 1)"
           [[ -n "$VERSION" ]] || { echo '::error::MARKETING_VERSION not found in the project.'; exit 65; }
           LOG="$RUNNER_TEMP/deliver-metadata.log"
           cd "$D"
@@ -761,8 +764,8 @@ jobs:
         run: |
           set -euo pipefail
           [[ -d "${SHOTS_OUT:-}" ]] || { echo '::error::No screenshots were generated.'; exit 65; }
-          D="$RUNNER_TEMP/sodesk-deliver"; rm -rf "$D"; mkdir -p "$D/metadata"
-          VERSION="$(sed -n 's/.*MARKETING_VERSION = \([0-9][0-9.]*\);.*/\1/p' SoDesk.xcodeproj/project.pbxproj | head -n 1)"
+          D="$RUNNER_TEMP/remohop-deliver"; rm -rf "$D"; mkdir -p "$D/metadata"
+          VERSION="$(sed -n 's/.*MARKETING_VERSION = \([0-9][0-9.]*\);.*/\1/p' RemoHop.xcodeproj/project.pbxproj | head -n 1)"
           [[ -n "$VERSION" ]] || { echo '::error::MARKETING_VERSION not found in the project.'; exit 65; }
           LOG="$RUNNER_TEMP/deliver-screenshots.log"
           cd "$D"
@@ -844,7 +847,7 @@ jobs:
           ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
         run: |
           set -euo pipefail
-          ARCHIVE="$RUNNER_TEMP/sodesk.xcarchive"; EXPORT_DIR="$RUNNER_TEMP/sodesk-export"; OPTS="$RUNNER_TEMP/sodesk-export.plist"
+          ARCHIVE="$RUNNER_TEMP/remohop.xcarchive"; EXPORT_DIR="$RUNNER_TEMP/remohop-export"; OPTS="$RUNNER_TEMP/remohop-export.plist"
           rm -rf "$ARCHIVE" "$EXPORT_DIR"; mkdir -p "$EXPORT_DIR"
           # MARKETING_VERSION is deliberately not overridden: the project's value is kept.
           # Export compliance is the owner's answer (mobile/ios/fastlane/export-compliance.env), never a CI guess:
@@ -861,15 +864,15 @@ jobs:
           show_errors() { grep -E 'error:|\*\* (ARCHIVE|EXPORT) FAILED|Error Domain|NSLocalizedDescription|requires a provisioning|No profile|No signing certificate|doesn.t include|Code Sign' "$1" | cut -c1-400 | sort -u | head -n 40 || true; }
           set +e
           xcodebuild archive -quiet \
-            -project mobile/ios/SoDesk.xcodeproj -scheme SoDesk -configuration Release \
+            -project mobile/ios/RemoHop.xcodeproj -scheme RemoHop -configuration Release \
             -destination 'generic/platform=iOS' -archivePath "$ARCHIVE" \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
             CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="$ASC_TEAM_ID" CODE_SIGN_IDENTITY='Apple Distribution' \
             PROVISIONING_PROFILE_SPECIFIER="$APPSTORE_PROFILE_NAME" \
-            ${EXTRA[@]+"${EXTRA[@]}"} > "$RUNNER_TEMP/sodesk-archive.log" 2>&1
+            ${EXTRA[@]+"${EXTRA[@]}"} > "$RUNNER_TEMP/remohop-archive.log" 2>&1
           st=$?
           set -e
-          if [[ "$st" -ne 0 ]]; then show_errors "$RUNNER_TEMP/sodesk-archive.log"; echo "::error::xcodebuild archive failed (exit $st)."; exit 65; fi
+          if [[ "$st" -ne 0 ]]; then show_errors "$RUNNER_TEMP/remohop-archive.log"; echo "::error::xcodebuild archive failed (exit $st)."; exit 65; fi
           python3 - "$OPTS" <<'PY'
           import os, plistlib, sys
           plistlib.dump({
@@ -880,20 +883,20 @@ jobs:
           }, open(sys.argv[1], "wb"))
           PY
           set +e
-          xcodebuild -exportArchive -quiet -archivePath "$ARCHIVE" -exportPath "$EXPORT_DIR" -exportOptionsPlist "$OPTS" > "$RUNNER_TEMP/sodesk-export.log" 2>&1
+          xcodebuild -exportArchive -quiet -archivePath "$ARCHIVE" -exportPath "$EXPORT_DIR" -exportOptionsPlist "$OPTS" > "$RUNNER_TEMP/remohop-export.log" 2>&1
           st=$?
           set -e
-          if [[ "$st" -ne 0 ]]; then show_errors "$RUNNER_TEMP/sodesk-export.log"; echo "::error::xcodebuild -exportArchive failed (exit $st)."; exit 65; fi
+          if [[ "$st" -ne 0 ]]; then show_errors "$RUNNER_TEMP/remohop-export.log"; echo "::error::xcodebuild -exportArchive failed (exit $st)."; exit 65; fi
           IPA="$(find "$EXPORT_DIR" -maxdepth 1 -name '*.ipa' -print -quit)"
           [[ -n "$IPA" ]] || { echo '::error::IPA was not exported.'; exit 65; }
-          V="$RUNNER_TEMP/sodesk-verify"; rm -rf "$V"; mkdir -p "$V"; unzip -q "$IPA" -d "$V"
+          V="$RUNNER_TEMP/remohop-verify"; rm -rf "$V"; mkdir -p "$V"; unzip -q "$IPA" -d "$V"
           APP="$(find "$V/Payload" -maxdepth 1 -type d -name '*.app' -print -quit)"
           PB=/usr/libexec/PlistBuddy
           codesign --verify --deep --strict "$APP"
           [[ "$($PB -c 'Print :CFBundleIdentifier' "$APP/Info.plist")" == "$EXPECTED_BUNDLE_ID" ]] || { echo '::error::Bundle ID mismatch'; exit 65; }
           [[ "$($PB -c 'Print :CFBundleVersion' "$APP/Info.plist")" == "$BUILD_NUMBER" ]] || { echo '::error::Build number mismatch'; exit 65; }
           VERSION="$($PB -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")"
-          test -f "$APP/sodesk-mobile.js" || { echo '::error::App bundle has no sodesk-mobile.js'; exit 65; }
+          test -f "$APP/remohop-mobile.js" || { echo '::error::App bundle has no remohop-mobile.js'; exit 65; }
           # What App Store processing needs (a missing piece is rejected by altool validate or processing).
           # The icon name may be a top-level key or sit inside CFBundleIcons (Xcode versions differ); a
           # real problem is reported by altool validate below, so only warn here and show the facts.
@@ -970,6 +973,6 @@ jobs:
             security list-keychains -d user -s "$ORIGINAL_DEFAULT_KEYCHAIN" >/dev/null 2>&1
           fi
           [[ -n "${KEYCHAIN_NAME:-}" ]] && security delete-keychain "$KEYCHAIN_NAME" >/dev/null 2>&1
-          rm -rf "$RUNNER_TEMP/sodesk-asc" "$RUNNER_TEMP/sodesk-export" "$RUNNER_TEMP/sodesk.xcarchive" "$RUNNER_TEMP/sodesk-verify" >/dev/null 2>&1
+          rm -rf "$RUNNER_TEMP/remohop-asc" "$RUNNER_TEMP/remohop-export" "$RUNNER_TEMP/remohop.xcarchive" "$RUNNER_TEMP/remohop-verify" >/dev/null 2>&1
           rm -f "$HOME/.appstoreconnect/private_keys/"AuthKey_*.p8 >/dev/null 2>&1
           true

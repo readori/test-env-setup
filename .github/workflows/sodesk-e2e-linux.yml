@@ -1,9 +1,9 @@
-# SoDesk (Go, binary `rds`) Linux end-to-end tests in a real environment.
+# RemoHop (Go, binary `remohop`) Linux end-to-end tests in a real environment.
 #
-# Public CI repository -> source readori/SoDesk. Each target is its own job, so one failure
+# Public CI repository -> source repository: env SOURCE_REPOSITORY. Each target is its own job, so one failure
 # does not hide the others:
 #
-#   signal   : the rendezvous server as a hardened systemd service (rds service install --role
+#   signal   : the rendezvous server as a hardened systemd service (remohop service install --role
 #              signal --relay --relay-ports 40000-40099) with real systemd: is-active, the
 #              hardening systemd reports, the server key, a host and a client connecting by
 #              9-digit ID through it (directly, then through its relay with direct UDP blocked by
@@ -11,17 +11,17 @@
 #              Driver: test/e2e/signal_service.sh.
 #   usbip    : USB/IP with the real kernel: usbip-host, vhci-hcd, dummy_hcd (built from the
 #              kernel's upstream source when the runner's kernel does not ship it) and a configfs
-#              mass-storage gadget backed by a file of random bytes; an rds host exports it, an
-#              rds client imports it over loopback; the disk is read back (sha256) and written
+#              mass-storage gadget backed by a file of random bytes; a remohop host exports it, an
+#              remohop client imports it over loopback; the disk is read back (sha256) and written
 #              through vhci; detach and session end restore the device. Driver: test/e2e/usbip.sh.
 #   accounts : accounts on the rendezvous server with a real SMTP server (Mailpit in Docker,
 #              STARTTLS and AUTH required, certificate from a throwaway CA): login codes by
-#              mail, a second device approved with the fingerprint comparison, rds account /
-#              rds devices, account-trust login without a password, removal revokes access.
+#              mail, a second device approved with the fingerprint comparison, remohop account /
+#              remohop devices, account-trust login without a password, removal revokes access.
 #              Driver: test/e2e/accounts_mailpit.sh -> go test ./test/e2e (TestAccounts*).
-#   web      : rds web behind a real Cloudflare quick tunnel (cloudflared, pinned release,
+#   web      : remohop web behind a real Cloudflare quick tunnel (cloudflared, pinned release,
 #              SHA-256 verified): page headers (HSTS, CSP), wrong then right gateway password,
-#              the __Host-sodesk Secure cookie, CSRF, a session to an rds host on the runner and
+#              the __Host-remohop Secure cookie, CSRF, a session to a remohop host on the runner and
 #              a terminal command over the WebSocket, all through the public URL.
 #              Driver: go test ./test/e2e (TestWebPublicE2E).
 #
@@ -33,7 +33,7 @@
 # trigger; never pull_request. The request file is plain KEY=VALUE text, parsed with strict
 # patterns and never sourced or executed:
 #
-#   REF=<sha>                         # readori/SoDesk branch, tag or SHA
+#   REF=<sha>                         # source repository branch, tag or SHA
 #   TARGETS=all                       # optional: all (default) or a comma list of
 #                                     # signal,usbip,accounts,web
 #
@@ -42,15 +42,15 @@
 # Logs carry results and failure tails only. Passwords (host, gateway, SMTP) are random per run,
 # live in 0600 files or process environments on the runner and are never printed; login codes,
 # session cookies and the tunnel's public host name are never printed either.
-name: SoDesk E2E Linux
+name: RemoHop E2E Linux
 
-run-name: SoDesk E2E Linux · ${{ github.event_name == 'push' && 'request (ci-requests/sodesk-e2e-linux.env)' || inputs.ref }}
+run-name: RemoHop E2E Linux · ${{ github.event_name == 'push' && 'request (ci-requests/sodesk-e2e-linux.env)' || inputs.ref }}
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 'readori/SoDesk branch, tag, or SHA'
+        description: 'Source repository branch, tag, or SHA'
         required: true
         default: 'main'
         type: string
@@ -67,8 +67,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: sodesk-e2e-linux-${{ inputs.ref || 'request' }}
+  group: remohop-e2e-linux-${{ inputs.ref || 'request' }}
   cancel-in-progress: true
+
+env:
+  # Private source repository. Change to readori/RemoHop once the GitHub repository is renamed.
+  SOURCE_REPOSITORY: readori/SoDesk
 
 jobs:
   request:
@@ -91,7 +95,7 @@ jobs:
           set -euo pipefail
           if [[ "$EVENT_NAME" == 'push' ]]; then
             # Download only the request file of this exact commit (public repo, no credentials).
-            REQ="$RUNNER_TEMP/sodesk-e2e-request.env"
+            REQ="$RUNNER_TEMP/remohop-e2e-request.env"
             curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/sodesk-e2e-linux.env at this commit.'; exit 64; }
             # Plain text, read line by line; never sourced or executed.
             SOURCE_REF="$(sed -n 's/^REF=//p' "$REQ" | head -n 1 | tr -d '\r')"
@@ -112,14 +116,14 @@ jobs:
           }
           [[ "$TARGETS" == all ]] && TARGETS='signal,usbip,accounts,web'
           [[ -n "${TARGET_REPO_PAT:-}" ]] || {
-            echo '::error::Missing public CI credential: TARGET_REPO_PAT (it must have read access to readori/SoDesk).'
+            echo '::error::Missing public CI credential: TARGET_REPO_PAT (it must have read access to the source repository, env SOURCE_REPOSITORY).'
             exit 78
           }
           echo "ref=$SOURCE_REF" >> "$GITHUB_OUTPUT"
           echo "targets=,$TARGETS," >> "$GITHUB_OUTPUT"
           echo "Source ref: $SOURCE_REF"
           echo "Targets:    $TARGETS"
-          { echo "### SoDesk E2E Linux"; echo; echo "- Ref: \`$SOURCE_REF\`"; echo "- Targets: $TARGETS"; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "### RemoHop E2E Linux"; echo; echo "- Ref: \`$SOURCE_REF\`"; echo "- Targets: $TARGETS"; } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------------------------
   signal:
@@ -135,14 +139,14 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: readori/SoDesk
+          repository: ${{ env.SOURCE_REPOSITORY }}
           ref: ${{ needs.request.outputs.ref }}
           token: ${{ secrets.TARGET_REPO_PAT }}
           path: source
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Build rds
+      - name: Build remohop
         working-directory: source
         env:
           GOTOOLCHAIN: auto
@@ -150,9 +154,9 @@ jobs:
           set -euo pipefail
           go version
           echo "commit: $(git rev-parse --short HEAD)"
-          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/rds" ./cmd/rds
-          echo "RDS_BIN=$RUNNER_TEMP/rds" >> "$GITHUB_ENV"
-          echo "- signal: \`readori/SoDesk@$(git rev-parse --short HEAD)\`, $(go version | cut -d' ' -f3)" >> "$GITHUB_STEP_SUMMARY"
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/remohop" ./cmd/remohop
+          echo "REMOHOP_BIN=$RUNNER_TEMP/remohop" >> "$GITHUB_ENV"
+          echo "- signal: \`$SOURCE_REPOSITORY@$(git rev-parse --short HEAD)\`, $(go version | cut -d' ' -f3)" >> "$GITHUB_STEP_SUMMARY"
 
       # Runs as the runner user (host and client); the script uses sudo for the service.
       - name: Rendezvous server as a systemd service
@@ -161,14 +165,14 @@ jobs:
           set -o pipefail
           [[ -f test/e2e/signal_service.sh ]] || { echo '::notice::test/e2e/signal_service.sh is not on this ref; skipped.'; exit 0; }
           code=0
-          bash test/e2e/signal_service.sh "$RDS_BIN" 2>&1 | cut -c1-400 || code=$?
+          bash test/e2e/signal_service.sh "$REMOHOP_BIN" 2>&1 | cut -c1-400 || code=$?
           echo "- signal service: $([[ $code == 0 ]] && echo PASS || echo FAIL)" >> "$GITHUB_STEP_SUMMARY"
           exit $code
 
       - name: Service journal (failure only)
         if: failure()
         run: |
-          sudo journalctl -u sodesk-signal --no-pager -o short-iso -n 60 2>/dev/null | cut -c1-400 || true
+          sudo journalctl -u remohop-signal --no-pager -o short-iso -n 60 2>/dev/null | cut -c1-400 || true
 
   # ---------------------------------------------------------------------------------------------
   usbip:
@@ -184,14 +188,14 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: readori/SoDesk
+          repository: ${{ env.SOURCE_REPOSITORY }}
           ref: ${{ needs.request.outputs.ref }}
           token: ${{ secrets.TARGET_REPO_PAT }}
           path: source
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Build rds
+      - name: Build remohop
         working-directory: source
         env:
           GOTOOLCHAIN: auto
@@ -199,9 +203,9 @@ jobs:
           set -euo pipefail
           go version
           echo "commit: $(git rev-parse --short HEAD)"
-          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/rds" ./cmd/rds
-          echo "RDS_BIN=$RUNNER_TEMP/rds" >> "$GITHUB_ENV"
-          echo "- usbip: \`readori/SoDesk@$(git rev-parse --short HEAD)\`, kernel $(uname -r)" >> "$GITHUB_STEP_SUMMARY"
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/remohop" ./cmd/remohop
+          echo "REMOHOP_BIN=$RUNNER_TEMP/remohop" >> "$GITHUB_ENV"
+          echo "- usbip: \`$SOURCE_REPOSITORY@$(git rev-parse --short HEAD)\`, kernel $(uname -r)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Kernel modules (linux-modules-extra)
         run: |
@@ -224,7 +228,7 @@ jobs:
       # Ubuntu's azure kernels ship no linux-modules-extra and no dummy_hcd (the virtual USB
       # controller the test plugs its gadget into). Build that one module from the kernel's own
       # source at this kernel's upstream tag (kernel.org), with the headers and compiler of the
-      # running kernel. A test fixture only; rds itself needs no extra module.
+      # running kernel. A test fixture only; remohop itself needs no extra module.
       - name: Build dummy_hcd if the kernel does not ship it
         working-directory: source
         run: |
@@ -244,7 +248,7 @@ jobs:
           set -o pipefail
           [[ -f test/e2e/usbip.sh ]] || { echo '::notice::test/e2e/usbip.sh is not on this ref; skipped.'; exit 0; }
           code=0
-          sudo env DUMMY_HCD_KO="${DUMMY_HCD_KO:-}" bash test/e2e/usbip.sh "$RDS_BIN" 2>&1 | cut -c1-400 || code=$?
+          sudo env DUMMY_HCD_KO="${DUMMY_HCD_KO:-}" bash test/e2e/usbip.sh "$REMOHOP_BIN" 2>&1 | cut -c1-400 || code=$?
           echo "- USB/IP: $([[ $code == 0 ]] && echo PASS || echo FAIL)" >> "$GITHUB_STEP_SUMMARY"
           exit $code
 
@@ -266,14 +270,14 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: readori/SoDesk
+          repository: ${{ env.SOURCE_REPOSITORY }}
           ref: ${{ needs.request.outputs.ref }}
           token: ${{ secrets.TARGET_REPO_PAT }}
           path: source
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Build rds
+      - name: Build remohop
         working-directory: source
         env:
           GOTOOLCHAIN: auto
@@ -281,9 +285,9 @@ jobs:
           set -euo pipefail
           go version
           echo "commit: $(git rev-parse --short HEAD)"
-          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/rds" ./cmd/rds
-          echo "RDS_BIN=$RUNNER_TEMP/rds" >> "$GITHUB_ENV"
-          echo "- accounts: \`readori/SoDesk@$(git rev-parse --short HEAD)\`, $(docker --version)" >> "$GITHUB_STEP_SUMMARY"
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/remohop" ./cmd/remohop
+          echo "REMOHOP_BIN=$RUNNER_TEMP/remohop" >> "$GITHUB_ENV"
+          echo "- accounts: \`$SOURCE_REPOSITORY@$(git rev-parse --short HEAD)\`, $(docker --version)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Accounts through Mailpit (STARTTLS + AUTH)
         working-directory: source
@@ -294,7 +298,7 @@ jobs:
           set -o pipefail
           [[ -f test/e2e/accounts_mailpit.sh ]] || { echo '::notice::test/e2e/accounts_mailpit.sh is not on this ref; skipped.'; exit 0; }
           code=0
-          bash test/e2e/accounts_mailpit.sh "$RDS_BIN" 2>&1 | cut -c1-400 || code=$?
+          bash test/e2e/accounts_mailpit.sh "$REMOHOP_BIN" 2>&1 | cut -c1-400 || code=$?
           echo "- accounts (Mailpit): $([[ $code == 0 ]] && echo PASS || echo FAIL)" >> "$GITHUB_STEP_SUMMARY"
           exit $code
 
@@ -305,15 +309,15 @@ jobs:
         working-directory: source
         env:
           GOTOOLCHAIN: auto
-          SODESK_ACCOUNTS_E2E: '1'
+          REMOHOP_ACCOUNTS_E2E: '1'
         run: |
           set -o pipefail
           [[ -f test/e2e/accounts_test.go ]] || { echo '::notice::no accounts e2e test on this ref; skipped.'; exit 0; }
-          SODESK_E2E_RDS="$RDS_BIN" go test -count=1 -v -run 'TestAccountsE2E|TestAccountsSMTPVerifiesTLS' ./test/e2e/ 2>&1 | cut -c1-400 | tail -n 80
+          REMOHOP_E2E_BIN="$REMOHOP_BIN" go test -count=1 -v -run 'TestAccountsE2E|TestAccountsSMTPVerifiesTLS' ./test/e2e/ 2>&1 | cut -c1-400 | tail -n 80
 
   # ---------------------------------------------------------------------------------------------
   web:
-    name: rds web behind Cloudflare Tunnel
+    name: remohop web behind Cloudflare Tunnel
     needs: request
     if: contains(needs.request.outputs.targets, ',web,')
     runs-on: ubuntu-latest
@@ -332,14 +336,14 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: readori/SoDesk
+          repository: ${{ env.SOURCE_REPOSITORY }}
           ref: ${{ needs.request.outputs.ref }}
           token: ${{ secrets.TARGET_REPO_PAT }}
           path: source
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Build rds
+      - name: Build remohop
         working-directory: source
         env:
           GOTOOLCHAIN: auto
@@ -347,9 +351,9 @@ jobs:
           set -euo pipefail
           go version
           echo "commit: $(git rev-parse --short HEAD)"
-          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/rds" ./cmd/rds
-          echo "RDS_BIN=$RUNNER_TEMP/rds" >> "$GITHUB_ENV"
-          echo "- web: \`readori/SoDesk@$(git rev-parse --short HEAD)\`, cloudflared $CLOUDFLARED_VERSION" >> "$GITHUB_STEP_SUMMARY"
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/remohop" ./cmd/remohop
+          echo "REMOHOP_BIN=$RUNNER_TEMP/remohop" >> "$GITHUB_ENV"
+          echo "- web: \`$SOURCE_REPOSITORY@$(git rev-parse --short HEAD)\`, cloudflared $CLOUDFLARED_VERSION" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Download cloudflared (pinned release, SHA-256 verified)
         env:
@@ -380,16 +384,16 @@ jobs:
           "$D/cloudflared" --version
           echo "CLOUDFLARED_BIN=$D/cloudflared" >> "$GITHUB_ENV"
 
-      - name: rds web through a quick tunnel
+      - name: remohop web through a quick tunnel
         working-directory: source
         env:
           GOTOOLCHAIN: auto
-          SODESK_WEB_E2E: '1'
+          REMOHOP_WEB_E2E: '1'
         run: |
           set -o pipefail
           [[ -f test/e2e/web_test.go ]] || { echo '::notice::no web e2e test on this ref; skipped.'; exit 0; }
           code=0
-          SODESK_E2E_RDS="$RDS_BIN" SODESK_E2E_CLOUDFLARED="$CLOUDFLARED_BIN" \
+          REMOHOP_E2E_BIN="$REMOHOP_BIN" REMOHOP_E2E_CLOUDFLARED="$CLOUDFLARED_BIN" \
             go test -count=1 -v -timeout 15m -run TestWebPublicE2E ./test/e2e/ 2>&1 | cut -c1-400 | tail -n 120 || code=$?
-          echo "- rds web behind Cloudflare Tunnel: $([[ $code == 0 ]] && echo PASS || echo FAIL)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- remohop web behind Cloudflare Tunnel: $([[ $code == 0 ]] && echo PASS || echo FAIL)" >> "$GITHUB_STEP_SUMMARY"
           exit $code

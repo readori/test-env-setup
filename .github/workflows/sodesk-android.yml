@@ -1,17 +1,17 @@
-# SoDesk Android app CI (controller app: native shell + WebView on an in-process Go gateway).
+# RemoHop Android app CI (controller app: native shell + WebView on an in-process Go gateway).
 #
-# Public CI repository -> source readori/SoDesk. Copy this file to .github/workflows/ in the CI repo.
+# Public CI repository -> source repository: env SOURCE_REPOSITORY. Copy this file to .github/workflows/ in the CI repo.
 #
 #   verify : JDK 17 + Android SDK (platform 35, build-tools 35.0.0, NDK r28c) + Go from go.mod ->
-#            mobile/android/build.sh (gomobile bind of mobile/sodeskcore -> app/libs/sodeskcore.aar,
+#            mobile/android/build.sh (gomobile bind of mobile/remohopcore -> app/libs/remohopcore.aar,
 #            then Gradle): assembleDebug, JVM unit tests, lint, the instrumented test APK; then
 #            (optional, on by default) the instrumented tests on an x86_64 emulator using the
 #            runner's KVM: the smoke test, and HostSessionTest, which drives the real app
-#            against a real `rds host` started on the runner (built here from the checked-out
+#            against a real `remohop host` started on the runner (built here from the checked-out
 #            source, fixed random password read from a file, reachable at 10.0.2.2:PORT from
 #            the emulator): pair, terminal, files + download hand-over, clipboard bridge,
 #            desktop tab, rotation, recreate, background. Also runs the Go tests of
-#            internal/mobile and mobile/sodeskcore.
+#            internal/mobile and mobile/remohopcore.
 #
 # No signing, no Play credentials, no keystore. Nothing is uploaded: no artifacts. The APK stays
 # on the runner. Release signing is added later by the maintainer, reusing existing secrets.
@@ -21,7 +21,7 @@
 # trigger; never pull_request. The request file is plain KEY=VALUE text, parsed with strict
 # patterns and never executed:
 #
-#   REF=main          # readori/SoDesk branch, tag or SHA
+#   REF=main          # source repository branch, tag or SHA
 #   EMULATOR=true     # optional; true (default) or false
 #
 # Safety rules (public repo, public logs): no pull_request triggers; third-party actions pinned
@@ -30,9 +30,9 @@
 # The host's password is random per run, kept in a 0600 file under RUNNER_TEMP, masked in the log,
 # handed to the test as an instrumentation argument and never echoed; the app's gateway URL (it
 # carries an access token) is never logged by the test. The host is stopped at the end of the job.
-name: SoDesk Android
+name: RemoHop Android
 
-run-name: SoDesk Android · ${{ github.event_name == 'push' && 'request (ci-requests/sodesk-android.env)' || format('verify · {0}', inputs.ref) }}
+run-name: RemoHop Android · ${{ github.event_name == 'push' && 'request (ci-requests/sodesk-android.env)' || format('verify · {0}', inputs.ref) }}
 
 on:
   workflow_dispatch:
@@ -44,7 +44,7 @@ on:
         type: choice
         options: [verify]
       ref:
-        description: 'readori/SoDesk branch, tag, or SHA'
+        description: 'Source repository branch, tag, or SHA'
         required: true
         default: 'main'
         type: string
@@ -61,24 +61,25 @@ permissions:
   contents: read
 
 concurrency:
-  group: sodesk-android-${{ inputs.ref || 'request' }}
+  group: remohop-android-${{ inputs.ref || 'request' }}
   cancel-in-progress: true
 
 env:
-  PRIVATE_SOURCE_REPOSITORY: readori/SoDesk
+  # Private source repository. Change to readori/RemoHop once the GitHub repository is renamed.
+  SOURCE_REPOSITORY: readori/SoDesk
   PRIVATE_SOURCE_PATH: source
   ANDROID_PLATFORM: 'platforms;android-35'
   ANDROID_BUILD_TOOLS: 'build-tools;35.0.0'
   ANDROID_NDK_VERSION: '28.2.13676358'
   EMULATOR_API: '34'
-  EXPECTED_APP_ID: com.readori.sodesk
+  EXPECTED_APP_ID: com.readori.remohop
   # The host the emulator test connects to (10.0.2.2 is the runner's loopback as the emulator sees it).
   E2E_HOST_PORT: '21118'
-  E2E_FILE_NAME: sodesk-e2e.txt
+  E2E_FILE_NAME: remohop-e2e.txt
 
 jobs:
   android:
-    name: Build SoDesk Android
+    name: Build RemoHop Android
     runs-on: ubuntu-latest
     timeout-minutes: 60
     defaults:
@@ -99,7 +100,7 @@ jobs:
           set -euo pipefail
           if [[ "$EVENT_NAME" == 'push' ]]; then
             # Download only the request file of this exact commit (public repo, no credentials).
-            REQ="$RUNNER_TEMP/sodesk-android-request.env"
+            REQ="$RUNNER_TEMP/remohop-android-request.env"
             curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/sodesk-android.env at this commit.'; exit 64; }
             # Plain text, read line by line; never sourced or executed.
             SOURCE_REF="$(sed -n 's/^REF=//p' "$REQ" | head -n 1 | tr -d '\r')"
@@ -118,7 +119,7 @@ jobs:
           }
           [[ "$EMULATOR" == 'true' || "$EMULATOR" == 'false' ]] || { echo '::error::EMULATOR must be true or false.'; exit 64; }
           [[ -n "${TARGET_REPO_PAT:-}" ]] || {
-            echo '::error::Missing public CI credential: TARGET_REPO_PAT (it must have read access to readori/SoDesk).'
+            echo '::error::Missing public CI credential: TARGET_REPO_PAT (it must have read access to the source repository, env SOURCE_REPOSITORY).'
             exit 78
           }
           echo "SOURCE_REF=$SOURCE_REF" >> "$GITHUB_ENV"
@@ -128,7 +129,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: readori/SoDesk
+          repository: ${{ env.SOURCE_REPOSITORY }}
           ref: ${{ env.SOURCE_REF }}
           token: ${{ secrets.TARGET_REPO_PAT }}
           path: ${{ env.PRIVATE_SOURCE_PATH }}
@@ -142,14 +143,14 @@ jobs:
         run: |
           set -euo pipefail
           C="$(git rev-parse HEAD)"
-          { echo '### SoDesk Android · verify'; echo; echo "- Source: \`$PRIVATE_SOURCE_REPOSITORY@${C:0:8}\` (ref \`$SOURCE_REF\`)"; } >> "$GITHUB_STEP_SUMMARY"
+          { echo '### RemoHop Android · verify'; echo; echo "- Source: \`$SOURCE_REPOSITORY@${C:0:8}\` (ref \`$SOURCE_REF\`)"; } >> "$GITHUB_STEP_SUMMARY"
           if [[ ! -f mobile/android/build.sh ]]; then
             echo '::notice::mobile/android/build.sh is not on this ref: the Android app is not there yet. Nothing to verify.'
             echo '- Result: skipped, no Android app at this ref' >> "$GITHUB_STEP_SUMMARY"
             echo 'ready=false' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          for f in go.mod mobile/go.mod mobile/sodeskcore/sodeskcore.go mobile/shared/sodesk-mobile.js \
+          for f in go.mod mobile/go.mod mobile/remohopcore/remohopcore.go mobile/shared/remohop-mobile.js \
                    mobile/android/gradlew mobile/android/gradle/wrapper/gradle-wrapper.properties mobile/android/app/build.gradle.kts; do
             [[ -f "$f" ]] || { echo "::error::$f is missing."; exit 66; }
           done
@@ -196,7 +197,7 @@ jobs:
           go vet ./internal/mobile
           go test -count=1 ./internal/mobile 2>&1 | cut -c1-2000 | tail -n 200
           (cd mobile && go vet ./... && go test -count=1 ./... 2>&1 | cut -c1-2000 | tail -n 100)
-          echo '- Go: internal/mobile and mobile/sodeskcore tests PASS' >> "$GITHUB_STEP_SUMMARY"
+          echo '- Go: internal/mobile and mobile/remohopcore tests PASS' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up Node.js 22 (browser test driver)
         if: steps.layout.outputs.ready == 'true'
@@ -212,7 +213,7 @@ jobs:
           [[ -f mobile/shared/test/phone_test.mjs ]] || { echo '::notice::no phone_test.mjs on this ref; skipped.'; exit 0; }
           command -v google-chrome >/dev/null || { echo '::notice::no Chrome on this runner; skipped.'; exit 0; }
           # Harness and the real gateway page against an in-process host (no screenshots kept).
-          SODESK_BROWSER_TEST=1 go test -count=1 -run TestPhoneBrowser -v ./internal/mobile 2>&1 | cut -c1-400 | tail -n 80
+          REMOHOP_BROWSER_TEST=1 go test -count=1 -run TestPhoneBrowser -v ./internal/mobile 2>&1 | cut -c1-400 | tail -n 80
           echo '- Phone-viewport browser test: PASS' >> "$GITHUB_STEP_SUMMARY"
 
       - name: gomobile bind + Gradle (debug APK, unit tests, lint, test APK)
@@ -234,7 +235,7 @@ jobs:
           [[ -f "$APK" ]] || { echo '::error::Debug APK was not produced.'; exit 65; }
           unzip -l "$APK" | grep -q 'lib/arm64-v8a/libgojni.so' || { echo '::error::APK has no arm64 Go core.'; exit 65; }
           unzip -l "$APK" | grep -q 'lib/x86_64/libgojni.so' || { echo '::error::APK has no x86_64 Go core.'; exit 65; }
-          unzip -l "$APK" | grep -q 'assets/sodesk-mobile.js' || { echo '::error::APK has no injected script.'; exit 65; }
+          unzip -l "$APK" | grep -q 'assets/remohop-mobile.js' || { echo '::error::APK has no injected script.'; exit 65; }
           AAPT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/aapt2"
           PKG="$("$AAPT" dump packagename "$APK")"
           [[ "$PKG" == "$EXPECTED_APP_ID" ]] || { echo "::error::Package name mismatch: $PKG"; exit 65; }
@@ -260,46 +261,46 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           ls -l /dev/kvm
 
-      - name: Build rds and start a host for the emulator test
+      - name: Build remohop and start a host for the emulator test
         if: steps.layout.outputs.ready == 'true' && steps.request.outputs.emulator == 'true'
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
         run: |
           set -euo pipefail
-          RDS="$RUNNER_TEMP/rds"
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o "$RDS" ./cmd/rds
-          HCFG="$RUNNER_TEMP/rds-host-config"
-          FILES="$RUNNER_TEMP/sodesk-e2e-files"
+          REMOHOP="$RUNNER_TEMP/remohop"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o "$REMOHOP" ./cmd/remohop
+          HCFG="$RUNNER_TEMP/remohop-host-config"
+          FILES="$RUNNER_TEMP/remohop-e2e-files"
           rm -rf "$HCFG" "$FILES"
           mkdir -p "$HCFG" "$FILES"
           chmod 700 "$HCFG"
           # The file the test lists and downloads. Keep in step with HostSessionTest.FILE_TEXT.
-          printf 'sodesk android e2e payload 7f3a\n' > "$FILES/$E2E_FILE_NAME"
+          printf 'remohop android e2e payload 7f3a\n' > "$FILES/$E2E_FILE_NAME"
           # Random per run, masked, kept in a private file; never on a command line.
           umask 077
-          PWFILE="$RUNNER_TEMP/sodesk-host-password"
+          PWFILE="$RUNNER_TEMP/remohop-host-password"
           openssl rand -hex 16 > "$PWFILE"
           echo "::add-mask::$(cat "$PWFILE")"
-          # `rds host passwd` reads the password from stdin when it is not a terminal
+          # `remohop host passwd` reads the password from stdin when it is not a terminal
           # (printf is a shell builtin: nothing appears in a process list).
-          export RDS_CONFIG_DIR="$HCFG" SHELL=/bin/bash
+          export REMOHOP_CONFIG_DIR="$HCFG" SHELL=/bin/bash
           PW="$(cat "$PWFILE")"
-          printf '%s\n%s\n' "$PW" "$PW" | "$RDS" host passwd > /dev/null
+          printf '%s\n%s\n' "$PW" "$PW" | "$REMOHOP" host passwd > /dev/null
           unset PW
           # No rendezvous server: the emulator dials 10.0.2.2:PORT directly. Bound to all interfaces
           # because the emulator's NAT reaches the runner through its loopback and its own address.
-          setsid nohup "$RDS" host --no-signal --listen "0.0.0.0:$E2E_HOST_PORT" > "$RUNNER_TEMP/rds-host.log" 2>&1 < /dev/null &
-          echo $! > "$RUNNER_TEMP/rds-host.pid"
+          setsid nohup "$REMOHOP" host --no-signal --listen "0.0.0.0:$E2E_HOST_PORT" > "$RUNNER_TEMP/remohop-host.log" 2>&1 < /dev/null &
+          echo $! > "$RUNNER_TEMP/remohop-host.pid"
           for i in $(seq 1 60); do
-            grep -q 'SoDesk host ready' "$RUNNER_TEMP/rds-host.log" 2>/dev/null && break
-            kill -0 "$(cat "$RUNNER_TEMP/rds-host.pid")" 2>/dev/null || break
+            grep -q 'RemoHop host ready' "$RUNNER_TEMP/remohop-host.log" 2>/dev/null && break
+            kill -0 "$(cat "$RUNNER_TEMP/remohop-host.pid")" 2>/dev/null || break
             sleep 0.5
           done
-          if ! grep -q 'SoDesk host ready' "$RUNNER_TEMP/rds-host.log" 2>/dev/null; then
-            sed -E 's/^( *Password: ).*/\1<hidden>/' "$RUNNER_TEMP/rds-host.log" | cut -c1-300 | tail -n 20
-            echo '::error::rds host did not start.'
+          if ! grep -q 'RemoHop host ready' "$RUNNER_TEMP/remohop-host.log" 2>/dev/null; then
+            sed -E 's/^( *Password: ).*/\1<hidden>/' "$RUNNER_TEMP/remohop-host.log" | cut -c1-300 | tail -n 20
+            echo '::error::remohop host did not start.'
             exit 1
           fi
-          echo "rds host is up on UDP $E2E_HOST_PORT (pid $(cat "$RUNNER_TEMP/rds-host.pid")), fixed password set, test file prepared"
+          echo "remohop host is up on UDP $E2E_HOST_PORT (pid $(cat "$RUNNER_TEMP/remohop-host.pid")), fixed password set, test file prepared"
 
       - name: Instrumented tests on an emulator (smoke + real host end to end, no uploads)
         if: steps.layout.outputs.ready == 'true' && steps.request.outputs.emulator == 'true'
@@ -339,24 +340,24 @@ jobs:
           # focus from the app under test; hide system error dialogs for the test run.
           "$ADB" shell settings put global hide_error_dialogs 1 > /dev/null 2>&1 || true
           # The host started in the previous step: address as the emulator sees the runner, password from the private file.
-          E2E_PW="$(cat "$RUNNER_TEMP/sodesk-host-password")"
+          E2E_PW="$(cat "$RUNNER_TEMP/remohop-host-password")"
           echo "::add-mask::$E2E_PW"
-          kill -0 "$(cat "$RUNNER_TEMP/rds-host.pid")" 2>/dev/null || { echo '::error::rds host is not running.'; exit 1; }
+          kill -0 "$(cat "$RUNNER_TEMP/remohop-host.pid")" 2>/dev/null || { echo '::error::remohop host is not running.'; exit 1; }
           "$ADB" logcat -c > /dev/null 2>&1 || true
           rc=0
           timeout 900 ./gradlew --no-daemon -Dorg.gradle.console=plain connectedDebugAndroidTest \
-            "-Pandroid.testInstrumentationRunnerArguments.sodesk_host=10.0.2.2:$E2E_HOST_PORT" \
-            "-Pandroid.testInstrumentationRunnerArguments.sodesk_password=$E2E_PW" \
-            "-Pandroid.testInstrumentationRunnerArguments.sodesk_dir=$RUNNER_TEMP/sodesk-e2e-files" \
-            "-Pandroid.testInstrumentationRunnerArguments.sodesk_file=$E2E_FILE_NAME" \
-            "-Pandroid.testInstrumentationRunnerArguments.sodesk_background_seconds=10" \
-            "-Pandroid.testInstrumentationRunnerArguments.sodesk_require=true" \
+            "-Pandroid.testInstrumentationRunnerArguments.remohop_host=10.0.2.2:$E2E_HOST_PORT" \
+            "-Pandroid.testInstrumentationRunnerArguments.remohop_password=$E2E_PW" \
+            "-Pandroid.testInstrumentationRunnerArguments.remohop_dir=$RUNNER_TEMP/remohop-e2e-files" \
+            "-Pandroid.testInstrumentationRunnerArguments.remohop_file=$E2E_FILE_NAME" \
+            "-Pandroid.testInstrumentationRunnerArguments.remohop_background_seconds=10" \
+            "-Pandroid.testInstrumentationRunnerArguments.remohop_require=true" \
             > "$RUNNER_TEMP/connected.log" 2>&1 || rc=$?
           unset E2E_PW
           [[ $rc -eq 124 ]] && echo '::error::connectedDebugAndroidTest timed out after 15 min' && tail -n 40 "$RUNNER_TEMP/connected.log"
           # Progress lines of the end-to-end test (its own tag; it never logs URLs or passwords).
-          echo '--- HostSessionTest progress (logcat tag SoDeskE2E) ---'
-          timeout 30 "$ADB" logcat -d -s SoDeskE2E:I 2>/dev/null | grep -v '^--------' | sed -E 's/^[0-9-]+ [0-9:.]+ +[0-9]+ +[0-9]+ //' | cut -c1-300 | tail -n 40 || true
+          echo '--- HostSessionTest progress (logcat tag RemoHopE2E) ---'
+          timeout 30 "$ADB" logcat -d -s RemoHopE2E:I 2>/dev/null | grep -v '^--------' | sed -E 's/^[0-9-]+ [0-9:.]+ +[0-9]+ +[0-9]+ //' | cut -c1-300 | tail -n 40 || true
           if [[ $rc -ne 0 ]]; then
             echo '--- window focus at failure ---'
             timeout 30 "$ADB" shell dumpsys window 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp' | cut -c1-200 | head -n 4 || true
@@ -382,26 +383,26 @@ jobs:
           sys.exit(0 if ran == 1 and skipped == 0 and failed == 0 else 1)
           PY
 
-      - name: Stop the SoDesk host
+      - name: Stop the RemoHop host
         if: always() && steps.layout.outputs.ready == 'true' && steps.request.outputs.emulator == 'true'
         run: |
-          if [[ -f "$RUNNER_TEMP/rds-host.pid" ]]; then
-            PID="$(cat "$RUNNER_TEMP/rds-host.pid")"
+          if [[ -f "$RUNNER_TEMP/remohop-host.pid" ]]; then
+            PID="$(cat "$RUNNER_TEMP/remohop-host.pid")"
             if kill -0 "$PID" 2>/dev/null; then
               if [[ "${{ job.status }}" == 'failure' ]]; then
-                echo '--- rds host log, tail ---'
-                sed -E 's/^( *Password: ).*/\1<hidden>/' "$RUNNER_TEMP/rds-host.log" | cut -c1-300 | tail -n 25
+                echo '--- remohop host log, tail ---'
+                sed -E 's/^( *Password: ).*/\1<hidden>/' "$RUNNER_TEMP/remohop-host.log" | cut -c1-300 | tail -n 25
               fi
               kill "$PID" 2>/dev/null || true
               sleep 1
               kill -9 "$PID" 2>/dev/null || true
-              echo "rds host stopped"
+              echo "remohop host stopped"
             else
-              echo 'rds host had already exited'
-              sed -E 's/^( *Password: ).*/\1<hidden>/' "$RUNNER_TEMP/rds-host.log" | cut -c1-300 | tail -n 25 || true
+              echo 'remohop host had already exited'
+              sed -E 's/^( *Password: ).*/\1<hidden>/' "$RUNNER_TEMP/remohop-host.log" | cut -c1-300 | tail -n 25 || true
             fi
           fi
-          shred -u "$RUNNER_TEMP/sodesk-host-password" 2>/dev/null || rm -f "$RUNNER_TEMP/sodesk-host-password"
+          shred -u "$RUNNER_TEMP/remohop-host-password" 2>/dev/null || rm -f "$RUNNER_TEMP/remohop-host-password"
 
       - name: Summary
         if: success() && steps.layout.outputs.ready == 'true'

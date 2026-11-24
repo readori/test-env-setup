@@ -1,20 +1,20 @@
-# SoDesk macOS release binary: universal `rds`, signed with Developer ID and notarized.
+# RemoHop macOS release binary: universal `remohop`, signed with Developer ID and notarized.
 #
-# Public CI repository -> source readori/SoDesk.
+# Public CI repository -> source repository: env SOURCE_REPOSITORY.
 #
-#   release : build rds for darwin/arm64 and darwin/amd64 (CGO_ENABLED=0, the Makefile's release
+#   release : build remohop for darwin/arm64 and darwin/amd64 (CGO_ENABLED=0, the Makefile's release
 #             flags) -> lipo into one universal binary -> codesign with the Developer ID
 #             Application certificate, hardened runtime, secure timestamp, no entitlements ->
 #             zip -> notarize with notarytool (App Store Connect API key) -> verify the
 #             signature, the notarization and Gatekeeper's verdict -> run the signed binary:
-#             `rds version`, `rds --help`, the loopback smoke test (host + client), and a desktop
+#             `remohop version`, `remohop --help`, the loopback smoke test (host + client), and a desktop
 #             probe that makes the hardened binary load system frameworks at run time.
 #
 # By default nothing is uploaded: no artifacts, no release. The summary reports the SHA-256 of
 # the signed binary and of the notarized zip. The exception is the release hand-off below.
 # A bare executable cannot carry a stapled ticket (stapler
 # only handles bundles, disk images and packages), so Gatekeeper checks the notarization of a
-# downloaded rds online on first run.
+# downloaded remohop online on first run.
 #
 # Secrets used: MACOS_DEVID_P12_BASE64 + MACOS_DEVID_P12_PASSWORD (the Developer ID Application
 # certificate with its key), ASC_KEY_ID + ASC_ISSUER_ID + ASC_PRIVATE_KEY (App Store Connect API
@@ -22,11 +22,11 @@
 # (source checkout). The certificate lives in a keychain made for this run and deleted at the
 # end, whatever happens.
 #
-# Release hand-off: the SoDesk repository's release workflow (readori/SoDesk, release.yml) starts
+# Release hand-off: the RemoHop repository's release workflow (env SOURCE_REPOSITORY, release.yml) starts
 # this workflow with workflow_dispatch (ref=<tag>, version=<tag>, upload=true, correlation=<id>),
-# waits for it, and downloads the artifact `rds-macos-universal` (the signed universal `rds`, the
+# waits for it, and downloads the artifact `remohop-macos-universal` (the signed universal `remohop`, the
 # notarized zip and SHA256SUMS-macos, kept 3 days) to put the binary into the release. The Apple
-# secrets stay here, in this repository; the SoDesk repository only holds a token that may start
+# secrets stay here, in this repository; the RemoHop repository only holds a token that may start
 # and read runs of this workflow. `upload` defaults to false, so request-file runs and manual runs
 # still upload nothing. The artifact exists only if every step above it passed (signature,
 # notarization, Gatekeeper check, the smoke tests and the framework probe).
@@ -36,7 +36,7 @@
 # trigger; never pull_request. The request file is plain KEY=VALUE text, parsed with strict
 # patterns and never executed:
 #
-#   REF=<sha>          # readori/SoDesk branch, tag or SHA
+#   REF=<sha>          # source repository branch, tag or SHA
 #   VERSION=v1.2.3     # optional: the version to stamp; default `git describe --tags --always`
 #
 # Steps that collect results start with `set +e`: the runner's bash runs with -e, which would
@@ -46,15 +46,15 @@
 # pinned to commit SHAs; secrets reach only the steps that need them, through env, and are never
 # echoed; the keychain password and the smoke test's host password are made per run and masked;
 # tool output that could quote a secret is not printed, only chosen fields.
-name: SoDesk macOS release
+name: RemoHop macOS release
 
-run-name: SoDesk macOS release · ${{ github.event_name == 'push' && 'request (ci-requests/sodesk-macos-release.env)' || inputs.ref }}${{ inputs.correlation && format(' [{0}]', inputs.correlation) || '' }}
+run-name: RemoHop macOS release · ${{ github.event_name == 'push' && 'request (ci-requests/sodesk-macos-release.env)' || inputs.ref }}${{ inputs.correlation && format(' [{0}]', inputs.correlation) || '' }}
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 'readori/SoDesk branch, tag, or SHA'
+        description: 'Source repository branch, tag, or SHA'
         required: true
         default: 'main'
         type: string
@@ -64,7 +64,7 @@ on:
         default: ''
         type: string
       upload:
-        description: 'Upload the signed binary as the artifact rds-macos-universal (release hand-off)'
+        description: 'Upload the signed binary as the artifact remohop-macos-universal (release hand-off)'
         required: false
         default: false
         type: boolean
@@ -81,19 +81,21 @@ permissions:
   contents: read
 
 concurrency:
-  group: sodesk-macos-release-${{ inputs.ref || 'request' }}
+  group: remohop-macos-release-${{ inputs.ref || 'request' }}
   cancel-in-progress: true
 
 env:
+  # Private source repository. Change to readori/RemoHop once the GitHub repository is renamed.
+  SOURCE_REPOSITORY: readori/SoDesk
   CGO_ENABLED: '0'
-  SIGN_IDENTIFIER: com.readori.sodesk.rds
+  SIGN_IDENTIFIER: com.readori.remohop.cli
   HOMEBREW_NO_AUTO_UPDATE: '1'
   HOMEBREW_NO_INSTALL_CLEANUP: '1'
   HOMEBREW_NO_ENV_HINTS: '1'
 
 jobs:
   release:
-    name: Sign and notarize rds
+    name: Sign and notarize remohop
     runs-on: macos-latest
     timeout-minutes: 60
     defaults:
@@ -119,7 +121,7 @@ jobs:
           set -euo pipefail
           if [[ "$EVENT_NAME" == 'push' ]]; then
             # Download only the request file of this exact commit (public repo, no credentials).
-            REQ="$RUNNER_TEMP/sodesk-macos-release-request.env"
+            REQ="$RUNNER_TEMP/remohop-macos-release-request.env"
             curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/sodesk-macos-release.env at this commit.'; exit 64; }
             # Plain text, read line by line; never sourced or executed.
             SOURCE_REF="$(sed -n 's/^REF=//p' "$REQ" | head -n 1 | tr -d '\r')"
@@ -157,7 +159,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: readori/SoDesk
+          repository: ${{ env.SOURCE_REPOSITORY }}
           ref: ${{ env.SOURCE_REF }}
           token: ${{ secrets.TARGET_REPO_PAT }}
           path: source
@@ -181,29 +183,29 @@ jobs:
           [[ -n "$VERSION" ]] || VERSION="$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)"
           [[ "$VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || { echo "::error::unusable version string from git describe."; exit 65; }
           grep -q 'internal/cli.Version=' Makefile || { echo '::error::the Makefile no longer sets internal/cli.Version; update this workflow.'; exit 65; }
-          OUT="$RUNNER_TEMP/sodesk-release"; rm -rf "$OUT"; mkdir -p "$OUT"
-          LDFLAGS="-s -w -X github.com/readori/SoDesk/internal/cli.Version=$VERSION"
+          OUT="$RUNNER_TEMP/remohop-release"; rm -rf "$OUT"; mkdir -p "$OUT"
+          LDFLAGS="-s -w -X github.com/readori/RemoHop/internal/cli.Version=$VERSION"
           for arch in arm64 amd64; do
-            CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" go build -trimpath -ldflags "$LDFLAGS" -o "$OUT/rds-darwin-$arch" ./cmd/rds
+            CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" go build -trimpath -ldflags "$LDFLAGS" -o "$OUT/remohop-darwin-$arch" ./cmd/remohop
           done
-          lipo -create -output "$OUT/rds" "$OUT/rds-darwin-arm64" "$OUT/rds-darwin-amd64"
-          chmod 755 "$OUT/rds"
-          ARCHS="$(lipo -archs "$OUT/rds")"
+          lipo -create -output "$OUT/remohop" "$OUT/remohop-darwin-arm64" "$OUT/remohop-darwin-amd64"
+          chmod 755 "$OUT/remohop"
+          ARCHS="$(lipo -archs "$OUT/remohop")"
           [[ "$ARCHS" == *arm64* && "$ARCHS" == *x86_64* ]] || { echo "::error::the binary is not universal: $ARCHS"; exit 65; }
-          GOT="$("$OUT/rds" version)"
-          [[ "$GOT" == "rds $VERSION" ]] || { echo "::error::the binary reports '$GOT', expected 'rds $VERSION'."; exit 65; }
+          GOT="$("$OUT/remohop" version)"
+          [[ "$GOT" == "remohop $VERSION" ]] || { echo "::error::the binary reports '$GOT', expected 'remohop $VERSION'."; exit 65; }
           # No dynamic libraries beyond the system's: nothing third-party to sign or to validate.
-          LIBS="$(otool -L "$OUT/rds" | awk '$0 !~ /:$/ && $1 !~ /^\/(usr\/lib|System)\// {print $1}' | sort -u | tr '\n' ' ')"
+          LIBS="$(otool -L "$OUT/remohop" | awk '$0 !~ /:$/ && $1 !~ /^\/(usr\/lib|System)\// {print $1}' | sort -u | tr '\n' ' ')"
           [[ -z "$LIBS" ]] || { echo "::error::the binary links non-system libraries: $LIBS"; exit 65; }
           C="$(git rev-parse HEAD)"
           {
             echo "OUT=$OUT"; echo "VERSION=$VERSION"; echo "SOURCE_SHA=$C"
           } >> "$GITHUB_ENV"
-          echo "built rds $VERSION ($ARCHS), $(du -h "$OUT/rds" | cut -f1), $(go version | cut -d' ' -f3), source ${C:0:8}"
+          echo "built remohop $VERSION ($ARCHS), $(du -h "$OUT/remohop" | cut -f1), $(go version | cut -d' ' -f3), source ${C:0:8}"
           {
-            echo '### SoDesk macOS release'; echo
-            echo "- Source: \`readori/SoDesk@${C:0:8}\` (ref \`$SOURCE_REF\`), version \`$VERSION\`, $(go version | cut -d' ' -f3), macOS $(sw_vers -productVersion)"
-            echo "- Universal binary: \`$ARCHS\`, $(du -h "$OUT/rds" | cut -f1), CGO off, system libraries only"
+            echo '### RemoHop macOS release'; echo
+            echo "- Source: \`$SOURCE_REPOSITORY@${C:0:8}\` (ref \`$SOURCE_REF\`), version \`$VERSION\`, $(go version | cut -d' ' -f3), macOS $(sw_vers -productVersion)"
+            echo "- Universal binary: \`$ARCHS\`, $(du -h "$OUT/remohop" | cut -f1), CGO off, system libraries only"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create the signing keychain and import the certificate
@@ -213,7 +215,7 @@ jobs:
           ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
         run: |
           set -euo pipefail
-          KEYCHAIN_NAME="sodesk-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.keychain-db"
+          KEYCHAIN_NAME="remohop-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.keychain-db"
           KEYCHAIN_PATH="$HOME/Library/Keychains/$KEYCHAIN_NAME"
           KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
           echo "::add-mask::$KEYCHAIN_PASSWORD"
@@ -230,7 +232,7 @@ jobs:
           OLD=(); while IFS= read -r k; do [[ -n "$k" ]] && OLD+=("$k"); done < <(tr ':' '\n' <<<"$ORIGINAL_KEYCHAINS")
           security list-keychains -d user -s "$KEYCHAIN_PATH" ${OLD[@]+"${OLD[@]}"}
 
-          P12="$RUNNER_TEMP/sodesk-devid.p12"
+          P12="$RUNNER_TEMP/remohop-devid.p12"
           trap 'rm -f "$P12"' EXIT
           ( umask 077; python3 -c '
           import base64, os, sys
@@ -266,7 +268,7 @@ jobs:
           echo "signing identity: $SIGN_NAME · certificate valid until ${EXPIRES:-unknown}"
           echo "- Signing identity: \`$SIGN_NAME\`, certificate valid until ${EXPIRES:-unknown}" >> "$GITHUB_STEP_SUMMARY"
 
-      # Hardened runtime, secure timestamp, and no entitlements: rds is a static Go program. It
+      # Hardened runtime, secure timestamp, and no entitlements: remohop is a static Go program. It
       # generates no code at run time (purego calls system frameworks through fixed trampolines,
       # so no allow-jit / allow-unsigned-executable-memory), the only libraries it loads are
       # Apple's own (they pass library validation, so no disable-library-validation), it needs
@@ -277,10 +279,10 @@ jobs:
         run: |
           set -euo pipefail
           codesign --force --sign "$SIGN_HASH" --keychain "$KEYCHAIN_PATH" --options runtime --timestamp \
-            --identifier "$SIGN_IDENTIFIER" "$OUT/rds" > "$RUNNER_TEMP/codesign.log" 2>&1 \
+            --identifier "$SIGN_IDENTIFIER" "$OUT/remohop" > "$RUNNER_TEMP/codesign.log" 2>&1 \
             || { cut -c1-300 "$RUNNER_TEMP/codesign.log" | tail -n 10; echo '::error::codesign failed.'; exit 1; }
-          codesign --verify --strict --verbose=2 "$OUT/rds" 2>&1 | cut -c1-200
-          INFO="$(codesign -dvvv --entitlements - "$OUT/rds" 2>&1)"
+          codesign --verify --strict --verbose=2 "$OUT/remohop" 2>&1 | cut -c1-200
+          INFO="$(codesign -dvvv --entitlements - "$OUT/remohop" 2>&1)"
           grep -E '^(Identifier|Format|CodeDirectory|Authority|TeamIdentifier|Timestamp|Runtime Version)=' <<<"$INFO" | cut -c1-200
           grep -q 'flags=.*runtime' <<<"$INFO" || { echo '::error::the signature does not have the hardened runtime flag.'; exit 1; }
           grep -q '^Timestamp=' <<<"$INFO" || { echo '::error::the signature has no secure timestamp.'; exit 1; }
@@ -288,9 +290,9 @@ jobs:
           if grep -q '<key>' <<<"$INFO"; then echo '::error::the signature carries entitlements; none are expected.'; exit 1; fi
           # Both slices are signed (lipo -create before signing; codesign signs each).
           for arch in arm64 x86_64; do
-            codesign --verify --strict --arch "$arch" "$OUT/rds" || { echo "::error::the $arch slice does not verify."; exit 1; }
+            codesign --verify --strict --arch "$arch" "$OUT/remohop" || { echo "::error::the $arch slice does not verify."; exit 1; }
           done
-          [[ "$("$OUT/rds" version)" == "rds $VERSION" ]] || { echo '::error::the signed binary does not run.'; exit 1; }
+          [[ "$("$OUT/remohop" version)" == "remohop $VERSION" ]] || { echo '::error::the signed binary does not run.'; exit 1; }
           echo '- Signature: Developer ID Application, hardened runtime, secure timestamp, no entitlements, both slices verify (`codesign --verify --strict`)' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Notarize
@@ -300,7 +302,7 @@ jobs:
           ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
         run: |
           set +e -uo pipefail
-          ASC_DIR="$RUNNER_TEMP/sodesk-asc"; rm -rf "$ASC_DIR"; ( umask 077; mkdir -p "$ASC_DIR" )
+          ASC_DIR="$RUNNER_TEMP/remohop-asc"; rm -rf "$ASC_DIR"; ( umask 077; mkdir -p "$ASC_DIR" )
           P8="$ASC_DIR/AuthKey.p8"
           ( umask 077; python3 -c '
           import base64, os, sys
@@ -311,9 +313,9 @@ jobs:
           open(sys.argv[1], "w").write(key + "\n")
           ' "$P8" ) || { echo '::error::ASC_PRIVATE_KEY is not a .p8 private key.'; exit 78; }
 
-          ZIP="$OUT/rds-macos-universal.zip"
+          ZIP="$OUT/remohop-macos-universal.zip"
           rm -f "$ZIP"
-          ( cd "$OUT" && /usr/bin/zip -q -X "$ZIP" rds ) || { echo '::error::zip failed.'; exit 1; }
+          ( cd "$OUT" && /usr/bin/zip -q -X "$ZIP" remohop ) || { echo '::error::zip failed.'; exit 1; }
           RESULT="$RUNNER_TEMP/notary-result.json"
           xcrun notarytool submit "$ZIP" --key "$P8" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" \
             --wait --timeout 30m --output-format json > "$RESULT" 2> "$RUNNER_TEMP/notary.err"
@@ -364,11 +366,11 @@ jobs:
           ok()   { printf '   ok    %s\n' "$*"; }
           fail() { printf '   FAIL  %s\n' "$*"; FAILED=1; }
           info() { printf '   info  %s\n' "$*"; }
-          BIN="$OUT/rds"
+          BIN="$OUT/remohop"
           if codesign --verify --strict --verbose=2 "$BIN" > "$RUNNER_TEMP/verify.txt" 2>&1; then ok 'codesign --verify --strict'; else fail 'codesign --verify --strict'; cut -c1-200 "$RUNNER_TEMP/verify.txt" | tail -n 5; fi
           # The zip holds exactly the binary that was signed.
           X="$RUNNER_TEMP/unzipped"; rm -rf "$X"; mkdir -p "$X"; /usr/bin/unzip -q "$ZIP" -d "$X"
-          if cmp -s "$X/rds" "$BIN" && codesign --verify --strict "$X/rds" 2>/dev/null; then ok 'the binary in the zip is the signed one and verifies after unpacking'; else fail 'the binary in the zip differs from the signed one'; fi
+          if cmp -s "$X/remohop" "$BIN" && codesign --verify --strict "$X/remohop" 2>/dev/null; then ok 'the binary in the zip is the signed one and verifies after unpacking'; else fail 'the binary in the zip differs from the signed one'; fi
 
           NOTARIZED=
           for _ in 1 2 3 4 5 6; do
@@ -380,27 +382,27 @@ jobs:
           ASSESS="$(spctl --assess --type install -vv "$BIN" 2>&1)"; code=$?
           SRC="$(sed -n 's/^source=//p' <<<"$ASSESS" | head -n 1)"
           if [[ "$code" -eq 0 && "$SRC" == *Notarized* ]]; then ok "spctl --assess --type install: accepted, source=$SRC"
-          else info "spctl --assess --type install: exit $code, $(head -n 1 <<<"$ASSESS" | sed -e "s#$BIN#rds#" | cut -c1-160) ${SRC:+source=$SRC} (spctl judges bundles and installers; for a bare tool the ticket check above is the authority)"; fi
+          else info "spctl --assess --type install: exit $code, $(head -n 1 <<<"$ASSESS" | sed -e "s#$BIN#remohop#" | cut -c1-160) ${SRC:+source=$SRC} (spctl judges bundles and installers; for a bare tool the ticket check above is the authority)"; fi
           STAPLE="$(xcrun stapler staple "$BIN" 2>&1 | tail -n 1 | cut -c1-160)"
           info "stapler on the bare executable: ${STAPLE:-no output} (expected: only bundles, disk images and packages can carry a stapled ticket)"
 
           # As downloaded: with the quarantine mark a browser sets, the system checks the
           # notarization before it lets the file run.
-          Q="$RUNNER_TEMP/quarantined"; rm -rf "$Q"; mkdir -p "$Q"; cp "$BIN" "$Q/rds"
-          xattr -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");Safari;$(uuidgen)" "$Q/rds"
-          GOT="$("$Q/rds" version 2>&1)"; code=$?
-          if [[ "$code" -eq 0 && "$GOT" == "rds $VERSION" ]]; then ok 'a quarantined copy (as if downloaded) runs'; else fail "a quarantined copy does not run: exit $code"; head -n 2 <<<"$GOT" | cut -c1-200; fi
+          Q="$RUNNER_TEMP/quarantined"; rm -rf "$Q"; mkdir -p "$Q"; cp "$BIN" "$Q/remohop"
+          xattr -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");Safari;$(uuidgen)" "$Q/remohop"
+          GOT="$("$Q/remohop" version 2>&1)"; code=$?
+          if [[ "$code" -eq 0 && "$GOT" == "remohop $VERSION" ]]; then ok 'a quarantined copy (as if downloaded) runs'; else fail "a quarantined copy does not run: exit $code"; head -n 2 <<<"$GOT" | cut -c1-200; fi
           # Under Rosetta, where the runner has it, the Intel slice runs too.
-          if GOT="$(arch -x86_64 "$BIN" version 2>/dev/null)" && [[ "$GOT" == "rds $VERSION" ]]; then ok 'the x86_64 slice runs (Rosetta)'; else info 'the x86_64 slice was not run (no Rosetta on this runner)'; fi
+          if GOT="$(arch -x86_64 "$BIN" version 2>/dev/null)" && [[ "$GOT" == "remohop $VERSION" ]]; then ok 'the x86_64 slice runs (Rosetta)'; else info 'the x86_64 slice was not run (no Rosetta on this runner)'; fi
 
           SHA_BIN="$(shasum -a 256 "$BIN" | cut -d' ' -f1)"; SHA_ZIP="$(shasum -a 256 "$ZIP" | cut -d' ' -f1)"
-          echo "   sha256 rds                      $SHA_BIN"
-          echo "   sha256 rds-macos-universal.zip  $SHA_ZIP"
+          echo "   sha256 remohop                      $SHA_BIN"
+          echo "   sha256 remohop-macos-universal.zip  $SHA_ZIP"
           {
             if [[ "$FAILED" -eq 0 ]]; then echo '- Verification: signature strict-valid, notarization ticket found online, quarantined copy runs: PASS'; else echo '- Verification: **FAIL** (see the log)'; fi
             echo '- Not stapled: a bare executable cannot carry a ticket (`stapler` handles bundles, disk images and packages); Gatekeeper looks the ticket up online on first run'
-            echo "- SHA-256 \`rds\` (universal, signed): \`$SHA_BIN\`"
-            echo "- SHA-256 \`rds-macos-universal.zip\` (as notarized): \`$SHA_ZIP\`"
+            echo "- SHA-256 \`remohop\` (universal, signed): \`$SHA_BIN\`"
+            echo "- SHA-256 \`remohop-macos-universal.zip\` (as notarized): \`$SHA_ZIP\`"
             echo '- Nothing uploaded unless the release hand-off was requested (upload=true).'
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$FAILED"
@@ -409,41 +411,41 @@ jobs:
         working-directory: source
         run: |
           set +e -uo pipefail
-          BIN="$OUT/rds"
+          BIN="$OUT/remohop"
           "$BIN" --help > "$RUNNER_TEMP/help.txt" 2>&1; code=$?
-          if [[ "$code" -eq 0 ]] && grep -q 'vpn' "$RUNNER_TEMP/help.txt" && grep -q 'desktop' "$RUNNER_TEMP/help.txt"; then echo "   ok    rds --help ($(wc -l < "$RUNNER_TEMP/help.txt" | tr -d ' ') lines)"; else echo "::error::rds --help failed (exit $code)."; head -n 5 "$RUNNER_TEMP/help.txt" | cut -c1-200; exit 1; fi
+          if [[ "$code" -eq 0 ]] && grep -q 'vpn' "$RUNNER_TEMP/help.txt" && grep -q 'desktop' "$RUNNER_TEMP/help.txt"; then echo "   ok    remohop --help ($(wc -l < "$RUNNER_TEMP/help.txt" | tr -d ' ') lines)"; else echo "::error::remohop --help failed (exit $code)."; head -n 5 "$RUNNER_TEMP/help.txt" | cut -c1-200; exit 1; fi
           [[ -f test/smoke/smoke.sh ]] || { echo '::error::test/smoke/smoke.sh is not on this ref.'; exit 66; }
           bash test/smoke/smoke.sh "$BIN" > "$RUNNER_TEMP/smoke.txt" 2>&1; code=$?
           cut -c1-300 "$RUNNER_TEMP/smoke.txt" | tail -n 80
           if [[ "$code" -eq 0 ]] && ! grep -q '^   FAIL' "$RUNNER_TEMP/smoke.txt"; then
-            echo "- Signed binary: \`rds --help\` and the loopback smoke test (host + client: $(grep -c '^   ok' "$RUNNER_TEMP/smoke.txt") checks): PASS" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Signed binary: \`remohop --help\` and the loopback smoke test (host + client: $(grep -c '^   ok' "$RUNNER_TEMP/smoke.txt") checks): PASS" >> "$GITHUB_STEP_SUMMARY"
           else
             echo '- Signed binary: loopback smoke test **FAIL**' >> "$GITHUB_STEP_SUMMARY"
             echo '::error::the loopback smoke test failed with the signed binary.'; exit 1
           fi
 
-      # The one thing the hardened runtime could break: rds loads CoreGraphics and
+      # The one thing the hardened runtime could break: remohop loads CoreGraphics and
       # ApplicationServices at run time (purego) for displays and input. A desktop probe makes
       # the signed host do exactly that; its JSON holds the viewer URL (with an access token),
       # so only chosen fields are printed.
       - name: Run the signed binary (system frameworks under the hardened runtime)
         run: |
           set +e -uo pipefail
-          BIN="$OUT/rds"
+          BIN="$OUT/remohop"
           command -v ffmpeg >/dev/null || brew install --quiet ffmpeg > "$RUNNER_TEMP/brew-ffmpeg.log" 2>&1 \
             || { echo '::warning::ffmpeg could not be installed; the framework check was skipped.'; echo '- Signed binary loading system frameworks: skipped (no ffmpeg)' >> "$GITHUB_STEP_SUMMARY"; exit 0; }
           W="$RUNNER_TEMP/release-probe"; rm -rf "$W"; mkdir -p "$W/host" "$W/cli"
           PORT=$((20000 + RANDOM % 10000)); TARGET="127.0.0.1:$PORT"
           PW="$(openssl rand -hex 16)"
           echo "::add-mask::$PW"
-          RDS_CONFIG_DIR="$W/host" "$BIN" host --no-signal --listen "$TARGET" --password "$PW" > "$W/host.log" 2>&1 < /dev/null &
+          REMOHOP_CONFIG_DIR="$W/host" "$BIN" host --no-signal --listen "$TARGET" --password "$PW" > "$W/host.log" 2>&1 < /dev/null &
           HOST_PID=$!
           CLI_PID=
           cleanup() { [[ -z "$CLI_PID" ]] || kill "$CLI_PID" 2>/dev/null; kill "$HOST_PID" 2>/dev/null; sleep 0.5; rm -rf "$W"; }
           trap cleanup EXIT
           for _ in $(seq 1 100); do grep -q 'host ready' "$W/host.log" 2>/dev/null && break; sleep 0.2; done
-          grep -q 'host ready' "$W/host.log" || { echo '::error::the signed rds host did not start.'; tail -n 5 "$W/host.log" | cut -c1-300; exit 1; }
-          RDS_CONFIG_DIR="$W/cli" RDS_PASSWORD="$PW" "$BIN" "$TARGET" desktop --no-open --json > "$W/desktop.json" 2> "$W/desktop.err" < /dev/null &
+          grep -q 'host ready' "$W/host.log" || { echo '::error::the signed remohop host did not start.'; tail -n 5 "$W/host.log" | cut -c1-300; exit 1; }
+          REMOHOP_CONFIG_DIR="$W/cli" REMOHOP_PASSWORD="$PW" "$BIN" "$TARGET" desktop --no-open --json > "$W/desktop.json" 2> "$W/desktop.err" < /dev/null &
           CLI_PID=$!
           for _ in $(seq 1 300); do
             grep -q '^}' "$W/desktop.json" 2>/dev/null && break
@@ -483,17 +485,17 @@ jobs:
         run: |
           set -euo pipefail
           H="$RUNNER_TEMP/handoff"; rm -rf "$H"; mkdir -p "$H"
-          cp "$OUT/rds" "$H/rds"
-          cp "$ZIP" "$H/rds-macos-universal.zip"
-          ( cd "$H" && shasum -a 256 rds rds-macos-universal.zip > SHA256SUMS-macos && cat SHA256SUMS-macos )
+          cp "$OUT/remohop" "$H/remohop"
+          cp "$ZIP" "$H/remohop-macos-universal.zip"
+          ( cd "$H" && shasum -a 256 remohop remohop-macos-universal.zip > SHA256SUMS-macos && cat SHA256SUMS-macos )
           echo "HANDOFF_DIR=$H" >> "$GITHUB_ENV"
-          echo "- Hand-off: artifact \`rds-macos-universal\` uploaded for the release workflow (kept 3 days)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Hand-off: artifact \`remohop-macos-universal\` uploaded for the release workflow (kept 3 days)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the signed binary (release hand-off)
         if: inputs.upload == true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: rds-macos-universal
+          name: remohop-macos-universal
           path: ${{ env.HANDOFF_DIR }}/*
           retention-days: 3
           if-no-files-found: error
@@ -507,5 +509,5 @@ jobs:
             [[ "${#OLD[@]}" -gt 0 ]] && security list-keychains -d user -s "${OLD[@]}" >/dev/null 2>&1
           fi
           [[ -n "${KEYCHAIN_NAME:-}" ]] && security delete-keychain "$KEYCHAIN_NAME" >/dev/null 2>&1
-          rm -rf "$RUNNER_TEMP/sodesk-asc" "$RUNNER_TEMP/sodesk-devid.p12" "$RUNNER_TEMP/notary-result.json" "$RUNNER_TEMP/notary-log.json" >/dev/null 2>&1
+          rm -rf "$RUNNER_TEMP/remohop-asc" "$RUNNER_TEMP/remohop-devid.p12" "$RUNNER_TEMP/notary-result.json" "$RUNNER_TEMP/notary-log.json" >/dev/null 2>&1
           true

@@ -1,20 +1,20 @@
-# SoDesk Windows end-to-end tests: features that only a real Windows desktop can prove.
+# RemoHop Windows end-to-end tests: features that only a real Windows desktop can prove.
 #
-# Public CI repository -> source readori/SoDesk.
+# Public CI repository -> source repository: env SOURCE_REPOSITORY.
 #
 #   mount : windows-11-arm (Windows 11, a desktop edition: it ships the WebClient service, the
 #           WebDAV redirector that windows-latest / Windows Server lacks without a reboot).
-#           `rds mount` end to end: loopback WebDAV server + `net use` drive mapping; read, write,
-#           rename, delete, unmap (internal/svc/fs/mount, TestDavE2EWindows, SODESK_MOUNT_E2E=1).
+#           `remohop mount` end to end: loopback WebDAV server + `net use` drive mapping; read, write,
+#           rename, delete, unmap (internal/svc/fs/mount, TestDavE2EWindows, REMOHOP_MOUNT_E2E=1).
 #   gui   : windows-latest (x64) and windows-11-arm (arm64, native Go): the interactive-desktop
 #           features. Reports whether the runner has a desktop it can inject into and capture, then
 #           runs SendInput tests (pointer read back with GetCursorPos, typing into a real text box),
 #           the screenshot service against a window of known colour, and a desktop session
 #           (ddagrab / gdigrab capture, encoder selection, client-side decode, input over the session)
 #           with a pinned, SHA-256-verified ffmpeg.
-#   unattended : windows-latest. `rds service install --unattended`: the real LocalSystem service shows
+#   unattended : windows-latest. `remohop service install --unattended`: the real LocalSystem service shows
 #           and controls the console session through its helper (internal/unattended,
-#           TestUnattendedE2E, SODESK_UNATTENDED_E2E=1): screenshot and desktop frames, input into a
+#           TestUnattendedE2E, REMOHOP_UNATTENDED_E2E=1): screenshot and desktop frames, input into a
 #           window, Ctrl+Alt+Del on the secure desktop, a UAC prompt where the runner allows one, and
 #           the lock screen. It locks the workstation at the end, so it has a job of its own.
 #
@@ -28,15 +28,15 @@
 # Safety rules (public repo, public logs): no pull_request triggers; only GitHub-owned actions,
 # pinned to commit SHAs; everything else is plain PowerShell; TARGET_REPO_PAT is used only by the
 # checkout step and not persisted; logs carry test results and failure tails only.
-name: SoDesk Windows E2E
+name: RemoHop Windows E2E
 
-run-name: SoDesk Windows E2E · ${{ github.event_name == 'push' && 'request (ci-requests/sodesk-e2e-windows.env)' || inputs.ref }}
+run-name: RemoHop Windows E2E · ${{ github.event_name == 'push' && 'request (ci-requests/sodesk-e2e-windows.env)' || inputs.ref }}
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 'readori/SoDesk branch, tag, or SHA'
+        description: 'Source repository branch, tag, or SHA'
         required: true
         default: 'main'
         type: string
@@ -48,10 +48,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: sodesk-e2e-windows-${{ inputs.ref || 'request' }}
+  group: remohop-e2e-windows-${{ inputs.ref || 'request' }}
   cancel-in-progress: true
 
 env:
+  # Private source repository. Change to readori/RemoHop once the GitHub repository is renamed.
+  SOURCE_REPOSITORY: readori/SoDesk
   # ffmpeg 9.1 "essentials" build by gyan.dev (x64; it runs on Windows 11 ARM under emulation).
   # GitHub's archive of the same release is the stable URL; the SHA-256 is checked before use.
   FFMPEG_URL: https://github.com/GyanD/codexffmpeg/releases/download/9.1/ffmpeg-9.1-essentials_build.zip
@@ -77,7 +79,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           if ($env:EVENT_NAME -eq 'push') {
             # Download only the request file of this exact commit (public repo, no credentials).
-            $req = Join-Path $env:RUNNER_TEMP 'sodesk-e2e-request.env'
+            $req = Join-Path $env:RUNNER_TEMP 'remohop-e2e-request.env'
             try { Invoke-WebRequest -Uri $env:REQUEST_URL -OutFile $req -MaximumRetryCount 3 -TimeoutSec 30 }
             catch { Write-Output '::error::Could not read ci-requests/sodesk-e2e-windows.env at this commit.'; exit 64 }
             # Plain text, read line by line; never sourced or executed.
@@ -91,7 +93,7 @@ jobs:
             exit 64
           }
           if (-not $env:TARGET_REPO_PAT) {
-            Write-Output '::error::Missing public CI credential: TARGET_REPO_PAT (it must have read access to readori/SoDesk).'
+            Write-Output '::error::Missing public CI credential: TARGET_REPO_PAT (it must have read access to the source repository, env SOURCE_REPOSITORY).'
             exit 78
           }
           "SOURCE_REF=$ref" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -100,7 +102,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: readori/SoDesk
+          repository: ${{ env.SOURCE_REPOSITORY }}
           ref: ${{ env.SOURCE_REF }}
           token: ${{ secrets.TARGET_REPO_PAT }}
           path: source
@@ -120,7 +122,7 @@ jobs:
           go version
           go env GOOS GOARCH CGO_ENABLED
           $sha = (git rev-parse --short HEAD)
-          @("### SoDesk Windows E2E · mount", "", "- Source: ``readori/SoDesk@$sha`` (ref ``$env:SOURCE_REF``)", "- $(go version)", "- $((Get-CimInstance Win32_OperatingSystem).Caption) $([Environment]::OSVersion.Version)") | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          @("### RemoHop Windows E2E · mount", "", "- Source: ``$($env:SOURCE_REPOSITORY)@$sha`` (ref ``$env:SOURCE_REF``)", "- $(go version)", "- $((Get-CimInstance Win32_OperatingSystem).Caption) $([Environment]::OSVersion.Version)") | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
       - name: Unit tests of the mount package (arm64)
         working-directory: source
@@ -144,13 +146,13 @@ jobs:
           reg.exe query 'HKLM\SYSTEM\CurrentControlSet\Services\WebClient\Parameters'
           Write-Output "OS: $((Get-CimInstance Win32_OperatingSystem).Caption) build $([Environment]::OSVersion.Version)"
 
-      # rds mount: loopback WebDAV server + `net use` through the WebClient redirector; read, write,
+      # remohop mount: loopback WebDAV server + `net use` through the WebClient redirector; read, write,
       # rename, delete and unmap through the drive letter, each checked against the remote directory.
       - name: WebDAV mount round trip
         id: e2e
         working-directory: source
         env:
-          SODESK_MOUNT_E2E: '1'
+          REMOHOP_MOUNT_E2E: '1'
           CGO_ENABLED: '0'
         run: |
           $log = Join-Path $env:RUNNER_TEMP 'mount-e2e.log'
@@ -182,8 +184,8 @@ jobs:
       run:
         shell: pwsh
     env:
-      SODESK_INPUT_E2E: '1'
-      SODESK_DESKTOP_E2E: '1'
+      REMOHOP_INPUT_E2E: '1'
+      REMOHOP_DESKTOP_E2E: '1'
       CGO_ENABLED: '0'
 
     steps:
@@ -196,7 +198,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           if ($env:EVENT_NAME -eq 'push') {
-            $req = Join-Path $env:RUNNER_TEMP 'sodesk-e2e-request.env'
+            $req = Join-Path $env:RUNNER_TEMP 'remohop-e2e-request.env'
             try { Invoke-WebRequest -Uri $env:REQUEST_URL -OutFile $req -MaximumRetryCount 3 -TimeoutSec 30 }
             catch { Write-Output '::error::Could not read ci-requests/sodesk-e2e-windows.env at this commit.'; exit 64 }
             $line = Get-Content -LiteralPath $req | Where-Object { $_ -cmatch '^REF=' } | Select-Object -First 1
@@ -209,7 +211,7 @@ jobs:
             exit 64
           }
           if (-not $env:TARGET_REPO_PAT) {
-            Write-Output '::error::Missing public CI credential: TARGET_REPO_PAT (it must have read access to readori/SoDesk).'
+            Write-Output '::error::Missing public CI credential: TARGET_REPO_PAT (it must have read access to the source repository, env SOURCE_REPOSITORY).'
             exit 78
           }
           "SOURCE_REF=$ref" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -218,7 +220,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: readori/SoDesk
+          repository: ${{ env.SOURCE_REPOSITORY }}
           ref: ${{ env.SOURCE_REF }}
           token: ${{ secrets.TARGET_REPO_PAT }}
           path: source
@@ -237,7 +239,7 @@ jobs:
           go version
           go env GOOS GOARCH CGO_ENABLED
           $sha = (git rev-parse --short HEAD)
-          @("### SoDesk Windows E2E · GUI · ${{ matrix.os }}", "", "- Source: ``readori/SoDesk@$sha`` (ref ``$env:SOURCE_REF``)", "- $(go version)", "- $((Get-CimInstance Win32_OperatingSystem).Caption) $([Environment]::OSVersion.Version), $env:PROCESSOR_ARCHITECTURE") | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          @("### RemoHop Windows E2E · GUI · ${{ matrix.os }}", "", "- Source: ``$($env:SOURCE_REPOSITORY)@$sha`` (ref ``$env:SOURCE_REF``)", "- $(go version)", "- $((Get-CimInstance Win32_OperatingSystem).Caption) $([Environment]::OSVersion.Version), $env:PROCESSOR_ARCHITECTURE") | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
       # Writes the helper that runs one go test selection and prints its tail, its RESULT lines and
       # the step-summary block. It is plain PowerShell written to the runner's temp directory.
@@ -310,7 +312,7 @@ jobs:
           Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
           $exe = Get-ChildItem -Path $dir -Recurse -Filter ffmpeg.exe | Select-Object -First 1
           if (-not $exe) { throw 'ffmpeg.exe is not in the archive' }
-          "RDS_FFMPEG=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "REMOHOP_FFMPEG=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           & $exe.FullName -hide_banner -version | Select-Object -First 1
           & $exe.FullName -hide_banner -filters 2>&1 | Select-String -Pattern ' ddagrab '
           & $exe.FullName -hide_banner -devices 2>&1 | Select-String -Pattern 'gdigrab'
@@ -320,8 +322,8 @@ jobs:
         working-directory: source
         run: |
           $ErrorActionPreference = 'Stop'
-          go build -trimpath -o "$env:RUNNER_TEMP\rds.exe" ./cmd/rds
-          & "$env:RUNNER_TEMP\rds.exe" version
+          go build -trimpath -o "$env:RUNNER_TEMP\remohop.exe" ./cmd/remohop
+          & "$env:RUNNER_TEMP\remohop.exe" version
           go vet ./internal/inject/ ./internal/svc/input/ ./internal/svc/screenshot/ ./internal/svc/desktop/ ./internal/wintest/
 
       # SendInput: the pointer lands on the exact pixel (read back with GetCursorPos), and Unicode text,
@@ -331,8 +333,8 @@ jobs:
         working-directory: source
         run: '& "$env:RUNNER_TEMP\gotest.ps1" -Title "SendInput injector" -Pkgs "./internal/inject/" -Run "TestWinE2E"'
 
-      # The same through the input service over a real rds session: move, click, type, key combos.
-      - name: Input service (rds input)
+      # The same through the input service over a real remohop session: move, click, type, key combos.
+      - name: Input service (remohop input)
         if: always()
         working-directory: source
         run: '& "$env:RUNNER_TEMP\gotest.ps1" -Title "input service" -Pkgs "./internal/svc/input/" -Run "TestWinMoveE2E|TestWinTypeE2E"'
@@ -354,7 +356,7 @@ jobs:
         working-directory: source
         run: '& "$env:RUNNER_TEMP\gotest.ps1" -Title "desktop session" -Pkgs "./internal/svc/desktop/" -Run "TestWinDesktopE2E"'
 
-  # Unattended access (rds service install --unattended): the real service, installed as LocalSystem
+  # Unattended access (remohop service install --unattended): the real service, installed as LocalSystem
   # in session 0, shows and controls the console session through its helper. The test connects as a
   # client and checks (a) screenshots and desktop frames of the console, (b) input into a real window,
   # Ctrl+Alt+Del (SendSAS, with the SoftwareSASGeneration policy set for the test) captured on the
@@ -369,7 +371,7 @@ jobs:
       run:
         shell: pwsh
     env:
-      SODESK_UNATTENDED_E2E: '1'
+      REMOHOP_UNATTENDED_E2E: '1'
       CGO_ENABLED: '0'
 
     steps:
@@ -382,7 +384,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           if ($env:EVENT_NAME -eq 'push') {
-            $req = Join-Path $env:RUNNER_TEMP 'sodesk-e2e-request.env'
+            $req = Join-Path $env:RUNNER_TEMP 'remohop-e2e-request.env'
             try { Invoke-WebRequest -Uri $env:REQUEST_URL -OutFile $req -MaximumRetryCount 3 -TimeoutSec 30 }
             catch { Write-Output '::error::Could not read ci-requests/sodesk-e2e-windows.env at this commit.'; exit 64 }
             $line = Get-Content -LiteralPath $req | Where-Object { $_ -cmatch '^REF=' } | Select-Object -First 1
@@ -395,7 +397,7 @@ jobs:
             exit 64
           }
           if (-not $env:TARGET_REPO_PAT) {
-            Write-Output '::error::Missing public CI credential: TARGET_REPO_PAT (it must have read access to readori/SoDesk).'
+            Write-Output '::error::Missing public CI credential: TARGET_REPO_PAT (it must have read access to the source repository, env SOURCE_REPOSITORY).'
             exit 78
           }
           "SOURCE_REF=$ref" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -404,7 +406,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: readori/SoDesk
+          repository: ${{ env.SOURCE_REPOSITORY }}
           ref: ${{ env.SOURCE_REF }}
           token: ${{ secrets.TARGET_REPO_PAT }}
           path: source
@@ -422,7 +424,7 @@ jobs:
         run: |
           go version
           $sha = (git rev-parse --short HEAD)
-          @("### SoDesk Windows E2E · unattended access · windows-latest", "", "- Source: ``readori/SoDesk@$sha`` (ref ``$env:SOURCE_REF``)", "- $(go version)", "- $((Get-CimInstance Win32_OperatingSystem).Caption) $([Environment]::OSVersion.Version), $env:PROCESSOR_ARCHITECTURE") | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          @("### RemoHop Windows E2E · unattended access · windows-latest", "", "- Source: ``$($env:SOURCE_REPOSITORY)@$sha`` (ref ``$env:SOURCE_REF``)", "- $(go version)", "- $((Get-CimInstance Win32_OperatingSystem).Caption) $([Environment]::OSVersion.Version), $env:PROCESSOR_ARCHITECTURE") | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
       - name: Test helper
         run: |
@@ -475,21 +477,21 @@ jobs:
           Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
           $exe = Get-ChildItem -Path $dir -Recurse -Filter ffmpeg.exe | Select-Object -First 1
           if (-not $exe) { throw 'ffmpeg.exe is not in the archive' }
-          "RDS_FFMPEG=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "REMOHOP_FFMPEG=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           & $exe.FullName -hide_banner -version | Select-Object -First 1
 
       - name: Build and vet
         working-directory: source
         run: |
           $ErrorActionPreference = 'Stop'
-          go build -trimpath -o "$env:RUNNER_TEMP\rds.exe" ./cmd/rds
+          go build -trimpath -o "$env:RUNNER_TEMP\remohop.exe" ./cmd/remohop
           go vet ./internal/unattended/ ./internal/service/ ./internal/inject/ ./internal/svc/desktop/ ./internal/svc/screenshot/
 
       # The e2e gate is off for this step: here the e2e tests skip.
       - name: Unit tests (unattended, service, inject)
         working-directory: source
         env:
-          SODESK_UNATTENDED_E2E: '0'
+          REMOHOP_UNATTENDED_E2E: '0'
         run: '& "$env:RUNNER_TEMP\gotest.ps1" -Title "unit tests" -Pkgs "./internal/unattended/ ./internal/service/ ./internal/inject/" -Run "."'
 
       # Installs the service with --unattended (removed again afterwards), then screenshot, desktop,
@@ -503,6 +505,6 @@ jobs:
         if: failure() && steps.e2e.conclusion == 'failure'
         continue-on-error: true
         run: |
-          Get-Service sodesk-ua-e2e -ErrorAction SilentlyContinue | Format-List Name, Status
-          Get-Process rds -ErrorAction SilentlyContinue | Select-Object Id, SessionId, StartTime, Path | Format-Table -AutoSize | Out-String -Width 200
+          Get-Service remohop-ua-e2e -ErrorAction SilentlyContinue | Format-List Name, Status
+          Get-Process remohop -ErrorAction SilentlyContinue | Select-Object Id, SessionId, StartTime, Path | Format-Table -AutoSize | Out-String -Width 200
           try { Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Service Control Manager'; StartTime=(Get-Date).AddMinutes(-30)} -MaxEvents 20 | Select-Object TimeCreated, Id, @{n='Msg';e={ $_.Message.Substring(0, [Math]::Min(300, $_.Message.Length)) }} | Format-List } catch { Write-Output "SCM events: $($_.Exception.Message)" }

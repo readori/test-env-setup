@@ -1,5 +1,5 @@
-# SoDesk (Go, binary `rds`) end-to-end tests over the real internet, through the project's
-# public rendezvous server (rds signal --relay, deployed separately; its address and public key
+# RemoHop (Go, binary `remohop`) end-to-end tests over the real internet, through the project's
+# public rendezvous server (remohop signal --relay, deployed separately; its address and public key
 # come from the request file).
 #
 #   relay  : one ubuntu runner, host and client find each other by 9-digit ID through the public
@@ -18,22 +18,22 @@
 # Triggers: workflow_dispatch, or a push to main that changes ci-requests/sodesk-e2e-internet.env.
 # The request file is plain KEY=VALUE text, parsed with strict patterns and never sourced:
 #
-#   REF=<sha>            # readori/SoDesk branch, tag or SHA
+#   REF=<sha>            # source repository branch, tag or SHA
 #   SIGNAL=HOST[:PORT]   # the public rendezvous server
 #   SIGNAL_PIN=KEY       # its public key (base64, public by design)
 #
 # Safety rules (public repo, public logs): no pull_request triggers; only GitHub-owned actions,
 # pinned to commit SHAs; TARGET_REPO_PAT is used by the checkout step and as key-derivation
 # input, never printed or persisted. Logs carry results and failure tails only.
-name: SoDesk E2E Internet
+name: RemoHop E2E Internet
 
-run-name: SoDesk E2E Internet · ${{ github.event_name == 'push' && 'request (ci-requests/sodesk-e2e-internet.env)' || inputs.ref }}
+run-name: RemoHop E2E Internet · ${{ github.event_name == 'push' && 'request (ci-requests/sodesk-e2e-internet.env)' || inputs.ref }}
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 'readori/SoDesk branch, tag, or SHA'
+        description: 'Source repository branch, tag, or SHA'
         required: true
         default: 'main'
         type: string
@@ -53,10 +53,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: sodesk-e2e-internet-${{ inputs.ref || 'request' }}
+  group: remohop-e2e-internet-${{ inputs.ref || 'request' }}
   cancel-in-progress: true
 
 env:
+  # Private source repository. Change to readori/RemoHop once the GitHub repository is renamed.
+  SOURCE_REPOSITORY: readori/SoDesk
   GOTOOLCHAIN: auto
 
 jobs:
@@ -95,7 +97,7 @@ jobs:
           [[ -n "${TARGET_REPO_PAT:-}" ]] || { echo '::error::Missing TARGET_REPO_PAT'; exit 78; }
           { echo "ref=$SOURCE_REF"; echo "signal=$SIGNAL"; echo "pin=$PIN"; } >> "$GITHUB_OUTPUT"
           echo "Source ref: $SOURCE_REF"; echo "Server:     $SIGNAL"
-          { echo "### SoDesk E2E Internet"; echo; echo "- Ref: \`$SOURCE_REF\`"; echo "- Rendezvous server: \`$SIGNAL\`"; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "### RemoHop E2E Internet"; echo; echo "- Ref: \`$SOURCE_REF\`"; echo "- Rendezvous server: \`$SIGNAL\`"; } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------------------------
   relay:
@@ -110,17 +112,17 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: readori/SoDesk
+          repository: ${{ env.SOURCE_REPOSITORY }}
           ref: ${{ needs.request.outputs.ref }}
           token: ${{ secrets.TARGET_REPO_PAT }}
           path: source
           fetch-depth: 1
           persist-credentials: false
-      - name: Build rds
+      - name: Build remohop
         working-directory: source
         run: |
           set -euo pipefail
-          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/rds" ./cmd/rds
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/remohop" ./cmd/remohop
           echo "commit $(git rev-parse --short HEAD), $(go version | cut -d' ' -f3)"
       - name: Host and client by ID, then through the relay
         working-directory: source
@@ -130,7 +132,7 @@ jobs:
         run: |
           set +e
           [[ -f test/e2e/public_signal.sh ]] || { echo '::notice::test/e2e/public_signal.sh is not on this ref; skipped.'; exit 0; }
-          bash test/e2e/public_signal.sh "$RUNNER_TEMP/rds" 2>&1 | cut -c1-400
+          bash test/e2e/public_signal.sh "$RUNNER_TEMP/remohop" 2>&1 | cut -c1-400
           code=${PIPESTATUS[0]}
           echo "- relay through the public server: $([[ $code == 0 ]] && echo PASS || echo FAIL)" >> "$GITHUB_STEP_SUMMARY"
           exit $code
@@ -152,17 +154,17 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: readori/SoDesk
+          repository: ${{ env.SOURCE_REPOSITORY }}
           ref: ${{ needs.request.outputs.ref }}
           token: ${{ secrets.TARGET_REPO_PAT }}
           path: source
           fetch-depth: 1
           persist-credentials: false
-      - name: Build rds and keyseed
+      - name: Build remohop and keyseed
         working-directory: source
         run: |
           set -euo pipefail
-          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/rds" ./cmd/rds
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/remohop" ./cmd/remohop
           CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/keyseed" ./test/e2e/keyseed
       - name: Register
         id: reg
@@ -178,11 +180,11 @@ jobs:
             echo "::add-mask::$pw"
             d="$RUNNER_TEMP/reg-$os"; mkdir -p "$d"
             SEED=$seed "$RUNNER_TEMP/keyseed" "$d/id.pem"
-            export RDS_CONFIG_DIR="$d/cfg"
-            "$RUNNER_TEMP/rds" key import "$d/id.pem" --yes >/dev/null
-            "$RUNNER_TEMP/rds" config set signal "$SIGNAL" >/dev/null
-            "$RUNNER_TEMP/rds" config set signal-pin "$SIGNAL_PIN" >/dev/null
-            "$RUNNER_TEMP/rds" host --password "$pw" > "$d/host.log" 2>&1 &
+            export REMOHOP_CONFIG_DIR="$d/cfg"
+            "$RUNNER_TEMP/remohop" key import "$d/id.pem" --yes >/dev/null
+            "$RUNNER_TEMP/remohop" config set signal "$SIGNAL" >/dev/null
+            "$RUNNER_TEMP/remohop" config set signal-pin "$SIGNAL_PIN" >/dev/null
+            "$RUNNER_TEMP/remohop" host --password "$pw" > "$d/host.log" 2>&1 &
             pid=$!
             id=
             for _ in $(seq 1 60); do
@@ -217,7 +219,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: readori/SoDesk
+          repository: ${{ env.SOURCE_REPOSITORY }}
           ref: ${{ needs.request.outputs.ref }}
           token: ${{ secrets.TARGET_REPO_PAT }}
           path: source
@@ -228,12 +230,12 @@ jobs:
         with:
           go-version-file: source/go.mod
           cache: false
-      - name: Build rds and keyseed
+      - name: Build remohop and keyseed
         working-directory: source
         run: |
           set -euo pipefail
           ext=; [[ "$RUNNER_OS" == Windows ]] && ext=.exe
-          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/rds$ext" ./cmd/rds
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/remohop$ext" ./cmd/remohop
           CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/keyseed$ext" ./test/e2e/keyseed
           echo "EXT=$ext" >> "$GITHUB_ENV"
       - name: Serve as a host for the client job
@@ -252,8 +254,8 @@ jobs:
           d="$RUNNER_TEMP/h"; mkdir -p "$d/files"
           echo "served by the $KEY host" > "$d/files/hello.txt"
           SEED=$seed "$RUNNER_TEMP/keyseed$EXT" "$d/id.pem"
-          export RDS_CONFIG_DIR="$d/cfg"
-          R="$RUNNER_TEMP/rds$EXT"
+          export REMOHOP_CONFIG_DIR="$d/cfg"
+          R="$RUNNER_TEMP/remohop$EXT"
           "$R" key import "$d/id.pem" --yes >/dev/null && rm -f "$d/id.pem"
           "$R" config set signal "$SIGNAL" >/dev/null
           "$R" config set signal-pin "$SIGNAL_PIN" >/dev/null
@@ -286,15 +288,15 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: readori/SoDesk
+          repository: ${{ env.SOURCE_REPOSITORY }}
           ref: ${{ needs.request.outputs.ref }}
           token: ${{ secrets.TARGET_REPO_PAT }}
           path: source
           fetch-depth: 1
           persist-credentials: false
-      - name: Build rds
+      - name: Build remohop
         working-directory: source
-        run: CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/rds" ./cmd/rds
+        run: CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/remohop" ./cmd/remohop
       - name: Connect to the Windows and macOS hosts by ID
         env:
           PAT: ${{ secrets.TARGET_REPO_PAT }}
@@ -304,8 +306,8 @@ jobs:
           ID_MACOS: ${{ needs.prepare.outputs.id_macos }}
         run: |
           set +e
-          R="$RUNNER_TEMP/rds"
-          export RDS_CONFIG_DIR="$RUNNER_TEMP/cli"
+          R="$RUNNER_TEMP/remohop"
+          export REMOHOP_CONFIG_DIR="$RUNNER_TEMP/cli"
           "$R" config set signal "$SIGNAL" >/dev/null
           "$R" config set signal-pin "$SIGNAL_PIN" >/dev/null
           head -c $((1 << 20)) /dev/urandom > "$RUNNER_TEMP/up.bin"
@@ -315,7 +317,7 @@ jobs:
             seed=$(printf '%s|%s|%s|%s' "$PAT" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$os" | sha256sum | cut -c1-64)
             pw=$(printf '%s|pw' "$seed" | sha256sum | cut -c1-24)
             echo "::add-mask::$pw"
-            export RDS_PASSWORD=$pw
+            export REMOHOP_PASSWORD=$pw
             echo; echo "== $os host (ID $id)"
             up=
             for _ in $(seq 1 40); do
@@ -331,8 +333,8 @@ jobs:
             if grep -q '^internet-ok$' <<<"$out"; then echo "   ok    shell -c"; else echo "   FAIL  shell -c: $(tail -n 2 <<<"$out")"; failed=1; fi
             rm -f "$RUNNER_TEMP/back.bin"
             start=$SECONDS
-            if "$R" "$id" cp "$RUNNER_TEMP/up.bin" :rds-e2e-up.bin > "$RUNNER_TEMP/c.txt" 2>&1 &&
-               "$R" "$id" cp :rds-e2e-up.bin "$RUNNER_TEMP/back.bin" >> "$RUNNER_TEMP/c.txt" 2>&1 &&
+            if "$R" "$id" cp "$RUNNER_TEMP/up.bin" :remohop-e2e-up.bin > "$RUNNER_TEMP/c.txt" 2>&1 &&
+               "$R" "$id" cp :remohop-e2e-up.bin "$RUNNER_TEMP/back.bin" >> "$RUNNER_TEMP/c.txt" 2>&1 &&
                cmp -s "$RUNNER_TEMP/up.bin" "$RUNNER_TEMP/back.bin"; then
               echo "   ok    1 MiB up and down, byte-identical ($((SECONDS - start)) s)"
             else
