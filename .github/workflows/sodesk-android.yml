@@ -540,6 +540,11 @@ jobs:
               echo '--- crash buffer / Go log (tail) ---'
               { timeout 30 "$ADB" logcat -d -b crash 2>/dev/null; timeout 30 "$ADB" logcat -d -s GoLog:* 2>/dev/null | grep -E 'panic|fatal|goroutine|\.go:[0-9]+' ; } \
                 | sed -E 's#(127\.0\.0\.1:[0-9]+/)[A-Za-z0-9_=-]{16,}#\1<token>#g; s#([?&](t|token|k)=)[A-Za-z0-9_=-]+#\1<token>#g' | grep -v '^--------' | cut -c1-300 | tail -n 60 || true
+              # Why the system ended the process, if it did (low memory killer, ANR, signal).
+              echo '--- process end (ActivityManager / lowmemorykiller) ---'
+              timeout 30 "$ADB" logcat -d 2>/dev/null | grep -E "$EXPECTED_APP_ID" | grep -iE 'has died|Killing|lowmemorykiller|lmkd|ANR in|Force stopping|signal [0-9]+|Fatal signal|WebView.*(crash|gone)' \
+                | sed -E 's#(127\.0\.0\.1:[0-9]+/)[A-Za-z0-9_=-]{16,}#\1<token>#g' | cut -c1-300 | tail -n 20 || true
+              echo "memory: $(timeout 10 "$ADB" shell cat /proc/meminfo 2>/dev/null | grep -E 'MemTotal|MemAvailable' | tr -s ' \r\n' ' ')"
               echo '--- window focus ---'
               timeout 30 "$ADB" shell dumpsys window 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp' | cut -c1-200 | head -n 4 || true
               echo "::error::StoreScreenshotsTest ($LOC) failed (exit $rc)."
