@@ -1150,8 +1150,9 @@ jobs:
           appId: $SIM_BUNDLE_ID
           ---
           - extendedWaitUntil: { visible: { id: "atlas-globe-stage" }, timeout: 20000 }
-          - extendedWaitUntil: { visible: { id: "globe-disc" }, timeout: 20000 }
-          - assertVisible: { id: "locate-button" }
+          # Build 25: whole 3:2 prints make the hero taller, so the globe card starts below the fold.
+          - scrollUntilVisible: { element: { id: "globe-disc" }, direction: DOWN, visibilityPercentage: 100, centerElement: true, timeout: 20000 }
+          - scrollUntilVisible: { element: { id: "locate-button" }, direction: UP, timeout: 10000 }
           - assertNotVisible: { id: "globe-pill" }
           - assertNotVisible: { id: "globe-country" }
           - scrollUntilVisible: { element: { id: "globe-disc" }, direction: DOWN, visibilityPercentage: 100, centerElement: true, timeout: 10000 }
