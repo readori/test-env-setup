@@ -132,6 +132,8 @@ jobs:
 
       - name: Prepare site (noindex) and bundle with wrangler dry-run (no credentials)
         shell: bash
+        env:
+          ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
         run: |
           set -euo pipefail
           SITE="$RUNNER_TEMP/site"
@@ -141,6 +143,19 @@ jobs:
           # for a year; index.html keeps the platform default (revalidate every time) and picks up new hashes.
           printf '/*\n  X-Robots-Tag: noindex, nofollow\n/assets/*\n  Cache-Control: public, max-age=31536000, immutable\n' > "$SITE/public/_headers"
           printf 'User-agent: *\nDisallow: /\n' > "$SITE/public/robots.txt"
+          # Universal Links (private repo T118): invite links https://${PUBLIC_DOMAIN}/?room=CODE open the iOS app when it
+          # is installed. The app ID prefix (team ID) comes from a secret at deploy time and is never printed.
+          if [[ -n "${ASC_TEAM_ID:-}" ]]; then
+            AASA='{"applinks":{"details":[{"appIDs":["TEAMID.com.readori.youxi"],"components":[{"/":"/","?":{"room":"?*"},"comment":"room invite"}]}]}}'
+            AASA="${AASA/TEAMID/$ASC_TEAM_ID}"
+            mkdir -p "$SITE/public/.well-known"
+            printf '%s\n' "$AASA" > "$SITE/public/.well-known/apple-app-site-association"
+            printf '%s\n' "$AASA" > "$SITE/public/apple-app-site-association"
+            printf '/.well-known/apple-app-site-association\n  Content-Type: application/json\n/apple-app-site-association\n  Content-Type: application/json\n' >> "$SITE/public/_headers"
+            echo 'apple-app-site-association: written'
+          else
+            echo '::warning::ASC_TEAM_ID is not set; apple-app-site-association not written (invite links will not open the app).'
+          fi
           cat > "$SITE/wrangler.jsonc" <<EOF
           {
             "name": "${WORKER_NAME}",
@@ -212,4 +227,9 @@ jobs:
           echo "noindex header: $robots"
           echo "- noindex header: $robots" >> "$GITHUB_STEP_SUMMARY"
           [[ "$robots" == yes ]] || echo '::warning::X-Robots-Tag noindex header is missing on /.'
+          for p in /.well-known/apple-app-site-association /apple-app-site-association; do
+            h="$(curl -s -D - -o /dev/null --max-time 20 "https://${PUBLIC_DOMAIN}${p}" | tr -d '\r' | grep -iE '^HTTP/|^content-type:' | tr '\n' ' ')"
+            echo "${p}: ${h}"
+            echo "- ${p}: ${h}" >> "$GITHUB_STEP_SUMMARY"
+          done
           (( fail == 0 )) || { echo '::error::The deployed site did not answer 200.'; exit 1; }
