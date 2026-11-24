@@ -787,14 +787,15 @@ jobs:
             SIZE="$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "$VIDEO")"
             UP0="$(head -n 1 "$W/screenrecord.log" | awk '{print $1}')"
             # The steps on the raw recording's timeline ("stage <name> uptime=<ms>" minus its start),
-            # then the published cut: from just after the first step (the home screen) to the end.
+            # then the published cut: from the home screen just before the first step to the end.
             sed -nE 's/.*stage ([a-z-]+) uptime=([0-9]+).*/\1 \2/p' "$W/progress.log" > "$W/stages.txt"
             python3 - "$W/stages.txt" "$UP0" "$DUR" > "$W/plan.txt" <<'PY'
           import sys
           rows = [l.split() for l in open(sys.argv[1]) if l.strip()]
           up0, dur = float(sys.argv[2]), float(sys.argv[3])
           t = [max(0.0, int(u) / 1000 - up0) for _, u in rows]
-          start = min(t[0] + 0.5, dur) if t else 0.0
+          # The test shows the home screen for 1.5 s before its first step: open on it.
+          start = min(max(t[0] - 1.2, 0.0), dur) if t else 0.0
           print('start %.2f' % start)
           for i, (name, _) in enumerate(rows):
               # A representative frame: halfway to the next step (or 2 s on for the last).
