@@ -757,6 +757,11 @@ jobs:
           set -e
           if [[ "$st" -ne 0 ]]; then
             grep -E '\[!\]|rror|nvalid|nable to|annot|ejected|ould not|not found|ITC|ENTITY' "$LOG" | grep -viE '@|phone|password|demo' | cut -c1-300 | sort -u | head -n 30 || true
+            # Where it failed: fastlane's step lines and the deliver/spaceship stack frames (code paths only).
+            echo '--- last fastlane steps ---'
+            grep -E '^\[[0-9:]+\]: ' "$LOG" | grep -viE '@|phone|password|demo|key' | cut -c1-200 | tail -n 25 || true
+            echo '--- stack (deliver/spaceship frames) ---'
+            grep -oE '(deliver|spaceship)/lib/[a-z_/]+\.rb:[0-9]+:in [^ ]+' "$LOG" | head -n 15 || true
             echo "::error::fastlane deliver failed (exit $st). If it says there is no editable version, create version $VERSION in App Store Connect (Prepare for Submission) and rerun."
             exit 1
           fi
