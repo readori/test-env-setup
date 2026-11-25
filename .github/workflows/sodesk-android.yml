@@ -557,9 +557,9 @@ jobs:
           mousepad meeting-notes.md > /dev/null 2>&1 &
           xfce4-terminal --working-directory="$HOME/Documents" -x bash -c "ls -lh -gG --color=auto --time-style='+%b %d'; exec bash -l" > /dev/null 2>&1 &
           sleep 5
-          wmctrl -r Thunar -e 0,30,52,640,420
-          wmctrl -r Mousepad -e 0,600,64,-1,-1
-          wmctrl -r Terminal -e 0,320,330,680,340
+          wmctrl -r Thunar -e 0,24,52,600,420
+          wmctrl -r Mousepad -e 0,648,64,604,380
+          wmctrl -r Terminal -e 0,330,330,660,340
           wmctrl -a Terminal
           echo "$(pgrep -l -u "$(id -u)" 'xfconfd|xfsettingsd|xfwm4|xfce4-panel' | awk '{print $2}' | tr '\n' ' ')| windows: $(wmctrl -l | awk '{$1=$2=$3=""; print}' | sed 's/^ *//' | tr '\n' ';' | cut -c1-200)"
           SH
