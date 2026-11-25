@@ -492,7 +492,7 @@ jobs:
           # host streams. Nothing in it is real data.
           sudo apt-get update -q > "$RUNNER_TEMP/shots-apt.log" 2>&1 \
             && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
-              xvfb xfce4 xfconf xfce4-settings xfce4-terminal mousepad greybird-gtk-theme elementary-xfce-icon-theme dbus-x11 ffmpeg xclip wmctrl fonts-dejavu-core >> "$RUNNER_TEMP/shots-apt.log" 2>&1 \
+              xvfb xfce4 xfconf xfce4-settings xfce4-terminal mousepad greybird-gtk-theme elementary-xfce-icon-theme dbus-x11 ffmpeg feh xclip wmctrl fonts-dejavu-core >> "$RUNNER_TEMP/shots-apt.log" 2>&1 \
             || { tail -n 20 "$RUNNER_TEMP/shots-apt.log" | cut -c1-300; echo '::error::installing the demo desktop failed.'; exit 1; }
           IP="$(hostname -I | awk '{print $1}')"
           sudo hostnamectl set-hostname "$SHOTS_HOSTNAME" > /dev/null 2>&1 || sudo hostname "$SHOTS_HOSTNAME"
@@ -522,7 +522,7 @@ jobs:
           sudo setfacl -R -b "$SHOTS_HOME" 2>/dev/null || true
           D="$SHOTS_HOME/Documents"
 
-          # The desktop: Xvfb (16:9), Xfce's window manager, desktop and panel as demo on one D-Bus
+          # The desktop: Xvfb (16:9), Xfce's window manager and panel and a wallpaper, as demo on one D-Bus
           # session (no session manager, no first-run dialogs), and three windows placed by hand.
           Xvfb :99 -screen 0 1280x720x24 -ac -nolisten tcp > "$RUNNER_TEMP/shots-xvfb.log" 2>&1 &
           XVFB_PID=$!
@@ -536,6 +536,9 @@ jobs:
           C="$HOME/.config/xfce4/xfconf/xfce-perchannel-xml"; mkdir -p "$C"
           [[ -f /etc/xdg/xfce4/panel/default.xml ]] && cp /etc/xdg/xfce4/panel/default.xml "$C/xfce4-panel.xml"
           eval "$(dbus-launch --sh-syntax)"
+          # The settings daemon on this bus (D-Bus activation alone did not start it here).
+          for x in /usr/lib/*/xfce4/xfconf/xfconfd /usr/lib/xfce4/xfconf/xfconfd; do [[ -x "$x" ]] && { "$x" > /dev/null 2>&1 & break; }; done
+          sleep 1
           xfsettingsd > /dev/null 2>&1 &
           sleep 1
           xfconf-query -c xsettings -p /Net/ThemeName -n -t string -s Greybird
@@ -543,7 +546,9 @@ jobs:
           xfconf-query -c xfwm4 -p /general/theme -n -t string -s Greybird
           xfwm4 > /dev/null 2>&1 &
           sleep 1
-          xfdesktop > /dev/null 2>&1 &
+          # A plain wallpaper (a gradient made here), set on the root window.
+          ffmpeg -v error -f lavfi -i 'gradients=s=1280x720:c0=0x0e3b43:c1=0x3a9d8f:nb_colors=2:x0=0:y0=720:x1=1280:y1=0:type=linear' -frames:v 1 -y /tmp/xdg-demo/wall.png \
+            && feh --no-fehbg --bg-fill /tmp/xdg-demo/wall.png
           xfce4-panel > /dev/null 2>&1 &
           sleep 3
           cd "$HOME/Documents"
@@ -555,7 +560,7 @@ jobs:
           wmctrl -r Mousepad -e 0,600,64,630,360
           wmctrl -r Terminal -e 0,320,330,680,340
           wmctrl -a Terminal
-          wmctrl -l | awk '{$1=$2=$3=""; print}' | sed 's/^ *//' | tr '\n' ';' | cut -c1-200
+          echo "$(pgrep -l -u "$(id -u)" 'xfconfd|xfsettingsd|xfwm4|xfce4-panel' | awk '{print $2}' | tr '\n' ' ')| windows: $(wmctrl -l | awk '{$1=$2=$3=""; print}' | sed 's/^ *//' | tr '\n' ';' | cut -c1-200)"
           SH
           chmod 755 "$DESK"
           echo "demo desktop: $(asdemo timeout 60 "$DESK" 2> "$RUNNER_TEMP/shots-desktop.log")"
@@ -591,7 +596,7 @@ jobs:
           # The app connects by the machine's name when the emulator resolves it, else by the address.
           TARGET="10.0.2.2:$SHOTS_HOST_PORT"
           RESOLVED="$(timeout 20 "$ADB" shell ping -c 1 -W 2 "$SHOTS_HOSTNAME" 2>&1 | head -n 1 | tr -d '\r' || true)"
-          if [[ "$RESOLVED" =~ ^PING\ $SHOTS_HOSTNAME\ \(([0-9.]+)\) ]]; then
+          if [[ "$RESOLVED" =~ ^PING\ [^\ ]+\ \(([0-9.]+)\) ]]; then
             TARGET="$SHOTS_HOSTNAME:$SHOTS_HOST_PORT"; echo "the emulator resolves $SHOTS_HOSTNAME to ${BASH_REMATCH[1]}: target $TARGET"
           else
             echo "::warning::the emulator does not resolve $SHOTS_HOSTNAME ($(cut -c1-120 <<<"$RESOLVED")); target $TARGET"
