@@ -13,7 +13,7 @@
 #   app      : when the commit has the desktop app (`app --smoke`), it starts it with a fresh,
 #              throw-away configuration and takes screenshots of its windows.
 #
-# Screenshots and the JSON reports are uploaded as one artifact per job (kept 14 days). They
+# Screenshots and the JSON reports are uploaded as one artifact per job (kept for the shortest time the repository allows). They
 # show test pages and a freshly made test configuration only: no credentials exist in this
 # workflow besides the read-only checkout token.
 #
@@ -101,25 +101,46 @@ jobs:
         run: |
           $out = "$env:RUNNER_TEMP\out"
           $edge = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
-          $p = Start-Process -PassThru "$env:RUNNER_TEMP\RemoHop.exe" -ArgumentList @('webview-selftest', '--browser', '--clip', "$PWD\internal\webview\testdata\clip1080.h264", '--out', "$out\edge.json", $edge, "--user-data-dir=$env:RUNNER_TEMP\edgeprof", '--no-first-run', '--new-window')
+          $p = Start-Process -PassThru "$env:RUNNER_TEMP\RemoHop.exe" -ArgumentList @('webview-selftest', '--browser', '--clip', "$PWD\internal\webview\testdata\clip1080.h264", '--out', "$out\edge.json", "`"$edge`"", "--user-data-dir=`"$env:RUNNER_TEMP\edgeprof`"", '--no-first-run', '--new-window')
           $p.WaitForExit(120000) | Out-Null
           if (Test-Path "$out\edge.json") { Get-Content "$out\edge.json" } else { Write-Output '::warning::no Edge report' }
       - name: Desktop app smoke test and screenshots
         working-directory: source
         run: |
           $out = "$env:RUNNER_TEMP\out"
-          if (-not (Select-String -Quiet -Path internal\desktop\*.go -Pattern 'smoke' -ErrorAction SilentlyContinue)) { 'no desktop app in this commit'; exit 0 }
+          if (-not (Test-Path internal\desktop) -or -not (Select-String -Quiet -Path internal\desktop\*.go -Pattern 'smoke')) { 'no desktop app in this commit'; exit 0 }
           $env:REMOHOP_CONFIG_DIR = "$env:RUNNER_TEMP\appcfg"
-          & "$env:RUNNER_TEMP\RemoHop.exe" app --smoke "$out" | Out-Null
-          Start-Sleep -Seconds 1
+          $p = Start-Process -PassThru "$env:RUNNER_TEMP\RemoHop.exe" -ArgumentList @('app', '--smoke', "`"$out`"")
           Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-          Get-ChildItem "$out\*.json" | ForEach-Object { "== $($_.Name)"; Get-Content $_ | Select-Object -First 60 }
+          $last = ''
+          $deadline = (Get-Date).AddMinutes(5)
+          # The app names each screen in out\step and waits for out\step.done.
+          while (-not $p.HasExited -and (Get-Date) -lt $deadline) {
+            if (Test-Path "$out\step") {
+              $step = (Get-Content "$out\step" -Raw).Trim()
+              if ($step -and $step -ne $last -and $step -match '^[a-z0-9-]+$') {
+                Start-Sleep -Milliseconds 500
+                $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+                $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+                [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+                $bmp.Save("$out\app-windows-$step.png")
+                "screenshot: $step"
+                New-Item -ItemType File -Force "$out\step.done" | Out-Null
+                $last = $step
+              }
+            }
+            Start-Sleep -Milliseconds 300
+          }
+          if (-not $p.HasExited) { $p.Kill() }
+          "exit $($p.ExitCode)"
+          if (Test-Path "$out\smoke.json") { Get-Content "$out\smoke.json" }
+          if (Test-Path "$env:RUNNER_TEMP\appcfg\desktop.log") { Get-Content "$env:RUNNER_TEMP\appcfg\desktop.log" -Tail 40 }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: desktop-app-windows
           path: ${{ runner.temp }}/out
-          retention-days: 14
+          retention-days: 1
           if-no-files-found: warn
 
   macos:
@@ -181,16 +202,34 @@ jobs:
           out="$RUNNER_TEMP/out"
           grep -qs smoke internal/desktop/*.go || { echo 'no desktop app in this commit'; exit 0; }
           export REMOHOP_CONFIG_DIR="$RUNNER_TEMP/appcfg"
-          "$APP_BIN" app --smoke "$out" > "$out/app.log" 2>&1
-          echo "exit $?"; tail -n 30 "$out/app.log"
-          for f in "$out"/*.json; do echo "== $f"; head -n 60 "$f"; done
+          "$APP_BIN" app --smoke "$out" > "$out/app.log" 2>&1 &
+          pid=$!
+          last=""
+          # The app names each screen in out/step and waits for out/step.done.
+          for i in $(seq 1 1000); do
+            kill -0 $pid 2>/dev/null || break
+            step="$(cat "$out/step" 2>/dev/null)"
+            if [ -n "$step" ] && [ "$step" != "$last" ] && [[ "$step" =~ ^[a-z0-9-]+$ ]]; then
+              sleep 0.5
+              screencapture -x "$out/app-macos-$step.png"
+              echo "screenshot: $step"
+              touch "$out/step.done"
+              last="$step"
+            fi
+            sleep 0.3
+          done
+          kill $pid 2>/dev/null
+          wait $pid; echo "exit $?"
+          tail -n 30 "$out/app.log"
+          cat "$out/smoke.json"
+          tail -n 40 "$RUNNER_TEMP/appcfg/desktop.log"
           exit 0
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: desktop-app-macos
           path: ${{ runner.temp }}/out
-          retention-days: 14
+          retention-days: 1
           if-no-files-found: warn
 
   linux:
@@ -254,14 +293,32 @@ jobs:
           out="$RUNNER_TEMP/out"
           grep -qs smoke internal/desktop/*.go || { echo 'no desktop app in this commit'; exit 0; }
           export REMOHOP_CONFIG_DIR="$RUNNER_TEMP/appcfg"
-          "$RUNNER_TEMP/remohop-quick" app --smoke "$out" > "$out/app.log" 2>&1
-          echo "exit $?"; tail -n 30 "$out/app.log"
-          for f in "$out"/*.json; do echo "== $f"; head -n 60 "$f"; done
+          "$RUNNER_TEMP/remohop-quick" app --smoke "$out" > "$out/app.log" 2>&1 &
+          pid=$!
+          last=""
+          # The app names each screen in out/step and waits for out/step.done.
+          for i in $(seq 1 1000); do
+            kill -0 $pid 2>/dev/null || break
+            step="$(cat "$out/step" 2>/dev/null)"
+            if [ -n "$step" ] && [ "$step" != "$last" ] && [[ "$step" =~ ^[a-z0-9-]+$ ]]; then
+              sleep 0.5
+              import -window root "$out/app-linux-$step.png"
+              echo "screenshot: $step"
+              touch "$out/step.done"
+              last="$step"
+            fi
+            sleep 0.3
+          done
+          kill $pid 2>/dev/null
+          wait $pid; echo "exit $?"
+          tail -n 30 "$out/app.log"
+          cat "$out/smoke.json"
+          tail -n 40 "$RUNNER_TEMP/appcfg/desktop.log"
           exit 0
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: desktop-app-linux
           path: ${{ runner.temp }}/out
-          retention-days: 14
+          retention-days: 1
           if-no-files-found: warn
