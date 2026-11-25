@@ -721,7 +721,14 @@ jobs:
             done
           done
 
-          # This Mac's desktop: a Finder window on the demo documents and a note in TextEdit.
+          # This Mac's desktop: one of macOS's own wallpapers (NSWorkspace, no TCC prompt), a Finder
+          # window on the demo documents and a note in TextEdit.
+          PIC="$(find '/System/Library/Desktop Pictures' -maxdepth 1 -type f \( -name '*.heic' -o -name '*.jpg' -o -name '*.png' \) 2>/dev/null | grep -viE 'solid|gradient|thumbnail' | sort | head -n 1)"
+          if [[ -n "$PIC" ]]; then
+            printf '%s\n' 'import AppKit' 'let u = URL(fileURLWithPath: CommandLine.arguments[1])' \
+              'for s in NSScreen.screens { try? NSWorkspace.shared.setDesktopImageURL(u, for: s, options: [:]) }' > "$W/wallpaper.swift"
+            swift "$W/wallpaper.swift" "$PIC" >/dev/null 2>&1 && echo "wallpaper: $(basename "$PIC")" || echo '::warning::could not set the wallpaper'
+          fi
           open "$D" >/dev/null 2>&1
           open -a TextEdit "$D/meeting-notes.txt" >/dev/null 2>&1
           sleep 3
@@ -733,17 +740,27 @@ jobs:
           # not a loopback address; the host listens on loopback only, no signal server.
           grep -q ' studio-mac$' /etc/hosts || echo '127.0.0.1 studio-mac' | sudo tee -a /etc/hosts >/dev/null
           sudo dscacheutil -flushcache >/dev/null 2>&1; sudo killall -HUP mDNSResponder >/dev/null 2>&1
-          HOME="$DEMO" SHELL=/bin/bash BASH_SILENCE_DEPRECATION_WARNING=1 REMOHOP_CONFIG_DIR="$W/host" \
-            "$W/remohop" host --no-signal --listen "127.0.0.1:$PORT" --password "$PW" > "$W/host.log" 2>&1 < /dev/null &
-          HOST_PID=$!
+          # A fresh host (and so a fresh shell) for every pass; the pairing lives in its config dir.
+          HOST_PID=''
+          start_host() {
+            HOME="$DEMO" SHELL=/bin/bash BASH_SILENCE_DEPRECATION_WARNING=1 REMOHOP_CONFIG_DIR="$W/host" \
+              "$W/remohop" host --no-signal --listen "127.0.0.1:$PORT" --password "$PW" > "$W/host.log" 2>&1 < /dev/null &
+            HOST_PID=$!
+            for _ in $(seq 1 150); do grep -q 'host ready' "$W/host.log" 2>/dev/null && return 0; sleep 0.2; done
+            echo '::error::remohop host did not start.'; grep -v Password "$W/host.log" | tail -n 5 | redact; return 1
+          }
+          stop_host() {
+            [[ -n "$HOST_PID" ]] || return 0
+            kill "$HOST_PID" 2>/dev/null; wait "$HOST_PID" 2>/dev/null; HOST_PID=''
+            pkill -f "remohop-capture/remohop host" 2>/dev/null; sleep 1
+          }
           SIMS=()
           cleanup() {
-            kill "$HOST_PID" 2>/dev/null || true
+            stop_host
             for u in ${SIMS[@]+"${SIMS[@]}"}; do xcrun simctl shutdown "$u" >/dev/null 2>&1; xcrun simctl delete "$u" >/dev/null 2>&1; done
           }
           trap cleanup EXIT
-          for _ in $(seq 1 150); do grep -q 'host ready' "$W/host.log" 2>/dev/null && break; sleep 0.2; done
-          grep -q 'host ready' "$W/host.log" || { echo '::error::remohop host did not start.'; grep -v Password "$W/host.log" | tail -n 5 | redact; exit 1; }
+          start_host || exit 1
           TARGET="127.0.0.1:$PORT"
           if REMOHOP_CONFIG_DIR="$W/cli" REMOHOP_PASSWORD="$PW" "$W/remohop" "studio-mac:$PORT" ping -c 1 > "$W/ping.log" 2>&1; then
             TARGET="studio-mac:$PORT"; echo "host: answers as studio-mac:$PORT"
@@ -755,7 +772,8 @@ jobs:
           [[ ",$DEVICES," == *,iphone69,* ]] && SETS+=('iphone69|iPhone 17 Pro Max,iPhone 16 Pro Max')
           [[ ",$DEVICES," == *,ipad13,* ]] && SETS+=('ipad13|iPad Pro 13-inch (M5),iPad Pro 13-inch (M4)')
           NAMES=(1-desktop 2-terminal 3-files 4-connect)
-          COMMAND='cd ~/Documents && ls -lh && cd Projects/website && git log --oneline --graph --decorate'
+          COMMAND='sw_vers && cd ~/Documents && ls -lh && cd Projects/website && git log --oneline --graph --decorate'
+          EXPECT='Initial commit'
           DD="$RUNNER_TEMP/DerivedData-remohop-capture"
           made=0
           for set in "${SETS[@]}"; do
@@ -795,9 +813,11 @@ jobs:
               xcrun simctl status_bar "$UDID" override --time 9:41 --batteryState charged --batteryLevel 100 --wifiBars 3 --cellularBars 4 --operatorName '' >/dev/null 2>&1
               S="$W/s-$KEY-$LANGCODE"; rm -rf "$S"; mkdir -p "$S"
               LOG="$RUNNER_TEMP/xccapture-$KEY-$LANGCODE.log"
+              stop_host; start_host || break
+              xattr -cr "$D" 2>/dev/null
               TEST_RUNNER_REMOHOP_E2E_TARGET="$TARGET" TEST_RUNNER_REMOHOP_E2E_PASSWORD="$PW" TEST_RUNNER_REMOHOP_E2E_DIR="$D" \
               TEST_RUNNER_REMOHOP_SHOTS_DIR="$S" TEST_RUNNER_REMOHOP_SHOTS_LANG="$LANGCODE" \
-              TEST_RUNNER_REMOHOP_SHOTS_ALIAS="$ALIAS" TEST_RUNNER_REMOHOP_SHOTS_COMMAND="$COMMAND" \
+              TEST_RUNNER_REMOHOP_SHOTS_ALIAS="$ALIAS" TEST_RUNNER_REMOHOP_SHOTS_COMMAND="$COMMAND" TEST_RUNNER_REMOHOP_SHOTS_EXPECT="$EXPECT" \
               xcodebuild test -quiet \
                 -project mobile/ios/RemoHop.xcodeproj -scheme RemoHop -configuration Debug \
                 -destination "platform=iOS Simulator,id=$UDID" \
