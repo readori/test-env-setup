@@ -537,7 +537,7 @@ jobs:
           [[ -f /etc/xdg/xfce4/panel/default.xml ]] && cp /etc/xdg/xfce4/panel/default.xml "$C/xfce4-panel.xml"
           eval "$(dbus-launch --sh-syntax)"
           # The settings daemon on this bus (D-Bus activation alone did not start it here).
-          for x in /usr/lib/*/xfce4/xfconf/xfconfd /usr/lib/xfce4/xfconf/xfconfd; do [[ -x "$x" ]] && { "$x" > /dev/null 2>&1 & break; }; done
+          for x in /usr/lib/*/xfce4/xfconf/xfconfd /usr/lib/xfce4/xfconf/xfconfd /usr/libexec/xfce4/xfconf/xfconfd /usr/libexec/xfconfd; do [[ -x "$x" ]] && { "$x" > /dev/null 2>&1 & break; }; done
           sleep 1
           xfsettingsd > /dev/null 2>&1 &
           sleep 1
@@ -549,7 +549,8 @@ jobs:
           # A plain wallpaper (a gradient made here), set on the root window.
           ffmpeg -v error -f lavfi -i 'gradients=s=1280x720:c0=0x0e3b43:c1=0x3a9d8f:nb_colors=2:x0=0:y0=720:x1=1280:y1=0:type=linear' -frames:v 1 -y /tmp/xdg-demo/wall.png \
             && feh --no-fehbg --bg-fill /tmp/xdg-demo/wall.png
-          xfce4-panel > /dev/null 2>&1 &
+          # The panel only with its settings daemon (without it, it shows as an empty box).
+          pgrep -u "$(id -u)" -x xfconfd > /dev/null && { xfce4-panel > /dev/null 2>&1 & }
           sleep 3
           cd "$HOME/Documents"
           thunar "$HOME/Documents" > /dev/null 2>&1 &
@@ -557,7 +558,7 @@ jobs:
           xfce4-terminal --working-directory="$HOME/Documents" -x bash -c "ls -lh -gG --color=auto --time-style='+%b %d'; exec bash -l" > /dev/null 2>&1 &
           sleep 5
           wmctrl -r Thunar -e 0,30,52,640,420
-          wmctrl -r Mousepad -e 0,600,64,630,360
+          wmctrl -r Mousepad -e 0,600,64,-1,-1
           wmctrl -r Terminal -e 0,320,330,680,340
           wmctrl -a Terminal
           echo "$(pgrep -l -u "$(id -u)" 'xfconfd|xfsettingsd|xfwm4|xfce4-panel' | awk '{print $2}' | tr '\n' ' ')| windows: $(wmctrl -l | awk '{$1=$2=$3=""; print}' | sed 's/^ *//' | tr '\n' ';' | cut -c1-200)"
