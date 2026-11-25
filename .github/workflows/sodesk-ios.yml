@@ -811,38 +811,53 @@ jobs:
               xcrun simctl boot "$UDID" >/dev/null 2>&1
               xcrun simctl bootstatus "$UDID" -b >/dev/null 2>&1 || { echo "::warning::$KEY/$LANGCODE: simulator did not boot."; continue; }
               xcrun simctl status_bar "$UDID" override --time 9:41 --batteryState charged --batteryLevel 100 --wifiBars 3 --cellularBars 4 --operatorName '' >/dev/null 2>&1
-              S="$W/s-$KEY-$LANGCODE"; rm -rf "$S"; mkdir -p "$S"
-              LOG="$RUNNER_TEMP/xccapture-$KEY-$LANGCODE.log"
-              stop_host; start_host || break
-              xattr -cr "$D" 2>/dev/null
-              TEST_RUNNER_REMOHOP_E2E_TARGET="$TARGET" TEST_RUNNER_REMOHOP_E2E_PASSWORD="$PW" TEST_RUNNER_REMOHOP_E2E_DIR="$D" \
-              TEST_RUNNER_REMOHOP_SHOTS_DIR="$S" TEST_RUNNER_REMOHOP_SHOTS_LANG="$LANGCODE" \
-              TEST_RUNNER_REMOHOP_SHOTS_ALIAS="$ALIAS" TEST_RUNNER_REMOHOP_SHOTS_COMMAND="$COMMAND" TEST_RUNNER_REMOHOP_SHOTS_EXPECT="$EXPECT" \
-              xcodebuild test -quiet \
-                -project mobile/ios/RemoHop.xcodeproj -scheme RemoHop -configuration Debug \
-                -destination "platform=iOS Simulator,id=$UDID" \
-                -only-testing:RemoHopTests/GatewayE2ETests/testStoreScreens \
-                -derivedDataPath "$DD" CODE_SIGNING_ALLOWED=NO > "$LOG" 2>&1 &
-              XPID=$!
-              got=0
-              for name in "${NAMES[@]}"; do
-                for _ in $(seq 1 1600); do
-                  [[ -f "$S/$name.ready" ]] && break
-                  kill -0 "$XPID" 2>/dev/null || break
-                  sleep 0.25
+              # Up to two tries per pass; each starts with a fresh shell on the host (the session
+              # "main" of the previous pass is ended), so the terminal shows one command.
+              for try in 1 2; do
+                S="$W/s-$KEY-$LANGCODE"; rm -rf "$S"; mkdir -p "$S"
+                LOG="$RUNNER_TEMP/xccapture-$KEY-$LANGCODE-$try.log"; RES="$W/r-$KEY-$LANGCODE-$try.xcresult"; rm -rf "$RES"
+                kill -0 "$HOST_PID" 2>/dev/null || start_host || break
+                REMOHOP_CONFIG_DIR="$W/cli" REMOHOP_PASSWORD="$PW" "$W/remohop" "$TARGET" shell kill main >/dev/null 2>&1
+                xattr -cr "$D" 2>/dev/null
+                TEST_RUNNER_REMOHOP_E2E_TARGET="$TARGET" TEST_RUNNER_REMOHOP_E2E_PASSWORD="$PW" TEST_RUNNER_REMOHOP_E2E_DIR="$D" \
+                TEST_RUNNER_REMOHOP_SHOTS_DIR="$S" TEST_RUNNER_REMOHOP_SHOTS_LANG="$LANGCODE" \
+                TEST_RUNNER_REMOHOP_SHOTS_ALIAS="$ALIAS" TEST_RUNNER_REMOHOP_SHOTS_COMMAND="$COMMAND" TEST_RUNNER_REMOHOP_SHOTS_EXPECT="$EXPECT" \
+                xcodebuild test -quiet \
+                  -project mobile/ios/RemoHop.xcodeproj -scheme RemoHop -configuration Debug \
+                  -destination "platform=iOS Simulator,id=$UDID" \
+                  -only-testing:RemoHopTests/GatewayE2ETests/testStoreScreens \
+                  -derivedDataPath "$DD" -resultBundlePath "$RES" CODE_SIGNING_ALLOWED=NO > "$LOG" 2>&1 &
+                XPID=$!
+                got=0
+                for name in "${NAMES[@]}"; do
+                  for _ in $(seq 1 1600); do
+                    [[ -f "$S/$name.ready" ]] && break
+                    kill -0 "$XPID" 2>/dev/null || break
+                    sleep 0.25
+                  done
+                  [[ -f "$S/$name.ready" ]] || break
+                  xcrun simctl io "$UDID" screenshot --type=png "$S/$name.png" >/dev/null 2>&1
+                  touch "$S/$name.done"
+                  got=$((got + 1))
                 done
-                [[ -f "$S/$name.ready" ]] || break
-                xcrun simctl io "$UDID" screenshot --type=png "$S/$name.png" >/dev/null 2>&1
-                touch "$S/$name.done"
-                got=$((got + 1))
-              done
-              wait "$XPID"; st=$?
-              echo "$KEY/$LOC: $got of ${#NAMES[@]} screens (xcodebuild exit $st)"
-              grep -E 'store screens:' "$LOG" | redact | head -n 10 || true
-              if [[ "$got" -ne ${#NAMES[@]} || "$st" -ne 0 ]]; then
+                wait "$XPID"; st=$?
+                echo "$KEY/$LOC (try $try): $got of ${#NAMES[@]} screens (xcodebuild exit $st)"
+                grep -E 'store screens:' "$LOG" | redact | head -n 10 || true
+                grep -iE 'desktop|capture|ffmpeg' "$W/host.log" | grep -v Password | tail -n 4 | redact
+                [[ "$got" -eq ${#NAMES[@]} && "$st" -eq 0 ]] && break
                 grep -E "error:|failed|XCTAssert|caught error|timed out|skipped" "$LOG" | redact | tail -n 15 || true
-                echo "--- xcodebuild log (tail) ---"; tail -n 30 "$LOG" | redact || true
-              fi
+                echo '--- test failures (xcresult) ---'
+                xcrun xcresulttool get test-results summary --path "$RES" 2>/dev/null | python3 -c '
+          import json, sys
+          try:
+              d = json.load(sys.stdin)
+          except Exception:
+              d = {}
+          for f in d.get("testFailures", []):
+              print("  " + str(f.get("testName", "")) + ": " + str(f.get("failureText", ""))[:300])
+          ' | redact
+                echo '--- host log (tail) ---'; grep -v Password "$W/host.log" | tail -n 8 | redact
+              done
               if [[ "$got" -gt 0 ]]; then
                 mkdir -p "$OUT/$KEY/$LOC"
                 for name in "${NAMES[@]}"; do
