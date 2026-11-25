@@ -12,19 +12,22 @@
 #            has never been published only accepts drafts). Google requires the very first bundle
 #            of a new app to be uploaded by hand in Play Console; use ARTIFACT=encrypted for that.
 #   screenshots : the store listing's phone screenshots only (no build, no bundle, tracks and releases
-#            untouched). Takes the artifact remohop-play-screenshots of a successful
-#            sodesk-android.yml run on main with SCREENSHOTS=true|only (en-US/*.png, zh-CN/*.png),
-#            checks it against Play's rules, then in one Play edit, per language: deletes the listing's
-#            phone screenshots, uploads the new ones in file-name order, and commits the edit. The
-#            images' Play URLs go to the job summary.
+#            untouched; the listing's text is never sent). Takes either the posters committed in the
+#            source repository at REF (SHOTS_RUN_ID=repo: mobile/android/store/screenshots/<locale>/
+#            <n>-<scene>.jpg|png) or the artifact remohop-play-screenshots of a successful
+#            sodesk-android.yml run on main with SCREENSHOTS=true|only (en-US/*.png, zh-CN/*.png, the
+#            raw captures), checks the images against Play's rules, then in one Play edit, per
+#            language: deletes the listing's phone screenshots, uploads the new ones in file-name
+#            order, and commits the edit. The images' Play URLs go to the job summary.
 #
 # Request file ci-requests/sodesk-android-release.env (plain KEY=VALUE, parsed with strict patterns,
 # never executed); a push to main that changes it starts a run:
 #
-#   REF=main                 # source branch, tag or SHA (build and upload)
+#   REF=main                 # source branch, tag or SHA (build and upload; screenshots with SHOTS_RUN_ID=repo)
 #   MODE=build               # build | upload | screenshots
-#   SHOTS_RUN_ID=latest      # screenshots only: the sodesk-android.yml run whose artifact to upload
-#                            # (its numeric id), or latest (default): the newest such artifact
+#   SHOTS_RUN_ID=latest      # screenshots only: repo = the posters committed at REF in
+#                            # mobile/android/store/screenshots; or the sodesk-android.yml run whose
+#                            # artifact to upload (its numeric id), or latest (default): the newest such artifact
 #   SHOTS_LANGS=en-US,zh-CN  # screenshots only: which listings to replace (default both; each must
 #                            # already exist on Play)
 #   VERSION_NAME=0.1.0       # optional; default 0.1.0
@@ -66,7 +69,7 @@ on:
         type: choice
         options: [build, upload, screenshots]
       shots_run_id:
-        description: 'screenshots only: sodesk-android.yml run id whose remohop-play-screenshots artifact to upload, or latest'
+        description: 'screenshots only: repo = the posters committed at ref (mobile/android/store/screenshots), or a sodesk-android.yml run id whose remohop-play-screenshots artifact to upload, or latest'
         required: false
         default: 'latest'
         type: string
@@ -363,6 +366,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_SHOTS_RUN_ID: ${{ inputs.shots_run_id }}
+          INPUT_REF: ${{ inputs.ref }}
           REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/sodesk-android-release.env
           HAVE_PLAY: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON != '' }}
         run: |
@@ -372,19 +376,68 @@ jobs:
             curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/sodesk-android-release.env at this commit.'; exit 64; }
             RUN_ID="$(sed -n 's/^SHOTS_RUN_ID=//p' "$REQ" | head -n 1 | tr -d '\r')"
             LANGS="$(sed -n 's/^SHOTS_LANGS=//p' "$REQ" | head -n 1 | tr -d '\r')"
+            SOURCE_REF="$(sed -n 's/^REF=//p' "$REQ" | head -n 1 | tr -d '\r')"
           else
-            RUN_ID="$INPUT_SHOTS_RUN_ID"; LANGS=''
+            RUN_ID="$INPUT_SHOTS_RUN_ID"; LANGS=''; SOURCE_REF="$INPUT_REF"
           fi
+          SOURCE_REF="${SOURCE_REF:-main}"
+          [[ "$SOURCE_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && ${#SOURCE_REF} -le 200 ]] || { echo '::error::bad REF'; exit 64; }
           RUN_ID="${RUN_ID:-latest}"
           LANGS="${LANGS:-en-US,zh-CN}"
           [[ "$LANGS" =~ ^(en-US|zh-CN)(,(en-US|zh-CN))?$ ]] || { echo '::error::SHOTS_LANGS must be en-US, zh-CN or en-US,zh-CN.'; exit 64; }
           echo "SHOTS_LANGS=${LANGS//,/ }" >> "$GITHUB_ENV"
-          [[ "$RUN_ID" == latest || "$RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]] || { echo '::error::SHOTS_RUN_ID must be latest or a run id (digits).'; exit 64; }
+          [[ "$RUN_ID" == latest || "$RUN_ID" == repo || "$RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]] || { echo '::error::SHOTS_RUN_ID must be repo, latest or a run id (digits).'; exit 64; }
           [[ "$HAVE_PLAY" == true ]] || { echo '::error::Missing secret PLAY_SERVICE_ACCOUNT_JSON.'; exit 78; }
           echo "SHOTS_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
-          echo "screenshots from: $RUN_ID · listings: $LANGS"
+          echo "SHOTS_REF=$SOURCE_REF" >> "$GITHUB_ENV"
+          if [[ "$RUN_ID" == repo ]]; then echo "screenshots from: $SOURCE_REPOSITORY@$SOURCE_REF mobile/android/store/screenshots · listings: $LANGS"
+          else echo "screenshots from: run $RUN_ID · listings: $LANGS"; fi
+
+      # SHOTS_RUN_ID=repo: only the posters' folder of the source repository (sparse, no history);
+      # nothing in it is run.
+      - name: Checkout the committed posters
+        if: env.SHOTS_RUN_ID == 'repo'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SHOTS_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: shots-src
+          fetch-depth: 1
+          sparse-checkout: mobile/android/store/screenshots
+          persist-credentials: false
+
+      - name: Take the committed posters
+        if: env.SHOTS_RUN_ID == 'repo'
+        run: |
+          set -euo pipefail
+          SRC=shots-src/mobile/android/store/screenshots
+          OUT="$RUNNER_TEMP/shots"; rm -rf "$OUT"; mkdir -p "$OUT"
+          # Only the expected names, as regular files (no links, no other paths).
+          python3 - "$SRC" "$OUT" <<'PY'
+          import os, re, shutil, sys
+          src, out = sys.argv[1:]
+          bad, n = [], 0
+          for loc in ('en-US', 'zh-CN'):
+              d = os.path.join(src, loc)
+              if not os.path.isdir(d) or os.path.islink(d):
+                  continue
+              os.makedirs(os.path.join(out, loc), exist_ok=True)
+              for f in sorted(os.listdir(d)):
+                  p = os.path.join(d, f)
+                  if not re.fullmatch(r'[1-8]-[a-z]{2,20}\.(png|jpg)', f) or os.path.islink(p) or not os.path.isfile(p):
+                      bad.append(f'{loc}/{f}'); continue
+                  shutil.copyfile(p, os.path.join(out, loc, f)); n += 1
+          if bad:
+              print('unexpected files in mobile/android/store/screenshots:', bad[:5]); sys.exit(1)
+          print(f'{n} committed posters')
+          PY
+          git -C shots-src log -1 --format='source commit %H (%cs)'
+          echo "SHOTS_DIR=$OUT" >> "$GITHUB_ENV"
+          echo "SHOTS_SOURCE_RUN=" >> "$GITHUB_ENV"
 
       - name: Fetch the screenshots artifact
+        if: env.SHOTS_RUN_ID != 'repo'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -436,7 +489,27 @@ jobs:
               b = z.read(n)
               os.makedirs(os.path.join(out, os.path.dirname(n)), exist_ok=True)
               open(os.path.join(out, n), 'wb').write(b)
-          # Play's rules for phone screenshots (PNG here): each side 320-3840 px, at most 2:1, 8 MB, 2-8 per language.
+          PY
+          rm -f "$W/shots.zip"
+          echo "SHOTS_DIR=$OUT" >> "$GITHUB_ENV"
+          echo "SHOTS_SOURCE_RUN=$RUN_ID" >> "$GITHUB_ENV"
+
+      - name: Check the images against Play's rules
+        run: |
+          set -euo pipefail
+          # Phone screenshots: PNG (opaque) or JPEG, each side 320-3840 px, at most 2:1, 8 MB, 2-8 per language.
+          python3 - "$SHOTS_DIR" <<'PY'
+          import os, struct, sys
+          out = sys.argv[1]
+          def jpeg_size(b):
+              i = 2
+              while i + 9 < len(b):
+                  if b[i] != 0xFF: return None
+                  m, n = b[i + 1], struct.unpack('>H', b[i + 2:i + 4])[0]
+                  if 0xC0 <= m <= 0xCF and m not in (0xC4, 0xC8, 0xCC):
+                      h, w = struct.unpack('>HH', b[i + 5:i + 9]); return w, h
+                  i += 2 + n
+              return None
           err = 0
           for loc in ('en-US', 'zh-CN'):
               d = os.path.join(out, loc)
@@ -445,17 +518,17 @@ jobs:
                   print(f'{loc}: {len(files)} screenshots (Play takes 2 to 8)'); err += 1
               for f in files:
                   b = open(os.path.join(d, f), 'rb').read()
-                  if b[:8] != b'\x89PNG\r\n\x1a\n':
-                      print(f'{loc}/{f}: not a PNG'); err += 1; continue
-                  w, h, depth, ctype = struct.unpack('>IIBB', b[16:26])
-                  ok = 320 <= min(w, h) and max(w, h) <= 3840 and max(w, h) <= 2 * min(w, h) and len(b) <= 8 * 1024 * 1024 and ctype in (0, 2)
+                  if f.endswith('.png') and b[:8] == b'\x89PNG\r\n\x1a\n':
+                      w, h, depth, ctype = struct.unpack('>IIBB', b[16:26]); opaque = ctype in (0, 2)
+                  elif f.endswith('.jpg') and b[:3] == b'\xff\xd8\xff' and jpeg_size(b):
+                      (w, h), opaque = jpeg_size(b), True
+                  else:
+                      print(f'{loc}/{f}: not a PNG or JPEG'); err += 1; continue
+                  ok = 320 <= min(w, h) and max(w, h) <= 3840 and max(w, h) <= 2 * min(w, h) and len(b) <= 8 * 1024 * 1024 and opaque
                   print(f'{loc}/{f}: {w}x{h}, {len(b) // 1024} KB: {"OK" if ok else "REJECTED"}')
                   err += 0 if ok else 1
           sys.exit(1 if err else 0)
           PY
-          rm -f "$W/shots.zip"
-          echo "SHOTS_DIR=$OUT" >> "$GITHUB_ENV"
-          echo "SHOTS_SOURCE_RUN=$RUN_ID" >> "$GITHUB_ENV"
 
       - name: Replace the Play listing's phone screenshots
         env:
@@ -509,7 +582,8 @@ jobs:
             call DELETE "$API/edits/$EDIT/listings/$LOC/phoneScreenshots" > /dev/null || { echo "::error::Could not delete the $LOC phone screenshots."; exit 1; }
             n=0
             for f in $(ls "$SHOTS_DIR/$LOC" | sort); do
-              R="$(call POST "$UPLOAD/edits/$EDIT/listings/$LOC/phoneScreenshots?uploadType=media" -H 'Content-Type: image/png' --data-binary "@$SHOTS_DIR/$LOC/$f")" \
+              case "$f" in *.jpg) TYPE=image/jpeg ;; *) TYPE=image/png ;; esac
+              R="$(call POST "$UPLOAD/edits/$EDIT/listings/$LOC/phoneScreenshots?uploadType=media" -H "Content-Type: $TYPE" --data-binary "@$SHOTS_DIR/$LOC/$f")" \
                 || { echo "::error::Upload of $LOC/$f failed."; exit 1; }
               n=$((n + 1))
               echo "$LOC/$f uploaded"
@@ -537,7 +611,8 @@ jobs:
           COMMITTED=true
           echo "Play edit committed: phone screenshots replaced for $SHOTS_LANGS."
           { echo '### RemoHop Play listing screenshots'; echo
-            echo "- From run [$SHOTS_SOURCE_RUN](https://github.com/${GITHUB_REPOSITORY}/actions/runs/$SHOTS_SOURCE_RUN) (artifact remohop-play-screenshots)"
+            if [[ -n "$SHOTS_SOURCE_RUN" ]]; then echo "- From run [$SHOTS_SOURCE_RUN](https://github.com/${GITHUB_REPOSITORY}/actions/runs/$SHOTS_SOURCE_RUN) (artifact remohop-play-screenshots)"
+            else echo "- From $SOURCE_REPOSITORY@$SHOTS_REF, mobile/android/store/screenshots (committed posters)"; fi
             cat "$SUMMARY"
             echo '- Tracks and releases unchanged; listing text unchanged.'; } >> "$GITHUB_STEP_SUMMARY"
 
