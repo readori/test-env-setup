@@ -13,8 +13,10 @@
 #            desktop tab, rotation, recreate, background. Also runs the Go tests of
 #            internal/mobile and mobile/remohopcore.
 #   screenshots (request key SCREENSHOTS=true|only): Google Play phone screenshots of the real app on a
-#            1080x1920 (9:16) emulator, connected to a second `remohop host` on the runner that has a
-#            demo home directory (/home/demo, files with made-up content). StoreScreenshotsTest runs
+#            1080x1920 (9:16) emulator, connected to a second `remohop host` on the runner, set up as a
+#            demo machine: host name studio-pc, user demo with a home of made-up files (/home/demo),
+#            and an Xvfb + Xfce desktop the host streams (apt: xvfb xfce4 ffmpeg xclip wmctrl). The
+#            app connects to studio-pc:PORT when the emulator resolves it. StoreScreenshotsTest runs
 #            once per store language (en -> en-US, zh -> zh-CN; the app's own language setting),
 #            with a clean status bar (System UI demo mode: 9:41, full battery and signal). The PNGs
 #            (opaque RGB, no alpha) are checked for Play's size and aspect rules and kept as the
@@ -113,6 +115,7 @@ env:
   # The screenshots host (SCREENSHOTS mode): its own port, password and demo home directory.
   SHOTS_HOST_PORT: '21119'
   SHOTS_HOME: /home/demo
+  SHOTS_HOSTNAME: studio-pc
   # The FGS demo video host (FGS_VIDEO mode): its own port, password and demo home directory.
   FGS_HOST_PORT: '21120'
 
@@ -464,8 +467,8 @@ jobs:
           sys.exit(0 if ran == 1 and skipped == 0 and failed == 0 else 1)
           PY
 
-      # SCREENSHOTS mode. A second remohop host whose home is a demo directory (made-up files), so the
-      # terminal and the Files tab show something meaningful; the app connects to it with a per-run
+      # SCREENSHOTS mode. A second remohop host on a demo machine (user demo, made-up files, an Xvfb
+      # desktop), so every tab shows something meaningful; the app connects to it with a per-run
       # password (typed into the form after the connect screen was captured). StoreScreenshotsTest
       # captures each screen with UiAutomation into the app's external files directory; the PNGs are
       # pulled, checked against Play's rules and kept as an artifact for sodesk-android-release.yml.
@@ -483,12 +486,25 @@ jobs:
           [[ -f "$APP_APK" && -f "$TEST_APK" && -x "$REMOHOP" ]] || { echo '::error::debug APK, test APK or remohop binary missing.'; exit 65; }
           grep -rq 'class StoreScreenshotsTest' app/src/androidTest || { echo '::error::StoreScreenshotsTest is not on this ref.'; exit 66; }
 
-          # The demo home directory: the files the terminal and the Files tab show (made-up content).
-          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 755 "$SHOTS_HOME"
-          D="$SHOTS_HOME/Documents"
-          mkdir -p "$D/Invoices" "$D/Photos" "$D/Projects"
+          # The demo machine, as a user's computer would look: its own name (studio-pc, which the
+          # emulator resolves through the runner's resolver), a user "demo" whose home holds made-up
+          # files, and an Xvfb desktop (Xfce: a file manager, an editor and a terminal) that the
+          # host streams. Nothing in it is real data.
+          sudo apt-get update -q > "$RUNNER_TEMP/shots-apt.log" 2>&1 \
+            && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+              xvfb xfce4 xfce4-terminal mousepad dbus-x11 ffmpeg xclip wmctrl adwaita-icon-theme fonts-dejavu-core >> "$RUNNER_TEMP/shots-apt.log" 2>&1 \
+            || { tail -n 20 "$RUNNER_TEMP/shots-apt.log" | cut -c1-300; echo '::error::installing the demo desktop failed.'; exit 1; }
+          IP="$(hostname -I | awk '{print $1}')"
+          sudo hostnamectl set-hostname "$SHOTS_HOSTNAME" > /dev/null 2>&1 || sudo hostname "$SHOTS_HOSTNAME"
+          echo "$IP $SHOTS_HOSTNAME" | sudo tee -a /etc/hosts > /dev/null
+          id demo > /dev/null 2>&1 || sudo useradd -m -d "$SHOTS_HOME" -s /bin/bash demo
+          asdemo() { sudo -u demo -H env HOME="$SHOTS_HOME" SHELL=/bin/bash DISPLAY=:99 "$@"; }
+
+          # The demo home directory: the files the terminal, the Files tab and the desktop show.
+          STAGE="$RUNNER_TEMP/shots-home"; rm -rf "$STAGE"; D="$STAGE/Documents"
+          mkdir -p "$D/Invoices" "$D/Photos" "$D/Projects/website" "$D/Projects/app"
           printf 'RemoHop demo files\n' > "$D/README.txt"
-          printf '# Weekly sync\n\n- Ship 1.0 to the store\n- New screenshots\n' > "$D/meeting-notes.md"
+          printf '# Weekly sync\n\n- Ship 1.0 to the store\n- New screenshots for Android and iOS\n- Plan the 1.1 roadmap\n\n## Next steps\n\n1. Final review on Thursday\n2. Send the press kit\n' > "$D/meeting-notes.md"
           printf 'month,orders,revenue\nJul,182,9310\nAug,205,10422\nSep,231,11870\n' > "$D/sales-q3.csv"
           head -c 48213 /dev/urandom > "$D/budget-2026.xlsx"
           head -c 1843307 /dev/urandom > "$D/presentation.pdf"
@@ -496,27 +512,49 @@ jobs:
           STAMPS=('2026-11-03 09:12' '2026-11-21 18:40' '2026-11-12 11:05' '2026-11-23 16:27' '2026-11-02 08:55' '2026-11-19 10:31' '2026-11-23 09:41' '2026-11-17 14:08' '2026-10-28 13:22')
           i=0
           for f in "$D"/*; do touch -d "${STAMPS[$((i % ${#STAMPS[@]}))]}" "$f"; i=$((i + 1)); done
-          # A login shell reads ~/.bash_profile: a short prompt, and an ls that fits a phone-wide
-          # terminal (coloured, human sizes, no owner/group columns, short dates).
-          printf '%s\n' "PS1='\\[\\e[1;32m\\]demo@remohop\\[\\e[0m\\]:\\[\\e[1;34m\\]\\w\\[\\e[0m\\]\\\$ '" \
-            "alias ls=\"ls --color=auto -h -gG --time-style='+%b %d'\"" > "$SHOTS_HOME/.bash_profile"
+          # A login shell reads ~/.bash_profile: the usual coloured prompt (demo@studio-pc), and an ls
+          # that fits a phone-wide terminal (coloured, human sizes, no owner/group columns, short dates).
+          printf '%s\n' "PS1='\\[\\e[1;32m\\]\\u@\\h\\[\\e[0m\\]:\\[\\e[1;34m\\]\\w\\[\\e[0m\\]\\\$ '" \
+            "alias ls=\"ls --color=auto -h -gG --time-style='+%b %d'\"" > "$STAGE/.bash_profile"
+          sudo cp -a "$STAGE/." "$SHOTS_HOME/"
+          sudo chown -R demo:demo "$SHOTS_HOME"
           # /home's default ACL would add a '+' to every mode string.
-          setfacl -R -b "$SHOTS_HOME" 2>/dev/null || true
+          sudo setfacl -R -b "$SHOTS_HOME" 2>/dev/null || true
+          D="$SHOTS_HOME/Documents"
 
-          # The screenshots host: own config, port and random password (masked, 0600 file, never echoed).
-          HCFG="$RUNNER_TEMP/remohop-shots-config"
-          rm -rf "$HCFG"; mkdir -p "$HCFG"; chmod 700 "$HCFG"
+          # The desktop: Xvfb, an Xfce session as demo, three windows placed by hand.
+          Xvfb :99 -screen 0 1152x720x24 -ac -nolisten tcp > "$RUNNER_TEMP/shots-xvfb.log" 2>&1 &
+          XVFB_PID=$!
+          for _ in $(seq 1 50); do [[ -S /tmp/.X11-unix/X99 ]] && break; sleep 0.2; done
+          asdemo setsid dbus-launch --exit-with-session startxfce4 > "$RUNNER_TEMP/shots-xfce.log" 2>&1 < /dev/null &
+          sleep 8
+          asdemo setsid thunar "$D" > /dev/null 2>&1 < /dev/null &
+          asdemo setsid mousepad "$D/meeting-notes.md" > /dev/null 2>&1 < /dev/null &
+          asdemo setsid xfce4-terminal --working-directory="$D" --geometry=78x16 -x bash -l > /dev/null 2>&1 < /dev/null &
+          sleep 5
+          asdemo wmctrl -r Thunar -e 0,24,56,620,430 > /dev/null 2>&1 || true
+          asdemo wmctrl -r Mousepad -e 0,560,44,560,380 > /dev/null 2>&1 || true
+          asdemo wmctrl -r Terminal -e 0,300,330,640,330 > /dev/null 2>&1 || true
+          asdemo wmctrl -a Terminal > /dev/null 2>&1 || true
+          echo "demo desktop: $(asdemo wmctrl -l 2>/dev/null | awk '{$1=$2=$3=""; print}' | sed 's/^ *//' | tr '\n' ';' | cut -c1-200)"
+
+          # The screenshots host, run as demo with the desktop: own config, port and random password
+          # (masked, 0600 file, never echoed).
+          sudo install -m 755 "$REMOHOP" /usr/local/bin/remohop
+          HCFG=/var/tmp/remohop-shots-config
+          sudo rm -rf "$HCFG"; sudo install -d -o demo -g demo -m 700 "$HCFG"
           umask 077
           PWFILE="$RUNNER_TEMP/remohop-shots-password"
           openssl rand -hex 16 > "$PWFILE"
           echo "::add-mask::$(cat "$PWFILE")"
           PW="$(cat "$PWFILE")"
-          printf '%s\n%s\n' "$PW" "$PW" | REMOHOP_CONFIG_DIR="$HCFG" SHELL=/bin/bash "$REMOHOP" host passwd > /dev/null
+          printf '%s\n%s\n' "$PW" "$PW" | asdemo REMOHOP_CONFIG_DIR="$HCFG" /usr/local/bin/remohop host passwd > /dev/null
           HLOG="$RUNNER_TEMP/remohop-shots-host.log"
-          HOME="$SHOTS_HOME" SHELL=/bin/bash REMOHOP_CONFIG_DIR="$HCFG" setsid nohup "$REMOHOP" host --no-signal --listen "0.0.0.0:$SHOTS_HOST_PORT" > "$HLOG" 2>&1 < /dev/null &
+          asdemo REMOHOP_CONFIG_DIR="$HCFG" setsid /usr/local/bin/remohop host --no-signal --listen "0.0.0.0:$SHOTS_HOST_PORT" > "$HLOG" 2>&1 < /dev/null &
           SHOTS_PID=$!
           cleanup() {
-            kill "$SHOTS_PID" 2>/dev/null || true
+            sudo pkill -u demo 2>/dev/null || true
+            kill "$XVFB_PID" 2>/dev/null || true
             shred -u "$PWFILE" 2>/dev/null || rm -f "$PWFILE"
           }
           trap cleanup EXIT
@@ -526,7 +564,15 @@ jobs:
             sleep 0.5
           done
           grep -q 'RemoHop host ready' "$HLOG" 2>/dev/null || { sed -E 's/^( *Password: ).*/\1<hidden>/' "$HLOG" | cut -c1-300 | tail -n 20; echo '::error::the screenshots host did not start.'; exit 1; }
-          echo "screenshots host up on UDP $SHOTS_HOST_PORT (home $SHOTS_HOME)"
+          echo "screenshots host up on UDP $SHOTS_HOST_PORT (user demo, home $SHOTS_HOME, display :99)"
+          # The app connects by the machine's name when the emulator resolves it, else by the address.
+          TARGET="10.0.2.2:$SHOTS_HOST_PORT"
+          RESOLVED="$(timeout 20 "$ADB" shell ping -c 1 -W 2 "$SHOTS_HOSTNAME" 2>&1 | head -n 1 | tr -d '\r' || true)"
+          if [[ "$RESOLVED" =~ ^PING\ $SHOTS_HOSTNAME\ \(([0-9.]+)\) ]]; then
+            TARGET="$SHOTS_HOSTNAME:$SHOTS_HOST_PORT"; echo "the emulator resolves $SHOTS_HOSTNAME to ${BASH_REMATCH[1]}: target $TARGET"
+          else
+            echo "::warning::the emulator does not resolve $SHOTS_HOSTNAME ($(cut -c1-120 <<<"$RESOLVED")); target $TARGET"
+          fi
 
           # A clean status bar (System UI demo mode) and gesture navigation (a thin bar, no buttons).
           "$ADB" shell settings put global sysui_demo_allowed 1 > /dev/null 2>&1 || true
@@ -550,11 +596,15 @@ jobs:
           DEVDIR="/sdcard/Android/data/$EXPECTED_APP_ID/files/store-shots"
           for L in en zh; do
             [[ "$L" == zh ]] && LOC=zh-CN || LOC=en-US
+            # Something on the host's clipboard for the Clipboard tab to fetch (made up, in the pass's language).
+            if [[ "$L" == zh ]]; then CLIP='会议改到周四上午 10:30，4B 会议室。议程见 Documents/meeting-notes.md'
+            else CLIP='Meeting moved to Thursday 10:30, room 4B. Agenda: Documents/meeting-notes.md'; fi
+            printf '%s' "$CLIP" | timeout 10 sudo -u demo -H env DISPLAY=:99 xclip -selection clipboard > /dev/null 2>&1 || echo "::warning::could not set the host's clipboard"
             "$ADB" logcat -c > /dev/null 2>&1 || true
             rc=0
             timeout 600 "$ADB" shell am instrument -w \
               -e class com.remohop.app.StoreScreenshotsTest -e remohop_shots 1 -e remohop_shots_lang "$L" \
-              -e remohop_host "10.0.2.2:$SHOTS_HOST_PORT" -e remohop_password "$PW" \
+              -e remohop_host "$TARGET" -e remohop_password "$PW" \
               -e remohop_dir "$D" -e remohop_file README.txt \
               "$EXPECTED_APP_ID.test/androidx.test.runner.AndroidJUnitRunner" > "$W/instrument-$L.log" 2>&1 || rc=$?
             echo "--- $LOC: StoreScreenshotsTest progress (logcat tag RemoHopShots) ---"
@@ -598,7 +648,7 @@ jobs:
           fi
 
           # Play's rules for phone screenshots: PNG or JPEG, each side 320-3840 px, at most 2:1, 8 MB;
-          # here also exactly 9:16 and opaque (RGB, no alpha channel); at least 2 and at most 8 per
+          # here also exactly 9:16 (16:9 for the landscape desktop) and opaque (RGB, no alpha channel); at least 2 and at most 8 per
           # language, the same screens in both languages.
           python3 - "$OUT" <<'PY'
           import os, struct, sys
@@ -613,7 +663,7 @@ jobs:
                       print(f'{loc}/{n}: not a PNG'); bad += 1; continue
                   w, h, depth, ctype = struct.unpack('>IIBB', b[16:26])
                   ok = (320 <= min(w, h) and max(w, h) <= 3840 and max(w, h) <= 2 * min(w, h)
-                        and w * 16 == h * 9 and depth == 8 and ctype == 2 and len(b) <= 8 * 1024 * 1024)
+                        and (w * 16 == h * 9 or w * 9 == h * 16) and depth == 8 and ctype == 2 and len(b) <= 8 * 1024 * 1024)
                   kind = {2: 'RGB', 6: 'RGBA'}.get(ctype, f'colour type {ctype}')
                   print(f'{loc}/{n}: {w}x{h} {kind} {depth}-bit, {len(b) // 1024} KB: {"OK" if ok else "REJECTED"}')
                   bad += 0 if ok else 1
