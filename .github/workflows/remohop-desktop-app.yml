@@ -13,7 +13,8 @@
 #   app      : when the commit has the desktop app (`app --smoke`), it starts it with a fresh,
 #              throw-away configuration and takes screenshots of its windows.
 #   quick    : the quick-support name of the same program (RemoHop-QuickSupport.exe, RemoHop Quick
-#              Support.app, remohop-quick) started without arguments must start quick support.
+#              Support.app, remohop-quick) started without arguments must start quick support;
+#              on macOS its page is also driven in Safari (safaridriver) and must render.
 #
 # Screenshots and the JSON reports are uploaded as one artifact per job (kept for the shortest time the repository allows). They
 # show test pages and a freshly made test configuration only: no credentials exist in this
@@ -257,6 +258,62 @@ jobs:
           kill $pid 2>/dev/null
           osascript -e 'quit app "Safari"' 2>/dev/null
           grep -q 'opening the window' "$REMOHOP_CONFIG_DIR/quick.log" && echo 'ok: the quick-support bundle started quick support' || { echo '::error::RemoHop Quick Support.app did not start quick support'; tail -n 10 "$REMOHOP_CONFIG_DIR/quick.log"; exit 1; }
+      - name: Quick support page in Safari (WebDriver)
+        # Safari is what most Macs open quick support in. Drive it with safaridriver and check
+        # that the first screen (the server choice) renders; screenshot it. Only the outcome is
+        # printed, never the page address.
+        run: |
+          set +e
+          out="$RUNNER_TEMP/out"
+          QS="$RUNNER_TEMP/dist/macos/RemoHop Quick Support.app"
+          [ -d "$QS" ] || { echo 'no quick support bundle in this commit'; exit 0; }
+          export REMOHOP_CONFIG_DIR="$RUNNER_TEMP/qscfg2"
+          "$QS/Contents/MacOS/RemoHop-QuickSupport" --quick --no-open > "$RUNNER_TEMP/qs-addr.txt" 2>&1 &
+          pid=$!
+          sudo safaridriver --enable
+          safaridriver -p 4444 > /dev/null 2>&1 &
+          drv=$!
+          sleep 4
+          python3 - "$RUNNER_TEMP/qs-addr.txt" "$out/quick-macos-safari.png" <<'PY'
+          import base64, json, re, sys, time, urllib.request
+          addr = None
+          for _ in range(40):
+              m = re.search(r'http://127\.0\.0\.1:\d+/\S+', open(sys.argv[1]).read())
+              if m:
+                  addr = m.group(0); break
+              time.sleep(0.5)
+          if not addr:
+              print('::error::quick support printed no page address'); sys.exit(1)
+          def call(method, path, body=None):
+              req = urllib.request.Request('http://127.0.0.1:4444' + path, method=method,
+                  data=None if body is None else json.dumps(body).encode(), headers={'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return json.load(r)['value']
+          sid = call('POST', '/session', {'capabilities': {'alwaysMatch': {'browserName': 'safari'}}})['sessionId']
+          try:
+              call('POST', f'/session/{sid}/window/rect', {'width': 520, 'height': 960})
+              call('POST', f'/session/{sid}/url', {'url': addr})
+              probe = "var q=function(i){var e=document.getElementById(i);return e?!e.hidden:null};return {ready:document.readyState,setup:q('setup'),ready_box:q('ready'),official:!!document.querySelector('input[name=mode][value=official]:checked'),text:document.body.innerText.slice(0,160)}"
+              st = {}
+              for _ in range(40):
+                  st = call('POST', f'/session/{sid}/execute/sync', {'script': probe, 'args': []})
+                  if st.get('setup'): break
+                  time.sleep(0.5)
+              print('page state:', json.dumps({k: st.get(k) for k in ('ready', 'setup', 'ready_box', 'official')}))
+              print('page text:', (st.get('text') or '').replace('\n', ' | '))
+              hello = call('POST', f'/session/{sid}/execute/async', {'args': [], 'script':
+                  "var done=arguments[arguments.length-1];fetch('api/hello',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).then(function(r){return r.text().then(function(t){done({status:r.status,code:r.ok?'':t.slice(0,120)})})},function(e){done({error:String(e)})})"})
+              print('POST api/hello from the page:', json.dumps(hello))
+              open(sys.argv[2], 'wb').write(base64.b64decode(call('GET', f'/session/{sid}/screenshot')))
+              if not st.get('setup'):
+                  print('::error::the quick support page did not render its first screen in Safari'); sys.exit(1)
+              print('ok: the server choice renders in Safari, official server preselected' if st.get('official') else '::warning::official server not preselected')
+          finally:
+              call('DELETE', f'/session/{sid}')
+          PY
+          rc=$?
+          kill $pid $drv 2>/dev/null
+          exit $rc
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
@@ -353,6 +410,11 @@ jobs:
           set +e
           out="$RUNNER_TEMP/out"
           export REMOHOP_CONFIG_DIR="$RUNNER_TEMP/qscfg"
+          # A fresh Chrome on the runner would first show its terms dialog over the window: give
+          # quick support's app window a throw-away profile that skips the first-run screens.
+          printf '#!/bin/sh\nexec google-chrome --user-data-dir="%s/qschrome" --no-first-run --no-default-browser-check "$@"\n' "$RUNNER_TEMP" > "$RUNNER_TEMP/chrome-ci"
+          chmod +x "$RUNNER_TEMP/chrome-ci"
+          export REMOHOP_QUICK_APP_BROWSER="$RUNNER_TEMP/chrome-ci"
           "$RUNNER_TEMP/remohop-quick" > "$out/quick-linux.log" 2>&1 &
           pid=$!
           sleep 12
