@@ -21,7 +21,8 @@
 #   testflight : Xcode 26.x + Go -> gomobile xcframework (as verify) -> Match (readonly) -> signed
 #                archive of the RemoHop scheme (generic iOS device, manual signing, Apple
 #                Distribution + the Match profile) -> IPA -> altool validate -> altool upload.
-#                CFBundleVersion = build_number input, or (empty) latest TestFlight build + 1.
+#                CFBundleVersion = build_number input, or (empty) the latest TestFlight build of the
+#                project's marketing version + 1, so every new version starts at build 1.
 #                The marketing version (CFBundleShortVersionString) stays whatever the Xcode
 #                project says.
 #
@@ -87,7 +88,7 @@ on:
         default: 'main'
         type: string
       build_number:
-        description: 'testflight: build number (CFBundleVersion). Empty = latest TestFlight build + 1.'
+        description: 'testflight: build number (CFBundleVersion), counted per version. Empty = latest build of this version + 1 (a new version starts at 1).'
         required: false
         default: ''
         type: string
@@ -1110,8 +1111,12 @@ jobs:
         if: env.MODE == 'testflight' && steps.layout.outputs.ready == 'true'
         run: |
           set -euo pipefail
+          # Build numbers count within one version: each new MARKETING_VERSION starts at 1
+          # (1.0.0 (1..5), then 1.0.1 (1), 1.0.1 (2), ...). Only builds of this version are compared.
+          VERSION="$(sed -n 's/.*MARKETING_VERSION = \([0-9][0-9.]*\);.*/\1/p' "$PRIVATE_SOURCE_PATH/mobile/ios/RemoHop.xcodeproj/project.pbxproj" | head -n 1)"
+          [[ -n "$VERSION" ]] || { echo '::error::MARKETING_VERSION not found in the project.'; exit 65; }
           set +e
-          OUT="$(fastlane run latest_testflight_build_number api_key_path:"$ASC_API_KEY_JSON" app_identifier:"$EXPECTED_BUNDLE_ID" initial_build_number:0 2>&1)"
+          OUT="$(fastlane run latest_testflight_build_number api_key_path:"$ASC_API_KEY_JSON" app_identifier:"$EXPECTED_BUNDLE_ID" version:"$VERSION" initial_build_number:0 2>&1)"
           st=$?
           set -e
           LATEST="$(printf '%s\n' "$OUT" | sed -n 's/.*Result: \([0-9][0-9]*\).*/\1/p' | tail -1)"
@@ -1121,13 +1126,13 @@ jobs:
             exit 1
           fi
           if [[ -n "$BUILD_NUMBER_INPUT" ]]; then
-            (( BUILD_NUMBER_INPUT > LATEST )) || { echo "::error::build_number $BUILD_NUMBER_INPUT must be higher than latest $LATEST."; exit 1; }
+            (( BUILD_NUMBER_INPUT > LATEST )) || { echo "::error::build_number $BUILD_NUMBER_INPUT must be higher than the latest build of $VERSION ($LATEST)."; exit 1; }
             BN="$BUILD_NUMBER_INPUT"
           else
             BN=$((LATEST + 1))
           fi
           echo "BUILD_NUMBER=$BN" >> "$GITHUB_ENV"
-          echo "Latest TestFlight build: $LATEST → this build: $BN"
+          echo "Version $VERSION: latest TestFlight build $LATEST → this build $BN"
 
       - name: Build signed archive and IPA
         if: env.MODE == 'testflight' && steps.layout.outputs.ready == 'true'
