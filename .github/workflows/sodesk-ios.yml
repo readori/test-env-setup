@@ -35,6 +35,15 @@
 #   screenshots: Go + gomobile, then the real app on 6.9" / 6.5" iPhone and 13" iPad simulators connected to
 #                a remohop host on the runner (GatewayE2ETests/testScreenshots) -> JPEGs -> deliver (screenshots
 #                only, same no-submit flags), locales en-US and zh-Hans.
+#   capture    : capture only, NOTHING is uploaded and no Apple credential is used: the real app on the
+#                simulators named by DEVICES (iphone69, ipad13; default ipad13), in a session with a remohop
+#                host on the runner that has a made-up home directory (/Users/demo) and its real macOS
+#                desktop (ffmpeg, Screen Recording granted through TCC as in sodesk-e2e-macos.yml).
+#                RemoHopTests/GatewayE2ETests/testStoreScreens stops at desktop, terminal, files and the
+#                connect screen (saved, named host), once per store language. The PNGs are kept as the
+#                7-day artifact remohop-ios-capture (<device>/<locale>/<n>-<screen>.png) for the poster
+#                build in mobile/ios/store-art. Push requests need [sodesk-ios-capture] in the commit
+#                message (own concurrency group, never cancelled, cancels nothing).
 #
 # Triggers: workflow_dispatch (modes verify, profile, testflight, metadata, screenshots), or a push to main that
 # changes ci-requests/sodesk-ios.env (how the project's AI engineer requests a run; verify by
@@ -42,8 +51,10 @@
 # patterns and never executed:
 #
 #   REF=main          # source repository branch, tag or SHA
-#   MODE=testflight   # optional: verify (default), profile, testflight, metadata or screenshots; all but verify
-#                     # also need [sodesk-ios-release] in the commit message (never cancelled)
+#   MODE=testflight   # optional: verify (default), profile, testflight, metadata, screenshots or capture;
+#                     # profile/testflight/metadata/screenshots also need [sodesk-ios-release] in the commit
+#                     # message (never cancelled); capture needs [sodesk-ios-capture]
+#   DEVICES=ipad13    # capture only, optional: comma list of iphone69, ipad13 (default ipad13)
 #   CONFIRM=WRITE     # profile only
 #   BUILD=12          # testflight only, optional (default: latest TestFlight build + 1)
 #
@@ -65,11 +76,11 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'verify = simulator build + tests + end-to-end, no signing; profile = one-time signing setup (needs confirm=WRITE); testflight = signed build + upload; metadata = App Store listing text/categories/age rating/review info; screenshots = generate in simulators and upload'
+        description: 'verify = simulator build + tests + end-to-end, no signing; profile = one-time signing setup (needs confirm=WRITE); testflight = signed build + upload; metadata = App Store listing text/categories/age rating/review info; screenshots = generate in simulators and upload; capture = generate the store screens in simulators, artifact only, no upload'
         required: true
         default: 'verify'
         type: choice
-        options: [verify, profile, testflight, metadata, screenshots]
+        options: [verify, profile, testflight, metadata, screenshots, capture]
       ref:
         description: 'Source repository branch, tag, or SHA (not used by profile)'
         required: true
@@ -79,6 +90,11 @@ on:
         description: 'testflight: build number (CFBundleVersion). Empty = latest TestFlight build + 1.'
         required: false
         default: ''
+        type: string
+      devices:
+        description: 'capture mode only: comma list of iphone69, ipad13'
+        required: false
+        default: 'ipad13'
         type: string
       confirm:
         description: 'profile mode only: type WRITE'
@@ -96,9 +112,11 @@ permissions:
 # run (an upload or a Match write must not be cut off).
 # A push whose commit message carries [sodesk-ios-release] is a release request (MODE=profile or
 # testflight in the request file) and, like a dispatched release, is never cancelled.
+# A capture run (MODE=capture with [sodesk-ios-capture], or a dispatched capture) has a group of its own:
+# it uploads nothing, so it neither waits for nor cancels release or verify runs.
 concurrency:
-  group: ${{ ((github.event_name == 'push' && contains(github.event.head_commit.message, '[sodesk-ios-release]')) || (github.event_name == 'workflow_dispatch' && inputs.mode != 'verify')) && 'remohop-ios-release' || format('remohop-ios-{0}', inputs.ref || 'request') }}
-  cancel-in-progress: ${{ !((github.event_name == 'push' && contains(github.event.head_commit.message, '[sodesk-ios-release]')) || (github.event_name == 'workflow_dispatch' && inputs.mode != 'verify')) }}
+  group: ${{ ((github.event_name == 'push' && contains(github.event.head_commit.message, '[sodesk-ios-capture]')) || (github.event_name == 'workflow_dispatch' && inputs.mode == 'capture')) && 'remohop-ios-capture' || (((github.event_name == 'push' && contains(github.event.head_commit.message, '[sodesk-ios-release]')) || (github.event_name == 'workflow_dispatch' && inputs.mode != 'verify')) && 'remohop-ios-release' || format('remohop-ios-{0}', inputs.ref || 'request')) }}
+  cancel-in-progress: ${{ !((github.event_name == 'push' && (contains(github.event.head_commit.message, '[sodesk-ios-release]') || contains(github.event.head_commit.message, '[sodesk-ios-capture]'))) || (github.event_name == 'workflow_dispatch' && inputs.mode != 'verify')) }}
 
 env:
   # Source repository (public since the open-source release).
@@ -140,6 +158,7 @@ jobs:
           INPUT_MODE: ${{ inputs.mode }}
           BUILD_NUMBER_INPUT: ${{ inputs.build_number }}
           CONFIRM: ${{ inputs.confirm }}
+          INPUT_DEVICES: ${{ inputs.devices }}
           HEAD_MESSAGE: ${{ github.event.head_commit.message }}
           REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/sodesk-ios.env
         run: |
@@ -154,14 +173,20 @@ jobs:
             MODE="$(sed -n 's/^MODE=//p' "$REQ" | head -n 1 | tr -d '\r')"; MODE="${MODE:-verify}"
             CONFIRM="$(sed -n 's/^CONFIRM=//p' "$REQ" | head -n 1 | tr -d '\r')"
             BUILD_NUMBER_INPUT="$(sed -n 's/^BUILD=//p' "$REQ" | head -n 1 | tr -d '\r')"
-            if [[ "$MODE" != verify && "$HEAD_MESSAGE" != *'[sodesk-ios-release]'* ]]; then
+            DEVICES="$(sed -n 's/^DEVICES=//p' "$REQ" | head -n 1 | tr -d '\r')"
+            if [[ "$MODE" == capture ]]; then
+              [[ "$HEAD_MESSAGE" == *'[sodesk-ios-capture]'* ]] || { echo '::error::a capture request (MODE=capture) needs [sodesk-ios-capture] in the commit message (its own concurrency group).'; exit 64; }
+            elif [[ "$MODE" != verify && "$HEAD_MESSAGE" != *'[sodesk-ios-release]'* ]]; then
               echo '::error::a release request (MODE=profile/testflight) needs [sodesk-ios-release] in the commit message, so it is never cancelled.'; exit 64
             fi
           else
             SOURCE_REF="$INPUT_REF"
             MODE="$INPUT_MODE"
+            DEVICES="$INPUT_DEVICES"
           fi
-          case "$MODE" in verify|profile|testflight|metadata|screenshots) ;; *) echo "::error::Unsupported mode: $MODE"; exit 64 ;; esac
+          case "$MODE" in verify|profile|testflight|metadata|screenshots|capture) ;; *) echo "::error::Unsupported mode: $MODE"; exit 64 ;; esac
+          DEVICES="${DEVICES:-ipad13}"
+          [[ "$DEVICES" =~ ^(iphone69|ipad13)(,(iphone69|ipad13))?$ ]] || { echo '::error::DEVICES must be a comma list of iphone69, ipad13.'; exit 64; }
           [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && ${#SOURCE_REF} -le 200 ]] || {
             echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only, no leading dash).'
             exit 64
@@ -174,7 +199,8 @@ jobs:
           if [[ "$MODE" == 'profile' && "$CONFIRM" != 'WRITE' ]]; then
             echo '::error::profile mode writes to the shared Match repo: set confirm=WRITE.'; exit 64
           fi
-          if [[ "$MODE" != 'verify' ]]; then
+          # capture uses no Apple credential (nothing is signed or uploaded).
+          if [[ "$MODE" != 'verify' && "$MODE" != 'capture' ]]; then
             missing=0
             for name in MATCH_PASSWORD ASC_ISSUER_ID ASC_KEY_ID ASC_PRIVATE_KEY ASC_TEAM_ID; do
               [[ -n "${!name:-}" ]] || { echo "::error::Missing secret $name"; missing=1; }
@@ -185,6 +211,7 @@ jobs:
             echo "SOURCE_REF=$SOURCE_REF"
             echo "MODE=$MODE"
             echo "BUILD_NUMBER_INPUT=$BUILD_NUMBER_INPUT"
+            echo "DEVICES=$DEVICES"
           } >> "$GITHUB_ENV"
           echo "Trigger: $EVENT_NAME · mode: $MODE · ref: $SOURCE_REF · build: ${BUILD_NUMBER_INPUT:-auto}"
 
@@ -624,10 +651,209 @@ jobs:
           echo "SHOTS_OUT=$OUT" >> "$GITHUB_ENV"
           echo "SHOT_SETS=$made" >> "$GITHUB_ENV"
 
+      # capture mode: the store screens of the real app, kept as an artifact. Nothing is uploaded
+      # anywhere and no Apple credential exists in this job (the keychain/API-key steps skip capture).
+      # The host on this Mac has a made-up home directory and shows this Mac's real desktop (a Finder
+      # and a TextEdit window on the demo files). The host's password is random per run and masked.
+      - name: Install ffmpeg for the host's desktop (capture)
+        if: steps.layout.outputs.ready == 'true' && env.MODE == 'capture'
+        run: |
+          set -euo pipefail
+          command -v ffmpeg >/dev/null || brew install --quiet ffmpeg > "$RUNNER_TEMP/brew-ffmpeg.log" 2>&1 || { tail -n 20 "$RUNNER_TEMP/brew-ffmpeg.log" | cut -c1-300; echo '::error::brew install ffmpeg failed.'; exit 1; }
+          ffmpeg -hide_banner -version | head -n 1
+          system_profiler SPDisplaysDataType 2>/dev/null | grep -E 'Resolution|UI Looks like' | sed 's/^ */  display: /' | head -n 4 || true
+
+      - name: Capture the store screens (simulators, app to remohop host on this Mac; no upload)
+        if: steps.layout.outputs.ready == 'true' && env.MODE == 'capture'
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        run: |
+          set +e -uo pipefail
+          redact() { sed -E 's#(127\.0\.0\.1:[0-9]+/)[A-Za-z0-9_-]{16,}#\1<token>#g' | cut -c1-400; }
+          grep -q 'func testStoreScreens' mobile/ios/RemoHopTests/GatewayE2ETests.swift || { echo '::error::GatewayE2ETests/testStoreScreens is not on this ref.'; exit 66; }
+          W="$RUNNER_TEMP/remohop-capture"; OUT="$RUNNER_TEMP/remohop-ios-capture"
+          rm -rf "$W" "$OUT"; mkdir -p "$W/host" "$W/cli" "$OUT"
+          CGO_ENABLED=0 go build -trimpath -o "$W/remohop" ./cmd/remohop || { echo '::error::building remohop for the host failed.'; exit 1; }
+
+          # The demo home directory (made-up content): what the terminal and the Files tab show.
+          DEMO=/Users/demo
+          sudo mkdir -p "$DEMO" && sudo chown "$(id -un)" "$DEMO"
+          D="$DEMO/Documents"
+          mkdir -p "$D/Invoices" "$D/Photos" "$D/Projects/website"
+          printf 'RemoHop demo files\n' > "$D/README.txt"
+          printf 'Weekly sync\n\n- Ship 1.0 to the App Store\n- New iPad screenshots\n- Plan the 1.1 release\n' > "$D/meeting-notes.txt"
+          printf 'month,orders,revenue\nJul,182,9310\nAug,205,10422\nSep,231,11870\n' > "$D/sales-q3.csv"
+          head -c 48213 /dev/urandom > "$D/budget-2026.xlsx"
+          head -c 1843307 /dev/urandom > "$D/presentation.pdf"
+          head -c 7340032 /dev/urandom > "$D/backup-2026-11.tar.gz"
+          head -c 2311420 /dev/urandom > "$D/Photos/beach.jpg"; head -c 1904113 /dev/urandom > "$D/Photos/team.jpg"
+          printf 'INV-1042,2026-11-02,1250.00\n' > "$D/Invoices/INV-1042.csv"
+          # A small project with a made-up history for the terminal.
+          (
+            cd "$D/Projects/website" && git init -q -b main && printf '<h1>Hello</h1>\n' > index.html && printf 'body{margin:0}\n' > style.css
+            n=0
+            for msg in 'Initial commit' 'Add the landing page' 'Dark mode styles' 'Pricing section' 'Fix the mobile menu' 'Contact form' 'Update screenshots'; do
+              n=$((n + 1)); printf '/* %s */\n' "$msg" >> style.css; git add -A
+              GIT_AUTHOR_DATE="2026-11-$((10 + n))T10:0$n:00" GIT_COMMITTER_DATE="2026-11-$((10 + n))T10:0$n:00" \
+                git -c user.name=Demo -c user.email=demo@example.com -c commit.gpgsign=false commit -q -m "$msg"
+            done
+          ) || echo '::warning::demo git history not created'
+          STAMPS=('202611030912' '202611211840' '202611121105' '202611231627' '202611020855' '202611191031' '202611230941' '202611171408' '202610281322')
+          i=0
+          for f in "$D"/*; do touch -t "${STAMPS[$((i % ${#STAMPS[@]}))]}" "$f"; i=$((i + 1)); done
+          # The login shell (bash) reads ~/.bash_profile: a short prompt and coloured ls.
+          printf '%s\n' "export BASH_SILENCE_DEPRECATION_WARNING=1" \
+            "PS1='\\[\\e[1;32m\\]demo@remohop\\[\\e[0m\\]:\\[\\e[1;34m\\]\\w\\[\\e[0m\\]\\\$ '" \
+            "export CLICOLOR=1 LSCOLORS=ExGxFxdxCxDxDxBxBxExEx" "alias ls='ls -G'" "cd ~" > "$DEMO/.bash_profile"
+
+          # Screen Recording for the host and ffmpeg (as in sodesk-e2e-macos.yml): copy a granted row.
+          FFMPEG="$(command -v ffmpeg)"
+          FFREAL="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$FFMPEG")"
+          for DB in "/Library/Application Support/com.apple.TCC/TCC.db" "$HOME/Library/Application Support/com.apple.TCC/TCC.db"; do
+            sudo test -f "$DB" || continue
+            for CLIENT in "$W/remohop" "$FFMPEG" "$FFREAL"; do
+              [[ "$CLIENT" =~ ^[A-Za-z0-9._/@+-]+$ ]] || continue
+              sudo sqlite3 "$DB" "
+                CREATE TEMP TABLE t AS SELECT * FROM access WHERE auth_value = 2 ORDER BY (service = 'kTCCServiceScreenCapture') DESC, (client_type = 1) DESC LIMIT 1;
+                UPDATE t SET service = 'kTCCServiceScreenCapture', client = '$CLIENT', client_type = 1, auth_value = 2, csreq = NULL,
+                  indirect_object_identifier_type = 0, indirect_object_identifier = 'UNUSED', indirect_object_code_identity = NULL;
+                INSERT OR REPLACE INTO access SELECT * FROM t;
+              " 2>/dev/null || echo "::warning::TCC: could not grant Screen Recording to $(basename "$CLIENT")"
+            done
+          done
+
+          # This Mac's desktop: a Finder window on the demo documents and a note in TextEdit.
+          open "$D" >/dev/null 2>&1
+          open -a TextEdit "$D/meeting-notes.txt" >/dev/null 2>&1
+          sleep 3
+
+          PORT=$((20000 + RANDOM % 10000))
+          PW="$(openssl rand -hex 16)"
+          echo "::add-mask::$PW"
+          # Signal on (the app connects by ID, as people do); --listen keeps a direct address as a fallback.
+          HOME="$DEMO" SHELL=/bin/bash BASH_SILENCE_DEPRECATION_WARNING=1 REMOHOP_CONFIG_DIR="$W/host" \
+            "$W/remohop" host --listen "0.0.0.0:$PORT" --password "$PW" > "$W/host.log" 2>&1 < /dev/null &
+          HOST_PID=$!
+          SIMS=()
+          cleanup() {
+            kill "$HOST_PID" 2>/dev/null || true
+            for u in ${SIMS[@]+"${SIMS[@]}"}; do xcrun simctl shutdown "$u" >/dev/null 2>&1; xcrun simctl delete "$u" >/dev/null 2>&1; done
+          }
+          trap cleanup EXIT
+          for _ in $(seq 1 150); do grep -q 'host ready' "$W/host.log" 2>/dev/null && break; sleep 0.2; done
+          grep -q 'host ready' "$W/host.log" || { echo '::error::remohop host did not start.'; grep -v Password "$W/host.log" | tail -n 5 | redact; exit 1; }
+          TARGET="127.0.0.1:$PORT"
+          HID="$(sed -n 's/^ *ID: *//p' "$W/host.log" | head -n 1 | tr -d ' \r')"
+          if [[ "$HID" =~ ^[0-9]{6,12}$ ]]; then
+            for _ in 1 2 3; do
+              if REMOHOP_CONFIG_DIR="$W/cli" REMOHOP_PASSWORD="$PW" "$W/remohop" "$HID" ping -c 1 > "$W/ping.log" 2>&1; then TARGET="$HID"; break; fi
+              sleep 5
+            done
+          fi
+          if [[ "$TARGET" == "$HID" ]]; then echo "host: reachable by its ID through the signal server"; else echo "::warning::host: not reachable by ID; using its direct address"; tail -n 3 "$W/ping.log" 2>/dev/null | redact; fi
+
+          SETS=()
+          [[ ",$DEVICES," == *,iphone69,* ]] && SETS+=('iphone69|iPhone 17 Pro Max,iPhone 16 Pro Max')
+          [[ ",$DEVICES," == *,ipad13,* ]] && SETS+=('ipad13|iPad Pro 13-inch (M5),iPad Pro 13-inch (M4)')
+          NAMES=(1-desktop 2-terminal 3-files 4-connect)
+          COMMAND='cd ~/Documents && ls -lh && cd Projects/website && git log --oneline --graph --decorate'
+          DD="$RUNNER_TEMP/DerivedData-remohop-capture"
+          made=0
+          for set in "${SETS[@]}"; do
+            IFS='|' read -r KEY NAMES_PREF <<< "$set"
+            PICK="$(xcrun simctl list devicetypes -j > "$W/types.json"; xcrun simctl list runtimes -j > "$W/runtimes.json"; python3 - "$W/types.json" "$W/runtimes.json" "$NAMES_PREF" <<'PY'
+          import json, sys
+          types = json.load(open(sys.argv[1]))['devicetypes']
+          runtimes = [r for r in json.load(open(sys.argv[2]))['runtimes'] if r.get('isAvailable') and r.get('platform', 'iOS') == 'iOS']
+          def ver(r):
+              return tuple(int(x) for x in r['version'].split('.') if x.isdigit())
+          for name in sys.argv[3].split(','):
+              for t in types:
+                  if t['name'] != name:
+                      continue
+                  ok = [r for r in runtimes if any(d['identifier'] == t['identifier'] for d in r.get('supportedDeviceTypes', []))]
+                  if ok:
+                      best = max(ok, key=ver)
+                      print(t['identifier'], best['identifier'], name.replace(' ', '_'))
+                      raise SystemExit(0)
+          PY
+            )"
+            if [[ -z "$PICK" ]]; then echo "::warning::$KEY: none of [$NAMES_PREF] is available on this runner; skipped."; continue; fi
+            read -r TYPE_ID RUNTIME_ID DEVNAME <<< "$PICK"
+            UDID="$(xcrun simctl create "remohop-capture-$KEY" "$TYPE_ID" "$RUNTIME_ID" 2>/dev/null)"
+            [[ -n "$UDID" ]] || { echo "::warning::$KEY: could not create a simulator; skipped."; continue; }
+            SIMS+=("$UDID")
+            echo "$KEY: ${DEVNAME//_/ } · $RUNTIME_ID"
+            for LANGCODE in en zh; do
+              if [[ "$LANGCODE" == zh ]]; then LOC=zh-Hans; SYSLANGS=(zh-Hans en); SYSLOCALE=zh_CN; ALIAS='工作室 Mac'; else LOC=en-US; SYSLANGS=(en); SYSLOCALE=en_US; ALIAS='Studio Mac'; fi
+              xcrun simctl boot "$UDID" >/dev/null 2>&1
+              xcrun simctl bootstatus "$UDID" -b >/dev/null 2>&1
+              xcrun simctl spawn "$UDID" defaults write -g AppleLanguages -array "${SYSLANGS[@]}" >/dev/null 2>&1
+              xcrun simctl spawn "$UDID" defaults write -g AppleLocale "$SYSLOCALE" >/dev/null 2>&1
+              xcrun simctl shutdown "$UDID" >/dev/null 2>&1
+              xcrun simctl boot "$UDID" >/dev/null 2>&1
+              xcrun simctl bootstatus "$UDID" -b >/dev/null 2>&1 || { echo "::warning::$KEY/$LANGCODE: simulator did not boot."; continue; }
+              xcrun simctl status_bar "$UDID" override --time 9:41 --batteryState charged --batteryLevel 100 --wifiBars 3 --cellularBars 4 --operatorName '' >/dev/null 2>&1
+              S="$W/s-$KEY-$LANGCODE"; rm -rf "$S"; mkdir -p "$S"
+              LOG="$RUNNER_TEMP/xccapture-$KEY-$LANGCODE.log"
+              TEST_RUNNER_REMOHOP_E2E_TARGET="$TARGET" TEST_RUNNER_REMOHOP_E2E_PASSWORD="$PW" TEST_RUNNER_REMOHOP_E2E_DIR="$D" \
+              TEST_RUNNER_REMOHOP_SHOTS_DIR="$S" TEST_RUNNER_REMOHOP_SHOTS_LANG="$LANGCODE" \
+              TEST_RUNNER_REMOHOP_SHOTS_ALIAS="$ALIAS" TEST_RUNNER_REMOHOP_SHOTS_COMMAND="$COMMAND" \
+              xcodebuild test -quiet \
+                -project mobile/ios/RemoHop.xcodeproj -scheme RemoHop -configuration Debug \
+                -destination "platform=iOS Simulator,id=$UDID" \
+                -only-testing:RemoHopTests/GatewayE2ETests/testStoreScreens \
+                -derivedDataPath "$DD" CODE_SIGNING_ALLOWED=NO > "$LOG" 2>&1 &
+              XPID=$!
+              got=0
+              for name in "${NAMES[@]}"; do
+                for _ in $(seq 1 1600); do
+                  [[ -f "$S/$name.ready" ]] && break
+                  kill -0 "$XPID" 2>/dev/null || break
+                  sleep 0.25
+                done
+                [[ -f "$S/$name.ready" ]] || break
+                xcrun simctl io "$UDID" screenshot --type=png "$S/$name.png" >/dev/null 2>&1
+                touch "$S/$name.done"
+                got=$((got + 1))
+              done
+              wait "$XPID"; st=$?
+              echo "$KEY/$LOC: $got of ${#NAMES[@]} screens (xcodebuild exit $st)"
+              grep -E 'store screens:' "$LOG" | redact | head -n 10 || true
+              if [[ "$got" -ne ${#NAMES[@]} || "$st" -ne 0 ]]; then
+                grep -E "error:|failed|XCTAssert|caught error|timed out|skipped" "$LOG" | redact | tail -n 15 || true
+                echo "--- xcodebuild log (tail) ---"; tail -n 30 "$LOG" | redact || true
+              fi
+              if [[ "$got" -gt 0 ]]; then
+                mkdir -p "$OUT/$KEY/$LOC"
+                for name in "${NAMES[@]}"; do
+                  [[ -f "$S/$name.png" ]] || continue
+                  cp "$S/$name.png" "$OUT/$KEY/$LOC/$name.png"
+                  echo "  $LOC/$name.png: $(sips -g pixelWidth -g pixelHeight "$S/$name.png" 2>/dev/null | awk '/pixel/{printf "%s ", $2}')"
+                done
+                made=$((made + got))
+              fi
+            done
+          done
+          # The Mac's own screen as the host saw it (for checking the desktop scene).
+          screencapture -x "$OUT/mac-desktop.png" >/dev/null 2>&1 || true
+          trap - EXIT; cleanup
+          [[ "$made" -gt 0 ]] || { echo '::error::no screen was captured.'; exit 1; }
+          echo "CAPTURE_OUT=$OUT" >> "$GITHUB_ENV"
+          echo "- Captured $made store screens (devices: $DEVICES; en-US, zh-Hans): artifact \`remohop-ios-capture\`. Nothing uploaded." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the captured screens (artifact, 7 days)
+        if: always() && env.MODE == 'capture' && env.CAPTURE_OUT != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: remohop-ios-capture
+          path: ${{ env.CAPTURE_OUT }}
+          retention-days: 7
+          if-no-files-found: error
+
       # ---- profile, testflight, metadata, screenshots: signing material / API key. Created only after all private-source
       # build scripts (gomobile bind above) ran, and removed in the last step. ----
       - name: Install pinned fastlane
-        if: env.MODE != 'verify' && (steps.layout.outputs.ready == 'true' || env.MODE == 'profile')
+        if: env.MODE != 'verify' && env.MODE != 'capture' && (steps.layout.outputs.ready == 'true' || env.MODE == 'profile')
         run: |
           set -euo pipefail
           GH="$RUNNER_TEMP/fastlane-gems"; rm -rf "$GH"; mkdir -p "$GH"
@@ -635,7 +861,7 @@ jobs:
           echo "GEM_HOME=$GH" >> "$GITHUB_ENV"; echo "GEM_PATH=$GH" >> "$GITHUB_ENV"; echo "$GH/bin" >> "$GITHUB_PATH"
 
       - name: Create ephemeral keychain and App Store Connect API key
-        if: env.MODE != 'verify' && (steps.layout.outputs.ready == 'true' || env.MODE == 'profile')
+        if: env.MODE != 'verify' && env.MODE != 'capture' && (steps.layout.outputs.ready == 'true' || env.MODE == 'profile')
         env:
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
@@ -989,6 +1215,8 @@ jobs:
             elif [[ "$MODE" == 'verify' ]]; then
               echo "- Go: \`$(go version | cut -d' ' -f3)\`"
               echo '- No signing; nothing uploaded.'
+            elif [[ "$MODE" == 'capture' ]]; then
+              echo '- Capture only: no Apple credential used, nothing uploaded to App Store Connect. Screens: artifact remohop-ios-capture.'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
