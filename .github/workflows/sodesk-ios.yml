@@ -726,12 +726,15 @@ jobs:
           open -a TextEdit "$D/meeting-notes.txt" >/dev/null 2>&1
           sleep 3
 
-          PORT=$((20000 + RANDOM % 10000))
+          PORT=21118
           PW="$(openssl rand -hex 16)"
           echo "::add-mask::$PW"
-          # Signal on (the app connects by ID, as people do); --listen keeps a direct address as a fallback.
+          # A host name for this Mac (the simulator uses the Mac's resolver), so the app shows a name and
+          # not a loopback address; the host listens on loopback only, no signal server.
+          grep -q ' studio-mac$' /etc/hosts || echo '127.0.0.1 studio-mac' | sudo tee -a /etc/hosts >/dev/null
+          sudo dscacheutil -flushcache >/dev/null 2>&1; sudo killall -HUP mDNSResponder >/dev/null 2>&1
           HOME="$DEMO" SHELL=/bin/bash BASH_SILENCE_DEPRECATION_WARNING=1 REMOHOP_CONFIG_DIR="$W/host" \
-            "$W/remohop" host --listen "0.0.0.0:$PORT" --password "$PW" > "$W/host.log" 2>&1 < /dev/null &
+            "$W/remohop" host --no-signal --listen "127.0.0.1:$PORT" --password "$PW" > "$W/host.log" 2>&1 < /dev/null &
           HOST_PID=$!
           SIMS=()
           cleanup() {
@@ -742,14 +745,11 @@ jobs:
           for _ in $(seq 1 150); do grep -q 'host ready' "$W/host.log" 2>/dev/null && break; sleep 0.2; done
           grep -q 'host ready' "$W/host.log" || { echo '::error::remohop host did not start.'; grep -v Password "$W/host.log" | tail -n 5 | redact; exit 1; }
           TARGET="127.0.0.1:$PORT"
-          HID="$(sed -n 's/^ *ID: *//p' "$W/host.log" | head -n 1 | tr -d ' \r')"
-          if [[ "$HID" =~ ^[0-9]{6,12}$ ]]; then
-            for _ in 1 2 3; do
-              if REMOHOP_CONFIG_DIR="$W/cli" REMOHOP_PASSWORD="$PW" "$W/remohop" "$HID" ping -c 1 > "$W/ping.log" 2>&1; then TARGET="$HID"; break; fi
-              sleep 5
-            done
+          if REMOHOP_CONFIG_DIR="$W/cli" REMOHOP_PASSWORD="$PW" "$W/remohop" "studio-mac:$PORT" ping -c 1 > "$W/ping.log" 2>&1; then
+            TARGET="studio-mac:$PORT"; echo "host: answers as studio-mac:$PORT"
+          else
+            echo "::warning::host: studio-mac:$PORT does not answer; using $TARGET"; tail -n 3 "$W/ping.log" | redact
           fi
-          if [[ "$TARGET" == "$HID" ]]; then echo "host: reachable by its ID through the signal server"; else echo "::warning::host: not reachable by ID; using its direct address"; tail -n 3 "$W/ping.log" 2>/dev/null | redact; fi
 
           SETS=()
           [[ ",$DEVICES," == *,iphone69,* ]] && SETS+=('iphone69|iPhone 17 Pro Max,iPhone 16 Pro Max')
