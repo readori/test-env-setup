@@ -1,0 +1,267 @@
+# RemoHop desktop app: native web view checks and screenshots on Windows, macOS and Linux.
+#
+# Public CI repository -> source repository: env SOURCE_REPOSITORY.
+#
+# Each job builds the double-click program (cmd/remohop-quick: RemoHop.exe, the binary inside
+# RemoHop.app, remohop-quick) from the requested commit, unsigned, and on a hosted runner with a
+# desktop:
+#
+#   selftest : `webview-selftest` opens the native web view (WebView2, WKWebView, WebKitGTK) with
+#              a page that reports WebCodecs support, which codecs decode, and the decode latency
+#              of a 1080p H.264 clip fed at 30 fps (internal/webview/testdata). The same page in a
+#              browser (Edge, Safari, Chrome) is the comparison. Reports are printed in the log.
+#   app      : when the commit has the desktop app (`app --smoke`), it starts it with a fresh,
+#              throw-away configuration and takes screenshots of its windows.
+#
+# Screenshots and the JSON reports are uploaded as one artifact per job (kept 14 days). They
+# show test pages and a freshly made test configuration only: no credentials exist in this
+# workflow besides the read-only checkout token.
+#
+# Trigger: workflow_dispatch with a full commit SHA (or branch). Only people with push access to
+# this repo can trigger; never pull_request.
+#
+# Safety rules (public repo, public logs): no pull_request triggers; only GitHub-owned actions,
+# pinned to commit SHAs; TARGET_REPO_PAT is used only by the checkout step and not persisted;
+# local page URLs (they carry access tokens) are never printed.
+name: RemoHop desktop app
+
+run-name: RemoHop desktop app · ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Source repository commit SHA (or branch)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remohop-desktop-app-${{ inputs.ref }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_REPOSITORY: readori/RemoHop
+  CGO_ENABLED: '0'
+
+jobs:
+  windows:
+    name: Windows (WebView2)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Validate ref
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          if ("$env:INPUT_REF" -cnotmatch '\A[A-Za-z0-9._/][A-Za-z0-9._/-]{0,199}\z') { Write-Output '::error::bad ref'; exit 64 }
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: source/go.mod
+          cache: false
+      - name: Build RemoHop.exe (GUI program, icon, manifest)
+        working-directory: source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          go run ./packaging/quick/gen -syso cmd/remohop-quick
+          go build -trimpath -ldflags "-s -w -H windowsgui" -o "$env:RUNNER_TEMP\RemoHop.exe" ./cmd/remohop-quick
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\out" | Out-Null
+          "{0:N1} MB" -f ((Get-Item "$env:RUNNER_TEMP\RemoHop.exe").Length / 1MB)
+          $v = (Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' -ErrorAction SilentlyContinue).pv
+          "WebView2 runtime: $v"
+      - name: Web view self-test
+        working-directory: source
+        run: |
+          $out = "$env:RUNNER_TEMP\out"
+          $p = Start-Process -PassThru "$env:RUNNER_TEMP\RemoHop.exe" -ArgumentList @('webview-selftest', '--clip', "$PWD\internal\webview\testdata\clip1080.h264", '--out', "$out\webview2.json", '--hold', '6s')
+          Start-Sleep -Seconds 9
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+          [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+          $bmp.Save("$out\windows-selftest.png")
+          $p.WaitForExit(90000) | Out-Null
+          if (Test-Path "$out\webview2.json") { Get-Content "$out\webview2.json" } else { Write-Output '::error::no report'; exit 1 }
+      - name: Same page in Microsoft Edge (comparison)
+        working-directory: source
+        run: |
+          $out = "$env:RUNNER_TEMP\out"
+          $edge = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
+          $p = Start-Process -PassThru "$env:RUNNER_TEMP\RemoHop.exe" -ArgumentList @('webview-selftest', '--browser', '--clip', "$PWD\internal\webview\testdata\clip1080.h264", '--out', "$out\edge.json", $edge, "--user-data-dir=$env:RUNNER_TEMP\edgeprof", '--no-first-run', '--new-window')
+          $p.WaitForExit(120000) | Out-Null
+          if (Test-Path "$out\edge.json") { Get-Content "$out\edge.json" } else { Write-Output '::warning::no Edge report' }
+      - name: Desktop app smoke test and screenshots
+        working-directory: source
+        run: |
+          $out = "$env:RUNNER_TEMP\out"
+          if (-not (Select-String -Quiet -Path internal\desktop\*.go -Pattern 'smoke' -ErrorAction SilentlyContinue)) { 'no desktop app in this commit'; exit 0 }
+          $env:REMOHOP_CONFIG_DIR = "$env:RUNNER_TEMP\appcfg"
+          & "$env:RUNNER_TEMP\RemoHop.exe" app --smoke "$out" | Out-Null
+          Start-Sleep -Seconds 1
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          Get-ChildItem "$out\*.json" | ForEach-Object { "== $($_.Name)"; Get-Content $_ | Select-Object -First 60 }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: desktop-app-windows
+          path: ${{ runner.temp }}/out
+          retention-days: 14
+          if-no-files-found: warn
+
+  macos:
+    name: macOS (WKWebView)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Validate ref
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          [[ "$INPUT_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]{0,199}$ ]] || { echo '::error::bad ref'; exit 64; }
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: source/go.mod
+          cache: false
+      - name: Build RemoHop.app (unsigned)
+        working-directory: source
+        run: |
+          set -eu
+          sw_vers
+          TARGETS=macos OUT="$RUNNER_TEMP/dist" sh packaging/quick/build.sh
+          mkdir -p "$RUNNER_TEMP/out"
+          du -sh "$RUNNER_TEMP/dist/macos/RemoHop.app"
+          echo "APP_BIN=$RUNNER_TEMP/dist/macos/RemoHop.app/Contents/MacOS/$(ls "$RUNNER_TEMP/dist/macos/RemoHop.app/Contents/MacOS")" >> "$GITHUB_ENV"
+      - name: Web view self-test
+        working-directory: source
+        run: |
+          set +e
+          out="$RUNNER_TEMP/out"
+          "$APP_BIN" webview-selftest --clip "$PWD/internal/webview/testdata/clip1080.h264" --out "$out/wkwebview.json" --hold 6s > "$out/wkwebview.log" 2>&1 &
+          pid=$!
+          sleep 9
+          screencapture -x "$out/macos-selftest.png"
+          wait $pid; rc=$?
+          echo "exit $rc"; tail -n 20 "$out/wkwebview.log"
+          cat "$out/wkwebview.json" || { echo '::error::no report'; exit 1; }
+      - name: Same page in Safari (comparison)
+        working-directory: source
+        run: |
+          set +e
+          out="$RUNNER_TEMP/out"
+          "$APP_BIN" webview-selftest --browser --clip "$PWD/internal/webview/testdata/clip1080.h264" --out "$out/safari.json" /usr/bin/open -a Safari > "$out/safari.log" 2>&1
+          cat "$out/safari.json" || echo '::warning::no Safari report'
+          osascript -e 'quit app "Safari"' 2>/dev/null
+          exit 0
+      - name: Desktop app smoke test and screenshots
+        working-directory: source
+        run: |
+          set +e
+          out="$RUNNER_TEMP/out"
+          grep -qs smoke internal/desktop/*.go || { echo 'no desktop app in this commit'; exit 0; }
+          export REMOHOP_CONFIG_DIR="$RUNNER_TEMP/appcfg"
+          "$APP_BIN" app --smoke "$out" > "$out/app.log" 2>&1
+          echo "exit $?"; tail -n 30 "$out/app.log"
+          for f in "$out"/*.json; do echo "== $f"; head -n 60 "$f"; done
+          exit 0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: desktop-app-macos
+          path: ${{ runner.temp }}/out
+          retention-days: 14
+          if-no-files-found: warn
+
+  linux:
+    name: Linux (WebKitGTK)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Validate ref
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          [[ "$INPUT_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]{0,199}$ ]] || { echo '::error::bad ref'; exit 64; }
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: source/go.mod
+          cache: false
+      - name: Install WebKitGTK, GStreamer decoders, Xvfb, a tray host
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libwebkit2gtk-4.1-0 gstreamer1.0-libav gstreamer1.0-plugins-good xvfb x11-apps imagemagick libayatana-appindicator3-1 >/dev/null
+          dpkg -l libwebkit2gtk-4.1-0 | tail -n 1
+      - name: Build remohop-quick
+        working-directory: source
+        run: |
+          set -eu
+          go build -trimpath -ldflags "-s -w" -o "$RUNNER_TEMP/remohop-quick" ./cmd/remohop-quick
+          file "$RUNNER_TEMP/remohop-quick"
+          mkdir -p "$RUNNER_TEMP/out"
+      - name: Web view self-test
+        working-directory: source
+        run: |
+          set +e
+          out="$RUNNER_TEMP/out"
+          Xvfb :55 -screen 0 1280x800x24 >/dev/null 2>&1 &
+          export DISPLAY=:55
+          sleep 1
+          "$RUNNER_TEMP/remohop-quick" webview-selftest --clip "$PWD/internal/webview/testdata/clip1080.h264" --out "$out/webkitgtk.json" --hold 6s > "$out/webkitgtk.log" 2>&1 &
+          pid=$!
+          sleep 8
+          import -window root "$out/linux-selftest.png"
+          wait $pid; echo "exit $?"
+          cat "$out/webkitgtk.json" || { echo '::error::no report'; exit 1; }
+          echo "== Chrome (comparison)"
+          "$RUNNER_TEMP/remohop-quick" webview-selftest --browser --clip "$PWD/internal/webview/testdata/clip1080.h264" --out "$out/chrome.json" \
+            google-chrome --user-data-dir="$RUNNER_TEMP/chromeprof" --no-first-run --new-window > /dev/null 2>&1
+          cat "$out/chrome.json"
+          echo "DISPLAY=:55" >> "$GITHUB_ENV"
+          exit 0
+      - name: Desktop app smoke test and screenshots
+        working-directory: source
+        run: |
+          set +e
+          out="$RUNNER_TEMP/out"
+          grep -qs smoke internal/desktop/*.go || { echo 'no desktop app in this commit'; exit 0; }
+          export REMOHOP_CONFIG_DIR="$RUNNER_TEMP/appcfg"
+          "$RUNNER_TEMP/remohop-quick" app --smoke "$out" > "$out/app.log" 2>&1
+          echo "exit $?"; tail -n 30 "$out/app.log"
+          for f in "$out"/*.json; do echo "== $f"; head -n 60 "$f"; done
+          exit 0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: desktop-app-linux
+          path: ${{ runner.temp }}/out
+          retention-days: 14
+          if-no-files-found: warn
