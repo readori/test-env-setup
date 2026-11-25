@@ -12,6 +12,8 @@
 #              browser (Edge, Safari, Chrome) is the comparison. Reports are printed in the log.
 #   app      : when the commit has the desktop app (`app --smoke`), it starts it with a fresh,
 #              throw-away configuration and takes screenshots of its windows.
+#   quick    : the quick-support name of the same program (RemoHop-QuickSupport.exe, RemoHop Quick
+#              Support.app, remohop-quick) started without arguments must start quick support.
 #
 # Screenshots and the JSON reports are uploaded as one artifact per job (kept for the shortest time the repository allows). They
 # show test pages and a freshly made test configuration only: no credentials exist in this
@@ -135,6 +137,23 @@ jobs:
           "exit $($p.ExitCode)"
           if (Test-Path "$out\smoke.json") { Get-Content "$out\smoke.json" }
           if (Test-Path "$env:RUNNER_TEMP\appcfg\desktop.log") { Get-Content "$env:RUNNER_TEMP\appcfg\desktop.log" -Tail 40 }
+      - name: Quick support launcher (RemoHop-QuickSupport.exe, no arguments)
+        run: |
+          $out = "$env:RUNNER_TEMP\out"
+          Copy-Item "$env:RUNNER_TEMP\RemoHop.exe" "$env:RUNNER_TEMP\RemoHop-QuickSupport.exe"
+          $env:REMOHOP_CONFIG_DIR = "$env:RUNNER_TEMP\qscfg"
+          $p = Start-Process -PassThru "$env:RUNNER_TEMP\RemoHop-QuickSupport.exe"
+          Start-Sleep -Seconds 12
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+          [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+          $bmp.Save("$out\quick-windows.png")
+          $log = "$env:RUNNER_TEMP\qscfg\quick.log"
+          if ((Test-Path $log) -and (Select-String -Quiet -Path $log -Pattern 'opening the window')) { 'ok: the quick-support name started quick support' } else { Write-Output '::error::RemoHop-QuickSupport.exe did not start quick support'; if (Test-Path $log) { Get-Content $log -Tail 10 }; $fail = 1 }
+          if (-not $p.HasExited) { $p.Kill() }
+          Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          if ($fail) { exit 1 }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
@@ -224,6 +243,20 @@ jobs:
           cat "$out/smoke.json"
           tail -n 40 "$RUNNER_TEMP/appcfg/desktop.log"
           exit 0
+      - name: Quick support launcher (RemoHop Quick Support.app, no arguments)
+        run: |
+          set +e
+          out="$RUNNER_TEMP/out"
+          QS="$RUNNER_TEMP/dist/macos/RemoHop Quick Support.app"
+          [ -d "$QS" ] || { echo 'no quick support bundle in this commit'; exit 0; }
+          export REMOHOP_CONFIG_DIR="$RUNNER_TEMP/qscfg"
+          "$QS/Contents/MacOS/RemoHop-QuickSupport" > "$out/quick-macos.log" 2>&1 &
+          pid=$!
+          sleep 12
+          screencapture -x "$out/quick-macos.png"
+          kill $pid 2>/dev/null
+          osascript -e 'quit app "Safari"' 2>/dev/null
+          grep -q 'opening the window' "$REMOHOP_CONFIG_DIR/quick.log" && echo 'ok: the quick-support bundle started quick support' || { echo '::error::RemoHop Quick Support.app did not start quick support'; tail -n 10 "$REMOHOP_CONFIG_DIR/quick.log"; exit 1; }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
@@ -315,6 +348,18 @@ jobs:
           cat "$out/smoke.json"
           tail -n 40 "$RUNNER_TEMP/appcfg/desktop.log"
           exit 0
+      - name: Quick support launcher (remohop-quick, no arguments)
+        run: |
+          set +e
+          out="$RUNNER_TEMP/out"
+          export REMOHOP_CONFIG_DIR="$RUNNER_TEMP/qscfg"
+          "$RUNNER_TEMP/remohop-quick" > "$out/quick-linux.log" 2>&1 &
+          pid=$!
+          sleep 12
+          import -window root "$out/quick-linux.png"
+          kill $pid 2>/dev/null
+          pkill -f chrome 2>/dev/null
+          grep -q 'opening the window' "$REMOHOP_CONFIG_DIR/quick.log" && echo 'ok: remohop-quick started quick support' || { echo '::error::remohop-quick did not start quick support'; tail -n 10 "$REMOHOP_CONFIG_DIR/quick.log"; exit 1; }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:

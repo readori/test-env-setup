@@ -1,4 +1,6 @@
-# RemoHop macOS release: the universal `remohop` CLI and the quick-support app RemoHop.app, both
+# RemoHop macOS release: the universal `remohop` CLI, the app RemoHop.app and (refs with the desktop
+# app) RemoHop Quick Support.app (RemoHop-QuickSupport-macos.zip, the same program under the name that
+# starts quick support), all
 # signed with Developer ID and notarized; the app is also stapled.
 #
 # Public CI repository -> source repository: env SOURCE_REPOSITORY.
@@ -250,6 +252,21 @@ jobs:
           echo "APP=$APP" >> "$GITHUB_ENV"
           echo "built RemoHop.app $BID $BVER ($ARCHS), $(du -sh "$APP" | cut -f1)"
           echo "- RemoHop.app: \`$BID\` $BVER, \`$ARCHS\`, $(du -sh "$APP" | cut -f1), licenses in Contents/Resources" >> "$GITHUB_STEP_SUMMARY"
+          # Quick support (refs with the desktop app): the same program as RemoHop-QuickSupport in a
+          # bundle of its own, so the person being helped double-clicks it without a flag.
+          SAPP="$Q/macos/RemoHop Quick Support.app"
+          if [[ -d "$SAPP" ]]; then
+            SBIN="$SAPP/Contents/MacOS/RemoHop-QuickSupport"
+            [[ -x "$SBIN" ]] || { echo '::error::RemoHop Quick Support.app has no Contents/MacOS/RemoHop-QuickSupport.'; exit 65; }
+            cmp -s "$SBIN" "$BIN" || { echo '::error::RemoHop Quick Support.app does not hold the same program as RemoHop.app.'; exit 65; }
+            SBID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$SAPP/Contents/Info.plist")"
+            [[ "$SBID" == com.remohop.quicksupport ]] || { echo "::error::unexpected bundle identifier '$SBID' for quick support."; exit 65; }
+            for f in LICENSE NOTICE THIRD_PARTY_LICENSES.txt RemoHop.icns; do
+              [[ -s "$SAPP/Contents/Resources/$f" ]] || { echo "::error::RemoHop Quick Support.app lacks Contents/Resources/$f."; exit 65; }
+            done
+            echo "SAPP=$SAPP" >> "$GITHUB_ENV"
+            echo "- RemoHop Quick Support.app: \`$SBID\`, the same program as RemoHop.app" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Create the signing keychain and import the certificate
         env:
@@ -366,6 +383,19 @@ jobs:
           done
           [[ "$("$APP/Contents/MacOS/RemoHop" version)" == "remohop $VERSION" ]] || { echo '::error::the signed app does not run.'; exit 1; }
           echo '- RemoHop.app signature: Developer ID Application, hardened runtime, secure timestamp, no entitlements, resources sealed, both slices verify' >> "$GITHUB_STEP_SUMMARY"
+          if [[ -n "${SAPP:-}" ]]; then
+            codesign --force --sign "$SIGN_HASH" --keychain "$KEYCHAIN_PATH" --options runtime --timestamp \
+              "$SAPP" > "$RUNNER_TEMP/codesign-sapp.log" 2>&1 \
+              || { cut -c1-300 "$RUNNER_TEMP/codesign-sapp.log" | tail -n 10; echo '::error::codesign of RemoHop Quick Support.app failed.'; exit 1; }
+            codesign --verify --deep --strict "$SAPP" || { echo '::error::RemoHop Quick Support.app does not verify.'; exit 1; }
+            INFO="$(codesign -dvvv --entitlements - "$SAPP" 2>&1)"
+            grep -q '^Identifier=com.remohop.quicksupport$' <<<"$INFO" || { echo '::error::quick support is not signed as com.remohop.quicksupport.'; exit 1; }
+            grep -q 'flags=.*runtime' <<<"$INFO" && grep -q '^Timestamp=' <<<"$INFO" && grep -q '^Authority=Developer ID Application' <<<"$INFO" \
+              || { echo '::error::the quick support signature lacks the hardened runtime, timestamp or Developer ID.'; exit 1; }
+            if grep -q '<key>' <<<"$INFO"; then echo '::error::the quick support signature carries entitlements; none are expected.'; exit 1; fi
+            [[ "$("$SAPP/Contents/MacOS/RemoHop-QuickSupport" version)" == "remohop $VERSION" ]] || { echo '::error::the signed quick support app does not run.'; exit 1; }
+            echo '- RemoHop Quick Support.app signature: the same checks: PASS' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Notarize
         env:
@@ -442,6 +472,12 @@ jobs:
             /usr/bin/ditto -c -k --keepParent "$APP" "$AZ" || { echo '::error::ditto failed.'; exit 1; }
             notarize "$AZ" RemoHop.app
             rm -f "$AZ"
+          fi
+          if [[ -n "${SAPP:-}" ]]; then
+            SZ="$RUNNER_TEMP/RemoHop-QuickSupport-notarize.zip"; rm -f "$SZ"
+            /usr/bin/ditto -c -k --keepParent "$SAPP" "$SZ" || { echo '::error::ditto failed.'; exit 1; }
+            notarize "$SZ" "RemoHop Quick Support.app"
+            rm -f "$SZ"
           fi
           rm -rf "$ASC_DIR"
 
@@ -553,8 +589,9 @@ jobs:
           kill "$QPID" 2>/dev/null; wait "$QPID" 2>/dev/null
 
           # LaunchServices starts the signed bundle the way a double-click does (no quarantine on this
-          # copy: the first-run confirmation would wait for a click). The window opens in the default
-          # browser; the process is then stopped.
+          # copy: the first-run confirmation would wait for a click). On refs with the desktop app it
+          # opens the app's own window, before that quick support's browser window; the process is then
+          # stopped.
           open -n "$APP" > "$W/open.txt" 2>&1; code=$?
           PIDS=
           for _ in $(seq 1 50); do
@@ -578,6 +615,57 @@ jobs:
           {
             if [[ "$FAILED" -eq 0 ]]; then echo '- RemoHop.app verification: stapled, deep strict signature, Gatekeeper accepts the quarantined copy from the zip (Notarized Developer ID), it runs, its UI server answers, LaunchServices starts it: PASS'; else echo '- RemoHop.app verification: **FAIL** (see the log)'; fi
             echo "- SHA-256 \`RemoHop-macos.zip\` (stapled app, ditto): \`$SHA_APPZIP\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$FAILED"
+
+      # Quick support's zip: unzip and open, nothing to install. The same checks as RemoHop.app's,
+      # and the double-click starts quick support (by the program's name), whose page answers.
+      - name: Staple and verify RemoHop Quick Support.app
+        if: env.SAPP != ''
+        run: |
+          set +e -uo pipefail
+          FAILED=0
+          ok()   { printf '   ok    %s\n' "$*"; }
+          fail() { printf '   FAIL  %s\n' "$*"; FAILED=1; }
+          STAPLED=
+          for _ in 1 2 3 4 5 6; do
+            if xcrun stapler staple "$SAPP" > "$RUNNER_TEMP/staple-q.txt" 2>&1; then STAPLED=1; break; fi
+            sleep 10
+          done
+          if [[ -n "$STAPLED" ]]; then ok 'stapler staple RemoHop Quick Support.app'; else fail 'stapler staple'; tail -n 3 "$RUNNER_TEMP/staple-q.txt" | cut -c1-200; fi
+          if xcrun stapler validate "$SAPP" > /dev/null 2>&1 && codesign --verify --deep --strict "$SAPP" > /dev/null 2>&1; then ok 'stapled, deep strict signature'; else fail 'stapler validate / codesign after stapling'; fi
+          SZIP="$OUT/RemoHop-QuickSupport-macos.zip"; rm -f "$SZIP"
+          /usr/bin/ditto -c -k --keepParent "$SAPP" "$SZIP" || fail 'ditto -c -k --keepParent'
+          echo "SZIP=$SZIP" >> "$GITHUB_ENV"
+          Q="$RUNNER_TEMP/qs-quarantined"; rm -rf "$Q"; mkdir -p "$Q"
+          /usr/bin/ditto -x -k "$SZIP" "$Q"
+          C="$Q/RemoHop Quick Support.app"
+          find "$C" -exec xattr -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");Safari;$(uuidgen)" {} \; 2>/dev/null
+          if codesign --verify --deep --strict "$C" 2>/dev/null && xcrun stapler validate "$C" > /dev/null 2>&1; then ok 'the app in the zip verifies and carries its ticket after unpacking'; else fail 'the unpacked app does not verify'; fi
+          ASSESS="$(spctl --assess --type execute -vv "$C" 2>&1)"; code=$?
+          SRC="$(sed -n 's/^source=//p' <<<"$ASSESS" | head -n 1)"
+          if [[ "$code" -eq 0 && "$SRC" == *Notarized* ]]; then ok "spctl --assess (quarantined copy): accepted, source=$SRC"; else fail "spctl --assess: exit $code ${SRC:+source=$SRC}"; fi
+          # A double-click (LaunchServices, no arguments) must start quick support, chosen by the
+          # program's name; quick support logs "opening the window" when it opens its browser page.
+          W="$RUNNER_TEMP/qs-probe"; rm -rf "$W"; mkdir -p "$W"
+          open -n "$SAPP" > "$W/open.txt" 2>&1; code=$?
+          PIDS=
+          for _ in $(seq 1 50); do
+            PIDS="$(pgrep -f "MacOS/RemoHop-QuickSupport" | tr '\n' ' ')"
+            [[ -n "$PIDS" ]] && break
+            sleep 0.2
+          done
+          sleep 3
+          if [[ "$code" -eq 0 ]] && pgrep -f "MacOS/RemoHop-QuickSupport" > /dev/null; then ok 'open -n RemoHop Quick Support.app: it starts and keeps running'; else fail "open -n: exit $code"; fi
+          LOG="$HOME/Library/Application Support/remohop/quick.log"
+          if [[ -f "$LOG" ]] && grep -q 'opening the window' "$LOG"; then ok 'it started quick support (quick.log: opening the window)'; else fail 'quick.log does not show quick support starting'; fi
+          pkill -f "MacOS/RemoHop-QuickSupport" 2>/dev/null
+          rm -rf "$W"
+          SHA_SZIP="$(shasum -a 256 "$SZIP" | cut -d' ' -f1)"
+          echo "   sha256 RemoHop-QuickSupport-macos.zip $SHA_SZIP"
+          {
+            if [[ "$FAILED" -eq 0 ]]; then echo '- RemoHop Quick Support.app: stapled, Gatekeeper accepts the quarantined copy, a double-click starts quick support: PASS'; else echo '- RemoHop Quick Support.app: **FAIL** (see the log)'; fi
+            echo "- SHA-256 \`RemoHop-QuickSupport-macos.zip\`: \`$SHA_SZIP\`"
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$FAILED"
 
@@ -732,6 +820,7 @@ jobs:
           FILES=(remohop remohop-macos-universal.zip)
           if [[ -n "${AZIP:-}" ]]; then cp "$AZIP" "$H/RemoHop-macos.zip"; FILES+=(RemoHop-macos.zip); fi
           if [[ -n "${DMG:-}" ]]; then cp "$DMG" "$H/RemoHop-macos.dmg"; FILES+=(RemoHop-macos.dmg); fi
+          if [[ -n "${SZIP:-}" ]]; then cp "$SZIP" "$H/RemoHop-QuickSupport-macos.zip"; FILES+=(RemoHop-QuickSupport-macos.zip); fi
           ( cd "$H" && shasum -a 256 "${FILES[@]}" > SHA256SUMS-macos && cat SHA256SUMS-macos )
           echo "HANDOFF_DIR=$H" >> "$GITHUB_ENV"
           echo "- Hand-off: artifact \`remohop-macos-universal\` uploaded for the release workflow (kept 3 days)" >> "$GITHUB_STEP_SUMMARY"
@@ -754,5 +843,5 @@ jobs:
             [[ "${#OLD[@]}" -gt 0 ]] && security list-keychains -d user -s "${OLD[@]}" >/dev/null 2>&1
           fi
           [[ -n "${KEYCHAIN_NAME:-}" ]] && security delete-keychain "$KEYCHAIN_NAME" >/dev/null 2>&1
-          rm -rf "$RUNNER_TEMP/remohop-asc" "$RUNNER_TEMP/remohop-devid.p12" "$RUNNER_TEMP/notary-result.json" "$RUNNER_TEMP/notary-log.json" "$RUNNER_TEMP/RemoHop-notarize.zip" "$RUNNER_TEMP/notary-dmg.json" "$RUNNER_TEMP/remohop-asc-dmg" >/dev/null 2>&1
+          rm -rf "$RUNNER_TEMP/remohop-asc" "$RUNNER_TEMP/remohop-devid.p12" "$RUNNER_TEMP/notary-result.json" "$RUNNER_TEMP/notary-log.json" "$RUNNER_TEMP/RemoHop-notarize.zip" "$RUNNER_TEMP/RemoHop-QuickSupport-notarize.zip" "$RUNNER_TEMP/notary-dmg.json" "$RUNNER_TEMP/remohop-asc-dmg" >/dev/null 2>&1
           true
