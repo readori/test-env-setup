@@ -138,6 +138,37 @@ jobs:
           "exit $($p.ExitCode)"
           if (Test-Path "$out\smoke.json") { Get-Content "$out\smoke.json" }
           if (Test-Path "$env:RUNNER_TEMP\appcfg\desktop.log") { Get-Content "$env:RUNNER_TEMP\appcfg\desktop.log" -Tail 40 }
+      # What the app's "Unattended access" runs after the UAC prompt: the elevated helper
+      # (the runner is already an administrator, so it is started directly). Timed, with
+      # its result, the service's state and log, then removed again.
+      - name: Unattended access helper (the elevated step)
+        continue-on-error: true
+        working-directory: source
+        run: |
+          if (-not (Select-String -Quiet -Path internal\desktop\*.go -Pattern 'desktop-unattended')) { 'no unattended helper in this commit'; exit 0 }
+          $env:REMOHOP_CONFIG_DIR = "$env:RUNNER_TEMP\uacfg"
+          $run = "$env:REMOHOP_CONFIG_DIR\run\unattended-ci"
+          New-Item -ItemType Directory -Force $run | Out-Null
+          Set-Content -NoNewline -Path "$run\password" -Value 'Ci-Unattended-Pass-42!'
+          foreach ($op in @('enable', 'status', 'disable')) {
+            $res = "$run\result-$op.json"
+            $args = @('desktop-unattended', $op, '--result', "`"$res`"")
+            if ($op -eq 'enable') { $args += @('--password-file', "`"$run\password`"") }
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $p = Start-Process -PassThru -FilePath "$env:RUNNER_TEMP\RemoHop.exe" -ArgumentList $args
+            if (-not $p.WaitForExit(240000)) { "::error::$op did not finish in 4 minutes"; $p.Kill() }
+            "$op : exit $($p.ExitCode) after $([int]$sw.Elapsed.TotalSeconds) s"
+            if (Test-Path $res) { "result: " + (Get-Content $res -Raw) } else { "::warning::$op wrote no result" }
+            if ($op -eq 'enable') {
+              sc.exe query RemoHop
+              sc.exe qc RemoHop
+              Get-ChildItem "$env:ProgramFiles\RemoHop" -ErrorAction SilentlyContinue | Select-Object Name, Length
+              Get-ChildItem "$env:ProgramData\RemoHop" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName, Length | Format-Table -AutoSize | Out-String -Width 200
+              $log = Get-ChildItem "$env:ProgramData\RemoHop" -Recurse -Filter '*.log' -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($log) { "---- $($log.FullName)"; Get-Content $log.FullName -Tail 40 }
+            }
+          }
+          sc.exe query RemoHop
       - name: Quick support launcher (RemoHop-QuickSupport.exe, no arguments)
         run: |
           $out = "$env:RUNNER_TEMP\out"
