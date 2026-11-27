@@ -3,7 +3,8 @@
 # Public CI repository -> source repository: env SOURCE_REPOSITORY.
 #
 #   test : gofmt, go vet for linux, darwin and windows, go test -race, and a check that the
-#          submodule upstream/ (the public RemoHop repository) points at a release tag.
+#          submodule upstream/ (the public RemoHop repository) points at a release tag or a
+#          commit on RemoHop's main.
 #
 # No deploy, signing or cloud credentials are used. Nothing is uploaded: no artifacts.
 #
@@ -103,12 +104,17 @@ jobs:
           head="$(git rev-parse --short HEAD)"
           cd upstream
           git fetch -q --depth 1 origin 'refs/tags/v*:refs/tags/v*' 2>/dev/null || true
+          git fetch -q --depth 200 origin '+refs/heads/main:refs/remotes/origin/main'
           tag="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
           { echo "### RemoHop Teams CI"; echo; echo "- Source: \`$SOURCE_REPOSITORY@$head\` (ref \`$SOURCE_REF\`)"; echo "- upstream: \`${tag:-$(git rev-parse --short HEAD)}\`"; echo "- $(go version)"; } >> "$GITHUB_STEP_SUMMARY"
-          case "$tag" in
-            v[0-9]*.[0-9]*.[0-9]*) echo "upstream = $tag" ;;
-            *) echo "::error::upstream/ must point at a RemoHop release tag (it is $(git rev-parse --short HEAD))"; exit 1 ;;
-          esac
+          # A release tag, or (while developing) a commit on RemoHop's main.
+          if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "upstream = $tag"
+          elif git merge-base --is-ancestor HEAD origin/main; then
+            echo "::notice::upstream/ is $(git rev-parse --short HEAD) on RemoHop main, not a release tag (fine for development, not for a release)"
+          else
+            echo "::error::upstream/ must point at a RemoHop release tag or a commit on RemoHop main (it is $(git rev-parse --short HEAD))"; exit 1
+          fi
 
       - name: gofmt
         if: always()
