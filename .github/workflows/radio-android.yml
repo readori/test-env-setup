@@ -258,7 +258,8 @@ jobs:
             if "$READELF" -lW "$so" | awk '$1=="LOAD"{print $NF}' | grep -qv '0x4000'; then echo "::error::not 16 KB: $(basename "$so")"; BAD=1; fi
           done
           [ "$BAD" = 0 ]
-          [[ -n "${EXPO_PUBLIC_HOURWAVE_API:-}" ]] || { echo '::error::EXPO_PUBLIC_HOURWAVE_API is empty'; exit 1; }          unzip -p "$AAB" base/assets/index.android.bundle | grep -aqF "$EXPO_PUBLIC_HOURWAVE_API" || { echo '::error::the JS bundle does not contain the API address (the app would show no stations)'; exit 1; }
+          [[ -n "${EXPO_PUBLIC_HOURWAVE_API:-}" ]] || { echo '::error::EXPO_PUBLIC_HOURWAVE_API is empty'; exit 1; }
+          unzip -p "$AAB" base/assets/index.android.bundle | grep -aqF "$EXPO_PUBLIC_HOURWAVE_API" || { echo '::error::the JS bundle does not contain the API address (the app would show no stations)'; exit 1; }
           jarsigner -verify "$AAB" > /dev/null || { echo '::error::bundle signature does not verify'; exit 1; }
           rm -rf "$RUNNER_TEMP/so"
           ls -l "$AAB" | awk '{print "bundle checks passed,", $5, "bytes"}'
