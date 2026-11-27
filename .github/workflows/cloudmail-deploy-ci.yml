@@ -18,6 +18,11 @@ on:
         required: true
         default: main
         type: string
+      cf_email_sending:
+        description: 'Declare the Cloudflare Email Service send_email binding `email` (outbound Email Sending)'
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -35,6 +40,7 @@ jobs:
     env:
       SOURCE_REPOSITORY: readori/CloudMail
       SOURCE_REF: ${{ inputs.source_ref }}
+      CF_EMAIL_SENDING: ${{ inputs.cf_email_sending }}
       TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
@@ -410,7 +416,13 @@ jobs:
               '',
           ])
 
-          if os.environ.get("EXISTING_SEND_EMAIL") == "true":
+          # CF_EMAIL_SENDING is empty for non-dispatch runs; empty means the default (true).
+          cf_email_flag = os.environ.get("CF_EMAIL_SENDING", "").strip().lower()
+          declare_cf_email = cf_email_flag not in {"false", "0", "no", "off"}
+          # Never drop an existing email binding, even when the input is turned off.
+          declare_email = declare_cf_email or os.environ.get("EXISTING_SEND_EMAIL") == "true"
+
+          if declare_email:
               lines.extend([
                   '[[send_email]]',
                   'name = "email"',
@@ -419,6 +431,14 @@ jobs:
 
           Path("wrangler-ci.toml").write_text("\n".join(lines), encoding="utf-8")
           print("✅ Generated CI config from existing Cloudflare bindings")
+          if declare_email:
+              print("✅ Cloudflare Email Service binding `email` declared (outbound Email Sending)")
+              print("ℹ️ The sender domain must be onboarded under Cloudflare dashboard → Email Service → Email Sending")
+          else:
+              print("ℹ️ Cloudflare Email Service binding `email` not declared (cf_email_sending=false, no existing binding)")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fp:
+              fp.write(f"CF_EMAIL_BINDING_DECLARED={'yes' if declare_email else 'no'}\n")
           PY
 
       - name: Validate and bootstrap D1 migration prerequisites
@@ -1286,4 +1306,5 @@ jobs:
             echo "- Private repository Actions used: **No**"
             echo "- Application secret values copied to public GitHub: **No**"
             echo "- Required public credentials: \`TARGET_REPO_PAT\`, \`CLOUDFLARE_API_TOKEN\`, \`CLOUDFLARE_ACCOUNT_ID\`"
+            echo "- Cloudflare Email Service \`email\` binding declared: **${CF_EMAIL_BINDING_DECLARED:-not rendered}**"
           } >> "$GITHUB_STEP_SUMMARY"
