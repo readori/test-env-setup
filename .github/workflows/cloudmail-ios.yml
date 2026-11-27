@@ -15,6 +15,12 @@ on:
           - archive
           - appstore-metadata
           - ipad-screenshots
+          - verify
+      source_ref:
+        description: 'Private CloudMail branch, tag, or commit SHA to check out (default main)'
+        required: false
+        default: 'main'
+        type: string
       app_version:
         description: 'CFBundleShortVersionString / App Store version, e.g. 1.0.0'
         required: true
@@ -65,7 +71,7 @@ jobs:
   # ========================================================================
   ios:
     name: Build CloudMail iOS
-    if: ${{ inputs.distribution == 'testflight' || inputs.distribution == 'sideload' || inputs.distribution == 'both' || inputs.distribution == 'archive' }}
+    if: ${{ inputs.distribution == 'testflight' || inputs.distribution == 'sideload' || inputs.distribution == 'both' || inputs.distribution == 'archive' || inputs.distribution == 'verify' }}
     permissions:
       contents: write
     # iPhone Duo / iPadOS 27 native layouts need the iOS 27.1 SDK. GitHub ships
@@ -93,7 +99,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: 'readori/CloudMail'
-          ref: 'main'
+          ref: ${{ inputs.source_ref || 'main' }}
           token: ${{ secrets.TARGET_REPO_PAT }}
           path: './'
           fetch-depth: 1
@@ -209,7 +215,7 @@ jobs:
           }
 
           case "$DISTRIBUTION" in
-            testflight|sideload|both|archive) ;;
+            testflight|sideload|both|archive|verify) ;;
             *)
               echo "::error::Unsupported iOS distribution task: $DISTRIBUTION"
               exit 64
@@ -296,6 +302,22 @@ jobs:
         run: /bin/bash scripts/ci_xcode_preflight.sh
 
       # ----------------------------------------------------------------------
+      # 5V. verify: compile-only check of a source ref.
+      #     Unsigned generic-iOS build plus Swift-based contract tests; no signing
+      #     secrets, no TestFlight upload, no IPA artifact or release.
+      # ----------------------------------------------------------------------
+      - name: Verify build (unsigned, no distribution)
+        if: ${{ inputs.distribution == 'verify' }}
+        working-directory: mail-ios
+        shell: bash
+        env:
+          CONFIGURATION: Release
+        run: |
+          set -euo pipefail
+          /bin/bash scripts/test_cloudmail_300_compatibility.sh
+          /bin/bash scripts/ci_xcode_build.sh
+
+      # ----------------------------------------------------------------------
       # 5A. Optional Sideload IPA
       #     Unsigned IPA; does NOT require Apple distribution signing secrets.
       # ----------------------------------------------------------------------
@@ -343,7 +365,7 @@ jobs:
             echo
             echo "- Version: \`${CLOUDMAIL_APP_VERSION}\`"
             echo "- Build: \`${CLOUDMAIL_BUILD_NUMBER}\`"
-            echo "- Private source: \`readori/CloudMail@main\`"
+            echo "- Private source: \`readori/CloudMail@${{ inputs.source_ref || 'main' }}\`"
             echo "- Source commit: \`${SOURCE_COMMIT}\`"
             echo "- GitHub workflow run: \`${GITHUB_RUN_NUMBER}\`"
             echo
@@ -736,7 +758,7 @@ jobs:
             echo "- Mode: \`${DISTRIBUTION}\`"
             echo "- Version: \`${CLOUDMAIL_APP_VERSION}\`"
             echo "- Build: \`${CLOUDMAIL_BUILD_NUMBER}\`"
-            echo "- Private source: \`readori/CloudMail@main\`"
+            echo "- Private source: \`readori/CloudMail@${{ inputs.source_ref || 'main' }}\`"
             echo "- Source commit: \`$(git rev-parse --short HEAD)\`"
             if [[ "$DISTRIBUTION" == 'testflight' || "$DISTRIBUTION" == 'both' || "$DISTRIBUTION" == 'archive' ]]; then
               echo "- Match bootstrap: \`${{ inputs.signing_bootstrap }}\`"
@@ -751,6 +773,9 @@ jobs:
             fi
             if [[ "$DISTRIBUTION" == 'sideload' || "$DISTRIBUTION" == 'both' ]]; then
               echo '- Sideload: IPA published as a prerelease in this public GitHub repository.'
+            fi
+            if [[ "$DISTRIBUTION" == 'verify' ]]; then
+              echo '- Verify: static QA, Xcode preflight, Swift contract tests and an unsigned generic-iOS Release build passed; nothing was signed, uploaded or published.'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -776,7 +801,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: 'readori/CloudMail'
-          ref: 'main'
+          ref: ${{ inputs.source_ref || 'main' }}
           token: ${{ secrets.TARGET_REPO_PAT }}
           path: './'
           fetch-depth: 1
@@ -840,7 +865,7 @@ jobs:
             echo '## CloudMail App Store metadata updated'
             echo
             echo "- App version: \`${CLOUDMAIL_APP_VERSION}\`"
-            echo "- Private source: \`readori/CloudMail@main\`"
+            echo "- Private source: \`readori/CloudMail@${{ inputs.source_ref || 'main' }}\`"
             echo "- Source commit: \`$(git rev-parse --short HEAD)\`"
             echo '- Binary uploaded: no'
             echo '- Screenshots uploaded: no'
@@ -877,7 +902,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: 'readori/CloudMail'
-          ref: 'main'
+          ref: ${{ inputs.source_ref || 'main' }}
           token: ${{ secrets.TARGET_REPO_PAT }}
           path: './'
           fetch-depth: 1
@@ -1285,7 +1310,7 @@ jobs:
           {
             echo '## CloudMail 13-inch iPad screenshots completed'
             echo
-            echo '- Private source: `readori/CloudMail@main`'
+            echo "- Private source: \`readori/CloudMail@${{ inputs.source_ref || 'main' }}\`"
             echo "- Source commit: \`$(git rev-parse --short HEAD)\`"
             echo '- Runner: `macos-15-intel`'
             echo '- Xcode: `26.x`'
