@@ -1,0 +1,127 @@
+# CloudMail Android build CI.
+# Public CI repository -> private source repository (readori/CloudMail, mail-android).
+#
+#   verify : JDK 17 + the runner's Android SDK -> ./gradlew assembleDebug + lintDebug. No signing,
+#            nothing uploaded. Confirms the Compose app compiles. The Gradle wrapper is bootstrapped
+#            at a pinned version from the runner's preinstalled gradle (no binary jar committed).
+#   build  : TODO (requires Play upload-signing secrets) — signed release AAB.
+#   upload : TODO (requires a Play Developer API service account) — upload the AAB to a Play track.
+#
+# Secrets needed later for build/upload (the owner must provide; not used by verify):
+#   ANDROID_UPLOAD_KEYSTORE_BASE64, ANDROID_UPLOAD_KEYSTORE_PASSWORD, ANDROID_UPLOAD_KEY_ALIAS,
+#   ANDROID_UPLOAD_KEY_PASSWORD, PLAY_SERVICE_ACCOUNT_JSON
+# verify only needs TARGET_REPO_PAT (read the private source).
+
+name: CloudMail Android
+
+run-name: CloudMail Android ${{ inputs.mode }} @ ${{ inputs.source_ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'verify = compile the app (no signing); build/upload require Play secrets (not set up yet)'
+        required: true
+        default: verify
+        type: choice
+        options: [verify, build, upload]
+      source_ref:
+        description: 'Private readori/CloudMail branch, tag or SHA'
+        required: true
+        default: main
+        type: string
+      gradle_version:
+        description: 'Gradle version to bootstrap the wrapper at'
+        required: false
+        default: '8.11.1'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudmail-android-${{ github.ref }}-${{ inputs.mode }}
+  cancel-in-progress: false
+
+jobs:
+  android:
+    name: Build CloudMail Android
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SOURCE_REPOSITORY: readori/CloudMail
+      TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+
+    steps:
+      - name: Validate inputs and credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || { echo '::error::Missing repository secret TARGET_REPO_PAT'; exit 78; }
+          case "${{ inputs.mode }}" in
+            verify) ;;
+            build|upload)
+              echo "::error::mode '${{ inputs.mode }}' needs Play upload-signing + service-account secrets that are not configured yet."
+              echo "::error::Provide ANDROID_UPLOAD_KEYSTORE_BASE64 / _PASSWORD / KEY_ALIAS / KEY_PASSWORD and PLAY_SERVICE_ACCOUNT_JSON, then this job will be enabled."
+              exit 64 ;;
+            *) echo "::error::Unknown mode"; exit 64 ;;
+          esac
+          [[ "${{ inputs.gradle_version }}" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || { echo '::error::Invalid gradle_version'; exit 64; }
+
+      - name: Checkout private CloudMail source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify Android project checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f mail-android/settings.gradle.kts || { echo '::error::mail-android project not found at this ref.'; exit 64; }
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v4.4.0
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Bootstrap Gradle wrapper (pinned)
+        working-directory: mail-android
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v gradle >/dev/null 2>&1; then
+            echo "::error::No preinstalled gradle on the runner to bootstrap the wrapper."; exit 69
+          fi
+          gradle --version
+          gradle wrapper --gradle-version "${{ inputs.gradle_version }}" --distribution-type bin --no-daemon
+          ./gradlew --version
+
+      - name: Compile (assembleDebug + lintDebug)
+        if: ${{ inputs.mode == 'verify' }}
+        working-directory: mail-android
+        shell: bash
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          GRADLE_OPTS: -Dorg.gradle.daemon=false
+        run: |
+          set -euo pipefail
+          : "${ANDROID_HOME:=${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ./gradlew --no-daemon --stacktrace :app:assembleDebug :app:lintDebug
+
+      - name: Verify summary
+        if: ${{ success() && inputs.mode == 'verify' }}
+        shell: bash
+        run: |
+          {
+            echo '## CloudMail Android verify'
+            echo
+            echo "- Source: \`readori/CloudMail@${{ inputs.source_ref }}\`"
+            echo "- Gradle: \`${{ inputs.gradle_version }}\` · JDK 17 · runner Android SDK"
+            echo '- Built `:app:assembleDebug` + `:app:lintDebug` (unsigned). No bundle uploaded.'
+          } >> "$GITHUB_STEP_SUMMARY"
