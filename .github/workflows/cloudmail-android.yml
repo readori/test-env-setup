@@ -1,7 +1,7 @@
 # CloudMail Android build CI.
 # Public CI repository -> private source repository (readori/CloudMail, mail-android).
 #
-#   verify : JDK 17 + the runner's Android SDK -> ./gradlew assembleDebug + lintDebug. No signing,
+#   verify : JDK 17 + the runner's Android SDK -> ./gradlew assembleDebug + testDebugUnitTest + lintDebug. No signing,
 #            nothing uploaded. Confirms the Compose app compiles. The Gradle wrapper is bootstrapped
 #            at a pinned version from the runner's preinstalled gradle (no binary jar committed).
 #   build  : TODO (requires Play upload-signing secrets) — signed release AAB.
@@ -101,7 +101,7 @@ jobs:
           gradle wrapper --gradle-version "${{ inputs.gradle_version }}" --distribution-type bin --no-daemon
           ./gradlew --version
 
-      - name: Compile (assembleDebug + lintDebug)
+      - name: Compile + unit tests (assembleDebug + testDebugUnitTest + lintDebug)
         if: ${{ inputs.mode == 'verify' }}
         working-directory: mail-android
         shell: bash
@@ -112,7 +112,7 @@ jobs:
           set -euo pipefail
           : "${ANDROID_HOME:=${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
           echo "ANDROID_HOME=$ANDROID_HOME"
-          ./gradlew --no-daemon --stacktrace :app:assembleDebug :app:lintDebug
+          ./gradlew --no-daemon --stacktrace :app:assembleDebug :app:testDebugUnitTest :app:lintDebug
 
       - name: Verify summary
         if: ${{ success() && inputs.mode == 'verify' }}
@@ -123,5 +123,5 @@ jobs:
             echo
             echo "- Source: \`readori/CloudMail@${{ inputs.source_ref }}\`"
             echo "- Gradle: \`${{ inputs.gradle_version }}\` · JDK 17 · runner Android SDK"
-            echo '- Built `:app:assembleDebug` + `:app:lintDebug` (unsigned). No bundle uploaded.'
+            echo '- Built `:app:assembleDebug` + `:app:testDebugUnitTest` + `:app:lintDebug` (unsigned). No bundle uploaded.'
           } >> "$GITHUB_STEP_SUMMARY"
