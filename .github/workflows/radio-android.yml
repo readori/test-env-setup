@@ -167,7 +167,7 @@ jobs:
           MANIFEST=$(java -jar "$RUNNER_TEMP/bundletool.jar" dump manifest --bundle="$AAB")
           grep -q 'package="com.readori.radio"' <<<"$MANIFEST" || { echo '::error::package is not com.readori.radio'; exit 1; }
           grep -q 'android:targetSdkVersion="36"' <<<"$MANIFEST" || { echo '::error::targetSdk is not 36'; exit 1; }
-          grep -q 'foregroundServiceType="mediaPlayback"' <<<"$MANIFEST" || { echo '::error::no mediaPlayback FGS'; exit 1; }
+          grep -Eq 'foregroundServiceType="(mediaPlayback|0x2|2)"' <<<"$MANIFEST" || { echo '::error::no mediaPlayback FGS'; grep -o 'foregroundServiceType="[^"]*"' <<<"$MANIFEST" || true; exit 1; }
           ALLOWED='INTERNET|FOREGROUND_SERVICE|FOREGROUND_SERVICE_MEDIA_PLAYBACK|WAKE_LOCK|ACCESS_NETWORK_STATE|DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'
           EXTRA=$(grep -o 'uses-permission[^>]*android:name="[^"]*"' <<<"$MANIFEST" | sed 's/.*name="//;s/"//;s/.*\.//' | grep -Ev "^($ALLOWED)$" || true)
           [ -z "$EXTRA" ] || { echo "::error::unexpected permissions: $EXTRA"; exit 1; }
