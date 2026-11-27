@@ -1,0 +1,76 @@
+# Radio Android upload key: one-off. Generates Hourwave's Play upload key on the runner and prints it
+# ONLY as sealed boxes for this repository's Actions public key (inputs public_key / key_id, from
+# GET /repos/{owner}/{repo}/actions/secrets/public-key). Only GitHub can open them; the caller then
+# PUTs each one as the secret named on its line. The key and its password never appear in the log
+# and leave the runner only as those sealed boxes. Not RemoHop's ANDROID_UPLOAD_* secrets.
+#
+# Secrets written afterwards (by the caller): RADIO_ANDROID_UPLOAD_KEYSTORE_BASE64,
+# RADIO_ANDROID_UPLOAD_KEYSTORE_PASSWORD, RADIO_ANDROID_UPLOAD_KEY_ALIAS, RADIO_ANDROID_UPLOAD_KEY_PASSWORD.
+# The upload certificate's SHA-256 fingerprint (public) is printed to check against Play Console.
+
+name: Radio Android upload key
+run-name: Radio Android upload key · ${{ inputs.key_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      public_key:
+        description: 'This repository''s Actions public key (base64)'
+        required: true
+        type: string
+      key_id:
+        description: 'Its key_id'
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  keygen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Generate the upload key and seal it
+        env:
+          PUBKEY: ${{ inputs.public_key }}
+          KEY_ID: ${{ inputs.key_id }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$PUBKEY" =~ ^[A-Za-z0-9+/]{43}=$ ]] || { echo '::error::public_key is not a base64 X25519 key.'; exit 1; }
+          [[ "$KEY_ID" =~ ^[0-9]+$ ]] || { echo '::error::key_id is not numeric.'; exit 1; }
+          python3 -m pip install --quiet --disable-pip-version-check 'pynacl==1.5.0' >/dev/null 2>&1 \
+            || { echo '::error::pip install pynacl failed.'; exit 1; }
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          pw="$(openssl rand -hex 24)"
+          echo "::add-mask::$pw"
+          alias='hourwave-upload'
+          # PKCS12: one password for the store and the key.
+          "$JAVA_HOME_17_X64/bin/keytool" -genkeypair -noprompt \
+            -keystore "$d/upload.p12" -storetype PKCS12 -alias "$alias" \
+            -keyalg RSA -keysize 4096 -validity 10000 \
+            -dname 'CN=Hourwave Upload, O=Readori' \
+            -storepass "$pw" -keypass "$pw" >/dev/null 2>&1 \
+            || { echo '::error::keytool failed.'; exit 1; }
+          printf '%s' "$pw" > "$d/pw"
+          printf '%s' "$alias" > "$d/alias"
+          base64 -w0 "$d/upload.p12" > "$d/ks"
+          fp="$("$JAVA_HOME_17_X64/bin/keytool" -list -v -keystore "$d/upload.p12" -storetype PKCS12 \
+            -storepass:file "$d/pw" -alias "$alias" 2>/dev/null | sed -n 's/^[[:space:]]*SHA256: //p' | head -1)"
+          echo "upload certificate SHA-256: ${fp:-unknown}"
+          D="$d" python3 - <<'PY'
+          import base64, os
+          from nacl import encoding, public
+          box = public.SealedBox(public.PublicKey(os.environ['PUBKEY'].encode(), encoding.Base64Encoder()))
+          d = os.environ['D']
+          for name, f in (
+              ('RADIO_ANDROID_UPLOAD_KEYSTORE_BASE64', 'ks'),
+              ('RADIO_ANDROID_UPLOAD_KEYSTORE_PASSWORD', 'pw'),
+              ('RADIO_ANDROID_UPLOAD_KEY_ALIAS', 'alias'),
+              ('RADIO_ANDROID_UPLOAD_KEY_PASSWORD', 'pw'),
+          ):
+              with open(os.path.join(d, f), 'rb') as fh:
+                  sealed = base64.b64encode(box.encrypt(fh.read())).decode()
+              print(f"SEALED {os.environ['KEY_ID']} {name} {sealed}")
+          PY
