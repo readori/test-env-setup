@@ -6,6 +6,9 @@
 #   bundle : the same checks, then a release .aab signed with Hourwave's upload key, and bundle checks
 #            (targetSdk 36, mediaPlayback FGS, permission allow-list, 16 KB pages, signature).
 #            Nothing leaves the runner unless aab_pubkey is given (see below).
+#   internal : bundle, then upload it to the Play internal track as a draft release through the Android
+#            Publisher API (secret PLAY_SERVICE_ACCOUNT_JSON; token masked, key file deleted at once).
+#   play-check : only opens and deletes a Play edit, to check the API accepts the app.
 #
 # aab_pubkey (bundle only, for the first hand-made upload in Play Console): base64 of an RSA public
 # key PEM. The .aab is encrypted with a random AES-256 key, that key is wrapped with the RSA public key,
@@ -25,9 +28,9 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'verify = checks + debug build; bundle = checks + signed .aab'
+        description: 'verify = checks + debug build; bundle = checks + signed .aab; internal = bundle + Play internal track (draft); play-check = only open and delete a Play edit'
         type: choice
-        options: [verify, bundle]
+        options: [verify, bundle, internal, play-check]
         default: verify
       ref:
         description: 'Branch, tag or SHA of readori/Radio'
@@ -58,6 +61,7 @@ concurrency:
 
 jobs:
   android:
+    if: inputs.mode != 'play-check'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -136,7 +140,7 @@ jobs:
           ls -l app/build/outputs/apk/debug/*.apk | awk '{print $5, $NF}'
 
       - name: Signed release bundle
-        if: inputs.mode == 'bundle'
+        if: inputs.mode == 'bundle' || inputs.mode == 'internal'
         working-directory: radio/apps/mobile/android
         env:
           KEYSTORE_BASE64: ${{ secrets.RADIO_ANDROID_UPLOAD_KEYSTORE_BASE64 }}
@@ -158,7 +162,7 @@ jobs:
           rm -f "$KS"
 
       - name: Bundle checks (manifest, 16 KB pages, signature)
-        if: inputs.mode == 'bundle'
+        if: inputs.mode == 'bundle' || inputs.mode == 'internal'
         working-directory: radio/apps/mobile/android
         run: |
           set -euo pipefail
@@ -184,7 +188,7 @@ jobs:
           ls -l "$AAB" | awk '{print "bundle checks passed,", $5, "bytes"}'
 
       - name: Encrypt the bundle for one recipient
-        if: inputs.mode == 'bundle' && inputs.aab_pubkey != ''
+        if: (inputs.mode == 'bundle' || inputs.mode == 'internal') && inputs.aab_pubkey != ''
         working-directory: radio/apps/mobile/android
         env:
           PUB: ${{ inputs.aab_pubkey }}
@@ -202,10 +206,103 @@ jobs:
           rm -f "$RUNNER_TEMP/k"
 
       - name: Upload the encrypted bundle (1 day)
-        if: inputs.mode == 'bundle' && inputs.aab_pubkey != ''
+        if: (inputs.mode == 'bundle' || inputs.mode == 'internal') && inputs.aab_pubkey != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hourwave-aab-encrypted
           path: ${{ runner.temp }}/out/
           retention-days: 1
           if-no-files-found: error
+
+      - name: Upload to Play internal testing (draft)
+        if: inputs.mode == 'internal'
+        working-directory: radio/apps/mobile/android
+        env:
+          PLAY_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          VNAME: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          umask 077
+          AAB=app/build/outputs/bundle/release/app-release.aab
+          umask 077
+          SA="$RUNNER_TEMP/sa.json"; printf '%s' "$PLAY_JSON" > "$SA"
+          KEY="$RUNNER_TEMP/sa.pem"
+          EMAIL="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));open(sys.argv[2],"w").write(d["private_key"]);print(d["client_email"])' "$SA" "$KEY")"
+          b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          NOW="$(date +%s)"
+          HDR="$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)"
+          CLAIMS="$(printf '{"iss":"%s","scope":"https://www.googleapis.com/auth/androidpublisher","aud":"https://oauth2.googleapis.com/token","iat":%s,"exp":%s}' "$EMAIL" "$NOW" "$((NOW + 1800))" | b64url)"
+          SIG="$(printf '%s.%s' "$HDR" "$CLAIMS" | openssl dgst -sha256 -sign "$KEY" -binary | b64url)"
+          rm -f "$KEY" "$SA"
+          TOKEN="$(curl -fsS --max-time 30 https://oauth2.googleapis.com/token \
+            --data-urlencode 'grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer' \
+            --data-urlencode "assertion=$HDR.$CLAIMS.$SIG" | python3 -c 'import json,sys;print(json.load(sys.stdin)["access_token"])')" \
+            || { echo '::error::Could not get a Google access token (service account key or clock).'; exit 1; }
+          echo "::add-mask::$TOKEN"
+          API="https://androidpublisher.googleapis.com/androidpublisher/v3/applications/com.readori.radio"
+          call() { # method url [curl args...]; prints the body, fails with Google's message on stderr (so it reaches the log when stdout is captured or dropped)
+            local m="$1" u="$2"; shift 2
+            local out code
+            out="$(curl -sS --max-time 600 -X "$m" -H "Authorization: Bearer $TOKEN" -w '\n%{http_code}' "$u" "$@")"
+            code="${out##*$'\n'}"; out="${out%$'\n'*}"
+            if [[ "$code" != 2* ]]; then
+              python3 -c 'import json,sys
+          try: e=json.loads(sys.argv[1])["error"]; print("Play API %s: %s" % (e.get("code"), e.get("message","")[:400]))
+          except Exception: print("Play API HTTP", sys.argv[2])' "$out" "$code" >&2
+              return 1
+            fi
+            printf '%s' "$out"
+          }
+          EDIT="$(call POST "$API/edits" -H 'Content-Type: application/json' -d '{}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')" \
+            || { echo '::error::Could not open a Play edit.'; exit 1; }
+          UP="$(call POST "https://androidpublisher.googleapis.com/upload/androidpublisher/v3/applications/com.readori.radio/edits/$EDIT/bundles?uploadType=media" \
+            -H 'Content-Type: application/octet-stream' --data-binary "@$AAB" | python3 -c 'import json,sys;print(json.load(sys.stdin)["versionCode"])')" \
+            || { echo '::error::Bundle upload failed.'; exit 1; }
+          BODY="$(printf '{"track":"internal","releases":[{"name":"%s (%s)","versionCodes":["%s"],"status":"draft"}]}' "$VNAME" "$UP" "$UP")"
+          call PUT "$API/edits/$EDIT/tracks/internal" -H 'Content-Type: application/json' -d "$BODY" > /dev/null || { echo '::error::Track update failed.'; exit 1; }
+          call POST "$API/edits/$EDIT:commit" > /dev/null || { echo '::error::Commit of the Play edit failed.'; exit 1; }
+          echo "Uploaded version code $UP to internal (draft)."
+
+  play-check:
+    if: inputs.mode == 'play-check'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Open and delete a Play edit
+        env:
+          PLAY_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          umask 077
+          SA="$RUNNER_TEMP/sa.json"; printf '%s' "$PLAY_JSON" > "$SA"
+          KEY="$RUNNER_TEMP/sa.pem"
+          EMAIL="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));open(sys.argv[2],"w").write(d["private_key"]);print(d["client_email"])' "$SA" "$KEY")"
+          b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          NOW="$(date +%s)"
+          HDR="$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)"
+          CLAIMS="$(printf '{"iss":"%s","scope":"https://www.googleapis.com/auth/androidpublisher","aud":"https://oauth2.googleapis.com/token","iat":%s,"exp":%s}' "$EMAIL" "$NOW" "$((NOW + 1800))" | b64url)"
+          SIG="$(printf '%s.%s' "$HDR" "$CLAIMS" | openssl dgst -sha256 -sign "$KEY" -binary | b64url)"
+          rm -f "$KEY" "$SA"
+          TOKEN="$(curl -fsS --max-time 30 https://oauth2.googleapis.com/token \
+            --data-urlencode 'grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer' \
+            --data-urlencode "assertion=$HDR.$CLAIMS.$SIG" | python3 -c 'import json,sys;print(json.load(sys.stdin)["access_token"])')" \
+            || { echo '::error::Could not get a Google access token (service account key or clock).'; exit 1; }
+          echo "::add-mask::$TOKEN"
+          API="https://androidpublisher.googleapis.com/androidpublisher/v3/applications/com.readori.radio"
+          call() { # method url [curl args...]; prints the body, fails with Google's message on stderr (so it reaches the log when stdout is captured or dropped)
+            local m="$1" u="$2"; shift 2
+            local out code
+            out="$(curl -sS --max-time 600 -X "$m" -H "Authorization: Bearer $TOKEN" -w '\n%{http_code}' "$u" "$@")"
+            code="${out##*$'\n'}"; out="${out%$'\n'*}"
+            if [[ "$code" != 2* ]]; then
+              python3 -c 'import json,sys
+          try: e=json.loads(sys.argv[1])["error"]; print("Play API %s: %s" % (e.get("code"), e.get("message","")[:400]))
+          except Exception: print("Play API HTTP", sys.argv[2])' "$out" "$code" >&2
+              return 1
+            fi
+            printf '%s' "$out"
+          }
+          EDIT="$(call POST "$API/edits" -H 'Content-Type: application/json' -d '{}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')" \
+            || { echo '::error::Could not open a Play edit.'; exit 1; }
+          call DELETE "$API/edits/$EDIT" > /dev/null || true
+          echo 'Play edit opened and deleted: the API accepts com.readori.radio.'
