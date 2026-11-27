@@ -350,7 +350,7 @@ jobs:
         run: |
           set -euo pipefail
           set +e
-          OUT="$(fastlane run latest_testflight_build_number api_key_path:"$ASC_API_KEY_JSON" app_identifier:"$EXPECTED_BUNDLE_ID" initial_build_number:0 2>&1)"
+          OUT="$(fastlane run latest_testflight_build_number api_key_path:"$ASC_API_KEY_JSON" app_identifier:"$EXPECTED_BUNDLE_ID" version:"$VERSION_INPUT" initial_build_number:0 2>&1)"
           st=$?
           set -e
           LATEST="$(printf '%s\n' "$OUT" | sed -n 's/.*Result: \([0-9][0-9]*\).*/\1/p' | tail -1)"
@@ -360,13 +360,13 @@ jobs:
             exit 1
           fi
           if [[ -n "$BUILD_NUMBER_INPUT" ]]; then
-            (( BUILD_NUMBER_INPUT > LATEST )) || { echo "::error::build_number $BUILD_NUMBER_INPUT must be higher than latest $LATEST."; exit 1; }
+            (( BUILD_NUMBER_INPUT > LATEST )) || { echo "::error::build_number $BUILD_NUMBER_INPUT must be higher than latest $LATEST for version $VERSION_INPUT."; exit 1; }
             BN="$BUILD_NUMBER_INPUT"
           else
             BN=$((LATEST + 1))
           fi
           echo "BUILD_NUMBER=$BN" >> "$GITHUB_ENV"
-          echo "Latest TestFlight build: $LATEST → this build: $BN"
+          echo "Latest TestFlight build of $VERSION_INPUT: $LATEST → this build: $BN"
 
       - name: Build signed archive and IPA
         if: ${{ inputs.mode == 'testflight' }}
