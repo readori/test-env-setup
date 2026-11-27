@@ -22,7 +22,7 @@
 # versionCode = major*1000000 + minor*10000 + patch*100 + build_number (1..99).
 
 name: Radio Android
-run-name: Radio Android · ${{ inputs.mode }} · ${{ inputs.ref }}
+run-name: Radio Android · ${{ inputs.mode }} · ${{ inputs.ref }} · api ${{ inputs.api_target }}
 
 on:
   workflow_dispatch:
@@ -51,6 +51,11 @@ on:
         required: false
         default: ''
         type: string
+      api_target:
+        description: 'API the app talks to (EXPO_PUBLIC_HOURWAVE_API): production | staging'
+        type: choice
+        options: [production, staging]
+        default: production
 
 permissions:
   contents: read
@@ -92,6 +97,76 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
+
+      - name: Resolve and mask the API base URL (EXPO_PUBLIC_*_API)
+        shell: bash
+        env:
+          API_TARGET: ${{ inputs.api_target }}
+          STAGING_API: ${{ secrets.RADIO_STAGING_API }}
+          PRODUCTION_API: ${{ secrets.RADIO_PRODUCTION_API }}
+        run: |
+          set -euo pipefail
+          # OPS-10b: the API address comes only from RADIO_STAGING_API / RADIO_PRODUCTION_API (no
+          # Cloudflare credentials in this job). Signed builds must name their API explicitly.
+          case "$API_TARGET" in
+            staging|production) ;;
+            *) echo "::error::Unsupported api_target: $API_TARGET"; exit 64 ;;
+          esac
+          if [[ "$API_TARGET" == production ]]; then
+            API_BASE="${PRODUCTION_API%/}"
+            HELPER="$RUNNER_TEMP/domain.mjs"
+            cat > "$HELPER" <<'JS'
+          // Usage: node domain.mjs <wrangler.jsonc>  -> the single custom domain of env.production
+          import { readFileSync } from 'node:fs';
+          function jsonc(text) {
+            let out = '';
+            let inString = false;
+            for (let i = 0; i < text.length; i++) {
+              const c = text[i];
+              if (inString) {
+                out += c;
+                if (c === '\\') out += text[++i];
+                else if (c === '"') inString = false;
+              } else if (c === '"') {
+                inString = true;
+                out += c;
+              } else if (c === '/' && text[i + 1] === '/') {
+                while (i < text.length && text[i] !== '\n') i++;
+                out += '\n';
+              } else if (c === '/' && text[i + 1] === '*') {
+                i += 2;
+                while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
+                i++;
+              } else out += c;
+            }
+            return JSON.parse(out.replace(/,(\s*[}\]])/g, '$1'));
+          }
+          let domain;
+          try {
+            const sect = jsonc(readFileSync(process.argv[2], 'utf8')).env?.production ?? {};
+            const domains = (sect.routes ?? []).filter((r) => r.custom_domain === true);
+            domain = domains.length === 1 ? domains[0].pattern : undefined;
+          } catch {}
+          if (!/^[a-z0-9][a-z0-9.-]{1,252}[a-z0-9]$/.test(domain ?? '')) {
+            console.error('::error::no production custom domain in workers/api/wrangler.jsonc');
+            process.exit(1);
+          }
+          process.stdout.write(domain);
+          JS
+            domain="$(node "$HELPER" "$GITHUB_WORKSPACE/radio/workers/api/wrangler.jsonc")"
+            echo "::add-mask::$domain"
+            # The secret cannot be read, so check it against the ref's config (neither is printed).
+            [[ "$API_BASE" == "https://${domain}" ]] || { echo '::error::RADIO_PRODUCTION_API is not https://<custom domain of env.production in workers/api/wrangler.jsonc>'; exit 1; }
+          else
+            API_BASE="${STAGING_API%/}"
+            [[ "$API_BASE" == https://* ]] || { echo '::error::RADIO_STAGING_API is not set (or not https)'; exit 1; }
+          fi
+          echo "::add-mask::$API_BASE"
+          # Only Metro (Gradle createBundleReleaseJsAndAssets) reads these; the app has no API without it.
+          echo "EXPO_PUBLIC_HOURWAVE_API=$API_BASE" >> "$GITHUB_ENV"
+          echo "API base: ${API_TARGET} (masked)"
+          SHA="$(git -C "$GITHUB_WORKSPACE/radio" rev-parse --short=8 HEAD)"
+          echo "EXPO_PUBLIC_HOURWAVE_SOURCE_SHA=$SHA" >> "$GITHUB_ENV"
 
       - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
@@ -183,6 +258,7 @@ jobs:
             if "$READELF" -lW "$so" | awk '$1=="LOAD"{print $NF}' | grep -qv '0x4000'; then echo "::error::not 16 KB: $(basename "$so")"; BAD=1; fi
           done
           [ "$BAD" = 0 ]
+          [[ -n "${EXPO_PUBLIC_HOURWAVE_API:-}" ]] || { echo '::error::EXPO_PUBLIC_HOURWAVE_API is empty'; exit 1; }          unzip -p "$AAB" base/assets/index.android.bundle | grep -aqF "$EXPO_PUBLIC_HOURWAVE_API" || { echo '::error::the JS bundle does not contain the API address (the app would show no stations)'; exit 1; }
           jarsigner -verify "$AAB" > /dev/null || { echo '::error::bundle signature does not verify'; exit 1; }
           rm -rf "$RUNNER_TEMP/so"
           ls -l "$AAB" | awk '{print "bundle checks passed,", $5, "bytes"}'
