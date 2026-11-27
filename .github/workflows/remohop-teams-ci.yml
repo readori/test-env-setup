@@ -1,0 +1,135 @@
+# RemoHop Teams (private, readori/remohop-teams) CI: the checks its own Actions cannot run.
+#
+# Public CI repository -> source repository: env SOURCE_REPOSITORY.
+#
+#   test : gofmt, go vet for linux, darwin and windows, go test -race, and a check that the
+#          submodule upstream/ (the public RemoHop repository) points at a release tag.
+#
+# No deploy, signing or cloud credentials are used. Nothing is uploaded: no artifacts.
+#
+# Triggers: workflow_dispatch, or a push to main that changes ci-requests/remohop-teams.env
+# (REF=branch, tag or SHA). Only people with push access to this repo can trigger; never
+# pull_request. The request file is parsed as plain KEY=VALUE text with strict patterns and is
+# never executed.
+#
+# Safety rules (public repo, public logs, private source): no pull_request triggers; third-party
+# actions pinned to commit SHAs; TARGET_REPO_PAT is used only by the checkout step and not
+# persisted; output is limited to file names (gofmt), vet findings, package results and the
+# output of failing tests. Source files are never printed.
+name: RemoHop Teams CI
+
+run-name: RemoHop Teams CI · ${{ github.event_name == 'push' && 'request (ci-requests/remohop-teams.env)' || inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Source repository branch, tag, or SHA'
+        required: true
+        default: 'main'
+        type: string
+  push:
+    branches: [main]
+    paths: ['ci-requests/remohop-teams.env']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remohop-teams-ci-${{ inputs.ref || 'request' }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_REPOSITORY: readori/remohop-teams
+
+jobs:
+  test:
+    name: fmt, vet and race tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Validate request and credentials
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          REQUEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/ci-requests/remohop-teams.env
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == 'push' ]]; then
+            REQ="$RUNNER_TEMP/remohop-teams-ci-request.env"
+            curl -fsSL --retry 3 --max-time 30 "$REQUEST_URL" -o "$REQ" || { echo '::error::Could not read ci-requests/remohop-teams.env at this commit.'; exit 64; }
+            # Plain text, read line by line; never sourced or executed.
+            SOURCE_REF="$(sed -n 's/^REF=//p' "$REQ" | head -n 1 | tr -d '\r')"
+          else
+            SOURCE_REF="$INPUT_REF"
+          fi
+          [[ -n "$SOURCE_REF" && "$SOURCE_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && ${#SOURCE_REF} -le 200 ]] || {
+            echo '::error::ref must be a non-empty branch, tag, or SHA (letters, digits, . _ / - only, no leading dash).'
+            exit 64
+          }
+          [[ -n "${TARGET_REPO_PAT:-}" ]] || {
+            echo '::error::Missing public CI credential: TARGET_REPO_PAT (it must have read access to the source repository, env SOURCE_REPOSITORY).'
+            exit 78
+          }
+          echo "SOURCE_REF=$SOURCE_REF" >> "$GITHUB_ENV"
+          echo "Source ref: $SOURCE_REF"
+
+      # upstream/ is the public RemoHop repository; it needs no credential.
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.TARGET_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+          submodules: true
+          persist-credentials: false
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: source/go.mod
+          cache: false
+
+      - name: Toolchain and upstream
+        working-directory: source
+        run: |
+          set -euo pipefail
+          go version
+          head="$(git rev-parse --short HEAD)"
+          cd upstream
+          git fetch -q --depth 1 origin 'refs/tags/v*:refs/tags/v*' 2>/dev/null || true
+          tag="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
+          { echo "### RemoHop Teams CI"; echo; echo "- Source: \`$SOURCE_REPOSITORY@$head\` (ref \`$SOURCE_REF\`)"; echo "- upstream: \`${tag:-$(git rev-parse --short HEAD)}\`"; echo "- $(go version)"; } >> "$GITHUB_STEP_SUMMARY"
+          case "$tag" in
+            v[0-9]*.[0-9]*.[0-9]*) echo "upstream = $tag" ;;
+            *) echo "::error::upstream/ must point at a RemoHop release tag (it is $(git rev-parse --short HEAD))"; exit 1 ;;
+          esac
+
+      - name: gofmt
+        if: always()
+        working-directory: source
+        run: |
+          set -euo pipefail
+          # File names only.
+          out="$(gofmt -l $(git ls-files '*.go'))"
+          if [[ -n "$out" ]]; then echo "$out"; echo '::error::gofmt: the files above need formatting'; exit 1; fi
+
+      - name: go vet (linux, darwin, windows)
+        if: always()
+        working-directory: source
+        run: |
+          set -euo pipefail
+          for os in linux darwin windows; do echo "== GOOS=$os"; GOOS=$os go vet ./...; done
+
+      - name: go test -race
+        if: always()
+        working-directory: source
+        run: |
+          set -o pipefail
+          # Package results plus the output of failing tests only.
+          go test -race -count=1 ./... 2>&1 | grep -a -v 'no test files' | cut -c1-2000 | tail -n 1500
