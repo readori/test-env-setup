@@ -58,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      XUNINE_IP: 146.235.209.71
+      XUNINE_IP: 192.9.148.147
     steps:
       - name: Install cloudflared (official release, pinned)
         if: inputs.key_source == 'oracle'
