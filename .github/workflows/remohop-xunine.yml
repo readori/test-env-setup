@@ -1,19 +1,27 @@
 # RemoHop rendezvous host xunine: probe, upgrade to a release, and turn on the operator's panel.
-# workflow_dispatch only. SSH key: secret XUNINE_SSH_4H24G (the owner added it for this job).
+# workflow_dispatch only.
 #
-#   probe   : who we are, arch, remohop version, remohop units and their state. Read-only.
+#   probe   : arch, whether the machine's public IPv4 is xunine's (yes/no), remohop version, remohop
+#             units and their state. Read-only.
 #   upgrade : download the release archive for the host's arch, check it against SHA256SUMS, keep
 #             /usr/local/bin/remohop.bak-<previous version>, install, add (once) a drop-in on
 #             remohop-signal that appends --panel 127.0.0.1:8810 to its current ExecStart and loads
 #             /etc/remohop/remohop-signal-panel.env (created empty, root 0600), restart every remohop
-#             unit with flags otherwise unchanged, then run the checks.
+#             unit with flags otherwise unchanged, then run the checks. Refuses unless remohop-signal
+#             exists on the machine.
 #   check   : the panel checks only (healthz, Cloudflare-ray 403, loopback-only listener) and unit state.
 #
-# Public log: no unit flags, no env file contents, no keys. Only versions, unit names/states and
-# check results are printed.
+# key_source:
+#   xunine : secret XUNINE_SSH_4H24G, direct SSH to xunine's public address.
+#   oracle : ORACLE_SSH_KEY / ORACLE_SSH_USER / ORACLE_SSH_HOST through the Cloudflare tunnel
+#            (cloudflared access ssh, Access service token ORACLE_ACCESS_CLIENT_ID/_SECRET), host key
+#            pinned from ORACLE_SSH_HOST_KEY when set. The owner asked to try this route on 2026-11-28.
+#
+# Public log: no hosts other than xunine's published address, no unit flags, no env file contents,
+# no keys. Only versions, unit names/states, yes/no identity and check results are printed.
 
 name: RemoHop xunine
-run-name: RemoHop xunine · ${{ inputs.mode }} · ${{ inputs.version }}
+run-name: RemoHop xunine · ${{ inputs.mode }} · ${{ inputs.version }} · ${{ inputs.key_source }}
 
 on:
   workflow_dispatch:
@@ -28,12 +36,12 @@ on:
         default: 'v1.0.8'
         type: string
       key_source:
-        description: 'xunine = XUNINE_SSH_4H24G; oracle = ORACLE_SSH_KEY (+ ORACLE_SSH_USER)'
+        description: 'xunine = XUNINE_SSH_4H24G direct; oracle = ORACLE_SSH_* through the Cloudflare tunnel'
         type: choice
         options: [xunine, oracle]
         default: xunine
       ssh_user:
-        description: 'SSH user (empty = try root, ubuntu, opc)'
+        description: 'SSH user for key_source=xunine (empty = try root, ubuntu, opc)'
         required: false
         default: ''
         type: string
@@ -50,47 +58,81 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      HOST: 146.235.209.71
+      XUNINE_IP: 146.235.209.71
     steps:
-      - name: SSH key
-        env:
-          KEY: ${{ inputs.key_source == 'oracle' && secrets.ORACLE_SSH_KEY || secrets.XUNINE_SSH_4H24G }}
-          O_HOST: ${{ inputs.key_source == 'oracle' && secrets.ORACLE_SSH_HOST || '' }}
-          VERSION: ${{ inputs.version }}
+      - name: Install cloudflared (official release, pinned)
+        if: inputs.key_source == 'oracle'
         run: |
           set -euo pipefail
-          [[ -n "$KEY" ]] || { echo '::error::Missing SSH key secret'; exit 78; }
-          if [[ -n "${O_HOST:-}" ]]; then [[ "$O_HOST" == "$HOST" ]] && echo "ORACLE_SSH_HOST: same host" || echo "ORACLE_SSH_HOST: a different host"; fi
+          curl -fsSL -o "$RUNNER_TEMP/cloudflared" https://github.com/cloudflare/cloudflared/releases/download/2026.10.3/cloudflared-linux-amd64
+          chmod +x "$RUNNER_TEMP/cloudflared"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: SSH setup
+        env:
+          SRC: ${{ inputs.key_source }}
+          VERSION: ${{ inputs.version }}
+          WANT: ${{ inputs.ssh_user }}
+          X_KEY: ${{ secrets.XUNINE_SSH_4H24G }}
+          O_KEY: ${{ inputs.key_source == 'oracle' && secrets.ORACLE_SSH_KEY || '' }}
+          O_USER: ${{ inputs.key_source == 'oracle' && secrets.ORACLE_SSH_USER || '' }}
+          O_HOST: ${{ inputs.key_source == 'oracle' && secrets.ORACLE_SSH_HOST || '' }}
+          O_HOST_KEY: ${{ inputs.key_source == 'oracle' && secrets.ORACLE_SSH_HOST_KEY || '' }}
+        run: |
+          set -euo pipefail
           [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo '::error::version must be vX.Y.Z'; exit 64; }
-          umask 077; mkdir -p ~/.ssh
-          printf '%s\n' "$KEY" | tr -d '\r' > ~/.ssh/id_xunine
-          ssh-keyscan -T 15 -t ed25519 "$HOST" 2>/dev/null > ~/.ssh/known_hosts
-          [[ -s ~/.ssh/known_hosts ]] || { echo '::error::ssh-keyscan got no host key'; exit 1; }
+          umask 077; d="$RUNNER_TEMP/ssh"; mkdir -p "$d"
+          cfg="$d/config"
+          if [[ "$SRC" == oracle ]]; then
+            echo "::add-mask::$O_HOST"
+            [[ -n "$O_KEY" && -n "$O_USER" && -n "$O_HOST" ]] || { echo '::error::Missing ORACLE_SSH_* secrets'; exit 78; }
+            printf '%s\n' "$O_KEY" | tr -d '\r' > "$d/key"
+            shk=accept-new; : > "$d/known"
+            if [[ -n "$O_HOST_KEY" ]]; then
+              printf '%s %s\n' "$O_HOST" "$(printf '%s\n' "$O_HOST_KEY" | tr -d '\r' | awk 'NF{print $1, $2; exit}')" > "$d/known"; shk=yes
+            fi
+            printf 'Host target\n  HostName %s\n  User %s\n  ProxyCommand cloudflared access ssh --hostname %%h\n  StrictHostKeyChecking %s\n' "$O_HOST" "$O_USER" "$shk" > "$cfg"
+            echo "users=$O_USER" > "$d/users"
+          else
+            [[ -n "$X_KEY" ]] || { echo '::error::Missing secret XUNINE_SSH_4H24G'; exit 78; }
+            printf '%s\n' "$X_KEY" | tr -d '\r' > "$d/key"
+            ssh-keyscan -T 15 -t ed25519 "$XUNINE_IP" 2>/dev/null > "$d/known"
+            [[ -s "$d/known" ]] || { echo '::error::ssh-keyscan got no host key'; exit 1; }
+            printf 'Host target\n  HostName %s\n  StrictHostKeyChecking yes\n' "$XUNINE_IP" > "$cfg"
+            echo "users=${WANT:-root ubuntu opc}" > "$d/users"
+          fi
+          printf '  IdentityFile %s\n  UserKnownHostsFile %s\n  BatchMode yes\n  ConnectTimeout 20\n  LogLevel ERROR\n' "$d/key" "$d/known" >> "$cfg"
 
       - name: Find the SSH user
-        id: who
         env:
-          WANT: ${{ inputs.ssh_user != '' && inputs.ssh_user || (inputs.key_source == 'oracle' && secrets.ORACLE_SSH_USER || '') }}
+          TUNNEL_SERVICE_TOKEN_ID: ${{ inputs.key_source == 'oracle' && secrets.ORACLE_ACCESS_CLIENT_ID || '' }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ inputs.key_source == 'oracle' && secrets.ORACLE_ACCESS_CLIENT_SECRET || '' }}
         run: |
-          set -euo pipefail
-          for u in ${WANT:-root ubuntu opc}; do
-            if ssh -i ~/.ssh/id_xunine -o BatchMode=yes -o ConnectTimeout=15 "$u@$HOST" true 2>/dev/null; then
-              echo "SSH_U=$u" >> "$GITHUB_ENV"; echo "SSH works as $u"; exit 0
+          set -uo pipefail
+          d="$RUNNER_TEMP/ssh"; source "$d/users"
+          for u in $users; do
+            if timeout 60 ssh -F "$d/config" -l "$u" target true 2> "$d/err"; then
+              echo "SSH_U=$u" >> "$GITHUB_ENV"; echo "SSH login works"; exit 0
             fi
           done
-          echo "key lines: $(wc -l < ~/.ssh/id_xunine); header: $(head -1 ~/.ssh/id_xunine | cut -c1-36)"
-          if ssh-keygen -y -P '' -f ~/.ssh/id_xunine > /tmp/pub 2>/tmp/kerr; then echo "public key: $(ssh-keygen -lf /tmp/pub)"; echo "public key line: $(cut -d" " -f1,2 /tmp/pub)"; else echo "ssh-keygen: $(head -1 /tmp/kerr)"; fi
-          ssh -v -i ~/.ssh/id_xunine -o BatchMode=yes -o ConnectTimeout=15 "${WANT:-root}@$HOST" true 2>&1 | grep -E 'Remote protocol|OpenSSH_|Authentications|Offering|Server accepts|Permission denied|Load key|Will attempt|Skipping|server-sig-algs|send_pubkey|no mutual|identity file|Trying|we sent|signature' | head -25 || true
-          echo '::error::The key is not accepted for root, ubuntu or opc.'; exit 1
+          if grep -q 'Permission denied' "$d/err"; then r=permission-denied
+          elif grep -qiE 'Host key verification failed|IDENTIFICATION HAS CHANGED' "$d/err"; then r=host-key-mismatch
+          elif grep -qiE '403|forbidden|access denied' "$d/err"; then r=access-denied
+          elif grep -qiE '530|502|websocket|bad handshake' "$d/err"; then r=tunnel-not-connected
+          elif grep -qiE 'timed out' "$d/err"; then r=timeout
+          else r=other; fi
+          echo "::error::SSH login failed: $r"; exit 1
 
-      - name: Run on xunine
+      - name: Run on the machine
         env:
           MODE: ${{ inputs.mode }}
           VERSION: ${{ inputs.version }}
+          TUNNEL_SERVICE_TOKEN_ID: ${{ inputs.key_source == 'oracle' && secrets.ORACLE_ACCESS_CLIENT_ID || '' }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ inputs.key_source == 'oracle' && secrets.ORACLE_ACCESS_CLIENT_SECRET || '' }}
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/id_xunine -o BatchMode=yes -o ConnectTimeout=15 "$SSH_U@$HOST" \
-            "MODE='$MODE' VERSION='$VERSION' sudo -n -E bash -s" <<'REMOTE'
+          timeout 900 ssh -F "$RUNNER_TEMP/ssh/config" -l "$SSH_U" target \
+            "MODE='$MODE' VERSION='$VERSION' XUNINE_IP='$XUNINE_IP' sudo -n -E bash -s" <<'REMOTE'
           set -euo pipefail
           units() { systemctl list-units --all 'remohop*.service' --no-legend --plain | awk '{print $1}'; }
           state() { for u in $(units); do printf '  %-24s %s\n' "$u" "$(systemctl is-active "$u" || true)"; done; }
@@ -99,8 +141,10 @@ jobs:
             echo "via Cloudflare (Cf-Ray): $(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'Cf-Ray: x' http://127.0.0.1:8810/ || true)"
             echo "listeners on 8810: $(ss -ltnH 'sport = :8810' | awk '{print $4}' | sort -u | tr '\n' ' ')"
           }
+          pub=$(curl -s4 --max-time 8 https://api.ipify.org || true)
+          if [[ "$pub" == "$XUNINE_IP" ]]; then echo "public IPv4 is xunine: yes"; else echo "public IPv4 is xunine: no"; fi
           echo "arch: $(uname -m)"
-          echo "remohop: $(/usr/local/bin/remohop version 2>/dev/null | head -1 || echo missing)"
+          echo "remohop: $( (/usr/local/bin/remohop version 2>/dev/null || echo missing) | head -1)"
           echo "units:"; state
           if [[ -f /etc/systemd/system/remohop-signal.service.d/zz-panel.conf ]]; then echo "panel drop-in: present"; else echo "panel drop-in: absent"; fi
           case "$MODE" in
@@ -108,6 +152,7 @@ jobs:
             check) checks; exit 0 ;;
           esac
           # --- upgrade ---
+          systemctl cat remohop-signal > /dev/null 2>&1 || { echo "no remohop-signal unit here; refusing to upgrade"; exit 1; }
           case "$(uname -m)" in x86_64) A=amd64;; aarch64) A=arm64;; *) echo "unsupported arch"; exit 1;; esac
           W=$(mktemp -d); cd "$W"
           base="https://github.com/readori/RemoHop/releases/download/$VERSION"
@@ -146,4 +191,4 @@ jobs:
 
       - name: Clean up
         if: always()
-        run: rm -f ~/.ssh/id_xunine
+        run: rm -rf "$RUNNER_TEMP/ssh"
