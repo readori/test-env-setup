@@ -132,7 +132,7 @@ jobs:
         run: |
           set -euo pipefail
           timeout 900 ssh -F "$RUNNER_TEMP/ssh/config" -l "$SSH_U" target \
-            "MODE='$MODE' VERSION='$VERSION' XUNINE_IP='$XUNINE_IP' sudo -n -E bash -s" <<'REMOTE'
+            "sudo -n env MODE='$MODE' VERSION='$VERSION' XUNINE_IP='$XUNINE_IP' bash -s" <<'REMOTE'
           set -euo pipefail
           units() { systemctl list-units --all 'remohop*.service' --no-legend --plain | awk '{print $1}'; }
           state() { for u in $(units); do printf '  %-24s %s\n' "$u" "$(systemctl is-active "$u" || true)"; done; }
