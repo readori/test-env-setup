@@ -96,6 +96,14 @@ jobs:
           else
             [[ -n "$X_KEY" ]] || { echo '::error::Missing secret XUNINE_SSH_4H24G'; exit 78; }
             printf '%s\n' "$X_KEY" | tr -d '\r' > "$d/key"
+            if head -1 "$d/key" | grep -q '^PuTTY-User-Key-File'; then
+              echo "key format: PuTTY (.ppk), converting"
+              sudo apt-get install -y -qq putty-tools > /dev/null 2>&1 || { echo '::error::could not install putty-tools'; exit 1; }
+              puttygen "$d/key" -O private-openssh -o "$d/key.openssh" --old-passphrase /dev/null 2> "$d/perr" \
+                || { echo "::error::puttygen could not convert the key: $(grep -oiE 'passphrase|wrong|unable|error[^.]*' "$d/perr" | head -1)"; exit 1; }
+              mv "$d/key.openssh" "$d/key"; chmod 600 "$d/key"
+            fi
+            echo "key: $(ssh-keygen -y -f "$d/key" 2>/dev/null | ssh-keygen -lf - 2>/dev/null || echo 'not usable')"
             ssh-keyscan -T 15 -t ed25519 "$XUNINE_IP" 2>/dev/null > "$d/known"
             [[ -s "$d/known" ]] || { echo '::error::ssh-keyscan got no host key'; exit 1; }
             printf 'Host target\n  HostName %s\n  StrictHostKeyChecking yes\n' "$XUNINE_IP" > "$cfg"
