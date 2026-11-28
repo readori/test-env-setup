@@ -72,8 +72,8 @@ jobs:
             fi
           done
           echo "key lines: $(wc -l < ~/.ssh/id_xunine); header: $(head -1 ~/.ssh/id_xunine | cut -c1-36)"
-          if ssh-keygen -y -P '' -f ~/.ssh/id_xunine > /tmp/pub 2>/tmp/kerr; then echo "public key: $(ssh-keygen -lf /tmp/pub)"; else echo "ssh-keygen: $(head -1 /tmp/kerr)"; fi
-          ssh -v -i ~/.ssh/id_xunine -o BatchMode=yes -o ConnectTimeout=15 "root@$HOST" true 2>&1 | grep -E 'Authentications that can continue|Offering|Server accepts|Permission denied|Load key' | head -6 || true
+          if ssh-keygen -y -P '' -f ~/.ssh/id_xunine > /tmp/pub 2>/tmp/kerr; then echo "public key: $(ssh-keygen -lf /tmp/pub)"; echo "public key line: $(cut -d" " -f1,2 /tmp/pub)"; else echo "ssh-keygen: $(head -1 /tmp/kerr)"; fi
+          ssh -v -i ~/.ssh/id_xunine -o BatchMode=yes -o ConnectTimeout=15 "${WANT:-root}@$HOST" true 2>&1 | grep -E 'Authentications that can continue|Offering|Server accepts|Permission denied|Load key' | head -6 || true
           echo '::error::The key is not accepted for root, ubuntu or opc.'; exit 1
 
       - name: Run on xunine
