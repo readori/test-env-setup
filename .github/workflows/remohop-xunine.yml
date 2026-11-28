@@ -12,7 +12,7 @@
 #   check   : the panel checks only (healthz, Cloudflare-ray 403, loopback-only listener) and unit state.
 #
 # key_source:
-#   xunine : secret XUNINE_SSH_4H24G, direct SSH to xunine's public address.
+#   xunine : secret XUNINE_SSH_REMOHOP, direct SSH to xunine's public address.
 #   oracle : ORACLE_SSH_KEY / ORACLE_SSH_USER / ORACLE_SSH_HOST through the Cloudflare tunnel
 #            (cloudflared access ssh, Access service token ORACLE_ACCESS_CLIENT_ID/_SECRET), host key
 #            pinned from ORACLE_SSH_HOST_KEY when set. The owner asked to try this route on 2026-11-28.
@@ -36,7 +36,7 @@ on:
         default: 'v1.0.8'
         type: string
       key_source:
-        description: 'xunine = XUNINE_SSH_4H24G direct; oracle = ORACLE_SSH_* through the Cloudflare tunnel'
+        description: 'xunine = XUNINE_SSH_REMOHOP direct; oracle = ORACLE_SSH_* through the Cloudflare tunnel'
         type: choice
         options: [xunine, oracle]
         default: xunine
@@ -73,7 +73,7 @@ jobs:
           SRC: ${{ inputs.key_source }}
           VERSION: ${{ inputs.version }}
           WANT: ${{ inputs.ssh_user }}
-          X_KEY: ${{ secrets.XUNINE_SSH_4H24G }}
+          X_KEY: ${{ secrets.XUNINE_SSH_REMOHOP }}
           O_KEY: ${{ inputs.key_source == 'oracle' && secrets.ORACLE_SSH_KEY || '' }}
           O_USER: ${{ inputs.key_source == 'oracle' && secrets.ORACLE_SSH_USER || '' }}
           O_HOST: ${{ inputs.key_source == 'oracle' && secrets.ORACLE_SSH_HOST || '' }}
@@ -94,7 +94,7 @@ jobs:
             printf 'Host target\n  HostName %s\n  User %s\n  ProxyCommand cloudflared access ssh --hostname %%h\n  StrictHostKeyChecking %s\n' "$O_HOST" "$O_USER" "$shk" > "$cfg"
             echo "users=\"$O_USER\"" > "$d/users"
           else
-            [[ -n "$X_KEY" ]] || { echo '::error::Missing secret XUNINE_SSH_4H24G'; exit 78; }
+            [[ -n "$X_KEY" ]] || { echo '::error::Missing secret XUNINE_SSH_REMOHOP'; exit 78; }
             printf '%s\n' "$X_KEY" | tr -d '\r' > "$d/key"
             if head -1 "$d/key" | grep -q '^PuTTY-User-Key-File'; then
               echo "key format: PuTTY (.ppk), converting"
