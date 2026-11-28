@@ -1,0 +1,140 @@
+# RemoHop rendezvous host xunine: probe, upgrade to a release, and turn on the operator's panel.
+# workflow_dispatch only. SSH key: secret XUNINE_SSH_4H24G (the owner added it for this job).
+#
+#   probe   : who we are, arch, remohop version, remohop units and their state. Read-only.
+#   upgrade : download the release archive for the host's arch, check it against SHA256SUMS, keep
+#             /usr/local/bin/remohop.bak-<previous version>, install, add (once) a drop-in on
+#             remohop-signal that appends --panel 127.0.0.1:8810 to its current ExecStart and loads
+#             /etc/remohop/remohop-signal-panel.env (created empty, root 0600), restart every remohop
+#             unit with flags otherwise unchanged, then run the checks.
+#   check   : the panel checks only (healthz, Cloudflare-ray 403, loopback-only listener) and unit state.
+#
+# Public log: no unit flags, no env file contents, no keys. Only versions, unit names/states and
+# check results are printed.
+
+name: RemoHop xunine
+run-name: RemoHop xunine · ${{ inputs.mode }} · ${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [probe, upgrade, check]
+        default: probe
+      version:
+        description: 'Release tag, e.g. v1.0.8 (upgrade)'
+        required: false
+        default: 'v1.0.8'
+        type: string
+      ssh_user:
+        description: 'SSH user (empty = try root, ubuntu, opc)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remohop-xunine
+  cancel-in-progress: false
+
+jobs:
+  xunine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      HOST: 146.235.209.71
+    steps:
+      - name: SSH key
+        env:
+          KEY: ${{ secrets.XUNINE_SSH_4H24G }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ -n "$KEY" ]] || { echo '::error::Missing secret XUNINE_SSH_4H24G'; exit 78; }
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo '::error::version must be vX.Y.Z'; exit 64; }
+          umask 077; mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" | tr -d '\r' > ~/.ssh/id_xunine
+          ssh-keyscan -T 15 -t ed25519 "$HOST" 2>/dev/null > ~/.ssh/known_hosts
+          [[ -s ~/.ssh/known_hosts ]] || { echo '::error::ssh-keyscan got no host key'; exit 1; }
+
+      - name: Find the SSH user
+        id: who
+        env:
+          WANT: ${{ inputs.ssh_user }}
+        run: |
+          set -euo pipefail
+          for u in ${WANT:-root ubuntu opc}; do
+            if ssh -i ~/.ssh/id_xunine -o BatchMode=yes -o ConnectTimeout=15 "$u@$HOST" true 2>/dev/null; then
+              echo "user=$u" >> "$GITHUB_OUTPUT"; echo "SSH works as $u"; exit 0
+            fi
+          done
+          echo '::error::The key is not accepted for root, ubuntu or opc.'; exit 1
+
+      - name: Run on xunine
+        env:
+          U: ${{ steps.who.outputs.user }}
+          MODE: ${{ inputs.mode }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_xunine -o BatchMode=yes -o ConnectTimeout=15 "$U@$HOST" \
+            "MODE='$MODE' VERSION='$VERSION' sudo -n -E bash -s" <<'REMOTE'
+          set -euo pipefail
+          units() { systemctl list-units --all 'remohop*.service' --no-legend --plain | awk '{print $1}'; }
+          state() { for u in $(units); do printf '  %-24s %s\n' "$u" "$(systemctl is-active "$u" || true)"; done; }
+          checks() {
+            echo "healthz: $(curl -s --max-time 5 http://127.0.0.1:8810/healthz || echo 'no answer')"
+            echo "via Cloudflare (Cf-Ray): $(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'Cf-Ray: x' http://127.0.0.1:8810/ || true)"
+            echo "listeners on 8810: $(ss -ltnH 'sport = :8810' | awk '{print $4}' | sort -u | tr '\n' ' ')"
+          }
+          echo "arch: $(uname -m)"
+          echo "remohop: $(/usr/local/bin/remohop version 2>/dev/null | head -1 || echo missing)"
+          echo "units:"; state
+          if [[ -f /etc/systemd/system/remohop-signal.service.d/zz-panel.conf ]]; then echo "panel drop-in: present"; else echo "panel drop-in: absent"; fi
+          case "$MODE" in
+            probe) exit 0 ;;
+            check) checks; exit 0 ;;
+          esac
+          # --- upgrade ---
+          case "$(uname -m)" in x86_64) A=amd64;; aarch64) A=arm64;; *) echo "unsupported arch"; exit 1;; esac
+          W=$(mktemp -d); cd "$W"
+          base="https://github.com/readori/RemoHop/releases/download/$VERSION"
+          curl -fsSLO "$base/remohop_linux_${A}.tar.gz"; curl -fsSLO "$base/SHA256SUMS"
+          sha256sum --ignore-missing -c SHA256SUMS
+          tar xzf "remohop_linux_${A}.tar.gz" remohop
+          NEW=$(./remohop version 2>/dev/null | head -1)
+          OLDV=$(/usr/local/bin/remohop version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+          if [[ -n "$OLDV" && "$OLDV" != "$VERSION" && ! -e "/usr/local/bin/remohop.bak-$OLDV" ]]; then
+            cp -p /usr/local/bin/remohop "/usr/local/bin/remohop.bak-$OLDV"; echo "backup: remohop.bak-$OLDV"
+          fi
+          install -m 0755 -o root -g root remohop /usr/local/bin/remohop
+          echo "installed: $NEW"
+          D=/etc/systemd/system/remohop-signal.service.d
+          if [[ ! -f $D/zz-panel.conf ]]; then
+            OLD=$(systemctl cat remohop-signal | grep '^ExecStart=.' | tail -1 | cut -d= -f2-)
+            [[ -n "$OLD" ]] || { echo "no ExecStart found for remohop-signal"; exit 1; }
+            if grep -q -- '--panel' <<<"$OLD"; then echo "ExecStart already has --panel; drop-in not added"; else
+              install -d -m 0755 "$D"
+              printf '[Service]\nEnvironmentFile=-/etc/remohop/remohop-signal-panel.env\nExecStart=\nExecStart=%s --panel 127.0.0.1:8810\n' "$OLD" > "$D/zz-panel.conf"
+              echo "panel drop-in: added (ExecStart kept, --panel 127.0.0.1:8810 appended)"
+            fi
+          fi
+          install -d -m 0755 /etc/remohop
+          [[ -e /etc/remohop/remohop-signal-panel.env ]] || install -m 600 -o root /dev/null /etc/remohop/remohop-signal-panel.env
+          systemctl daemon-reload
+          systemctl restart $(units)
+          sleep 5
+          echo "after restart:"; state
+          echo "remohop: $(/usr/local/bin/remohop version 2>/dev/null | head -1)"
+          checks
+          rm -rf "$W"
+          bad=0; for u in $(units); do systemctl is-active -q "$u" || bad=1; done
+          [[ $bad == 0 ]] || { echo "a remohop unit is not active"; exit 1; }
+          REMOTE
+
+      - name: Clean up
+        if: always()
+        run: rm -f ~/.ssh/id_xunine
