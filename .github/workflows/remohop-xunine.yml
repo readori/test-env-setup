@@ -27,6 +27,11 @@ on:
         required: false
         default: 'v1.0.8'
         type: string
+      key_source:
+        description: 'xunine = XUNINE_SSH_4H24G; oracle = ORACLE_SSH_KEY (+ ORACLE_SSH_USER)'
+        type: choice
+        options: [xunine, oracle]
+        default: xunine
       ssh_user:
         description: 'SSH user (empty = try root, ubuntu, opc)'
         required: false
@@ -49,11 +54,13 @@ jobs:
     steps:
       - name: SSH key
         env:
-          KEY: ${{ secrets.XUNINE_SSH_4H24G }}
+          KEY: ${{ inputs.key_source == 'oracle' && secrets.ORACLE_SSH_KEY || secrets.XUNINE_SSH_4H24G }}
+          O_HOST: ${{ inputs.key_source == 'oracle' && secrets.ORACLE_SSH_HOST || '' }}
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          [[ -n "$KEY" ]] || { echo '::error::Missing secret XUNINE_SSH_4H24G'; exit 78; }
+          [[ -n "$KEY" ]] || { echo '::error::Missing SSH key secret'; exit 78; }
+          if [[ -n "${O_HOST:-}" ]]; then [[ "$O_HOST" == "$HOST" ]] && echo "ORACLE_SSH_HOST: same host" || echo "ORACLE_SSH_HOST: a different host"; fi
           [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo '::error::version must be vX.Y.Z'; exit 64; }
           umask 077; mkdir -p ~/.ssh
           printf '%s\n' "$KEY" | tr -d '\r' > ~/.ssh/id_xunine
@@ -63,12 +70,12 @@ jobs:
       - name: Find the SSH user
         id: who
         env:
-          WANT: ${{ inputs.ssh_user }}
+          WANT: ${{ inputs.ssh_user != '' && inputs.ssh_user || (inputs.key_source == 'oracle' && secrets.ORACLE_SSH_USER || '') }}
         run: |
           set -euo pipefail
           for u in ${WANT:-root ubuntu opc}; do
             if ssh -i ~/.ssh/id_xunine -o BatchMode=yes -o ConnectTimeout=15 "$u@$HOST" true 2>/dev/null; then
-              echo "user=$u" >> "$GITHUB_OUTPUT"; echo "SSH works as $u"; exit 0
+              echo "SSH_U=$u" >> "$GITHUB_ENV"; echo "SSH works as $u"; exit 0
             fi
           done
           echo "key lines: $(wc -l < ~/.ssh/id_xunine); header: $(head -1 ~/.ssh/id_xunine | cut -c1-36)"
@@ -78,12 +85,11 @@ jobs:
 
       - name: Run on xunine
         env:
-          U: ${{ steps.who.outputs.user }}
           MODE: ${{ inputs.mode }}
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/id_xunine -o BatchMode=yes -o ConnectTimeout=15 "$U@$HOST" \
+          ssh -i ~/.ssh/id_xunine -o BatchMode=yes -o ConnectTimeout=15 "$SSH_U@$HOST" \
             "MODE='$MODE' VERSION='$VERSION' sudo -n -E bash -s" <<'REMOTE'
           set -euo pipefail
           units() { systemctl list-units --all 'remohop*.service' --no-legend --plain | awk '{print $1}'; }
