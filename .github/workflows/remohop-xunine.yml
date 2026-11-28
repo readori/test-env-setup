@@ -28,7 +28,7 @@ on:
     inputs:
       mode:
         type: choice
-        options: [probe, upgrade, check]
+        options: [probe, upgrade, check, panel-env]
         default: probe
       version:
         description: 'Release tag, e.g. v1.0.8 (upgrade)'
@@ -131,6 +131,22 @@ jobs:
           else r=other; fi
           echo "::error::SSH login failed: $r"; exit 1
 
+      - name: Write the panel env file (panel-env)
+        if: inputs.mode == 'panel-env'
+        env:
+          P_TEAM: ${{ secrets.XUNINE_PANEL_CF_TEAM }}
+          P_AUD: ${{ secrets.XUNINE_PANEL_CF_AUD }}
+          P_EMAILS: ${{ secrets.XUNINE_PANEL_CF_EMAILS }}
+          TUNNEL_SERVICE_TOKEN_ID: ${{ inputs.key_source == 'oracle' && secrets.ORACLE_ACCESS_CLIENT_ID || '' }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ inputs.key_source == 'oracle' && secrets.ORACLE_ACCESS_CLIENT_SECRET || '' }}
+        run: |
+          set -euo pipefail
+          [[ -n "$P_TEAM" && -n "$P_AUD" ]] || { echo '::error::Missing XUNINE_PANEL_CF_TEAM / XUNINE_PANEL_CF_AUD'; exit 78; }
+          { printf 'REMOHOP_PANEL_CF_TEAM=%s\nREMOHOP_PANEL_CF_AUD=%s\n' "$P_TEAM" "$P_AUD"; [[ -z "$P_EMAILS" ]] || printf 'REMOHOP_PANEL_CF_EMAILS=%s\n' "$P_EMAILS"; } \
+            | timeout 120 ssh -F "$RUNNER_TEMP/ssh/config" -l "$SSH_U" target \
+              "sudo -n sh -c 'umask 077; install -d -m 0755 /etc/remohop; cat > /etc/remohop/remohop-signal-panel.env.new && chown root:root /etc/remohop/remohop-signal-panel.env.new && chmod 600 /etc/remohop/remohop-signal-panel.env.new && mv /etc/remohop/remohop-signal-panel.env.new /etc/remohop/remohop-signal-panel.env'"
+          echo "panel env file written ($([[ -z "$P_EMAILS" ]] && echo 2 || echo 3) settings, root 0600)"
+
       - name: Run on the machine
         env:
           MODE: ${{ inputs.mode }}
@@ -164,6 +180,11 @@ jobs:
           case "$MODE" in
             probe) exit 0 ;;
             check) checks; exit 0 ;;
+            panel-env)
+              echo "env file: $(stat -c '%U %a' /etc/remohop/remohop-signal-panel.env), $(grep -c '^REMOHOP_PANEL_' /etc/remohop/remohop-signal-panel.env) settings"
+              systemctl restart remohop-signal; sleep 4
+              echo "remohop-signal: $(systemctl is-active remohop-signal)"
+              checks; exit 0 ;;
           esac
           # --- upgrade ---
           systemctl cat remohop-signal > /dev/null 2>&1 || { echo "no remohop-signal unit here; refusing to upgrade"; exit 1; }
