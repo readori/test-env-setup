@@ -1,16 +1,21 @@
 # CloudMail Android build CI.
 # Public CI repository -> private source repository (readori/CloudMail, mail-android).
 #
-#   verify : JDK 17 + the runner's Android SDK -> ./gradlew assembleDebug + testDebugUnitTest + lintDebug. No signing,
-#            nothing uploaded. Confirms the Compose app compiles. The Gradle wrapper is bootstrapped
-#            at a pinned version from the runner's preinstalled gradle (no binary jar committed).
-#   build  : TODO (requires Play upload-signing secrets) — signed release AAB.
-#   upload : TODO (requires a Play Developer API service account) — upload the AAB to a Play track.
+#   verify     : JDK 17 + the runner's Android SDK -> assembleDebug + testDebugUnitTest + lintDebug.
+#                No signing, nothing uploaded.
+#   bundle     : unit tests, then a release .aab signed with CF Mail's own upload key
+#                (CLOUDMAIL_ANDROID_UPLOAD_*; not RemoHop's ANDROID_UPLOAD_* nor Hourwave's RADIO_*),
+#                and bundle checks (package, targetSdk 36, permission allow-list, no AD_ID, signature).
+#                Nothing leaves the runner unless aab_pubkey is given (see below).
+#   internal   : bundle, then upload it to the Play internal track as a draft release through the
+#                Android Publisher API (PLAY_SERVICE_ACCOUNT_JSON; token masked, key file deleted at once).
+#   play-check : only opens and deletes a Play edit, to check the API accepts com.readori.mail.
 #
-# Secrets needed later for build/upload (the owner must provide; not used by verify):
-#   ANDROID_UPLOAD_KEYSTORE_BASE64, ANDROID_UPLOAD_KEYSTORE_PASSWORD, ANDROID_UPLOAD_KEY_ALIAS,
-#   ANDROID_UPLOAD_KEY_PASSWORD, PLAY_SERVICE_ACCOUNT_JSON
-# verify only needs TARGET_REPO_PAT (read the private source).
+# aab_pubkey (bundle only, for the first hand-made upload in Play Console): base64 of an RSA public key
+# PEM. The .aab is encrypted with a random AES-256 key wrapped with that RSA key, and both go up as a
+# 1-day artifact, so only the holder of the private key can open it.
+#
+# Version: versionName = version; versionCode = major*1000000 + minor*10000 + patch*100 + build_number.
 
 name: CloudMail Android
 
@@ -20,15 +25,30 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'verify = compile the app (no signing); build/upload require Play secrets (not set up yet)'
+        description: 'verify = debug build + tests + lint; bundle = signed .aab; internal = bundle + Play internal track (draft); play-check = open and delete a Play edit'
         required: true
         default: verify
         type: choice
-        options: [verify, build, upload]
+        options: [verify, bundle, internal, play-check]
       source_ref:
         description: 'Private readori/CloudMail branch, tag or SHA'
         required: true
         default: main
+        type: string
+      version:
+        description: 'versionName x.y.z (bundle/internal)'
+        required: false
+        default: '1.0.0'
+        type: string
+      build_number:
+        description: 'Build number 1..99 (bundle/internal)'
+        required: false
+        default: '1'
+        type: string
+      aab_pubkey:
+        description: 'bundle only: base64 RSA public key PEM; set = encrypted 1-day .aab artifact'
+        required: false
+        default: ''
         type: string
       gradle_version:
         description: 'Gradle version to bootstrap the wrapper at'
@@ -45,9 +65,10 @@ concurrency:
 
 jobs:
   android:
+    if: inputs.mode != 'play-check'
     name: Build CloudMail Android
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       SOURCE_REPOSITORY: readori/CloudMail
       TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
@@ -55,18 +76,18 @@ jobs:
     steps:
       - name: Validate inputs and credentials
         shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+          VERSION: ${{ inputs.version }}
+          BUILD: ${{ inputs.build_number }}
+          GRADLE_VERSION: ${{ inputs.gradle_version }}
         run: |
           set -euo pipefail
           [[ -n "${TARGET_REPO_PAT:-}" ]] || { echo '::error::Missing repository secret TARGET_REPO_PAT'; exit 78; }
-          case "${{ inputs.mode }}" in
-            verify) ;;
-            build|upload)
-              echo "::error::mode '${{ inputs.mode }}' needs Play upload-signing + service-account secrets that are not configured yet."
-              echo "::error::Provide ANDROID_UPLOAD_KEYSTORE_BASE64 / _PASSWORD / KEY_ALIAS / KEY_PASSWORD and PLAY_SERVICE_ACCOUNT_JSON, then this job will be enabled."
-              exit 64 ;;
-            *) echo "::error::Unknown mode"; exit 64 ;;
-          esac
-          [[ "${{ inputs.gradle_version }}" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || { echo '::error::Invalid gradle_version'; exit 64; }
+          case "$MODE" in verify|bundle|internal) ;; *) echo "::error::Unknown mode"; exit 64 ;; esac
+          [[ "$GRADLE_VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || { echo '::error::Invalid gradle_version'; exit 64; }
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo '::error::version must be x.y.z'; exit 64; }
+          [[ "$BUILD" =~ ^[0-9]+$ ]] && (( BUILD >= 1 && BUILD <= 99 )) || { echo '::error::build_number 1..99'; exit 64; }
 
       - name: Checkout private CloudMail source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -106,7 +127,6 @@ jobs:
         working-directory: mail-android
         shell: bash
         env:
-          ANDROID_HOME: ${{ env.ANDROID_HOME }}
           GRADLE_OPTS: -Dorg.gradle.daemon=false
         run: |
           set -euo pipefail
@@ -125,3 +145,174 @@ jobs:
             echo "- Gradle: \`${{ inputs.gradle_version }}\` · JDK 17 · runner Android SDK"
             echo '- Built `:app:assembleDebug` + `:app:testDebugUnitTest` + `:app:lintDebug` (unsigned). No bundle uploaded.'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Signed release bundle
+        if: inputs.mode == 'bundle' || inputs.mode == 'internal'
+        working-directory: mail-android
+        shell: bash
+        env:
+          GRADLE_OPTS: -Dorg.gradle.daemon=false
+          VERSION: ${{ inputs.version }}
+          BUILD: ${{ inputs.build_number }}
+          KEYSTORE_BASE64: ${{ secrets.CLOUDMAIL_ANDROID_UPLOAD_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.CLOUDMAIL_ANDROID_UPLOAD_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.CLOUDMAIL_ANDROID_UPLOAD_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.CLOUDMAIL_ANDROID_UPLOAD_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [[ -n "$KEYSTORE_BASE64" && -n "$KEYSTORE_PASSWORD" && -n "$KEY_ALIAS" ]] || { echo '::error::Missing CLOUDMAIL_ANDROID_UPLOAD_* secrets.'; exit 78; }
+          [[ "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]
+          CODE=$(( BASH_REMATCH[1] * 1000000 + BASH_REMATCH[2] * 10000 + BASH_REMATCH[3] * 100 + BUILD ))
+          echo "versionName=$VERSION versionCode=$CODE"
+          umask 077
+          KS="$RUNNER_TEMP/upload.p12"
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$KS"
+          ./gradlew --no-daemon -q :app:testDebugUnitTest :app:bundleRelease \
+            -Pcfmail.versionCode="$CODE" -Pcfmail.versionName="$VERSION" \
+            -Pandroid.injected.signing.store.file="$KS" \
+            -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEY_PASSWORD" > "$RUNNER_TEMP/b.log" 2>&1 \
+            || { rm -f "$KS"; grep -E "^e: |error:|ERROR|FAILURE|FAILED|What went wrong|Missing class" -A3 "$RUNNER_TEMP/b.log" | head -80; exit 1; }
+          rm -f "$KS"
+
+      - name: Bundle checks (package, targetSdk, permissions, signature)
+        if: inputs.mode == 'bundle' || inputs.mode == 'internal'
+        working-directory: mail-android
+        shell: bash
+        run: |
+          set -euo pipefail
+          AAB=app/build/outputs/bundle/release/app-release.aab
+          curl -sSfLo "$RUNNER_TEMP/bundletool.jar" https://github.com/google/bundletool/releases/download/1.18.3/bundletool-all-1.18.3.jar
+          MANIFEST=$(java -jar "$RUNNER_TEMP/bundletool.jar" dump manifest --bundle="$AAB")
+          grep -q 'package="com.readori.mail"' <<<"$MANIFEST" || { echo '::error::package is not com.readori.mail'; exit 1; }
+          grep -q 'android:targetSdkVersion="36"' <<<"$MANIFEST" || { echo '::error::targetSdk is not 36'; exit 1; }
+          grep -q 'com.android.vending.BILLING' <<<"$MANIFEST" || { echo '::error::no BILLING permission'; exit 1; }
+          if grep -q 'AD_ID' <<<"$MANIFEST"; then echo '::error::AD_ID permission must not be declared'; exit 1; fi
+          ALLOWED='INTERNET|ACCESS_NETWORK_STATE|POST_NOTIFICATIONS|BILLING|DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'
+          EXTRA=$(grep -o 'uses-permission[^>]*android:name="[^"]*"' <<<"$MANIFEST" | sed 's/.*name="//;s/"//;s/.*\.//' | grep -Ev "^($ALLOWED)$" || true)
+          [ -z "$EXTRA" ] || { echo "::error::unexpected permissions: $EXTRA"; exit 1; }
+          grep -o 'android:versionCode="[^"]*"\|android:versionName="[^"]*"' <<<"$MANIFEST" | head -2
+          jarsigner -verify "$AAB" > /dev/null || { echo '::error::bundle signature does not verify'; exit 1; }
+          ls -l "$AAB" | awk '{print "bundle checks passed,", $5, "bytes"}'
+
+      - name: Encrypt the bundle for one recipient
+        if: (inputs.mode == 'bundle' || inputs.mode == 'internal') && inputs.aab_pubkey != ''
+        working-directory: mail-android
+        shell: bash
+        env:
+          PUB: ${{ inputs.aab_pubkey }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/out"
+          printf '%s' "$PUB" | base64 -d > "$RUNNER_TEMP/pub.pem"
+          openssl pkey -pubin -in "$RUNNER_TEMP/pub.pem" -noout || { echo '::error::aab_pubkey is not a public key PEM'; exit 1; }
+          openssl rand 32 > "$RUNNER_TEMP/k"
+          openssl pkeyutl -encrypt -pubin -inkey "$RUNNER_TEMP/pub.pem" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+            -in "$RUNNER_TEMP/k" -out "$RUNNER_TEMP/out/cfmail.key.enc"
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass file:"$RUNNER_TEMP/k" \
+            -in app/build/outputs/bundle/release/app-release.aab -out "$RUNNER_TEMP/out/cfmail.aab.enc"
+          rm -f "$RUNNER_TEMP/k"
+
+      - name: Upload the encrypted bundle (1 day)
+        if: (inputs.mode == 'bundle' || inputs.mode == 'internal') && inputs.aab_pubkey != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cfmail-aab-encrypted
+          path: ${{ runner.temp }}/out/
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Upload to Play internal testing (draft)
+        if: inputs.mode == 'internal'
+        working-directory: mail-android
+        env:
+          PLAY_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          VNAME: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          umask 077
+          AAB=app/build/outputs/bundle/release/app-release.aab
+          umask 077
+          SA="$RUNNER_TEMP/sa.json"; printf '%s' "$PLAY_JSON" > "$SA"
+          KEY="$RUNNER_TEMP/sa.pem"
+          EMAIL="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));open(sys.argv[2],"w").write(d["private_key"]);print(d["client_email"])' "$SA" "$KEY")"
+          b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          NOW="$(date +%s)"
+          HDR="$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)"
+          CLAIMS="$(printf '{"iss":"%s","scope":"https://www.googleapis.com/auth/androidpublisher","aud":"https://oauth2.googleapis.com/token","iat":%s,"exp":%s}' "$EMAIL" "$NOW" "$((NOW + 1800))" | b64url)"
+          SIG="$(printf '%s.%s' "$HDR" "$CLAIMS" | openssl dgst -sha256 -sign "$KEY" -binary | b64url)"
+          rm -f "$KEY" "$SA"
+          TOKEN="$(curl -fsS --max-time 30 https://oauth2.googleapis.com/token \
+            --data-urlencode 'grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer' \
+            --data-urlencode "assertion=$HDR.$CLAIMS.$SIG" | python3 -c 'import json,sys;print(json.load(sys.stdin)["access_token"])')" \
+            || { echo '::error::Could not get a Google access token (service account key or clock).'; exit 1; }
+          echo "::add-mask::$TOKEN"
+          API="https://androidpublisher.googleapis.com/androidpublisher/v3/applications/com.readori.mail"
+          call() { # method url [curl args...]; prints the body, fails with Google's message on stderr (so it reaches the log when stdout is captured or dropped)
+            local m="$1" u="$2"; shift 2
+            local out code
+            out="$(curl -sS --max-time 600 -X "$m" -H "Authorization: Bearer $TOKEN" -w '\n%{http_code}' "$u" "$@")"
+            code="${out##*$'\n'}"; out="${out%$'\n'*}"
+            if [[ "$code" != 2* ]]; then
+              python3 -c 'import json,sys
+          try: e=json.loads(sys.argv[1])["error"]; print("Play API %s: %s" % (e.get("code"), e.get("message","")[:400]))
+          except Exception: print("Play API HTTP", sys.argv[2])' "$out" "$code" >&2
+              return 1
+            fi
+            printf '%s' "$out"
+          }
+          EDIT="$(call POST "$API/edits" -H 'Content-Type: application/json' -d '{}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')" \
+            || { echo '::error::Could not open a Play edit.'; exit 1; }
+          UP="$(call POST "https://androidpublisher.googleapis.com/upload/androidpublisher/v3/applications/com.readori.mail/edits/$EDIT/bundles?uploadType=media" \
+            -H 'Content-Type: application/octet-stream' --data-binary "@$AAB" | python3 -c 'import json,sys;print(json.load(sys.stdin)["versionCode"])')" \
+            || { echo '::error::Bundle upload failed.'; exit 1; }
+          BODY="$(printf '{"track":"internal","releases":[{"name":"%s (%s)","versionCodes":["%s"],"status":"draft"}]}' "$VNAME" "$UP" "$UP")"
+          call PUT "$API/edits/$EDIT/tracks/internal" -H 'Content-Type: application/json' -d "$BODY" > /dev/null || { echo '::error::Track update failed.'; exit 1; }
+          call POST "$API/edits/$EDIT:commit" > /dev/null || { echo '::error::Commit of the Play edit failed.'; exit 1; }
+          echo "Uploaded version code $UP to internal (draft)."
+
+  play-check:
+    if: inputs.mode == 'play-check'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Open and delete a Play edit
+        env:
+          PLAY_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          umask 077
+          SA="$RUNNER_TEMP/sa.json"; printf '%s' "$PLAY_JSON" > "$SA"
+          KEY="$RUNNER_TEMP/sa.pem"
+          EMAIL="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));open(sys.argv[2],"w").write(d["private_key"]);print(d["client_email"])' "$SA" "$KEY")"
+          b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          NOW="$(date +%s)"
+          HDR="$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)"
+          CLAIMS="$(printf '{"iss":"%s","scope":"https://www.googleapis.com/auth/androidpublisher","aud":"https://oauth2.googleapis.com/token","iat":%s,"exp":%s}' "$EMAIL" "$NOW" "$((NOW + 1800))" | b64url)"
+          SIG="$(printf '%s.%s' "$HDR" "$CLAIMS" | openssl dgst -sha256 -sign "$KEY" -binary | b64url)"
+          rm -f "$KEY" "$SA"
+          TOKEN="$(curl -fsS --max-time 30 https://oauth2.googleapis.com/token \
+            --data-urlencode 'grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer' \
+            --data-urlencode "assertion=$HDR.$CLAIMS.$SIG" | python3 -c 'import json,sys;print(json.load(sys.stdin)["access_token"])')" \
+            || { echo '::error::Could not get a Google access token (service account key or clock).'; exit 1; }
+          echo "::add-mask::$TOKEN"
+          API="https://androidpublisher.googleapis.com/androidpublisher/v3/applications/com.readori.mail"
+          call() { # method url [curl args...]; prints the body, fails with Google's message on stderr (so it reaches the log when stdout is captured or dropped)
+            local m="$1" u="$2"; shift 2
+            local out code
+            out="$(curl -sS --max-time 600 -X "$m" -H "Authorization: Bearer $TOKEN" -w '\n%{http_code}' "$u" "$@")"
+            code="${out##*$'\n'}"; out="${out%$'\n'*}"
+            if [[ "$code" != 2* ]]; then
+              python3 -c 'import json,sys
+          try: e=json.loads(sys.argv[1])["error"]; print("Play API %s: %s" % (e.get("code"), e.get("message","")[:400]))
+          except Exception: print("Play API HTTP", sys.argv[2])' "$out" "$code" >&2
+              return 1
+            fi
+            printf '%s' "$out"
+          }
+          EDIT="$(call POST "$API/edits" -H 'Content-Type: application/json' -d '{}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')" \
+            || { echo '::error::Could not open a Play edit.'; exit 1; }
+          call DELETE "$API/edits/$EDIT" > /dev/null || true
+          echo 'Play edit opened and deleted: the API accepts com.readori.mail.'
