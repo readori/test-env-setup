@@ -155,6 +155,12 @@ jobs:
           echo "remohop: $( (/usr/local/bin/remohop version 2>/dev/null || echo missing) | head -1)"
           echo "units:"; state
           if [[ -f /etc/systemd/system/remohop-signal.service.d/zz-panel.conf ]]; then echo "panel drop-in: present"; else echo "panel drop-in: absent"; fi
+          if [[ "$MODE" == probe ]]; then
+            echo "remohop binaries: $(ls /usr/local/bin /usr/bin /opt 2>/dev/null | grep -i remohop | sort -u | tr '\n' ' ')"
+            echo "units matching remo: $(systemctl list-unit-files --no-legend 2>/dev/null | awk '{print $1}' | grep -i remo | tr '\n' ' ')"
+            echo "containers matching remo: $( (docker ps -a --format '{{.Names}} {{.Image}}' 2>/dev/null || true) | grep -i remo | tr '\n' ';')"
+            echo "listening on 2111x: $(ss -lntuH 2>/dev/null | awk '{print $1, $5}' | grep -E ':2111[4-9]$' | sort -u | tr '\n' ';')"
+          fi
           case "$MODE" in
             probe) exit 0 ;;
             check) checks; exit 0 ;;
